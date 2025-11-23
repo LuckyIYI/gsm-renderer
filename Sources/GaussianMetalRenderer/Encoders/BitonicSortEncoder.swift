@@ -160,7 +160,7 @@ final class BitonicSortEncoder {
             let icb = device.makeIndirectCommandBuffer(
                 descriptor: descriptor,
                 maxCommandCount: commandCount,
-                options: .storageModePrivate
+                options: .storageModeShared
             )
         else {
             fatalError("Failed to create indirect command buffer for bitonic")
@@ -173,7 +173,7 @@ final class BitonicSortEncoder {
         // Argument buffer for the ICB container
         let argBuffer = device.makeBuffer(
             length: icbArgEncoder.encodedLength,
-            options: .storageModePrivate
+            options: .storageModeShared
         )!
         icbArgEncoder.setArgumentBuffer(argBuffer, offset: 0)
         icbArgEncoder.setIndirectCommandBuffer(icb, index: 0)

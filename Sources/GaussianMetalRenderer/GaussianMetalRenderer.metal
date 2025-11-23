@@ -450,7 +450,7 @@ kernel void projectGaussiansKernel(
             harmonics[baseColor + 2]
         );
     } else {
-        float3 dir = normalize(position - camera.cameraCenter);
+        float3 dir = normalize(camera.cameraCenter - position);
         float shBasis[16];
         shBasis[0] = SH_C0;
         shBasis[1] = -SH_C1 * dir.y;
@@ -536,9 +536,6 @@ kernel void renderTiles(
     GaussianHeader header = headers[tileId];
     uint start = header.offset;
     uint count = header.count;
-    if (params.maxPerTile > 0 && count > params.maxPerTile) {
-        count = params.maxPerTile;
-    }
     if (count == 0) { return; }
 
     for (uint i = 0; i < count; ++i) {

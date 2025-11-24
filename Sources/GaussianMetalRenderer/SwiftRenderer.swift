@@ -101,14 +101,17 @@ public final class Renderer: @unchecked Sendable {
         private var gaussianColorsCache: MTLBuffer?
         private var gaussianOpacitiesCache: MTLBuffer?
         
-    private let sortAlgorithm: SortAlgorithm = .bitonic
+    private let sortAlgorithm: SortAlgorithm = .radix
+    private let precision: Precision
+    private let effectivePrecision: Precision
+    public var precisionSetting: Precision { self.effectivePrecision }
             
     private enum SortAlgorithm {
         case bitonic
         case radix
     }
 
-    init() {
+    public init(precision: Precision = .float32, useIndirectBitonic: Bool = true) {
         guard let device = MTLCreateSystemDefaultDevice() else {
             fatalError("Metal device unavailable")
         }
@@ -119,17 +122,172 @@ public final class Renderer: @unchecked Sendable {
         self.queue = queue
         
         do {
+            // Try compiling from bundled .metal source first to pick up new kernels; fall back to prebuilt metallib.
             let currentFileURL = URL(fileURLWithPath: #filePath)
             let moduleDir = currentFileURL.deletingLastPathComponent()
             let metallibURL = moduleDir.appendingPathComponent("GaussianMetalRenderer.metallib")
-            let library = try device.makeLibrary(URL: metallibURL)
+            var chosen: MTLLibrary?
+            if
+                let metalURL = Bundle.module.url(forResource: "GaussianMetalRenderer", withExtension: "metal"),
+                let source = try? String(contentsOf: metalURL, encoding: .utf8) {
+                do {
+                    chosen = try device.makeLibrary(source: source, options: nil)
+                } catch {
+                    print("[Renderer] Failed to compile Metal source from bundle: \(error)")
+                }
+            }
+            if chosen == nil {
+                chosen = try device.makeLibrary(URL: metallibURL)
+            }
+            var library = chosen!
+            if precision == .float16 {
+                // Ensure half kernels are available; if not, attempt a direct compile from source next to the binary.
+                if library.makeFunction(name: "packTileDataKernelHalf") == nil || library.makeFunction(name: "renderTilesHalf") == nil {
+                    let fallbackSourceURL = moduleDir.appendingPathComponent("GaussianMetalRenderer.metal")
+                    if let source = try? String(contentsOf: fallbackSourceURL, encoding: .utf8) {
+                        do {
+                            let rebuilt = try device.makeLibrary(source: source, options: nil)
+                            library = rebuilt
+                        } catch {
+                            print("[Renderer] Failed to compile Metal source for half precision: \(error)")
+                        }
+                    }
+                }
+                if library.makeFunction(name: "packTileDataKernelHalf") == nil || library.makeFunction(name: "renderTilesHalf") == nil {
+                    let halfOnlySource = """
+                    #include <metal_stdlib>
+                    using namespace metal;
+                    struct GaussianHeader { uint offset; uint count; };
+                    struct TileAssignmentHeader { uint totalAssignments; uint maxAssignments; uint paddedCount; uint overflow; };
+                    struct PackParams { uint totalAssignments; uint padding; };
+                    struct RenderParams { uint width; uint height; uint tileWidth; uint tileHeight; uint tilesX; uint tilesY; uint maxPerTile; uint whiteBackground; uint activeTileCount; uint gaussianCount; };
+                    kernel void packTileDataKernelHalf(
+                        const device int* sortedIndices [[buffer(0)]],
+                        const device float2* means [[buffer(1)]],
+                        const device float4* conics [[buffer(2)]],
+                        const device packed_float3* colors [[buffer(3)]],
+                        const device float* opacities [[buffer(4)]],
+                        const device float* depths [[buffer(5)]],
+                        device half2* outMeans [[buffer(6)]],
+                        device half4* outConics [[buffer(7)]],
+                        device half4* outColors [[buffer(8)]],
+                        device half* outOpacities [[buffer(9)]],
+                        device half* outDepths [[buffer(10)]],
+                        const device TileAssignmentHeader* header [[buffer(11)]],
+                        const device int* tileIndices [[buffer(12)]],
+                        const device int* tileIds [[buffer(13)]],
+                        constant PackParams& params [[buffer(14)]],
+                        uint gid [[thread_position_in_grid]]
+                    ) {
+                        uint total = header->totalAssignments;
+                        if (gid >= total) { return; }
+                        int src = sortedIndices[gid];
+                        if (src < 0) { return; }
+                        float2 m = means[src];
+                        float4 c = conics[src];
+                        float3 col = float3(colors[src]);
+                        outMeans[gid] = half2(m);
+                        outConics[gid] = half4(c);
+                        outColors[gid] = half4(half3(col), half(0.0));
+                        outOpacities[gid] = half(opacities[src]);
+                        outDepths[gid] = half(depths[src]);
+                    }
+                    kernel void renderTilesHalf(
+                        const device GaussianHeader* headers [[buffer(0)]],
+                        const device half2* means [[buffer(1)]],
+                        const device half4* conics [[buffer(2)]],
+                        const device half4* colors [[buffer(3)]],
+                        const device half* opacities [[buffer(4)]],
+                        const device half* depths [[buffer(5)]],
+                        device float* colorOut [[buffer(6)]],
+                        device float* depthOut [[buffer(7)]],
+                        device float* alphaOut [[buffer(8)]],
+                        constant RenderParams& params [[buffer(9)]],
+                        const device uint* activeTiles [[buffer(10)]],
+                        const device uint* activeTileCount [[buffer(11)]],
+                        uint3 localPos3 [[thread_position_in_threadgroup]],
+                        uint3 tileCoord [[threadgroup_position_in_grid]]
+                    ) {
+                        uint tilesX = params.tilesX;
+                        uint tilesY = params.tilesY;
+                        uint tileId = tileCoord.x;
+                        if (tileId >= tilesX * tilesY) { return; }
+                        uint tileWidth = params.tileWidth;
+                        uint tileHeight = params.tileHeight;
+                        uint localX = localPos3.x;
+                        uint localY = localPos3.y;
+                        uint tileX = tileId % tilesX;
+                        uint tileY = tileId / tilesX;
+                        uint px = tileX * tileWidth + localX;
+                        uint py = tileY * tileHeight + localY;
+                        bool inBounds = (px < params.width) && (py < params.height);
+                        float3 accumColor = float3(0.0f);
+                        float accumDepth = 0.0f;
+                        float accumAlpha = 0.0f;
+                        float trans = 1.0f;
+                        GaussianHeader header = headers[tileId];
+                        uint start = header.offset;
+                        uint count = header.count;
+                        if (count == 0) { return; }
+                        for (uint i = 0; i < count; ++i) {
+                            uint gIdx = start + i;
+                            if (inBounds) {
+                                float2 mean = float2(means[gIdx]);
+                                float4 conic = float4(conics[gIdx]);
+                                float3 color = float3(colors[gIdx].xyz);
+                                float baseOpacity = metal::min(float(opacities[gIdx]), 0.99f);
+                                if (baseOpacity > 0.0f) {
+                                    float fx = float(px);
+                                    float fy = float(py);
+                                    float dx = fx - mean.x;
+                                    float dy = fy - mean.y;
+                                    float quad = dx * dx * conic.x + dy * dy * conic.z + 2.0f * dx * dy * conic.y;
+                                    if (quad < 20.0f && (conic.x != 0.0f || conic.z != 0.0f)) {
+                                        float weight = metal::exp(-0.5f * quad);
+                                        float alpha = weight * baseOpacity;
+                                        if (alpha > 1e-4f) {
+                                            float contrib = trans * alpha;
+                                            trans *= (1.0f - alpha);
+                                            accumAlpha += contrib;
+                                            accumColor += color * contrib;
+                                            accumDepth += float(depths[gIdx]) * contrib;
+                                            if (trans < 1e-3f) { break; }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        if (inBounds) {
+                            if (params.whiteBackground != 0) {
+                                accumColor += float3(trans);
+                            }
+                            uint pixelIndex = py * params.width + px;
+                            uint base = pixelIndex * 3;
+                            colorOut[base + 0] = accumColor.x;
+                            colorOut[base + 1] = accumColor.y;
+                            colorOut[base + 2] = accumColor.z;
+                            depthOut[pixelIndex] = accumDepth;
+                            alphaOut[pixelIndex] = accumAlpha;
+                        }
+                    }
+                    """
+                    do {
+                        let halfLib = try device.makeLibrary(source: halfOnlySource, options: nil)
+                        library = halfLib
+                    } catch {
+                        print("[Renderer] Failed to compile inline half-precision Metal source: \(error)")
+                    }
+                }
+            }
+            let halfAvailable = library.makeFunction(name: "packTileDataKernelHalf") != nil && library.makeFunction(name: "renderTilesHalf") != nil
             self.library = library
+            self.effectivePrecision = (precision == .float16 && halfAvailable) ? .float16 : .float32
             
             self.tileBoundsEncoder = try TileBoundsEncoder(device: device, library: library)
             self.coverageEncoder = try CoverageEncoder(device: device, library: library)
             self.scatterEncoder = try ScatterEncoder(device: device, library: library)
-            self.sortKeyGenEncoder = try SortKeyGenEncoder(device: device, library: library)
-            self.bitonicSortEncoder = try BitonicSortEncoder(device: device, library: library, useIndirect: false)
+        self.sortKeyGenEncoder = try SortKeyGenEncoder(device: device, library: library)
+        self.bitonicSortEncoder = try BitonicSortEncoder(device: device, library: library, useIndirect: useIndirectBitonic)
             self.radixSortEncoder = try RadixSortEncoder(device: device, library: library)
             self.packEncoder = try PackEncoder(device: device, library: library)
             self.renderEncoder = try RenderEncoder(device: device, library: library)
@@ -149,7 +307,8 @@ public final class Renderer: @unchecked Sendable {
         } catch {
             fatalError("Failed to load library or initialize encoders: \(error)")
         }
-        
+        self.precision = precision
+
         // Initialize frame slots
         for _ in 0..<maxInFlightFrames {
             self.frameResources.append(nil)
@@ -160,7 +319,7 @@ public final class Renderer: @unchecked Sendable {
     func triggerCapture(path: String) {
         self.nextFrameCapturePath = path
     }
-    
+
     // MARK: - Render Methods
     
     func render(
@@ -218,18 +377,19 @@ public final class Renderer: @unchecked Sendable {
             depths: depthsBuf,
             tileCount: headerCount,
             activeTileIndices: activeTileIndices,
-            activeTileCount: activeTileCount
+            activeTileCount: activeTileCount,
+            precision: .float32
         )
         
         guard let commandBuffer = self.queue.makeCommandBuffer() else { return -1 }
-        
         return self.encodeAndRunRender(
             commandBuffer: commandBuffer,
             ordered: ordered,
             colorOutPtr: colorOutPtr,
             depthOutPtr: depthOutPtr,
             alphaOutPtr: alphaOutPtr,
-            params: params
+            params: params,
+            gaussianCount: totalAssignments
         )
     }
     
@@ -288,7 +448,21 @@ public final class Renderer: @unchecked Sendable {
             return -1 
         }
         
-        guard let assignment = self.buildTileAssignmentsGPU(commandBuffer: commandBuffer, gaussianCount: count, gaussianBuffers: inputs, params: params, frame: frame) else {
+        let estimatedAssignments = self.estimateAssignmentCapacity(
+            gaussianCount: count,
+            meansPtr: meansPtr,
+            radiiPtr: radiiPtr,
+            params: params
+        )
+        
+        guard let assignment = self.buildTileAssignmentsGPU(
+            commandBuffer: commandBuffer,
+            gaussianCount: count,
+            gaussianBuffers: inputs,
+            params: params,
+            frame: frame,
+            estimatedAssignments: estimatedAssignments
+        ) else {
             self.releaseFrame(index: slotIndex)
             return -3
         }
@@ -299,10 +473,25 @@ public final class Renderer: @unchecked Sendable {
             assignment: assignment,
             gaussianBuffers: inputs,
             params: params,
-            frame: frame
+            frame: frame,
+            precision: self.effectivePrecision
         ) else {
             self.releaseFrame(index: slotIndex)
             return -4
+        }
+
+        if ProcessInfo.processInfo.environment["GAUSSIAN_RENDERER_DEBUG"] == "1" {
+            let headerPtr = ordered.headers.contents().bindMemory(to: GaussianHeader.self, capacity: assignment.tileCount)
+            var nonZero = 0
+            var sumCounts = 0
+            var maxCount = 0
+            for i in 0..<assignment.tileCount {
+                let c = Int(headerPtr[i].count)
+                sumCounts += c
+                if c > 0 { nonZero += 1 }
+                if c > maxCount { maxCount = c }
+            }
+            print("[Renderer][Debug] tiles nonZero=\(nonZero)/\(assignment.tileCount) sum=\(sumCounts) max=\(maxCount)")
         }
         
         return self.encodeAndRunRenderWithFrame(
@@ -313,7 +502,8 @@ public final class Renderer: @unchecked Sendable {
             colorOutPtr: colorOutPtr,
             depthOutPtr: depthOutPtr,
             alphaOutPtr: alphaOutPtr,
-            params: params
+            params: params,
+            gaussianCount: count
         )
     }
     
@@ -374,7 +564,8 @@ public final class Renderer: @unchecked Sendable {
             assignment: assignment,
             gaussianBuffers: gaussianBuffers,
             params: params,
-            frame: frame
+            frame: frame,
+            precision: self.effectivePrecision
         ) else {
             self.releaseFrame(index: slotIndex)
             return -4
@@ -388,7 +579,8 @@ public final class Renderer: @unchecked Sendable {
             colorOutPtr: colorOutPtr,
             depthOutPtr: depthOutPtr,
             alphaOutPtr: alphaOutPtr,
-            params: params
+            params: params,
+            gaussianCount: count
         )
         
         if MTLCaptureManager.shared().isCapturing {
@@ -447,7 +639,8 @@ public final class Renderer: @unchecked Sendable {
             assignment: assignment,
             gaussianBuffers: gaussianBuffers,
             params: params,
-            frame: frame
+            frame: frame,
+            precision: self.effectivePrecision
         ) else {
             self.releaseFrame(index: slotIndex)
             if MTLCaptureManager.shared().isCapturing { MTLCaptureManager.shared().stopCapture() }
@@ -460,7 +653,8 @@ public final class Renderer: @unchecked Sendable {
             ordered: ordered,
             params: params,
             frame: frame,
-            slotIndex: slotIndex
+            slotIndex: slotIndex,
+            precision: self.effectivePrecision
         )
         
         guard submission else {
@@ -479,24 +673,55 @@ public final class Renderer: @unchecked Sendable {
     
     // MARK: - Helper Methods
     
+    private func estimateAssignmentCapacity(
+        gaussianCount: Int,
+        meansPtr: UnsafePointer<Float>,
+        radiiPtr: UnsafePointer<Float>,
+        params: RenderParams
+    ) -> Int {
+        guard gaussianCount > 0 else { return 1 }
+        let tilesX = Int(params.tilesX)
+        let tilesY = Int(params.tilesY)
+        let tileW = Float(params.tileWidth)
+        let tileH = Float(params.tileHeight)
+        var total = 0
+        for i in 0..<gaussianCount {
+            let mx = meansPtr[i * 2 + 0]
+            let my = meansPtr[i * 2 + 1]
+            let r = radiiPtr[i]
+            let minX = max(0, Int(floor((mx - r) / tileW)))
+            let maxX = min(tilesX - 1, Int(ceil((mx + r) / tileW)))
+            let minY = max(0, Int(floor((my - r) / tileH)))
+            let maxY = min(tilesY - 1, Int(ceil((my + r) / tileH)))
+            if maxX < minX || maxY < minY { continue }
+            let spanX = maxX - minX + 1
+            let spanY = maxY - minY + 1
+            total += spanX * spanY
+        }
+        // Clamp to a reasonable upper bound to avoid runaway allocations.
+        let conservativeCap = Int(params.tilesX * params.tilesY) * max(1, Int(params.maxPerTile == 0 ? UInt32(gaussianCount) : params.maxPerTile))
+        let estimate = min(total, conservativeCap)
+        return max(estimate, gaussianCount)
+    }
+    
     internal func buildTileAssignmentsGPU(
         commandBuffer: MTLCommandBuffer,
         gaussianCount: Int,
         gaussianBuffers: GaussianInputBuffers,
         params: RenderParams,
-        frame: FrameResources
+        frame: FrameResources,
+        estimatedAssignments: Int? = nil
     ) -> TileAssignmentBuffers? {
         let tileCount = Int(params.tilesX * params.tilesY)
         let perTileLimit = (params.maxPerTile == 0) ? UInt32(max(gaussianCount, 1)) : params.maxPerTile
-        
         let baseCapacity = max(tileCount * Int(perTileLimit), 1)
-        // Conservatively allow each gaussian to touch up to 8 tiles (radius may span multiple tiles).
-        let overlapCapacity = gaussianCount * 8
-        let forcedCapacity = max(baseCapacity, overlapCapacity)
+        let estimated = max(estimatedAssignments ?? 0, gaussianCount)
+        // Keep a small headroom on the estimate and ensure we never go below the per-tile contract.
+        let estimatedWithMargin = Int(Double(estimated) * 1.2)
+        let forcedCapacity = max(baseCapacity, estimatedWithMargin)
         guard self.prepareTileBuilderResources(frame: frame, gaussianCount: gaussianCount, tileCount: tileCount, maxPerTile: Int(perTileLimit), forcedCapacity: forcedCapacity) else {
             return nil
         }
-
         
         self.tileBoundsEncoder.encode(
             commandBuffer: commandBuffer,
@@ -529,6 +754,45 @@ public final class Renderer: @unchecked Sendable {
             tileIdsBuffer: frame.tileIds!,
             tileAssignmentHeader: frame.tileAssignmentHeader!
         )
+
+        if ProcessInfo.processInfo.environment["GAUSSIAN_RENDERER_DEBUG"] == "1" {
+            // Copy private offsets/bounds to temporary shared buffers for inspection.
+            let offsetsBytes = (gaussianCount + 1) * MemoryLayout<UInt32>.stride
+            let boundsBytes = gaussianCount * MemoryLayout<SIMD4<Int32>>.stride
+            let offsetsSnapshot = self.device.makeBuffer(length: offsetsBytes, options: .storageModeShared)
+            let boundsSnapshot = self.device.makeBuffer(length: boundsBytes, options: .storageModeShared)
+            if let offsetsSnapshot, let boundsSnapshot {
+                if let blit = commandBuffer.makeBlitCommandEncoder() {
+                    blit.copy(from: frame.offsetsBuffer!, sourceOffset: 0, to: offsetsSnapshot, destinationOffset: 0, size: offsetsBytes)
+                    blit.copy(from: frame.boundsBuffer!, sourceOffset: 0, to: boundsSnapshot, destinationOffset: 0, size: boundsBytes)
+                    blit.endEncoding()
+                }
+                commandBuffer.addCompletedHandler { [weak frame] _ in
+                    guard let headerBuf = frame?.tileAssignmentHeader else { return }
+                    let headerPtr = headerBuf.contents().bindMemory(to: TileAssignmentHeaderSwift.self, capacity: 1)
+                    let h = headerPtr.pointee
+                    let offsetPtr = offsetsSnapshot.contents().bindMemory(to: UInt32.self, capacity: max(1, gaussianCount + 1))
+                    let totalFromOffsets = gaussianCount > 0 ? Int(offsetPtr[gaussianCount]) : 0
+                    let boundsPtr = boundsSnapshot.contents().bindMemory(to: SIMD4<Int32>.self, capacity: max(1, gaussianCount))
+                    let sample = (0..<min(4, gaussianCount)).map { i in
+                        let b = boundsPtr[i]
+                        return "[\(b.x),\(b.y),\(b.z),\(b.w)]"
+                    }.joined(separator: " ")
+                    print("[Renderer][Debug] tileAssign total=\(h.totalAssignments) padded=\(h.paddedCount) offsetsLast=\(totalFromOffsets) boundsSample=\(sample)")
+                    // Small tileId histogram from initial assignments
+                    var tileCounts: [Int: Int] = [:]
+                    if let tileIdsBuf = frame?.tileIds {
+                        let tileIdsPtr = tileIdsBuf.contents().bindMemory(to: Int32.self, capacity: Int(h.totalAssignments))
+                        for i in 0..<Int(h.totalAssignments) {
+                            let t = Int(tileIdsPtr[i])
+                            tileCounts[t, default: 0] += 1
+                        }
+                        let sampleHist = tileCounts.keys.sorted().prefix(8).map { "\($0):\(tileCounts[$0]!)" }.joined(separator: ", ")
+                        print("[Renderer][Debug] tileIds unique=\(tileCounts.count) sample[\(sampleHist)]")
+                    }
+                }
+            }
+        }
         
         return TileAssignmentBuffers(
             tileCount: tileCount,
@@ -546,17 +810,20 @@ public final class Renderer: @unchecked Sendable {
         assignment: TileAssignmentBuffers,
         gaussianBuffers: GaussianInputBuffers,
         params: RenderParams,
-        frame: FrameResources
+        frame: FrameResources,
+        precision: Precision
     ) -> OrderedGaussianBuffers? {
         let maxAssignments = assignment.maxAssignments
-        guard self.prepareOrderedBuffers(frame: frame, maxAssignments: maxAssignments, tileCount: assignment.tileCount) else { return nil }
+        guard self.prepareOrderedBuffers(frame: frame, maxAssignments: maxAssignments, tileCount: assignment.tileCount, precision: precision) else { return nil }
         
-        guard let sortKeysBuffer = self.ensureBuffer(&frame.sortKeys, length: frame.tileAssignmentPaddedCapacity * MemoryLayout<SIMD2<UInt32>>.stride, options: .storageModeShared, label: "SortKeys"),
-              let sortedIndicesBuffer = self.ensureBuffer(&frame.sortedIndices, length: frame.tileAssignmentPaddedCapacity * MemoryLayout<Int32>.stride, options: .storageModeShared, label: "SortedIndices")
+        guard let sortKeysBuffer = self.ensureBuffer(&frame.sortKeys, length: frame.tileAssignmentPaddedCapacity * MemoryLayout<SIMD2<UInt32>>.stride, options: .storageModePrivate, label: "SortKeys"),
+              let sortedIndicesBuffer = self.ensureBuffer(&frame.sortedIndices, length: frame.tileAssignmentPaddedCapacity * MemoryLayout<Int32>.stride, options: .storageModePrivate, label: "SortedIndices")
         else { return nil }
 
-        let totalAssignments = Int(0) // Not needed for indirect dispatch if we use buffers correctly
-        
+        let headerPtr = assignment.header.contents().bindMemory(to: TileAssignmentHeaderSwift.self, capacity: 1)
+        let totalAssignments = Int(headerPtr.pointee.totalAssignments)
+        let paddedCount = Int(headerPtr.pointee.paddedCount)
+
         guard let dispatchArgs = frame.dispatchArgs else { return nil }
 
         self.dispatchEncoder.encode(
@@ -578,7 +845,7 @@ public final class Renderer: @unchecked Sendable {
         )
 
         if self.sortAlgorithm == .radix {
-            _ = self.ensureRadixBuffers(frame: frame, paddedCapacity: frame.tileAssignmentPaddedCapacity)
+            _ = self.ensureRadixBuffers(frame: frame, paddedCapacity: paddedCount)
              let radixBuffers = RadixBufferSet(
                 histogram: frame.radixHistogram!,
                 blockSums: frame.radixBlockSums!,
@@ -621,7 +888,7 @@ public final class Renderer: @unchecked Sendable {
                 header: assignment.header,
                 dispatchArgs: dispatchArgs,
                 offsets: offsets,
-                paddedCapacity: frame.tileAssignmentPaddedCapacity
+                paddedCapacity: paddedCount
             )
         }
         
@@ -645,8 +912,32 @@ public final class Renderer: @unchecked Sendable {
             dispatchArgs: dispatchArgs,
             dispatchOffset: DispatchSlot.pack.rawValue * MemoryLayout<DispatchIndirectArgsSwift>.stride,
             activeTileIndices: frame.activeTileIndices!,
-            activeTileCount: frame.activeTileCount!
+            activeTileCount: frame.activeTileCount!,
+            precision: precision
         )
+
+        if ProcessInfo.processInfo.environment["GAUSSIAN_RENDERER_DEBUG"] == "1" {
+            commandBuffer.addCompletedHandler { _ in
+                let sorted = sortKeysBuffer.contents().bindMemory(to: SIMD2<UInt32>.self, capacity: frame.tileAssignmentPaddedCapacity)
+                let headerPtr = assignment.header.contents().bindMemory(to: TileAssignmentHeaderSwift.self, capacity: 1)
+                let total = Int(headerPtr.pointee.totalAssignments)
+                var tileHistogram: [UInt32: Int] = [:]
+                var minTile: UInt32 = .max
+                var maxTile: UInt32 = 0
+                var sentinelCount = 0
+                let paddedCount = Int(headerPtr.pointee.paddedCount)
+                for i in 0..<paddedCount {
+                    let t = sorted[i].x
+                    if t == 0xFFFFFFFF { sentinelCount += 1; continue }
+                    tileHistogram[t, default: 0] += 1
+                    if t < minTile { minTile = t }
+                    if t > maxTile { maxTile = t }
+                }
+                let sample = tileHistogram.keys.sorted().prefix(8).map { "\($0):\(tileHistogram[$0]!)" }.joined(separator: ", ")
+                let tile0 = tileHistogram[0] ?? 0
+                print("[Renderer][Debug] sortedKeys tiles \(tileHistogram.count) unique min=\(minTile) max=\(maxTile) sentinel=\(sentinelCount) padded=\(paddedCount) tile0=\(tile0) sample[\(sample)]")
+            }
+        }
         
         return OrderedGaussianBuffers(
             headers: orderedBuffers.headers,
@@ -657,7 +948,8 @@ public final class Renderer: @unchecked Sendable {
             depths: orderedBuffers.depths,
             tileCount: assignment.tileCount,
             activeTileIndices: frame.activeTileIndices!,
-            activeTileCount: frame.activeTileCount!
+            activeTileCount: frame.activeTileCount!,
+            precision: precision
         )
     }
         
@@ -667,7 +959,8 @@ public final class Renderer: @unchecked Sendable {
         ordered: OrderedGaussianBuffers,
         params: RenderParams,
         frame: FrameResources,
-        slotIndex: Int
+        slotIndex: Int,
+        precision: Precision
     ) -> Bool {
         guard let outputs = frame.outputBuffers, let dispatchArgs = frame.dispatchArgs else { return false }
         
@@ -677,7 +970,8 @@ public final class Renderer: @unchecked Sendable {
             outputBuffers: outputs,
             params: params,
             dispatchArgs: dispatchArgs,
-            dispatchOffset: DispatchSlot.renderTiles.rawValue * MemoryLayout<DispatchIndirectArgsSwift>.stride
+            dispatchOffset: DispatchSlot.renderTiles.rawValue * MemoryLayout<DispatchIndirectArgsSwift>.stride,
+            precision: precision
         )
 
         return true
@@ -689,7 +983,8 @@ public final class Renderer: @unchecked Sendable {
         colorOutPtr: UnsafeMutablePointer<Float>?,
         depthOutPtr: UnsafeMutablePointer<Float>?,
         alphaOutPtr: UnsafeMutablePointer<Float>?,
-        params: RenderParams
+        params: RenderParams,
+        gaussianCount: Int = 0
     ) -> Int32 {
         guard let (frame, slotIndex) = self.acquireFrame(width: Int(params.width), height: Int(params.height)) else { return -5 }
         
@@ -701,7 +996,8 @@ public final class Renderer: @unchecked Sendable {
             colorOutPtr: colorOutPtr,
             depthOutPtr: depthOutPtr,
             alphaOutPtr: alphaOutPtr,
-            params: params
+            params: params,
+            gaussianCount: gaussianCount
         )
     }
     
@@ -713,7 +1009,8 @@ public final class Renderer: @unchecked Sendable {
         colorOutPtr: UnsafeMutablePointer<Float>?,
         depthOutPtr: UnsafeMutablePointer<Float>?,
         alphaOutPtr: UnsafeMutablePointer<Float>?,
-        params: RenderParams
+        params: RenderParams,
+        gaussianCount: Int = 0
     ) -> Int32 {
         let cpuReadback = !(colorOutPtr == nil && depthOutPtr == nil && alphaOutPtr == nil)
         guard self.submitRender(
@@ -721,7 +1018,8 @@ public final class Renderer: @unchecked Sendable {
             ordered: ordered,
             params: params,
             frame: frame,
-            slotIndex: slotIndex
+            slotIndex: slotIndex,
+            precision: self.effectivePrecision
         ) else { return -5 }
 
         if !cpuReadback {
@@ -737,6 +1035,20 @@ public final class Renderer: @unchecked Sendable {
         }
         commandBuffer.commit()
         commandBuffer.waitUntilCompleted()
+
+        if ProcessInfo.processInfo.environment["GAUSSIAN_RENDERER_DEBUG"] == "1" {
+            let headerPtr = ordered.headers.contents().bindMemory(to: GaussianHeader.self, capacity: ordered.tileCount)
+            var nonZero = 0
+            var sumCounts = 0
+            var maxCount = 0
+            for i in 0..<ordered.tileCount {
+                let c = Int(headerPtr[i].count)
+                sumCounts += c
+                if c > 0 { nonZero += 1 }
+                if c > maxCount { maxCount = c }
+            }
+            print("[Renderer][Debug] post-render headers nonZero=\(nonZero)/\(ordered.tileCount) sum=\(sumCounts) max=\(maxCount)")
+        }
         
         guard let outputs = frame.outputBuffers else { return -6 }
         let pixelCount = Int(params.width * params.height)
@@ -927,8 +1239,8 @@ public final class Renderer: @unchecked Sendable {
             let _ = self.ensureBuffer(&frame.partialSumsBuffer, length: partialSumsBytes, options: .storageModePrivate, label: "PartialSums"),
             let _ = self.ensureBuffer(&frame.scatterDispatchBuffer, length: dispatchBytes, options: .storageModePrivate, label: "ScatterDispatch"),
             let _ = self.ensureBuffer(&frame.tileAssignmentHeader, length: headerBytes, options: .storageModeShared, label: "TileHeader"),
-            let _ = self.ensureBuffer(&frame.tileIndices, length: tileIndexBytes, options: .storageModeShared, label: "TileIndices"),
-            let _ = self.ensureBuffer(&frame.tileIds, length: tileIdBytes, options: .storageModeShared, label: "TileIds")
+            let _ = self.ensureBuffer(&frame.tileIndices, length: tileIndexBytes, options: .storageModePrivate, label: "TileIndices"),
+            let _ = self.ensureBuffer(&frame.tileIds, length: tileIdBytes, options: .storageModePrivate, label: "TileIds")
         else {
             return false
         }
@@ -938,20 +1250,30 @@ public final class Renderer: @unchecked Sendable {
         headerPtr.pointee.maxAssignments = UInt32(totalAssignments)
         headerPtr.pointee.paddedCount = UInt32(frame.tileAssignmentPaddedCapacity)
         headerPtr.pointee.totalAssignments = UInt32(0)
+        headerPtr.pointee.overflow = 0
         
         return true
     }
     
-    internal func prepareOrderedBuffers(frame: FrameResources, maxAssignments: Int, tileCount: Int) -> Bool {
+    internal func prepareOrderedBuffers(frame: FrameResources, maxAssignments: Int, tileCount: Int, precision: Precision) -> Bool {
         let assignmentCount = max(1, maxAssignments)
         let headerCount = max(1, tileCount)
+        
+        let half2Stride = MemoryLayout<UInt16>.stride * 2 // half2
+        let half4Stride = MemoryLayout<UInt16>.stride * 4 // half4
+        func strideForMeans() -> Int { precision == .float16 ? half2Stride : 8 }
+        func strideForConics() -> Int { precision == .float16 ? half4Stride : 16 }
+        func strideForColors() -> Int { precision == .float16 ? MemoryLayout<UInt16>.stride * 3 : 12 }
+        func strideForOpacities() -> Int { precision == .float16 ? MemoryLayout<UInt16>.stride : 4 }
+        func strideForDepths() -> Int { precision == .float16 ? MemoryLayout<UInt16>.stride : 4 }
+        
         guard
-            self.ensureBuffer(&frame.orderedHeaders, length: headerCount * MemoryLayout<GaussianHeader>.stride, options: .storageModeShared, label: "OrderedHeaders") != nil,
-            self.ensureBuffer(&frame.packedMeans, length: assignmentCount * 8, options: .storageModeShared, label: "PackedMeans") != nil,
-            self.ensureBuffer(&frame.packedConics, length: assignmentCount * 16, options: .storageModeShared, label: "PackedConics") != nil,
-            self.ensureBuffer(&frame.packedColors, length: assignmentCount * 12, options: .storageModeShared, label: "PackedColors") != nil,
-            self.ensureBuffer(&frame.packedOpacities, length: assignmentCount * 4, options: .storageModeShared, label: "PackedOpacities") != nil,
-            self.ensureBuffer(&frame.packedDepths, length: assignmentCount * 4, options: .storageModeShared, label: "PackedDepths") != nil,
+            self.ensureBuffer(&frame.orderedHeaders, length: headerCount * MemoryLayout<GaussianHeader>.stride, options: .storageModePrivate, label: "OrderedHeaders") != nil,
+            self.ensureBuffer(&frame.packedMeans, length: assignmentCount * strideForMeans(), options: .storageModePrivate, label: "PackedMeans") != nil,
+            self.ensureBuffer(&frame.packedConics, length: assignmentCount * strideForConics(), options: .storageModePrivate, label: "PackedConics") != nil,
+            self.ensureBuffer(&frame.packedColors, length: assignmentCount * strideForColors(), options: .storageModePrivate, label: "PackedColors") != nil,
+            self.ensureBuffer(&frame.packedOpacities, length: assignmentCount * strideForOpacities(), options: .storageModePrivate, label: "PackedOpacities") != nil,
+            self.ensureBuffer(&frame.packedDepths, length: assignmentCount * strideForDepths(), options: .storageModePrivate, label: "PackedDepths") != nil,
             self.ensureBuffer(&frame.activeTileIndices, length: headerCount * 4, options: .storageModePrivate, label: "ActiveTileIndices") != nil,
             let _ = self.ensureBuffer(&frame.activeTileCount, length: 4, options: .storageModePrivate, label: "ActiveTileCount")
         else { return false }
@@ -1047,4 +1369,3 @@ public final class Renderer: @unchecked Sendable {
     // MARK: - Debug Methods
 
 }
-

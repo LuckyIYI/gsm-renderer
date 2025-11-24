@@ -51,7 +51,8 @@ final class CoverageEncoder {
             encoder.setBuffer(opacitiesBuffer, offset: 0, index: 2)
             encoder.setBytes(&params, length: MemoryLayout<CoverageParamsSwift>.stride, index: 3)
             let threads = MTLSize(width: gaussianCount, height: 1, depth: 1)
-            let tg = MTLSize(width: self.coveragePipeline.threadExecutionWidth, height: 1, depth: 1)
+            let tgWidth = self.coveragePipeline.threadExecutionWidth
+            let tg = MTLSize(width: tgWidth, height: 1, depth: 1)
             encoder.dispatchThreads(threads, threadsPerThreadgroup: tg)
             encoder.endEncoding()
         }

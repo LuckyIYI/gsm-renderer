@@ -89,6 +89,75 @@ final class RenderTests: XCTestCase {
         XCTAssertLessThan(b, 0.1, "Blue channel should be inactive")
     }
     
+    func testRenderRawSimpleGaussianHalf() {
+        let renderer = Renderer(precision: .float16)
+        let width: Int32 = 16
+        let height: Int32 = 16
+        let tileWidth: Int32 = 16
+        let tileHeight: Int32 = 16
+        let count = 1
+        
+        let means: [Float] = [8.0, 8.0]
+        let conics: [Float] = [1.0, 0.0, 1.0, 0.0]
+        let colors: [Float] = [1.0, 0.0, 0.0]
+        let opacities: [Float] = [1.0]
+        let depths: [Float] = [1.0]
+        let radii: [Float] = [8.0]
+        
+        var colorOut = [Float](repeating: 0, count: Int(width * height) * 3)
+        var depthOut = [Float](repeating: 0, count: Int(width * height))
+        var alphaOut = [Float](repeating: 0, count: Int(width * height))
+        
+        let params = RenderParams(
+            width: UInt32(width),
+            height: UInt32(height),
+            tileWidth: UInt32(tileWidth),
+            tileHeight: UInt32(tileHeight),
+            tilesX: 1,
+            tilesY: 1,
+            maxPerTile: 100,
+            whiteBackground: 0,
+            activeTileCount: 0,
+            gaussianCount: UInt32(count)
+        )
+        
+        let result = means.withUnsafeBufferPointer { meansBuf in
+            conics.withUnsafeBufferPointer { conicsBuf in
+                colors.withUnsafeBufferPointer { colorsBuf in
+                    opacities.withUnsafeBufferPointer { opacitiesBuf in
+                        depths.withUnsafeBufferPointer { depthsBuf in
+                            radii.withUnsafeBufferPointer { radiiBuf in
+                                colorOut.withUnsafeMutableBufferPointer { colorOutBuf in
+                                    depthOut.withUnsafeMutableBufferPointer { depthOutBuf in
+                                        alphaOut.withUnsafeMutableBufferPointer { alphaOutBuf in
+                                            renderer.renderRaw(
+                                                gaussianCount: count,
+                                                meansPtr: meansBuf.baseAddress!,
+                                                conicsPtr: conicsBuf.baseAddress!,
+                                                colorsPtr: colorsBuf.baseAddress!,
+                                                opacityPtr: opacitiesBuf.baseAddress!,
+                                                depthsPtr: depthsBuf.baseAddress!,
+                                                radiiPtr: radiiBuf.baseAddress!,
+                                                colorOutPtr: colorOutBuf.baseAddress!,
+                                                depthOutPtr: depthOutBuf.baseAddress!,
+                                                alphaOutPtr: alphaOutBuf.baseAddress!,
+                                                params: params
+                                            )
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        
+        XCTAssertEqual(result, 0, "Render failed with code \(result)")
+        let centerIdx = 136
+        XCTAssertGreaterThan(alphaOut[centerIdx], 0.1, "Pixel alpha should be non-zero in half mode")
+    }
+    
     func testRenderGridPattern() {
         let width: Int32 = 256
         let height: Int32 = 256
@@ -134,7 +203,8 @@ final class RenderTests: XCTestCase {
                 colors.append(contentsOf: [1.0, 1.0, 1.0])
                 opacities.append(1.0)
                 depths.append(Float.random(in: 0.1...10.0))
-                radii.append(Float(tileWidth) / 2.0)
+                // Keep radius confined to the home tile to avoid multi-tile spill for this stress test.
+                radii.append(Float(tileWidth) / 4.0)
             }
         }
         

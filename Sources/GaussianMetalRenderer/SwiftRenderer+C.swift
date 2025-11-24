@@ -66,7 +66,8 @@ public func gaussian_renderer_render(
         depths: Renderer.shared.makeBuffer(ptr: depthsPtr, count: count)!,
         tileCount: count,
         activeTileIndices: frame.activeTileIndices!,
-        activeTileCount: frame.activeTileCount!
+        activeTileCount: frame.activeTileCount!,
+        precision: .float32
     )
     
     guard let commandBuffer = Renderer.shared.queue.makeCommandBuffer() else { 
@@ -199,7 +200,8 @@ public func gaussian_renderer_render_raw(
         assignment: assignment,
         gaussianBuffers: inputs,
         params: params,
-        frame: frame
+        frame: frame,
+        precision: Renderer.shared.precisionSetting
     ) else {
         Renderer.shared.releaseFrame(index: slotIndex)
         return -4
@@ -338,7 +340,8 @@ public func gaussian_renderer_render_world(
         assignment: assignment,
         gaussianBuffers: gaussianBuffers,
         params: params,
-        frame: frame
+        frame: frame,
+        precision: Renderer.shared.precisionSetting
     ) else {
         Renderer.shared.releaseFrame(index: slotIndex)
         return -4
@@ -892,7 +895,8 @@ public func gaussian_renderer_debug_dump_raw(
         assignment: assignment,
         gaussianBuffers: inputs,
         params: params,
-        frame: frame
+        frame: frame,
+        precision: renderer.precisionSetting
     ) else {
         return -4
     }

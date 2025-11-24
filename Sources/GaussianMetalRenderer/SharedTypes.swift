@@ -8,13 +8,13 @@ public struct TileAssignmentHeaderSwift {
     public var totalAssignments: UInt32
     public var maxAssignments: UInt32
     public var paddedCount: UInt32
-    public var padding: UInt32
+    public var overflow: UInt32
 
-    public init(totalAssignments: UInt32 = 0, maxAssignments: UInt32 = 0, paddedCount: UInt32 = 0, padding: UInt32 = 0) {
+    public init(totalAssignments: UInt32 = 0, maxAssignments: UInt32 = 0, paddedCount: UInt32 = 0, overflow: UInt32 = 0) {
         self.totalAssignments = totalAssignments
         self.maxAssignments = maxAssignments
         self.paddedCount = paddedCount
-        self.padding = padding
+        self.overflow = overflow
     }
 }
 
@@ -190,6 +190,11 @@ public struct OrderedBufferSet {
     public let depths: MTLBuffer
 }
 
+public enum Precision {
+    case float32
+    case float16
+}
+
 public struct OrderedGaussianBuffers {
     public let headers: MTLBuffer
     public let means: MTLBuffer
@@ -200,6 +205,7 @@ public struct OrderedGaussianBuffers {
     public let tileCount: Int
     public let activeTileIndices: MTLBuffer
     public let activeTileCount: MTLBuffer
+    public let precision: Precision
 }
 
 public struct SortBufferSet {

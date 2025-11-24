@@ -23,7 +23,8 @@ let package = Package(
             name: "GaussianMetalRenderer",
             path: "Sources",
             resources: [
-                .process("GaussianMetalRenderer/GaussianMetalRenderer.metallib")
+                .process("GaussianMetalRenderer/GaussianMetalRenderer.metallib"),
+                .process("GaussianMetalRenderer/GaussianMetalRenderer.metal")
             ]
         ),
         .testTarget(

@@ -103,7 +103,8 @@ final class PackTests: XCTestCase {
             dispatchArgs: dispatchArgs,
             dispatchOffset: 0,
             activeTileIndices: activeTileIndices,
-            activeTileCount: activeTileCount
+            activeTileCount: activeTileCount,
+            precision: .float32
         )
         
         commandBuffer.commit()

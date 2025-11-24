@@ -489,101 +489,96 @@ kernel void projectGaussiansKernel(
     outMask[gid] = 1;
 }
 
-kernel void renderTiles(
-    const device GaussianHeader* headers [[buffer(0)]],
-    const device float2* means [[buffer(1)]],
-    const device float4* conics [[buffer(2)]],
-    const device packed_float3* colors [[buffer(3)]],
-    const device float* opacities [[buffer(4)]],
-    const device float* depths [[buffer(5)]],
-    device float* colorOut [[buffer(6)]],
-    device float* depthOut [[buffer(7)]],
-    device float* alphaOut [[buffer(8)]],
-    constant RenderParams& params [[buffer(9)]],
-    const device uint* activeTiles [[buffer(10)]],
-    const device uint* activeTileCount [[buffer(11)]],
-    uint3 localPos3 [[thread_position_in_threadgroup]],
-    uint3 tileCoord [[threadgroup_position_in_grid]]
-) {
-    uint tilesX = params.tilesX;
-    uint tilesY = params.tilesY;
-    uint tileId = tileCoord.x;
-    uint activeCount = activeTileCount[0];
-    if (tileId >= activeCount) {
-        return;
-    }
-    uint mappedTile = activeTiles[tileId];
-    if (mappedTile >= tilesX * tilesY) {
-        return;
-    }
-    tileId = mappedTile;
-
-    uint tileWidth = params.tileWidth;
-    uint tileHeight = params.tileHeight;
-    uint localX = localPos3.x;
-    uint localY = localPos3.y;
-    uint tileX = tileId % tilesX;
-    uint tileY = tileId / tilesX;
-    uint px = tileX * tileWidth + localX;
-    uint py = tileY * tileHeight + localY;
-    bool inBounds = (px < params.width) && (py < params.height);
-
-    float3 accumColor = float3(0.0f);
-    float accumDepth = 0.0f;
-    float accumAlpha = 0.0f;
-    float trans = 1.0f;
-
-    GaussianHeader header = headers[tileId];
-    uint start = header.offset;
-    uint count = header.count;
-    if (count == 0) { return; }
-
-    for (uint i = 0; i < count; ++i) {
-        uint gIdx = start + i;
-        if (inBounds) {
-            // Quick rejection for empty/degenerate assignments
-            float2 mean = means[gIdx];
-            float4 conic = conics[gIdx];
-            float3 color = float3(colors[gIdx]);
-            float baseOpacity = metal::min(opacities[gIdx], 0.99f);
-            if (baseOpacity > 0.0f) {
-                float fx = float(px);
-                float fy = float(py);
-                float dx = fx - mean.x;
-                float dy = fy - mean.y;
-                float quad = dx * dx * conic.x + dy * dy * conic.z + 2.0f * dx * dy * conic.y;
-                
-                // Skip very small/degenerate gaussians and far tails
-                if (quad < 20.0f && (conic.x != 0.0f || conic.z != 0.0f)) {
-                    float weight = metal::exp(-0.5f * quad);
-                    float alpha = weight * baseOpacity;
-                    if (alpha > 1e-4f) {
-                        float contrib = trans * alpha;
-                        trans *= (1.0f - alpha);
-                        accumAlpha += contrib;
-                        accumColor += color * contrib;
-                        accumDepth += depths[gIdx] * contrib;
-                        // Early exit if pixel is effectively opaque
-                        if (trans < 1e-3f) { break; }
-                    }
-                }
-            }
-        }
-    }
-
-    if (inBounds) {
-        if (params.whiteBackground != 0) {
-            accumColor += float3(trans);
-        }
-        uint pixelIndex = py * params.width + px;
-        uint base = pixelIndex * 3;
-        colorOut[base + 0] = accumColor.x;
-        colorOut[base + 1] = accumColor.y;
-        colorOut[base + 2] = accumColor.z;
-        depthOut[pixelIndex] = accumDepth;
-        alphaOut[pixelIndex] = accumAlpha;
-    }
+#define DEFINE_RENDER_KERNEL(NAME, SCALAR2, SCALAR4, PACKED3, SCALARS, LOAD_COLOR) \
+kernel void NAME( \
+    const device GaussianHeader* headers [[buffer(0)]], \
+    const device SCALAR2* means [[buffer(1)]], \
+    const device SCALAR4* conics [[buffer(2)]], \
+    const device PACKED3* colors [[buffer(3)]], \
+    const device SCALARS* opacities [[buffer(4)]], \
+    const device SCALARS* depths [[buffer(5)]], \
+    device float* colorOut [[buffer(6)]], \
+    device float* depthOut [[buffer(7)]], \
+    device float* alphaOut [[buffer(8)]], \
+    constant RenderParams& params [[buffer(9)]], \
+    const device uint* activeTiles [[buffer(10)]], \
+    const device uint* activeTileCount [[buffer(11)]], \
+    uint3 localPos3 [[thread_position_in_threadgroup]], \
+    uint3 tileCoord [[threadgroup_position_in_grid]] \
+) { \
+    uint activeCount = activeTileCount[0]; \
+    uint activeIdx = tileCoord.x; \
+    if (activeIdx >= activeCount) { return; } \
+    uint tileId = activeTiles[activeIdx]; \
+    uint tilesX = params.tilesX; \
+    uint tileWidth = params.tileWidth; \
+    uint tileHeight = params.tileHeight; \
+    uint localX = localPos3.x; \
+    uint localY = localPos3.y; \
+    uint tileX = tileId % tilesX; \
+    uint tileY = tileId / tilesX; \
+    uint px = tileX * tileWidth + localX; \
+    uint py = tileY * tileHeight + localY; \
+    bool inBounds = (px < params.width) && (py < params.height); \
+    float3 accumColor = float3(0.0f); \
+    float accumDepth = 0.0f; \
+    float accumAlpha = 0.0f; \
+    float trans = 1.0f; \
+    GaussianHeader header = headers[tileId]; \
+    uint start = header.offset; \
+    uint count = header.count; \
+    if (count == 0) { return; } \
+    for (uint i = 0; i < count; ++i) { \
+        uint gIdx = start + i; \
+        if (inBounds) { \
+            float2 mean = float2(means[gIdx]); \
+            float4 conic = float4(conics[gIdx]); \
+            float3 color = LOAD_COLOR(colors[gIdx]); \
+            float baseOpacity = metal::min(float(opacities[gIdx]), 0.99f); \
+            if (baseOpacity > 0.0f) { \
+                float fx = float(px); \
+                float fy = float(py); \
+                float dx = fx - mean.x; \
+                float dy = fy - mean.y; \
+                float quad = dx * dx * conic.x + dy * dy * conic.z + 2.0f * dx * dy * conic.y; \
+                if (quad < 20.0f && (conic.x != 0.0f || conic.z != 0.0f)) { \
+                    float weight = metal::exp(-0.5f * quad); \
+                    float alpha = weight * baseOpacity; \
+                    if (alpha > 1e-4f) { \
+                        float contrib = trans * alpha; \
+                        trans *= (1.0f - alpha); \
+                        accumAlpha += contrib; \
+                        accumColor += color * contrib; \
+                        accumDepth += float(depths[gIdx]) * contrib; \
+                        if (trans < 1e-3f) { break; } \
+                    } \
+                } \
+            } \
+        } \
+    } \
+    if (inBounds) { \
+        if (params.whiteBackground != 0) { \
+            accumColor += float3(trans); \
+        } \
+        uint pixelIndex = py * params.width + px; \
+        uint base = pixelIndex * 3; \
+        colorOut[base + 0] = accumColor.x; \
+        colorOut[base + 1] = accumColor.y; \
+        colorOut[base + 2] = accumColor.z; \
+        depthOut[pixelIndex] = accumDepth; \
+        alphaOut[pixelIndex] = accumAlpha; \
+    } \
 }
+
+#define LOAD_FLOAT_COLOR(x) float3(x)
+#define LOAD_HALF_COLOR(x) float3(x)
+
+DEFINE_RENDER_KERNEL(renderTiles, float2, float4, packed_float3, float, LOAD_FLOAT_COLOR)
+DEFINE_RENDER_KERNEL(renderTilesHalf, half2, half4, packed_half3, half, LOAD_HALF_COLOR)
+
+#undef LOAD_FLOAT_COLOR
+#undef LOAD_HALF_COLOR
+#undef DEFINE_RENDER_KERNEL
 
 struct ClearParams {
     uint pixelCount;
@@ -637,7 +632,7 @@ struct TileAssignmentHeader {
     uint totalAssignments;
     uint maxAssignments;
     uint paddedCount;
-    uint reserved;
+    uint overflow;
 };
 
 struct SortKeyParams {
@@ -756,15 +751,18 @@ kernel void computeSortKeysKernel(
     uint gid [[thread_position_in_grid]]
 ) {
     uint totalAssignments = header.totalAssignments;
-    if (gid < totalAssignments) {
-        int g = tileIndices[gid];
-        uint tileId = (uint)tileIds[gid];
-        uint depthBits = as_type<uint>(depths[g]);
-        sortKeys[gid] = uint2(tileId, depthBits);
-        sortedIndices[gid] = g;
-    } else {
-        sortKeys[gid] = uint2(0xFFFFFFFFu, 0xFFFFFFFFu);
-        sortedIndices[gid] = -1;
+    uint padded = header.paddedCount;
+    if (gid < padded) {
+        if (gid < totalAssignments) {
+            int g = tileIndices[gid];
+            uint tileId = (uint)tileIds[gid];
+            uint depthBits = as_type<uint>(depths[g]);
+            sortKeys[gid] = uint2(tileId, depthBits);
+            sortedIndices[gid] = g;
+        } else {
+            sortKeys[gid] = uint2(0xFFFFFFFFu, 0xFFFFFFFFu);
+            sortedIndices[gid] = -1;
+        }
     }
 }
 
@@ -773,38 +771,40 @@ struct PackParams {
     uint padding;
 };
 
-kernel void packTileDataKernel(
-    const device int* sortedIndices [[buffer(0)]],
-    const device float2* means [[buffer(1)]],
-    const device float4* conics [[buffer(2)]],
-    const device packed_float3* colors [[buffer(3)]],
-    const device float* opacities [[buffer(4)]],
-    const device float* depths [[buffer(5)]],
-    device float2* outMeans [[buffer(6)]],
-    device float4* outConics [[buffer(7)]],
-    device packed_float3* outColors [[buffer(8)]],
-    device float* outOpacities [[buffer(9)]],
-    device float* outDepths [[buffer(10)]],
-    const device TileAssignmentHeader* header [[buffer(11)]],
-    const device int* tileIndices [[buffer(12)]],
-    const device int* tileIds [[buffer(13)]],
-    constant PackParams& params [[buffer(14)]],
-    uint gid [[thread_position_in_grid]]
-) {
-    uint total = header->totalAssignments;
-    if (gid >= total) {
-        return;
-    }
-    int src = sortedIndices[gid];
-    if (src < 0) {
-        return;
-    }
-    outMeans[gid] = means[src];
-    outConics[gid] = conics[src];
-    outColors[gid] = colors[src];
-    outOpacities[gid] = opacities[src];
-    outDepths[gid] = depths[src];
+#define DEFINE_PACK_KERNEL(NAME, SCALAR2, SCALAR4, PACKED3, OUT2, OUT4, OUT3, OUTS) \
+kernel void NAME( \
+    const device int* sortedIndices [[buffer(0)]], \
+    const device SCALAR2* means [[buffer(1)]], \
+    const device SCALAR4* conics [[buffer(2)]], \
+    const device PACKED3* colors [[buffer(3)]], \
+    const device float* opacities [[buffer(4)]], \
+    const device float* depths [[buffer(5)]], \
+    device OUT2* outMeans [[buffer(6)]], \
+    device OUT4* outConics [[buffer(7)]], \
+    device OUT3* outColors [[buffer(8)]], \
+    device OUTS* outOpacities [[buffer(9)]], \
+    device OUTS* outDepths [[buffer(10)]], \
+    const device TileAssignmentHeader* header [[buffer(11)]], \
+    const device int* tileIndices [[buffer(12)]], \
+    const device int* tileIds [[buffer(13)]], \
+    constant PackParams& params [[buffer(14)]], \
+    uint gid [[thread_position_in_grid]] \
+) { \
+    uint total = header->totalAssignments; \
+    if (gid >= total) { return; } \
+    int src = sortedIndices[gid]; \
+    if (src < 0) { return; } \
+    outMeans[gid] = OUT2(means[src]); \
+    outConics[gid] = OUT4(conics[src]); \
+    outColors[gid] = OUT3(colors[src]); \
+    outOpacities[gid] = OUTS(opacities[src]); \
+    outDepths[gid] = OUTS(depths[src]); \
 }
+
+DEFINE_PACK_KERNEL(packTileDataKernel, float2, float4, packed_float3, float2, float4, packed_float3, float)
+DEFINE_PACK_KERNEL(packTileDataKernelHalf, float2, float4, packed_float3, half2, half4, packed_half3, half)
+
+#undef DEFINE_PACK_KERNEL
 
 kernel void buildHeadersFromSortedKernel(
     const device uint2* sortedKeys [[buffer(0)]],
@@ -888,9 +888,7 @@ kernel void prepareRenderDispatchKernel(
         return;
     }
     uint count = activeCount[0];
-    if (count > params.tileCount) {
-        count = params.tileCount;
-    }
+    if (count > params.tileCount) { count = params.tileCount; }
     dispatchArgs[DispatchSlotRenderTiles].threadgroupsPerGridX = count;
     dispatchArgs[DispatchSlotRenderTiles].threadgroupsPerGridY = 1u;
     dispatchArgs[DispatchSlotRenderTiles].threadgroupsPerGridZ = 1u;
@@ -1124,6 +1122,7 @@ kernel void gaussianCoverageKernel(
         coverageCounts[idx] = 0u;
         return;
     }
+    // Coverage is per-tile, not per-pixel.
     int width = max(0, rect.y - rect.x + 1);
     int height = max(0, rect.w - rect.z + 1);
     uint count = (width > 0 && height > 0) ? uint(width * height) : 0u;
@@ -1231,11 +1230,13 @@ kernel void coverageStoreTotalKernel(
     uint lastIndex = count - 1;
     uint total = offsets[lastIndex] + coverageCounts[lastIndex];
     offsets[count] = total;
-    uint cappedTotal = (total > header[0].maxAssignments) ? header[0].maxAssignments : total;
+    bool overflow = total > header[0].maxAssignments;
+    uint cappedTotal = overflow ? header[0].maxAssignments : total;
     header[0].totalAssignments = cappedTotal;
     uint padded = nextPowerOfTwo(cappedTotal);
     if (padded == 0u) { padded = 1u; }
     header[0].paddedCount = padded;
+    header[0].overflow = overflow ? 1u : 0u;
 }
 
 kernel void scatterDispatchKernel(

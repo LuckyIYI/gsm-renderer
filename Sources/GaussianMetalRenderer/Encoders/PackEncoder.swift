@@ -4,6 +4,7 @@ final class PackEncoder {
     private let packPipeline: MTLComputePipelineState
     private let headerFromSortedPipeline: MTLComputePipelineState
     private let compactActiveTilesPipeline: MTLComputePipelineState
+    private let packPipelineHalf: MTLComputePipelineState?
     
     let packThreadgroupSize: Int
 
@@ -17,6 +18,54 @@ final class PackEncoder {
         }
         
         self.packPipeline = try device.makeComputePipelineState(function: packFn)
+        if let packHalfFn = library.makeFunction(name: "packTileDataKernelHalf") {
+            self.packPipelineHalf = try? device.makeComputePipelineState(function: packHalfFn)
+        } else {
+            let halfOnlySource = """
+            #include <metal_stdlib>
+            using namespace metal;
+            struct GaussianHeader { uint offset; uint count; };
+            struct TileAssignmentHeader { uint totalAssignments; uint maxAssignments; uint paddedCount; uint overflow; };
+            struct PackParams { uint totalAssignments; uint padding; };
+            kernel void packTileDataKernelHalf(
+                const device int* sortedIndices [[buffer(0)]],
+                const device float2* means [[buffer(1)]],
+                const device float4* conics [[buffer(2)]],
+                const device packed_float3* colors [[buffer(3)]],
+                const device float* opacities [[buffer(4)]],
+                const device float* depths [[buffer(5)]],
+                device half2* outMeans [[buffer(6)]],
+                device half4* outConics [[buffer(7)]],
+                device half4* outColors [[buffer(8)]],
+                device half* outOpacities [[buffer(9)]],
+                device half* outDepths [[buffer(10)]],
+                const device TileAssignmentHeader* header [[buffer(11)]],
+                const device int* tileIndices [[buffer(12)]],
+                const device int* tileIds [[buffer(13)]],
+                constant PackParams& params [[buffer(14)]],
+                uint gid [[thread_position_in_grid]]
+            ) {
+                uint total = header->totalAssignments;
+                if (gid >= total) { return; }
+                int src = sortedIndices[gid];
+                if (src < 0) { return; }
+                float2 m = means[src];
+                float4 c = conics[src];
+                float3 col = float3(colors[src]);
+                outMeans[gid] = half2(m);
+                outConics[gid] = half4(c);
+                outColors[gid] = packed_half3(col);
+                outOpacities[gid] = half(opacities[src]);
+                outDepths[gid] = half(depths[src]);
+            }
+            """
+            if let lib = try? device.makeLibrary(source: halfOnlySource, options: nil),
+               let fn = lib.makeFunction(name: "packTileDataKernelHalf") {
+                self.packPipelineHalf = try? device.makeComputePipelineState(function: fn)
+            } else {
+                self.packPipelineHalf = nil
+            }
+        }
         self.headerFromSortedPipeline = try device.makeComputePipelineState(function: headerFn)
         self.compactActiveTilesPipeline = try device.makeComputePipelineState(function: compactFn)
         
@@ -34,12 +83,17 @@ final class PackEncoder {
         dispatchArgs: MTLBuffer,
         dispatchOffset: Int,
         activeTileIndices: MTLBuffer,
-        activeTileCount: MTLBuffer
+        activeTileCount: MTLBuffer,
+        precision: Precision
     ) {
         // 1. Pack
         if let encoder = commandBuffer.makeComputeCommandEncoder() {
             encoder.label = "Pack"
-            encoder.setComputePipelineState(self.packPipeline)
+            if precision == .float16, let halfPipe = self.packPipelineHalf {
+                encoder.setComputePipelineState(halfPipe)
+            } else {
+                encoder.setComputePipelineState(self.packPipeline)
+            }
             encoder.setBuffer(sortedIndices, offset: 0, index: 0)
             encoder.setBuffer(gaussianBuffers.means, offset: 0, index: 1)
             encoder.setBuffer(gaussianBuffers.conics, offset: 0, index: 2)
@@ -69,6 +123,12 @@ final class PackEncoder {
             )
             encoder.endEncoding()
         }
+
+        // Reset active tile count before header/compaction pass.
+        if let blit = commandBuffer.makeBlitCommandEncoder() {
+            blit.fill(buffer: activeTileCount, range: 0 ..< MemoryLayout<UInt32>.stride, value: 0)
+            blit.endEncoding()
+        }
         
         // 2. Headers From Sorted
         if let encoder = commandBuffer.makeComputeCommandEncoder() {
@@ -84,18 +144,13 @@ final class PackEncoder {
             encoder.setBytes(&headerParams, length: MemoryLayout<HeaderFromSortedParamsSwift>.stride, index: 3)
             
             let threads = MTLSize(width: assignment.tileCount, height: 1, depth: 1)
-            let tg = MTLSize(width: self.headerFromSortedPipeline.threadExecutionWidth, height: 1, depth: 1)
+            let tgWidth = self.headerFromSortedPipeline.threadExecutionWidth
+            let tg = MTLSize(width: tgWidth, height: 1, depth: 1)
             encoder.dispatchThreads(threads, threadsPerThreadgroup: tg)
             encoder.endEncoding()
         }
-        
-        // 3. Clear Active Count
-        if let blit = commandBuffer.makeBlitCommandEncoder() {
-            blit.fill(buffer: activeTileCount, range: 0 ..< MemoryLayout<UInt32>.stride, value: 0)
-            blit.endEncoding()
-        }
-        
-        // 4. Compact Active Tiles
+
+        // 3. Compact Active Tiles
         if let encoder = commandBuffer.makeComputeCommandEncoder() {
             encoder.label = "CompactActiveTiles"
             encoder.setComputePipelineState(self.compactActiveTilesPipeline)

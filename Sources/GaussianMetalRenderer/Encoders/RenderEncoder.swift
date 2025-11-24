@@ -2,12 +2,14 @@ import Metal
 
 final class RenderEncoder {
     private let renderPipeline: MTLComputePipelineState
+    private let renderPipelineHalf: MTLComputePipelineState?
     private let prepareDispatchPipeline: MTLComputePipelineState
     private let clearPipeline: MTLComputePipelineState
 
     init(device: MTLDevice, library: MTLLibrary) throws {
         guard
             let renderFn = library.makeFunction(name: "renderTiles"),
+            let renderHalfFn = library.makeFunction(name: "renderTilesHalf"),
             let prepFn = library.makeFunction(name: "prepareRenderDispatchKernel"),
             let clearFn = library.makeFunction(name: "clearRenderTargetsKernel")
         else {
@@ -15,6 +17,7 @@ final class RenderEncoder {
         }
         
         self.renderPipeline = try device.makeComputePipelineState(function: renderFn)
+        self.renderPipelineHalf = try? device.makeComputePipelineState(function: renderHalfFn)
         self.prepareDispatchPipeline = try device.makeComputePipelineState(function: prepFn)
         self.clearPipeline = try device.makeComputePipelineState(function: clearFn)
     }
@@ -25,7 +28,8 @@ final class RenderEncoder {
         outputBuffers: RenderOutputBuffers,
         params: RenderParams,
         dispatchArgs: MTLBuffer,
-        dispatchOffset: Int
+        dispatchOffset: Int,
+        precision: Precision
     ) {
         // 1. Prepare Dispatch (CPU-side check handled in SwiftRenderer, this is GPU dispatch preparation)
         if let encoder = commandBuffer.makeComputeCommandEncoder() {
@@ -69,7 +73,11 @@ final class RenderEncoder {
         // 3. Render Tiles
         if let encoder = commandBuffer.makeComputeCommandEncoder() {
             encoder.label = "RenderTiles"
-            encoder.setComputePipelineState(self.renderPipeline)
+            if precision == .float16, let halfPipe = self.renderPipelineHalf {
+                encoder.setComputePipelineState(halfPipe)
+            } else {
+                encoder.setComputePipelineState(self.renderPipeline)
+            }
             encoder.setBuffer(orderedBuffers.headers, offset: 0, index: 0)
             encoder.setBuffer(orderedBuffers.means, offset: 0, index: 1)
             encoder.setBuffer(orderedBuffers.conics, offset: 0, index: 2)

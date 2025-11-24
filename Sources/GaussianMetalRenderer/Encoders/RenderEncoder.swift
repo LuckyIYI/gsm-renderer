@@ -8,8 +8,8 @@ final class RenderEncoder {
 
     init(device: MTLDevice, library: MTLLibrary) throws {
         guard
-            let renderFn = library.makeFunction(name: "renderTiles"),
-            let renderHalfFn = library.makeFunction(name: "renderTilesHalf"),
+            let renderFn = library.makeFunction(name: "renderTiles_float"),
+            let renderHalfFn = library.makeFunction(name: "renderTiles_half"),
             let prepFn = library.makeFunction(name: "prepareRenderDispatchKernel"),
             let clearFn = library.makeFunction(name: "clearRenderTargetsKernel")
         else {

@@ -163,10 +163,9 @@ final class RadixSortEncoder {
             encoder.label = "RadixExclusive_\(shift)"
             encoder.setComputePipelineState(self.exclusiveScanPipeline)
             encoder.setBuffer(radixBuffers.blockSums, offset: 0, index: 0)
+            encoder.setBuffer(header, offset: 0, index: 1)
             
-            encoder.setThreadgroupMemoryLength(self.blockSize * 4, index: 0)
-            
-            let tg = MTLSize(width: self.blockSize, height: 1, depth: 1)
+            let tg = MTLSize(width: 1, height: 1, depth: 1)
             encoder.dispatchThreadgroups(
                 indirectBuffer: dispatchArgs,
                 indirectBufferOffset: offsets.exclusive,

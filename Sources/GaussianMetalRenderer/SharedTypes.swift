@@ -195,6 +195,11 @@ public enum Precision {
     case float16
 }
 
+public enum SortAlgorithm {
+    case bitonic
+    case radix
+}
+
 public struct OrderedGaussianBuffers {
     public let headers: MTLBuffer
     public let means: MTLBuffer

@@ -98,20 +98,15 @@ public final class Renderer: @unchecked Sendable {
     private var gaussianMaskCache: MTLBuffer?
     private var gaussianDepthsCache: MTLBuffer?
     private var gaussianConicsCache: MTLBuffer?
-        private var gaussianColorsCache: MTLBuffer?
-        private var gaussianOpacitiesCache: MTLBuffer?
+    private var gaussianColorsCache: MTLBuffer?
+    private var gaussianOpacitiesCache: MTLBuffer?
         
-    private let sortAlgorithm: SortAlgorithm = .radix
+    private let sortAlgorithm: SortAlgorithm
     private let precision: Precision
     private let effectivePrecision: Precision
     public var precisionSetting: Precision { self.effectivePrecision }
-            
-    private enum SortAlgorithm {
-        case bitonic
-        case radix
-    }
 
-    public init(precision: Precision = .float32, useIndirectBitonic: Bool = true) {
+    public init(precision: Precision = .float32, useIndirectBitonic: Bool = true, sortAlgorithm: SortAlgorithm = .bitonic) {
         guard let device = MTLCreateSystemDefaultDevice() else {
             fatalError("Metal device unavailable")
         }
@@ -122,172 +117,19 @@ public final class Renderer: @unchecked Sendable {
         self.queue = queue
         
         do {
-            // Try compiling from bundled .metal source first to pick up new kernels; fall back to prebuilt metallib.
             let currentFileURL = URL(fileURLWithPath: #filePath)
             let moduleDir = currentFileURL.deletingLastPathComponent()
             let metallibURL = moduleDir.appendingPathComponent("GaussianMetalRenderer.metallib")
-            var chosen: MTLLibrary?
-            if
-                let metalURL = Bundle.module.url(forResource: "GaussianMetalRenderer", withExtension: "metal"),
-                let source = try? String(contentsOf: metalURL, encoding: .utf8) {
-                do {
-                    chosen = try device.makeLibrary(source: source, options: nil)
-                } catch {
-                    print("[Renderer] Failed to compile Metal source from bundle: \(error)")
-                }
-            }
-            if chosen == nil {
-                chosen = try device.makeLibrary(URL: metallibURL)
-            }
-            var library = chosen!
-            if precision == .float16 {
-                // Ensure half kernels are available; if not, attempt a direct compile from source next to the binary.
-                if library.makeFunction(name: "packTileDataKernelHalf") == nil || library.makeFunction(name: "renderTilesHalf") == nil {
-                    let fallbackSourceURL = moduleDir.appendingPathComponent("GaussianMetalRenderer.metal")
-                    if let source = try? String(contentsOf: fallbackSourceURL, encoding: .utf8) {
-                        do {
-                            let rebuilt = try device.makeLibrary(source: source, options: nil)
-                            library = rebuilt
-                        } catch {
-                            print("[Renderer] Failed to compile Metal source for half precision: \(error)")
-                        }
-                    }
-                }
-                if library.makeFunction(name: "packTileDataKernelHalf") == nil || library.makeFunction(name: "renderTilesHalf") == nil {
-                    let halfOnlySource = """
-                    #include <metal_stdlib>
-                    using namespace metal;
-                    struct GaussianHeader { uint offset; uint count; };
-                    struct TileAssignmentHeader { uint totalAssignments; uint maxAssignments; uint paddedCount; uint overflow; };
-                    struct PackParams { uint totalAssignments; uint padding; };
-                    struct RenderParams { uint width; uint height; uint tileWidth; uint tileHeight; uint tilesX; uint tilesY; uint maxPerTile; uint whiteBackground; uint activeTileCount; uint gaussianCount; };
-                    kernel void packTileDataKernelHalf(
-                        const device int* sortedIndices [[buffer(0)]],
-                        const device float2* means [[buffer(1)]],
-                        const device float4* conics [[buffer(2)]],
-                        const device packed_float3* colors [[buffer(3)]],
-                        const device float* opacities [[buffer(4)]],
-                        const device float* depths [[buffer(5)]],
-                        device half2* outMeans [[buffer(6)]],
-                        device half4* outConics [[buffer(7)]],
-                        device half4* outColors [[buffer(8)]],
-                        device half* outOpacities [[buffer(9)]],
-                        device half* outDepths [[buffer(10)]],
-                        const device TileAssignmentHeader* header [[buffer(11)]],
-                        const device int* tileIndices [[buffer(12)]],
-                        const device int* tileIds [[buffer(13)]],
-                        constant PackParams& params [[buffer(14)]],
-                        uint gid [[thread_position_in_grid]]
-                    ) {
-                        uint total = header->totalAssignments;
-                        if (gid >= total) { return; }
-                        int src = sortedIndices[gid];
-                        if (src < 0) { return; }
-                        float2 m = means[src];
-                        float4 c = conics[src];
-                        float3 col = float3(colors[src]);
-                        outMeans[gid] = half2(m);
-                        outConics[gid] = half4(c);
-                        outColors[gid] = half4(half3(col), half(0.0));
-                        outOpacities[gid] = half(opacities[src]);
-                        outDepths[gid] = half(depths[src]);
-                    }
-                    kernel void renderTilesHalf(
-                        const device GaussianHeader* headers [[buffer(0)]],
-                        const device half2* means [[buffer(1)]],
-                        const device half4* conics [[buffer(2)]],
-                        const device half4* colors [[buffer(3)]],
-                        const device half* opacities [[buffer(4)]],
-                        const device half* depths [[buffer(5)]],
-                        device float* colorOut [[buffer(6)]],
-                        device float* depthOut [[buffer(7)]],
-                        device float* alphaOut [[buffer(8)]],
-                        constant RenderParams& params [[buffer(9)]],
-                        const device uint* activeTiles [[buffer(10)]],
-                        const device uint* activeTileCount [[buffer(11)]],
-                        uint3 localPos3 [[thread_position_in_threadgroup]],
-                        uint3 tileCoord [[threadgroup_position_in_grid]]
-                    ) {
-                        uint tilesX = params.tilesX;
-                        uint tilesY = params.tilesY;
-                        uint tileId = tileCoord.x;
-                        if (tileId >= tilesX * tilesY) { return; }
-                        uint tileWidth = params.tileWidth;
-                        uint tileHeight = params.tileHeight;
-                        uint localX = localPos3.x;
-                        uint localY = localPos3.y;
-                        uint tileX = tileId % tilesX;
-                        uint tileY = tileId / tilesX;
-                        uint px = tileX * tileWidth + localX;
-                        uint py = tileY * tileHeight + localY;
-                        bool inBounds = (px < params.width) && (py < params.height);
-                        float3 accumColor = float3(0.0f);
-                        float accumDepth = 0.0f;
-                        float accumAlpha = 0.0f;
-                        float trans = 1.0f;
-                        GaussianHeader header = headers[tileId];
-                        uint start = header.offset;
-                        uint count = header.count;
-                        if (count == 0) { return; }
-                        for (uint i = 0; i < count; ++i) {
-                            uint gIdx = start + i;
-                            if (inBounds) {
-                                float2 mean = float2(means[gIdx]);
-                                float4 conic = float4(conics[gIdx]);
-                                float3 color = float3(colors[gIdx].xyz);
-                                float baseOpacity = metal::min(float(opacities[gIdx]), 0.99f);
-                                if (baseOpacity > 0.0f) {
-                                    float fx = float(px);
-                                    float fy = float(py);
-                                    float dx = fx - mean.x;
-                                    float dy = fy - mean.y;
-                                    float quad = dx * dx * conic.x + dy * dy * conic.z + 2.0f * dx * dy * conic.y;
-                                    if (quad < 20.0f && (conic.x != 0.0f || conic.z != 0.0f)) {
-                                        float weight = metal::exp(-0.5f * quad);
-                                        float alpha = weight * baseOpacity;
-                                        if (alpha > 1e-4f) {
-                                            float contrib = trans * alpha;
-                                            trans *= (1.0f - alpha);
-                                            accumAlpha += contrib;
-                                            accumColor += color * contrib;
-                                            accumDepth += float(depths[gIdx]) * contrib;
-                                            if (trans < 1e-3f) { break; }
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                        if (inBounds) {
-                            if (params.whiteBackground != 0) {
-                                accumColor += float3(trans);
-                            }
-                            uint pixelIndex = py * params.width + px;
-                            uint base = pixelIndex * 3;
-                            colorOut[base + 0] = accumColor.x;
-                            colorOut[base + 1] = accumColor.y;
-                            colorOut[base + 2] = accumColor.z;
-                            depthOut[pixelIndex] = accumDepth;
-                            alphaOut[pixelIndex] = accumAlpha;
-                        }
-                    }
-                    """
-                    do {
-                        let halfLib = try device.makeLibrary(source: halfOnlySource, options: nil)
-                        library = halfLib
-                    } catch {
-                        print("[Renderer] Failed to compile inline half-precision Metal source: \(error)")
-                    }
-                }
-            }
-            let halfAvailable = library.makeFunction(name: "packTileDataKernelHalf") != nil && library.makeFunction(name: "renderTilesHalf") != nil
+            let library = try device.makeLibrary(URL: metallibURL)
+
             self.library = library
-            self.effectivePrecision = (precision == .float16 && halfAvailable) ? .float16 : .float32
+            self.effectivePrecision = precision
             
             self.tileBoundsEncoder = try TileBoundsEncoder(device: device, library: library)
             self.coverageEncoder = try CoverageEncoder(device: device, library: library)
             self.scatterEncoder = try ScatterEncoder(device: device, library: library)
-        self.sortKeyGenEncoder = try SortKeyGenEncoder(device: device, library: library)
-        self.bitonicSortEncoder = try BitonicSortEncoder(device: device, library: library, useIndirect: useIndirectBitonic)
+            self.sortKeyGenEncoder = try SortKeyGenEncoder(device: device, library: library)
+            self.bitonicSortEncoder = try BitonicSortEncoder(device: device, library: library, useIndirect: useIndirectBitonic)
             self.radixSortEncoder = try RadixSortEncoder(device: device, library: library)
             self.packEncoder = try PackEncoder(device: device, library: library)
             self.renderEncoder = try RenderEncoder(device: device, library: library)
@@ -308,6 +150,7 @@ public final class Renderer: @unchecked Sendable {
             fatalError("Failed to load library or initialize encoders: \(error)")
         }
         self.precision = precision
+        self.sortAlgorithm = sortAlgorithm
 
         // Initialize frame slots
         for _ in 0..<maxInFlightFrames {
@@ -1336,12 +1179,12 @@ public final class Renderer: @unchecked Sendable {
             frameInUse[index] = false
         }
     }
-
+    
     
     internal func ensureRadixBuffers(frame: FrameResources, paddedCapacity: Int) -> Bool {
-        let valuesPerGroup = 256 * 4
+        let valuesPerGroup = self.radixSortEncoder.blockSize * self.radixSortEncoder.grainSize
         let gridSize = max(1, (paddedCapacity + valuesPerGroup - 1) / valuesPerGroup)
-        let histogramCount = gridSize * 256
+        let histogramCount = gridSize * self.radixSortEncoder.radix
         let blockBytes = gridSize * 4
         let fusedKeyBytes = paddedCapacity * 8
         

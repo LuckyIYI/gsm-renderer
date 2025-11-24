@@ -10,7 +10,7 @@ final class PackEncoder {
 
     init(device: MTLDevice, library: MTLLibrary) throws {
         guard
-            let packFn = library.makeFunction(name: "packTileDataKernel"),
+            let packFn = library.makeFunction(name: "packTileDataKernel_float"),
             let headerFn = library.makeFunction(name: "buildHeadersFromSortedKernel"),
             let compactFn = library.makeFunction(name: "compactActiveTilesKernel")
         else {
@@ -18,53 +18,10 @@ final class PackEncoder {
         }
         
         self.packPipeline = try device.makeComputePipelineState(function: packFn)
-        if let packHalfFn = library.makeFunction(name: "packTileDataKernelHalf") {
+        if let packHalfFn = library.makeFunction(name: "packTileDataKernel_half") {
             self.packPipelineHalf = try? device.makeComputePipelineState(function: packHalfFn)
         } else {
-            let halfOnlySource = """
-            #include <metal_stdlib>
-            using namespace metal;
-            struct GaussianHeader { uint offset; uint count; };
-            struct TileAssignmentHeader { uint totalAssignments; uint maxAssignments; uint paddedCount; uint overflow; };
-            struct PackParams { uint totalAssignments; uint padding; };
-            kernel void packTileDataKernelHalf(
-                const device int* sortedIndices [[buffer(0)]],
-                const device float2* means [[buffer(1)]],
-                const device float4* conics [[buffer(2)]],
-                const device packed_float3* colors [[buffer(3)]],
-                const device float* opacities [[buffer(4)]],
-                const device float* depths [[buffer(5)]],
-                device half2* outMeans [[buffer(6)]],
-                device half4* outConics [[buffer(7)]],
-                device half4* outColors [[buffer(8)]],
-                device half* outOpacities [[buffer(9)]],
-                device half* outDepths [[buffer(10)]],
-                const device TileAssignmentHeader* header [[buffer(11)]],
-                const device int* tileIndices [[buffer(12)]],
-                const device int* tileIds [[buffer(13)]],
-                constant PackParams& params [[buffer(14)]],
-                uint gid [[thread_position_in_grid]]
-            ) {
-                uint total = header->totalAssignments;
-                if (gid >= total) { return; }
-                int src = sortedIndices[gid];
-                if (src < 0) { return; }
-                float2 m = means[src];
-                float4 c = conics[src];
-                float3 col = float3(colors[src]);
-                outMeans[gid] = half2(m);
-                outConics[gid] = half4(c);
-                outColors[gid] = packed_half3(col);
-                outOpacities[gid] = half(opacities[src]);
-                outDepths[gid] = half(depths[src]);
-            }
-            """
-            if let lib = try? device.makeLibrary(source: halfOnlySource, options: nil),
-               let fn = lib.makeFunction(name: "packTileDataKernelHalf") {
-                self.packPipelineHalf = try? device.makeComputePipelineState(function: fn)
-            } else {
-                self.packPipelineHalf = nil
-            }
+            self.packPipelineHalf = nil
         }
         self.headerFromSortedPipeline = try device.makeComputePipelineState(function: headerFn)
         self.compactActiveTilesPipeline = try device.makeComputePipelineState(function: compactFn)

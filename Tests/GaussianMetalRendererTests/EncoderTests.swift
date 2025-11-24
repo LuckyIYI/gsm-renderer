@@ -405,6 +405,105 @@ final class EncoderTests: XCTestCase {
             let k2Val = (UInt64(k2.x) << 32) | UInt64(k2.y)
             XCTAssertLessThanOrEqual(k1Val, k2Val, "Keys not sorted at \(i)")
         }
-    
+
+    }
+
+    func testRadixSortNonPowerOfTwo() throws {
+        let encoder = try RadixSortEncoder(device: device, library: library)
+        let count = 12_345
+        var paddedCount = 1
+        while paddedCount < count { paddedCount <<= 1 }
+
+        var keys = [SIMD2<UInt32>](repeating: SIMD2<UInt32>(0xFFFFFFFF, 0xFFFFFFFF), count: paddedCount)
+        var indices = [Int32](repeating: -1, count: paddedCount)
+
+        for i in 0..<count {
+            let tileId = UInt32.random(in: 0..<50)
+            let depth = Float.random(in: 0.1...100.0)
+            keys[i] = SIMD2<UInt32>(tileId, depth.bitPattern)
+            indices[i] = Int32(i)
+        }
+
+        let cpuSorted = zip(keys, indices).sorted { a, b in
+            if a.0.x != b.0.x { return a.0.x < b.0.x }
+            return a.0.y < b.0.y
+        }
+
+        let keyBuffer = device.makeBuffer(bytes: keys, length: paddedCount * MemoryLayout<SIMD2<UInt32>>.stride, options: .storageModeShared)!
+        let indicesBuffer = device.makeBuffer(bytes: indices, length: paddedCount * MemoryLayout<Int32>.stride, options: .storageModeShared)!
+        let headerBuffer = device.makeBuffer(length: MemoryLayout<TileAssignmentHeaderSwift>.stride, options: .storageModeShared)!
+        let dispatchArgs = device.makeBuffer(length: 4096, options: .storageModePrivate)!
+
+        let headerPtr = headerBuffer.contents().bindMemory(to: TileAssignmentHeaderSwift.self, capacity: 1)
+        headerPtr.pointee.totalAssignments = UInt32(count)
+        headerPtr.pointee.paddedCount = UInt32(paddedCount)
+
+        let dispatchEncoder = try DispatchEncoder(
+            device: device,
+            library: library,
+            config: AssignmentDispatchConfigSwift(
+                sortThreadgroupSize: 256,
+                fuseThreadgroupSize: 256,
+                unpackThreadgroupSize: 256,
+                packThreadgroupSize: 256,
+                bitonicThreadgroupSize: 256,
+                radixBlockSize: 256,
+                radixGrainSize: 4
+            )
+        )
+
+        let valuesPerGroup = 256 * 4
+        let gridSize = max(1, (paddedCount + valuesPerGroup - 1) / valuesPerGroup)
+        let histogramCount = gridSize * 256
+
+        let radixBuffers = RadixBufferSet(
+            histogram: device.makeBuffer(length: histogramCount * 4, options: .storageModePrivate)!,
+            blockSums: device.makeBuffer(length: gridSize * 4, options: .storageModePrivate)!,
+            scannedHistogram: device.makeBuffer(length: histogramCount * 4, options: .storageModePrivate)!,
+            fusedKeys: device.makeBuffer(length: paddedCount * 8, options: .storageModePrivate)!,
+            scratchKeys: device.makeBuffer(length: paddedCount * 8, options: .storageModePrivate)!,
+            scratchPayload: device.makeBuffer(length: paddedCount * 4, options: .storageModePrivate)!
+        )
+
+        let offsets = (
+            fuse: DispatchSlot.fuseKeys.rawValue * MemoryLayout<DispatchIndirectArgsSwift>.stride,
+            unpack: DispatchSlot.unpackKeys.rawValue * MemoryLayout<DispatchIndirectArgsSwift>.stride,
+            histogram: DispatchSlot.radixHistogram.rawValue * MemoryLayout<DispatchIndirectArgsSwift>.stride,
+            scanBlocks: DispatchSlot.radixScanBlocks.rawValue * MemoryLayout<DispatchIndirectArgsSwift>.stride,
+            exclusive: DispatchSlot.radixExclusive.rawValue * MemoryLayout<DispatchIndirectArgsSwift>.stride,
+            apply: DispatchSlot.radixApply.rawValue * MemoryLayout<DispatchIndirectArgsSwift>.stride,
+            scatter: DispatchSlot.radixScatter.rawValue * MemoryLayout<DispatchIndirectArgsSwift>.stride
+        )
+
+        let commandBuffer = queue.makeCommandBuffer()!
+        dispatchEncoder.encode(commandBuffer: commandBuffer, header: headerBuffer, dispatchArgs: dispatchArgs)
+        commandBuffer.commit()
+        commandBuffer.waitUntilCompleted()
+
+        let sortCommand = queue.makeCommandBuffer()!
+        encoder.encode(
+            commandBuffer: sortCommand,
+            keyBuffer: keyBuffer,
+            sortedIndices: indicesBuffer,
+            header: headerBuffer,
+            dispatchArgs: dispatchArgs,
+            radixBuffers: radixBuffers,
+            offsets: offsets
+        )
+        sortCommand.commit()
+        sortCommand.waitUntilCompleted()
+
+        let gpuKeys = keyBuffer.contents().bindMemory(to: SIMD2<UInt32>.self, capacity: count)
+        let gpuIndices = indicesBuffer.contents().bindMemory(to: Int32.self, capacity: count)
+
+        for i in 0..<count {
+            let cpu = cpuSorted[i]
+            let gpuKey = gpuKeys[i]
+            let gpuIdx = gpuIndices[i]
+            if cpu.0 != gpuKey || cpu.1 != gpuIdx {
+                XCTFail("Mismatch at \(i): cpuKey \(cpu.0) gpuKey \(gpuKey) cpuIdx \(cpu.1) gpuIdx \(gpuIdx)")
+                break
+            }
+        }
     }
 }

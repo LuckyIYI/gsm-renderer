@@ -15,9 +15,7 @@ let package = Package(
             targets: ["GaussianMetalRenderer"]
         ),
     ],
-    dependencies: [
-        .package(url: "https://github.com/weichsel/ZIPFoundation", from: "0.9.17"),
-    ],
+    dependencies: [],
     targets: [
         .target(
             name: "GaussianMetalRenderer",

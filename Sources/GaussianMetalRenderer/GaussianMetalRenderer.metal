@@ -381,74 +381,77 @@ inline float radiusFromCovariance(float2x2 cov) {
     return 3.0f * ceil(radius);
 }
 
-kernel void projectGaussiansKernel(
-    const device packed_float3* positions [[buffer(0)]],
-    const device packed_float3* scales [[buffer(1)]],
-    const device float4* rotations [[buffer(2)]],
-    const device float* opacities [[buffer(3)]],
-    const device float* harmonics [[buffer(4)]],
-    device float2* outMeans [[buffer(5)]],
-    device float4* outConics [[buffer(6)]],
-    device packed_float3* outColors [[buffer(7)]],
-    device float* outOpacities [[buffer(8)]],
-    device float* outDepths [[buffer(9)]],
-    device float* outRadii [[buffer(10)]],
+// =============================================================================
+// Templated projection kernel - single implementation for all precision combos
+// =============================================================================
+// InPos3: packed_float3 or packed_half3 (world positions)
+// InT: float or half (world scalars: opacities, harmonics)
+// InQuat: float4 or half4 (quaternions)
+// OutVec2: float2 or half2 (screen means)
+// OutVec4: float4 or half4 (conics)
+// OutT: float or half (output scalars: opacities, depths, colors)
+// OutPacked3: packed_float3 or packed_half3 (output colors)
+template <typename InPos3, typename InT, typename InQuat,
+          typename OutVec2, typename OutVec4, typename OutT, typename OutPacked3>
+kernel void projectGaussiansImpl(
+    const device InPos3* positions [[buffer(0)]],
+    const device InPos3* scales [[buffer(1)]],
+    const device InQuat* rotations [[buffer(2)]],
+    const device InT* opacities [[buffer(3)]],
+    const device InT* harmonics [[buffer(4)]],
+    device OutVec2* outMeans [[buffer(5)]],
+    device OutVec4* outConics [[buffer(6)]],
+    device OutPacked3* outColors [[buffer(7)]],
+    device OutT* outOpacities [[buffer(8)]],
+    device OutT* outDepths [[buffer(9)]],
+    device float* outRadii [[buffer(10)]],  // Always float for tile bounds accuracy
     device uchar* outMask [[buffer(11)]],
     constant CameraUniforms& camera [[buffer(12)]],
     uint gid [[thread_position_in_grid]]
 ) {
-    if (gid >= camera.gaussianCount) {
-        return;
-    }
-    float3 position = positions[gid];
+    if (gid >= camera.gaussianCount) { return; }
+
+    // Read input and promote to float for computation accuracy
+    float3 position = float3(positions[gid]);
     float4 viewPos4 = camera.viewMatrix * float4(position, 1.0f);
     float depth = safeDepthComponent(viewPos4.z);
+
     if (depth <= camera.nearPlane) {
         outMask[gid] = 0;
         outRadii[gid] = 0.0f;
         return;
     }
+
     float4 clip = camera.projectionMatrix * viewPos4;
     if (fabs(clip.w) < 1e-6f) {
         outMask[gid] = 2;
         outRadii[gid] = 0.0f;
         return;
     }
+
     float ndcX = clip.x / clip.w;
     float ndcY = clip.y / clip.w;
     float px = ((ndcX + 1.0f) * camera.width - 1.0f) * 0.5f;
     float py = ((ndcY + 1.0f) * camera.height - 1.0f) * 0.5f;
-    float3 scale = scales[gid];
-    float4 quat = rotations[gid];
+
+    float3 scale = float3(scales[gid]);
+    float4 quat = float4(rotations[gid]);
     float3x3 cov3d = buildCovariance3D(scale, quat);
+
     float3 viewRow0 = float3(camera.viewMatrix[0][0], camera.viewMatrix[1][0], camera.viewMatrix[2][0]);
     float3 viewRow1 = float3(camera.viewMatrix[0][1], camera.viewMatrix[1][1], camera.viewMatrix[2][1]);
     float3 viewRow2 = float3(camera.viewMatrix[0][2], camera.viewMatrix[1][2], camera.viewMatrix[2][2]);
     float3x3 viewRot = matrixFromRows(viewRow0, viewRow1, viewRow2);
-    float2x2 cov2d = projectCovariance(
-        cov3d,
-        viewPos4.xyz,
-        viewRot,
-        camera.focalX,
-        camera.focalY,
-        camera.width,
-        camera.height
-    );
+
+    float2x2 cov2d = projectCovariance(cov3d, viewPos4.xyz, viewRot, camera.focalX, camera.focalY, camera.width, camera.height);
     float4 conic = invertCovariance2D(cov2d);
     float radius = radiusFromCovariance(cov2d);
-    outMeans[gid] = float2(px, py);
-    outConics[gid] = conic;
-    outOpacities[gid] = opacities[gid];
-    outDepths[gid] = depth;
-    outRadii[gid] = radius;
+
+    // Compute SH color
     float3 color = float3(0.0f);
     if (camera.shComponents == 0) {
         uint baseColor = gid * 3u;
-        color = float3(
-            harmonics[baseColor + 0],
-            harmonics[baseColor + 1],
-            harmonics[baseColor + 2]
-        );
+        color = float3(float(harmonics[baseColor + 0]), float(harmonics[baseColor + 1]), float(harmonics[baseColor + 2]));
     } else {
         float3 dir = normalize(camera.cameraCenter - position);
         float shBasis[16];
@@ -456,18 +459,13 @@ kernel void projectGaussiansKernel(
         shBasis[1] = -SH_C1 * dir.y;
         shBasis[2] = SH_C1 * dir.z;
         shBasis[3] = -SH_C1 * dir.x;
-        float xx = dir.x * dir.x;
-        float yy = dir.y * dir.y;
-        float zz = dir.z * dir.z;
-        float xy = dir.x * dir.y;
-        float yz = dir.y * dir.z;
-        float xz = dir.x * dir.z;
+        float xx = dir.x * dir.x, yy = dir.y * dir.y, zz = dir.z * dir.z;
+        float xy = dir.x * dir.y, yz = dir.y * dir.z, xz = dir.x * dir.z;
         shBasis[4] = SH_C2_0 * xy;
         shBasis[5] = SH_C2_1 * yz;
         shBasis[6] = SH_C2_2 * (2.0f * zz - xx - yy);
         shBasis[7] = SH_C2_3 * xz;
         shBasis[8] = SH_C2_4 * (xx - yy);
-        
         shBasis[9] = SH_C3_0 * dir.y * (3.0f * xx - yy);
         shBasis[10] = SH_C3_1 * xy * dir.z;
         shBasis[11] = SH_C3_2 * dir.y * (4.0f * zz - xx - yy);
@@ -479,15 +477,53 @@ kernel void projectGaussiansKernel(
         uint coeffs = camera.shComponents;
         uint base = gid * coeffs * 3u;
         for (uint i = 0; i < min(coeffs, 16u); ++i) {
-            color.x += harmonics[base + i] * shBasis[i];
-            color.y += harmonics[base + coeffs + i] * shBasis[i];
-            color.z += harmonics[base + coeffs * 2u + i] * shBasis[i];
+            color.x += float(harmonics[base + i]) * shBasis[i];
+            color.y += float(harmonics[base + coeffs + i]) * shBasis[i];
+            color.z += float(harmonics[base + coeffs * 2u + i]) * shBasis[i];
         }
     }
     color = max(color + float3(0.5f), float3(0.0f));
-    outColors[gid] = color;
+
+    // Write outputs (convert to output precision)
+    outMeans[gid] = OutVec2(px, py);
+    outConics[gid] = OutVec4(conic);
+    outOpacities[gid] = OutT(opacities[gid]);
+    outDepths[gid] = OutT(depth);
+    outRadii[gid] = radius;  // Always float
+    outColors[gid] = OutPacked3(color);
     outMask[gid] = 1;
 }
+
+// Instantiation macro for projectGaussians variants
+#define instantiate_projectGaussians(name, InPos3, InT, InQuat, OutVec2, OutVec4, OutT, OutPacked3) \
+    template [[host_name("projectGaussians_" #name)]] \
+    kernel void projectGaussiansImpl<InPos3, InT, InQuat, OutVec2, OutVec4, OutT, OutPacked3>( \
+        const device InPos3* positions [[buffer(0)]], \
+        const device InPos3* scales [[buffer(1)]], \
+        const device InQuat* rotations [[buffer(2)]], \
+        const device InT* opacities [[buffer(3)]], \
+        const device InT* harmonics [[buffer(4)]], \
+        device OutVec2* outMeans [[buffer(5)]], \
+        device OutVec4* outConics [[buffer(6)]], \
+        device OutPacked3* outColors [[buffer(7)]], \
+        device OutT* outOpacities [[buffer(8)]], \
+        device OutT* outDepths [[buffer(9)]], \
+        device float* outRadii [[buffer(10)]], \
+        device uchar* outMask [[buffer(11)]], \
+        constant CameraUniforms& camera [[buffer(12)]], \
+        uint gid [[thread_position_in_grid]] \
+    );
+
+// Float input -> Float output (standard path)
+instantiate_projectGaussians(float, packed_float3, float, float4, float2, float4, float, packed_float3)
+
+// Float input -> Half output (for half pipeline with float world data)
+instantiate_projectGaussians(half, packed_float3, float, float4, half2, half4, half, packed_half3)
+
+// Half input -> Half output (full half pipeline)
+instantiate_projectGaussians(half_input, packed_half3, half, half4, half2, half4, half, packed_half3)
+
+#undef instantiate_projectGaussians
 
 template <typename T, typename Vec2, typename Vec4, typename Packed3>
 kernel void renderTiles(
@@ -594,6 +630,113 @@ instantiate_renderTiles(half, half, half2, half4, packed_half3)
 
 #undef instantiate_renderTiles
 
+// Texture-based rendering template
+template <typename T, typename Vec2, typename Vec4, typename Packed3>
+kernel void renderTilesDirect(
+    const device GaussianHeader* headers [[buffer(0)]],
+    const device Vec2* means [[buffer(1)]],
+    const device Vec4* conics [[buffer(2)]],
+    const device Packed3* colors [[buffer(3)]],
+    const device T* opacities [[buffer(4)]],
+    const device T* depths [[buffer(5)]],
+    texture2d<float, access::write> colorTex [[texture(0)]],
+    texture2d<float, access::write> depthTex [[texture(1)]],
+    texture2d<float, access::write> alphaTex [[texture(2)]],
+    constant RenderParams& params [[buffer(9)]],
+    const device uint* activeTiles [[buffer(10)]],
+    const device uint* activeTileCount [[buffer(11)]],
+    uint3 localPos3 [[thread_position_in_threadgroup]],
+    uint3 tileCoord [[threadgroup_position_in_grid]]
+) {
+    uint activeCount = activeTileCount[0];
+    uint activeIdx = tileCoord.x;
+    if (activeIdx >= activeCount) { return; }
+    uint tileId = activeTiles[activeIdx];
+    uint tilesX = params.tilesX;
+    uint tileWidth = params.tileWidth;
+    uint tileHeight = params.tileHeight;
+    uint localX = localPos3.x;
+    uint localY = localPos3.y;
+    uint tileX = tileId % tilesX;
+    uint tileY = tileId / tilesX;
+    uint px = tileX * tileWidth + localX;
+    uint py = tileY * tileHeight + localY;
+    bool inBounds = (px < params.width) && (py < params.height);
+    float3 accumColor = float3(0.0f);
+    float accumDepth = 0.0f;
+    float accumAlpha = 0.0f;
+    float trans = 1.0f;
+    GaussianHeader header = headers[tileId];
+    uint start = header.offset;
+    uint count = header.count;
+    
+    if (count > 0) {
+        for (uint i = 0; i < count; ++i) {
+            uint gIdx = start + i;
+            if (inBounds) {
+                float2 mean = float2(means[gIdx]);
+                float4 conic = float4(conics[gIdx]);
+                float3 color = float3(colors[gIdx]);
+                float baseOpacity = metal::min(float(opacities[gIdx]), 0.99f);
+                if (baseOpacity > 0.0f) {
+                    float fx = float(px);
+                    float fy = float(py);
+                    float dx = fx - mean.x;
+                    float dy = fy - mean.y;
+                    float quad = dx * dx * conic.x + dy * dy * conic.z + 2.0f * dx * dy * conic.y;
+                    if (quad < 20.0f && (conic.x != 0.0f || conic.z != 0.0f)) {
+                        float weight = metal::exp(-0.5f * quad);
+                        float alpha = weight * baseOpacity;
+                        if (alpha > 1e-4f) {
+                            float contrib = trans * alpha;
+                            trans *= (1.0f - alpha);
+                            accumAlpha += contrib;
+                            accumColor += color * contrib;
+                            accumDepth += float(depths[gIdx]) * contrib;
+                            if (trans < 1e-3f) { break; }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    
+    if (inBounds) {
+        if (params.whiteBackground != 0) {
+            accumColor += float3(trans);
+        }
+        
+        uint2 coords = uint2(px, py);
+        colorTex.write(float4(accumColor, 1.0f), coords);
+        depthTex.write(float4(accumDepth, 0, 0, 0), coords); 
+        alphaTex.write(float4(accumAlpha, 0, 0, 0), coords);
+    }
+}
+
+#define instantiate_renderTilesDirect(name, T, Vec2, Vec4, Packed3) \
+    template [[host_name("renderTilesDirect_" #name)]] \
+    kernel void renderTilesDirect<T, Vec2, Vec4, Packed3>( \
+        const device GaussianHeader* headers [[buffer(0)]], \
+        const device Vec2* means [[buffer(1)]], \
+        const device Vec4* conics [[buffer(2)]], \
+        const device Packed3* colors [[buffer(3)]], \
+        const device T* opacities [[buffer(4)]], \
+        const device T* depths [[buffer(5)]], \
+        texture2d<float, access::write> colorTex [[texture(0)]], \
+        texture2d<float, access::write> depthTex [[texture(1)]], \
+        texture2d<float, access::write> alphaTex [[texture(2)]], \
+        constant RenderParams& params [[buffer(9)]], \
+        const device uint* activeTiles [[buffer(10)]], \
+        const device uint* activeTileCount [[buffer(11)]], \
+        uint3 localPos3 [[thread_position_in_threadgroup]], \
+        uint3 tileCoord [[threadgroup_position_in_grid]] \
+    );
+
+instantiate_renderTilesDirect(float, float, float2, float4, packed_float3)
+instantiate_renderTilesDirect(half, half, half2, half4, packed_half3)
+
+#undef instantiate_renderTilesDirect
+
 struct ClearParams {
     uint pixelCount;
     uint whiteBackground;
@@ -616,6 +759,28 @@ kernel void clearRenderTargetsKernel(
     colorOut[base + 2] = bg;
     depthOut[gid] = 0.0f;
     alphaOut[gid] = 0.0f;
+}
+
+struct ClearTextureParams {
+    uint width;
+    uint height;
+    uint whiteBackground;
+};
+
+kernel void clearRenderTexturesKernel(
+    texture2d<float, access::write> colorTex [[texture(0)]],
+    texture2d<float, access::write> depthTex [[texture(1)]],
+    texture2d<float, access::write> alphaTex [[texture(2)]],
+    constant ClearTextureParams& params [[buffer(0)]],
+    uint2 gid [[thread_position_in_grid]]
+) {
+    if (gid.x >= params.width || gid.y >= params.height) {
+        return;
+    }
+    float bg = (params.whiteBackground != 0u) ? 1.0f : 0.0f;
+    colorTex.write(float4(bg, bg, bg, 1.0f), gid);
+    depthTex.write(float4(0.0f), gid);
+    alphaTex.write(float4(0.0f), gid);
 }
 
 struct TileBoundsParams {
@@ -1663,7 +1828,7 @@ kernel void radixHistogramKernel(
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
-    // 2) Load keys blocked per group into registers
+    // 2) Load keys in blocked fashion per group into registers
     KeyType keys[GRAIN_SIZE];
     KeyType sentinelKey = (KeyType)0;
 
@@ -1805,11 +1970,13 @@ kernel void radixScatterKernel(
     uint assignmentsRemain = (base_id < totalAssignments) ? (totalAssignments - base_id) : 0;
     uint available         = min(bufferRemaining, assignmentsRemain);
 
-    // 1) Load keys / payloads in striped fashion into registers
+    // 1) Load keys / payloads in STRIPED fashion (not blocked)
+    // Striped: thread i loads elements i, i+BLOCK_SIZE, i+2*BLOCK_SIZE, ...
     KeyType keys[GRAIN_SIZE];
     uint    payloads[GRAIN_SIZE];
 
-    KeyType keySentinel = (KeyType)0;
+    // Use max key as sentinel - sorts to the end, out of the way
+    KeyType keySentinel = ~(KeyType)0;
 
     LoadStripedLocalFromGlobal<GRAIN_SIZE>(
         keys,
@@ -1837,44 +2004,57 @@ kernel void radixScatterKernel(
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
-    // 3) Per-bin local counters in LDS
-    threadgroup atomic_uint local_bin_counters[RADIX];
-    for (uint i = 0; i < (RADIX + BLOCK_SIZE - 1u) / BLOCK_SIZE; ++i) {
-        uint bin = local_id + i * BLOCK_SIZE;
-        if (bin < RADIX) {
-            atomic_store_explicit(&local_bin_counters[bin], 0u, memory_order_relaxed);
+    // Shared memory for sorting operations
+    threadgroup KeyPayload tg_kp[BLOCK_SIZE];
+    threadgroup ushort tg_short[BLOCK_SIZE];
+
+    // 3) Process one element per thread at a time (GRAIN_SIZE chunks)
+    // Each chunk: sort by bin, compute local offsets, scatter
+    for (ushort chunk = 0; chunk < GRAIN_SIZE; ++chunk) {
+        uint global_idx = base_id + local_id + chunk * BLOCK_SIZE;
+
+        KeyPayload kp;
+        kp.key = keys[chunk];
+        kp.payload = payloads[chunk];
+
+        // Partial radix sort: reorders elements so same-bin elements are contiguous
+        kp = PartialRadixSort(kp, tg_kp, local_id, (ushort)current_digit);
+
+        // Extract bin after sorting
+        ushort my_bin = ValueToKeyAtDigit(kp.key, (ushort)current_digit);
+
+        // Head discontinuity: is this thread first with this bin?
+        uchar head_flag = FlagHeadDiscontinuity<BLOCK_SIZE>((ushort)my_bin, tg_short, local_id);
+
+        // Inclusive max scan to find run start position
+        ushort flag_pos = head_flag ? local_id : 0;
+        ushort run_start = ThreadgroupPrefixScan<SCAN_TYPE_INCLUSIVE>(
+            flag_pos, tg_short, local_id, MaxOp<ushort>());
+
+        // Local offset within run
+        ushort local_offset = local_id - run_start;
+
+        // Tail discontinuity: is this thread last with this bin?
+        uchar tail_flag = FlagTailDiscontinuity<BLOCK_SIZE>((ushort)my_bin, tg_short, local_id);
+
+        // After PartialRadixSort, elements are redistributed among threads.
+        // Check validity via payload (UINT_MAX = invalid sentinel)
+        bool is_valid = (kp.payload != UINT_MAX);
+
+        // Scatter to output (only valid elements)
+        if (is_valid) {
+            uint dst = global_bin_base[my_bin] + local_offset;
+            output_keys[dst] = kp.key;
+            output_payload[dst] = kp.payload;
         }
-    }
-    threadgroup_barrier(mem_flags::mem_threadgroup);
 
-    // 4) Compute destination indices
-    uint out_indices[GRAIN_SIZE];
-
-    for (ushort i = 0; i < GRAIN_SIZE; ++i) {
-        uint offset_in_block = local_id + i * BLOCK_SIZE;
-        uint global_idx      = base_id + offset_in_block;
-
-        if (global_idx >= totalAssignments) {
-            out_indices[i] = UINT_MAX;
-            continue;
+        // Update global offsets for threads at run boundaries (only for valid elements)
+        // Sentinels sort to the end, so they're in their own "bin" (bin 255 all 1s) and
+        // won't interfere with valid elements' offset updates
+        if (tail_flag && is_valid) {
+            global_bin_base[my_bin] += local_offset + 1;
         }
-
-        KeyType k  = keys[i];
-        uchar   bin = (uchar)ValueToKeyAtDigit(k, (ushort)current_digit);
-
-        uint local_index = atomic_fetch_add_explicit(
-            &local_bin_counters[bin], 1u, memory_order_relaxed);
-
-        out_indices[i] = global_bin_base[bin] + local_index;
-    }
-
-    // 5) Scatter keys + payloads
-    for (ushort i = 0; i < GRAIN_SIZE; ++i) {
-        uint dst = out_indices[i];
-        if (dst < totalAssignments) {
-            output_keys[dst]    = keys[i];
-            output_payload[dst] = payloads[i];
-        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
     }
 }
 

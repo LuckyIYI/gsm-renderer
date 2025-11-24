@@ -78,15 +78,15 @@ final class RadixSortEncoder {
             tileBytes += 1
             remainingTiles >>= 8
         }
-        tileBytes = max(tileBytes, 2) // Keep at least 16 bits for tiles.
+        // Only do as many tile bytes as actually needed - extra passes with all elements
+        // in the same bin will scramble the sorted order due to atomic racing
         let passCount = min(8, depthBytes + tileBytes)
 
         var sourceKeys = radixBuffers.fusedKeys
         var destKeys = radixBuffers.scratchKeys
-        
         var sourcePayload = sortedIndices
         var destPayload = radixBuffers.scratchPayload
-        
+
         for digit in 0..<passCount {
             encodeOnePass(
                 commandBuffer: commandBuffer,
@@ -103,7 +103,19 @@ final class RadixSortEncoder {
             swap(&sourceKeys, &destKeys)
             swap(&sourcePayload, &destPayload)
         }
-        
+
+        // If passCount is odd, the sorted payload is in scratchPayload, not sortedIndices.
+        // Copy it back to sortedIndices.
+        if passCount % 2 != 0 {
+            if let blit = commandBuffer.makeBlitCommandEncoder() {
+                blit.label = "CopyPayload"
+                blit.copy(from: radixBuffers.scratchPayload, sourceOffset: 0,
+                         to: sortedIndices, destinationOffset: 0,
+                         size: sortedIndices.length)
+                blit.endEncoding()
+            }
+        }
+
         // 3. Unpack keys back to original layout
         if let encoder = commandBuffer.makeComputeCommandEncoder() {
             encoder.label = "UnpackKeys"

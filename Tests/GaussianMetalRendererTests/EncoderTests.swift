@@ -153,9 +153,9 @@ final class EncoderTests: XCTestCase {
     func testBitonicSort() throws {
         let encoder = try BitonicSortEncoder(device: device, library: library)
         
-        let count = 2048 // Reduced size for debugging
+//        let count = 2048 // Reduced size for debugging
 //        let count = 65536 // workd
-//        let count = 131072 // works
+        let count = 131072 // works
 //        let count = 262144 
 
         var keys = [SIMD2<UInt32>](repeating: .zero, count: count)

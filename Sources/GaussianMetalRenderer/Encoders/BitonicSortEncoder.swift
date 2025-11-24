@@ -4,9 +4,10 @@ final class BitonicSortEncoder {
     private let firstPassPipeline: MTLComputePipelineState
     private let generalPassPipeline: MTLComputePipelineState
     private let finalPassPipeline: MTLComputePipelineState
-    private let icbFillPipeline: MTLComputePipelineState
-    private let icbArgEncoder: MTLArgumentEncoder
+    private let icbFillPipeline: MTLComputePipelineState?
+    private let icbArgEncoder: MTLArgumentEncoder?
     private let device: MTLDevice
+    private let useIndirect: Bool
 
     private var icb: MTLIndirectCommandBuffer?
     private var icbArgBuffer: MTLBuffer?
@@ -21,8 +22,10 @@ final class BitonicSortEncoder {
 
     let unitSize: Int
 
-    init(device: MTLDevice, library: MTLLibrary) throws {
+    init(device: MTLDevice, library: MTLLibrary, useIndirect: Bool = true) throws {
         self.device = device
+        self.useIndirect = useIndirect
+        
         guard
             let firstFn = library.makeFunction(name: "bitonicSortFirstPass"),
             let generalFn = library.makeFunction(name: "bitonicSortGeneralPass"),
@@ -32,18 +35,28 @@ final class BitonicSortEncoder {
             fatalError("Bitonic sort functions missing")
         }
         
-        func makeICBSafePipeline(_ fn: MTLFunction) throws -> MTLComputePipelineState {
-            let desc = MTLComputePipelineDescriptor()
-            desc.computeFunction = fn
-            desc.supportIndirectCommandBuffers = true
-            return try device.makeComputePipelineState(descriptor: desc, options: [], reflection: nil)
+        func makePipeline(_ fn: MTLFunction) throws -> MTLComputePipelineState {
+            if useIndirect {
+                let desc = MTLComputePipelineDescriptor()
+                desc.computeFunction = fn
+                desc.supportIndirectCommandBuffers = true
+                return try device.makeComputePipelineState(descriptor: desc, options: [], reflection: nil)
+            } else {
+                return try device.makeComputePipelineState(function: fn)
+            }
         }
         
-        self.firstPassPipeline = try makeICBSafePipeline(firstFn)
-        self.generalPassPipeline = try makeICBSafePipeline(generalFn)
-        self.finalPassPipeline = try makeICBSafePipeline(finalFn)
-        self.icbFillPipeline = try makeICBSafePipeline(icbFillFn)
-        self.icbArgEncoder = icbFillFn.makeArgumentEncoder(bufferIndex: 0)
+        self.firstPassPipeline = try makePipeline(firstFn)
+        self.generalPassPipeline = try makePipeline(generalFn)
+        self.finalPassPipeline = try makePipeline(finalFn)
+        
+        if useIndirect {
+            self.icbFillPipeline = try makePipeline(icbFillFn)
+            self.icbArgEncoder = icbFillFn.makeArgumentEncoder(bufferIndex: 0)
+        } else {
+            self.icbFillPipeline = nil
+            self.icbArgEncoder = nil
+        }
         
         let bitonicMax = min(firstPassPipeline.maxTotalThreadsPerThreadgroup, 512)
         self.unitSize = BitonicSortEncoder.largestPowerOfTwo(lessThanOrEqualTo: bitonicMax)
@@ -144,6 +157,7 @@ final class BitonicSortEncoder {
     }
     
     private func ensureICB(maxPaddedCapacity: Int) {
+        guard self.useIndirect else { return }
         if let _ = self.icb, maxPaddedCapacity <= self.icbMaxPadded {
             return
         }
@@ -171,12 +185,13 @@ final class BitonicSortEncoder {
         self.icbMaxPadded   = maxPaddedCapacity
 
         // Argument buffer for the ICB container
+        guard let encoder = self.icbArgEncoder else { return }
         let argBuffer = device.makeBuffer(
-            length: icbArgEncoder.encodedLength,
+            length: encoder.encodedLength,
             options: .storageModeShared
         )!
-        icbArgEncoder.setArgumentBuffer(argBuffer, offset: 0)
-        icbArgEncoder.setIndirectCommandBuffer(icb, index: 0)
+        encoder.setArgumentBuffer(argBuffer, offset: 0)
+        encoder.setIndirectCommandBuffer(icb, index: 0)
         self.icbArgBuffer = argBuffer
 
         let firstBytes = commandCount * firstParamStride
@@ -188,10 +203,43 @@ final class BitonicSortEncoder {
         self.passTypeBuffer = device.makeBuffer(length: commandCount * MemoryLayout<UInt32>.stride,
                                                 options: .storageModeShared)
 
-        // Build static schedule (pipelines, params, pass types) for this capacity
         self.buildScheduleForCapacity(maxPaddedCapacity)
     }
     func encode(
+        commandBuffer: MTLCommandBuffer,
+        sortKeys: MTLBuffer,
+        sortedIndices: MTLBuffer,
+        header: MTLBuffer,
+        dispatchArgs: MTLBuffer,
+        offsets: (first: Int, general: Int, final: Int),
+        paddedCapacity: Int,
+        debugParams: MTLBuffer? = nil
+    ) {
+        if useIndirect {
+            encodeIndirect(
+                commandBuffer: commandBuffer,
+                sortKeys: sortKeys,
+                sortedIndices: sortedIndices,
+                header: header,
+                dispatchArgs: dispatchArgs,
+                offsets: offsets,
+                paddedCapacity: paddedCapacity,
+                debugParams: debugParams
+            )
+        } else {
+            encodeDirect(
+                commandBuffer: commandBuffer,
+                sortKeys: sortKeys,
+                sortedIndices: sortedIndices,
+                header: header,
+                dispatchArgs: dispatchArgs,
+                offsets: offsets,
+                paddedCapacity: paddedCapacity
+            )
+        }
+    }
+
+    func encodeIndirect(
         commandBuffer: MTLCommandBuffer,
         sortKeys: MTLBuffer,
         sortedIndices: MTLBuffer,
@@ -205,7 +253,8 @@ final class BitonicSortEncoder {
         self.ensureICB(maxPaddedCapacity: paddedCapacity)
         guard let icb = self.icb,
               let icbArgBuffer = self.icbArgBuffer,
-              let passTypeBuffer = self.passTypeBuffer else { return }
+              let passTypeBuffer = self.passTypeBuffer,
+              let fillPipeline = self.icbFillPipeline else { return }
 
         let commandsToRun = self.icbMaxCommands
 
@@ -220,7 +269,7 @@ final class BitonicSortEncoder {
         // Mask dispatch counts on GPU (single thread)
         if let enc = commandBuffer.makeComputeCommandEncoder() {
             enc.label = "BitonicICBFill"
-            enc.setComputePipelineState(self.icbFillPipeline)
+            enc.setComputePipelineState(fillPipeline)
             enc.setBuffer(icbArgBuffer,    offset: 0, index: 0)
             enc.setBuffer(header,          offset: 0, index: 1)
             enc.setBuffer(dispatchArgs,    offset: 0, index: 2)

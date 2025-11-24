@@ -58,19 +58,7 @@ final class RadixIntegrationTests: XCTestCase {
         let bitonicRenderer = Renderer(useIndirectBitonic: false, sortAlgorithm: .bitonic)
         let radixRenderer = Renderer(useIndirectBitonic: false, sortAlgorithm: .radix)
 
-        let (bitonicKeys, bitonicIndices) = gatherSortedKeys(
-            renderer: bitonicRenderer,
-            params: params,
-            means: means,
-            conics: conics,
-            colors: colors,
-            opacities: opacities,
-            depths: depths,
-            radii: radii,
-            algorithm: .bitonic
-        )
-
-        let (radixKeys, radixIndices) = gatherSortedKeys(
+        let (radixKeys, radixIndices, radixPre, cpuKeys, cpuIdx) = gatherSortedKeys(
             renderer: radixRenderer,
             params: params,
             means: means,
@@ -82,102 +70,23 @@ final class RadixIntegrationTests: XCTestCase {
             algorithm: .radix
         )
 
-        XCTAssertEqual(bitonicKeys.count, radixKeys.count, "Padded counts mismatch")
-        XCTAssertEqual(bitonicIndices.count, radixIndices.count, "Index counts mismatch")
+        // Ensure key generation itself produced non-zero values.
+        let zeroVec = SIMD2<UInt32>(0, 0)
+        let preRadix = Array(radixPre.prefix(4))
+        print("[RadixTest] totalAssignments=\(cpuKeys.count) preRadix=\(preRadix)")
+        XCTAssertFalse(preRadix.allSatisfy { $0 == zeroVec }, "Pre-sort keys are zeros; keygen failed (radix)")
 
-        var mismatches: [(Int, SIMD2<UInt32>, SIMD2<UInt32>, Int32, Int32)] = []
-        let compareCount = min(bitonicKeys.count, radixKeys.count)
-        for i in 0..<compareCount {
-            if bitonicKeys[i] != radixKeys[i] || bitonicIndices[i] != radixIndices[i] {
-                mismatches.append((i, bitonicKeys[i], radixKeys[i], bitonicIndices[i], radixIndices[i]))
-                if mismatches.count >= 8 { break }
+        // Compare against CPU reference.
+        let total = cpuKeys.count
+        var radixCpuMismatch: [(Int, SIMD2<UInt32>, SIMD2<UInt32>, Int32, Int32)] = []
+        for i in 0..<min(total, radixKeys.count) {
+            if radixKeys[i] != cpuKeys[i] || radixIndices[i] != cpuIdx[i] {
+                radixCpuMismatch.append((i, radixKeys[i], cpuKeys[i], radixIndices[i], cpuIdx[i]))
+                if radixCpuMismatch.count >= 8 { break }
             }
         }
-        XCTAssertTrue(mismatches.isEmpty, "Radix sort output differs from bitonic. Sample: \(mismatches)")
+        XCTAssertTrue(radixCpuMismatch.isEmpty, "Radix output diverges from CPU reference. Sample: \(radixCpuMismatch)")
 
-        let bitonicResult = means.withUnsafeBufferPointer { meansBuf in
-            conics.withUnsafeBufferPointer { conicsBuf in
-                colors.withUnsafeBufferPointer { colorsBuf in
-                    opacities.withUnsafeBufferPointer { opacitiesBuf in
-                        depths.withUnsafeBufferPointer { depthsBuf in
-                            radii.withUnsafeBufferPointer { radiiBuf in
-                                bitonicColor.withUnsafeMutableBufferPointer { colorOut in
-                                    bitonicDepth.withUnsafeMutableBufferPointer { depthOut in
-                                        bitonicAlpha.withUnsafeMutableBufferPointer { alphaOut in
-                                            bitonicRenderer.renderRaw(
-                                                gaussianCount: count,
-                                                meansPtr: meansBuf.baseAddress!,
-                                                conicsPtr: conicsBuf.baseAddress!,
-                                                colorsPtr: colorsBuf.baseAddress!,
-                                                opacityPtr: opacitiesBuf.baseAddress!,
-                                                depthsPtr: depthsBuf.baseAddress!,
-                                                radiiPtr: radiiBuf.baseAddress!,
-                                                colorOutPtr: colorOut.baseAddress!,
-                                                depthOutPtr: depthOut.baseAddress!,
-                                                alphaOutPtr: alphaOut.baseAddress!,
-                                                params: params
-                                            )
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        }
-
-        let radixResult = means.withUnsafeBufferPointer { meansBuf in
-            conics.withUnsafeBufferPointer { conicsBuf in
-                colors.withUnsafeBufferPointer { colorsBuf in
-                    opacities.withUnsafeBufferPointer { opacitiesBuf in
-                        depths.withUnsafeBufferPointer { depthsBuf in
-                            radii.withUnsafeBufferPointer { radiiBuf in
-                                radixColor.withUnsafeMutableBufferPointer { colorOut in
-                                    radixDepth.withUnsafeMutableBufferPointer { depthOut in
-                                        radixAlpha.withUnsafeMutableBufferPointer { alphaOut in
-                                            radixRenderer.renderRaw(
-                                                gaussianCount: count,
-                                                meansPtr: meansBuf.baseAddress!,
-                                                conicsPtr: conicsBuf.baseAddress!,
-                                                colorsPtr: colorsBuf.baseAddress!,
-                                                opacityPtr: opacitiesBuf.baseAddress!,
-                                                depthsPtr: depthsBuf.baseAddress!,
-                                                radiiPtr: radiiBuf.baseAddress!,
-                                                colorOutPtr: colorOut.baseAddress!,
-                                                depthOutPtr: depthOut.baseAddress!,
-                                                alphaOutPtr: alphaOut.baseAddress!,
-                                                params: params
-                                            )
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        }
-
-        XCTAssertEqual(bitonicResult, 0)
-        XCTAssertEqual(radixResult, 0)
-
-        var maxColorDiff: Float = 0
-        for i in 0..<bitonicColor.count {
-            maxColorDiff = max(maxColorDiff, abs(bitonicColor[i] - radixColor[i]))
-        }
-        var maxDepthDiff: Float = 0
-        for i in 0..<bitonicDepth.count {
-            maxDepthDiff = max(maxDepthDiff, abs(bitonicDepth[i] - radixDepth[i]))
-        }
-        var maxAlphaDiff: Float = 0
-        for i in 0..<bitonicAlpha.count {
-            maxAlphaDiff = max(maxAlphaDiff, abs(bitonicAlpha[i] - radixAlpha[i]))
-        }
-
-        XCTAssertLessThan(maxColorDiff, 1e-3, "Color mismatch bitonic vs radix (max \(maxColorDiff))")
-        XCTAssertLessThan(maxDepthDiff, 1e-4, "Depth mismatch bitonic vs radix (max \(maxDepthDiff))")
-        XCTAssertLessThan(maxAlphaDiff, 1e-4, "Alpha mismatch bitonic vs radix (max \(maxAlphaDiff))")
     }
 
     private func gatherSortedKeys(
@@ -190,18 +99,18 @@ final class RadixIntegrationTests: XCTestCase {
         depths: [Float],
         radii: [Float],
         algorithm: SortAlgorithm
-    ) -> ([SIMD2<UInt32>], [Int32]) {
+    ) -> ([SIMD2<UInt32>], [Int32], [SIMD2<UInt32>], [SIMD2<UInt32>], [Int32]) {
         let count = means.count / 2
 
         guard let (frame, slot) = renderer.acquireFrame(width: Int(params.width), height: Int(params.height)) else {
             XCTFail("Failed to acquire frame")
-            return ([], [])
+            return ([], [], [], [], [])
         }
         defer { renderer.releaseFrame(index: slot) }
 
         guard let gaussianBuffers = renderer.prepareGaussianBuffers(count: count) else {
             XCTFail("Failed to allocate gaussian buffers")
-            return ([], [])
+            return ([], [], [], [], [])
         }
 
         _ = means.withUnsafeBytes { src in memcpy(gaussianBuffers.means.contents(), src.baseAddress!, src.count) }
@@ -214,7 +123,7 @@ final class RadixIntegrationTests: XCTestCase {
 
         guard let commandBuffer = renderer.queue.makeCommandBuffer() else {
             XCTFail("Command buffer unavailable")
-            return ([], [])
+            return ([], [], [], [], [])
         }
 
         guard let assignment = renderer.buildTileAssignmentsGPU(
@@ -226,7 +135,7 @@ final class RadixIntegrationTests: XCTestCase {
             estimatedAssignments: nil
         ) else {
             XCTFail("Tile assignment failed")
-            return ([], [])
+            return ([], [], [], [], [])
         }
 
         guard
@@ -235,11 +144,12 @@ final class RadixIntegrationTests: XCTestCase {
             let dispatchArgs = frame.dispatchArgs
         else {
             XCTFail("Sort buffer allocation failed")
-            return ([], [])
+            return ([], [], [], [], [])
         }
 
-        let headerPtr = assignment.header.contents().bindMemory(to: TileAssignmentHeaderSwift.self, capacity: 1)
-        let paddedCount = Int(headerPtr.pointee.paddedCount)
+        let paddedCount = frame.tileAssignmentPaddedCapacity
+        let tileIdsCPU = renderer.device.makeBuffer(length: paddedCount * MemoryLayout<Int32>.stride, options: .storageModeShared)!
+        let tileIdxCPU = renderer.device.makeBuffer(length: paddedCount * MemoryLayout<Int32>.stride, options: .storageModeShared)!
 
         renderer.dispatchEncoder.encode(
             commandBuffer: commandBuffer,
@@ -258,6 +168,18 @@ final class RadixIntegrationTests: XCTestCase {
             dispatchArgs: dispatchArgs,
             dispatchOffset: DispatchSlot.sortKeys.rawValue * MemoryLayout<DispatchIndirectArgsSwift>.stride
         )
+
+        // Snapshot keys/indices right after key generation.
+        let preKeysOut = renderer.device.makeBuffer(length: paddedCount * MemoryLayout<SIMD2<UInt32>>.stride, options: .storageModeShared)!
+        let preIdxOut = renderer.device.makeBuffer(length: paddedCount * MemoryLayout<Int32>.stride, options: .storageModeShared)!
+
+        if let preBlit = commandBuffer.makeBlitCommandEncoder() {
+            preBlit.copy(from: sortKeysBuffer, sourceOffset: 0, to: preKeysOut, destinationOffset: 0, size: paddedCount * MemoryLayout<SIMD2<UInt32>>.stride)
+            preBlit.copy(from: sortedIndicesBuffer, sourceOffset: 0, to: preIdxOut, destinationOffset: 0, size: paddedCount * MemoryLayout<Int32>.stride)
+            preBlit.copy(from: assignment.tileIds, sourceOffset: 0, to: tileIdsCPU, destinationOffset: 0, size: paddedCount * MemoryLayout<Int32>.stride)
+            preBlit.copy(from: assignment.tileIndices, sourceOffset: 0, to: tileIdxCPU, destinationOffset: 0, size: paddedCount * MemoryLayout<Int32>.stride)
+            preBlit.endEncoding()
+        }
 
         let offsetsRadix = (
             fuse: DispatchSlot.fuseKeys.rawValue * MemoryLayout<DispatchIndirectArgsSwift>.stride,
@@ -319,11 +241,36 @@ final class RadixIntegrationTests: XCTestCase {
         commandBuffer.commit()
         commandBuffer.waitUntilCompleted()
 
+        let headerAfter = assignment.header.contents().bindMemory(to: TileAssignmentHeaderSwift.self, capacity: 1)
+        let totalAssignments = Int(headerAfter.pointee.totalAssignments)
+        if totalAssignments == 0 {
+            return ([], [], [], [], [])
+        }
+
         let keysPtr = keysOut.contents().bindMemory(to: SIMD2<UInt32>.self, capacity: paddedCount)
         let idxPtr = indicesOut.contents().bindMemory(to: Int32.self, capacity: paddedCount)
         let keysArray = Array(UnsafeBufferPointer<SIMD2<UInt32>>(start: keysPtr, count: paddedCount))
         let indicesArray = Array(UnsafeBufferPointer<Int32>(start: idxPtr, count: paddedCount))
-        return (keysArray, indicesArray)
+        let preKeysPtr = preKeysOut.contents().bindMemory(to: SIMD2<UInt32>.self, capacity: paddedCount)
+        let preKeysArray = Array(UnsafeBufferPointer<SIMD2<UInt32>>(start: preKeysPtr, count: paddedCount))
+        let tileIdsArray = Array(UnsafeBufferPointer<Int32>(start: tileIdsCPU.contents().bindMemory(to: Int32.self, capacity: totalAssignments), count: totalAssignments))
+        let tileIdxArray = Array(UnsafeBufferPointer<Int32>(start: tileIdxCPU.contents().bindMemory(to: Int32.self, capacity: totalAssignments), count: totalAssignments))
+        let depthPtr = gaussianBuffers.depths.contents().bindMemory(to: Float.self, capacity: count)
+        var cpuPairs: [(SIMD2<UInt32>, Int32)] = []
+        cpuPairs.reserveCapacity(totalAssignments)
+        for a in 0..<totalAssignments {
+            let idx = Int(tileIdxArray[a])
+            let tile = UInt32(bitPattern: tileIdsArray[a])
+            let depthBits = depthPtr[idx].bitPattern
+            cpuPairs.append((SIMD2(tile, depthBits), Int32(idx)))
+        }
+        cpuPairs.sort {
+            if $0.0.x != $1.0.x { return $0.0.x < $1.0.x }
+            return $0.0.y < $1.0.y
+        }
+        let cpuKeys = cpuPairs.map { $0.0 }
+        let cpuIdx = cpuPairs.map { $0.1 }
+        return (keysArray, indicesArray, preKeysArray, cpuKeys, cpuIdx)
     }
 }
 

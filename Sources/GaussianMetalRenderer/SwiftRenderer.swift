@@ -106,7 +106,7 @@ public final class Renderer: @unchecked Sendable {
     private let effectivePrecision: Precision
     public var precisionSetting: Precision { self.effectivePrecision }
 
-    public init(precision: Precision = .float32, useIndirectBitonic: Bool = true, sortAlgorithm: SortAlgorithm = .bitonic) {
+    public init(precision: Precision = .float32, useIndirectBitonic: Bool = true, sortAlgorithm: SortAlgorithm = .radix) {
         guard let device = MTLCreateSystemDefaultDevice() else {
             fatalError("Metal device unavailable")
         }
@@ -321,20 +321,6 @@ public final class Renderer: @unchecked Sendable {
         ) else {
             self.releaseFrame(index: slotIndex)
             return -4
-        }
-
-        if ProcessInfo.processInfo.environment["GAUSSIAN_RENDERER_DEBUG"] == "1" {
-            let headerPtr = ordered.headers.contents().bindMemory(to: GaussianHeader.self, capacity: assignment.tileCount)
-            var nonZero = 0
-            var sumCounts = 0
-            var maxCount = 0
-            for i in 0..<assignment.tileCount {
-                let c = Int(headerPtr[i].count)
-                sumCounts += c
-                if c > 0 { nonZero += 1 }
-                if c > maxCount { maxCount = c }
-            }
-            print("[Renderer][Debug] tiles nonZero=\(nonZero)/\(assignment.tileCount) sum=\(sumCounts) max=\(maxCount)")
         }
         
         return self.encodeAndRunRenderWithFrame(
@@ -597,45 +583,6 @@ public final class Renderer: @unchecked Sendable {
             tileIdsBuffer: frame.tileIds!,
             tileAssignmentHeader: frame.tileAssignmentHeader!
         )
-
-        if ProcessInfo.processInfo.environment["GAUSSIAN_RENDERER_DEBUG"] == "1" {
-            // Copy private offsets/bounds to temporary shared buffers for inspection.
-            let offsetsBytes = (gaussianCount + 1) * MemoryLayout<UInt32>.stride
-            let boundsBytes = gaussianCount * MemoryLayout<SIMD4<Int32>>.stride
-            let offsetsSnapshot = self.device.makeBuffer(length: offsetsBytes, options: .storageModeShared)
-            let boundsSnapshot = self.device.makeBuffer(length: boundsBytes, options: .storageModeShared)
-            if let offsetsSnapshot, let boundsSnapshot {
-                if let blit = commandBuffer.makeBlitCommandEncoder() {
-                    blit.copy(from: frame.offsetsBuffer!, sourceOffset: 0, to: offsetsSnapshot, destinationOffset: 0, size: offsetsBytes)
-                    blit.copy(from: frame.boundsBuffer!, sourceOffset: 0, to: boundsSnapshot, destinationOffset: 0, size: boundsBytes)
-                    blit.endEncoding()
-                }
-                commandBuffer.addCompletedHandler { [weak frame] _ in
-                    guard let headerBuf = frame?.tileAssignmentHeader else { return }
-                    let headerPtr = headerBuf.contents().bindMemory(to: TileAssignmentHeaderSwift.self, capacity: 1)
-                    let h = headerPtr.pointee
-                    let offsetPtr = offsetsSnapshot.contents().bindMemory(to: UInt32.self, capacity: max(1, gaussianCount + 1))
-                    let totalFromOffsets = gaussianCount > 0 ? Int(offsetPtr[gaussianCount]) : 0
-                    let boundsPtr = boundsSnapshot.contents().bindMemory(to: SIMD4<Int32>.self, capacity: max(1, gaussianCount))
-                    let sample = (0..<min(4, gaussianCount)).map { i in
-                        let b = boundsPtr[i]
-                        return "[\(b.x),\(b.y),\(b.z),\(b.w)]"
-                    }.joined(separator: " ")
-                    print("[Renderer][Debug] tileAssign total=\(h.totalAssignments) padded=\(h.paddedCount) offsetsLast=\(totalFromOffsets) boundsSample=\(sample)")
-                    // Small tileId histogram from initial assignments
-                    var tileCounts: [Int: Int] = [:]
-                    if let tileIdsBuf = frame?.tileIds {
-                        let tileIdsPtr = tileIdsBuf.contents().bindMemory(to: Int32.self, capacity: Int(h.totalAssignments))
-                        for i in 0..<Int(h.totalAssignments) {
-                            let t = Int(tileIdsPtr[i])
-                            tileCounts[t, default: 0] += 1
-                        }
-                        let sampleHist = tileCounts.keys.sorted().prefix(8).map { "\($0):\(tileCounts[$0]!)" }.joined(separator: ", ")
-                        print("[Renderer][Debug] tileIds unique=\(tileCounts.count) sample[\(sampleHist)]")
-                    }
-                }
-            }
-        }
         
         return TileAssignmentBuffers(
             tileCount: tileCount,
@@ -758,29 +705,6 @@ public final class Renderer: @unchecked Sendable {
             activeTileCount: frame.activeTileCount!,
             precision: precision
         )
-
-        if ProcessInfo.processInfo.environment["GAUSSIAN_RENDERER_DEBUG"] == "1" {
-            commandBuffer.addCompletedHandler { _ in
-                let sorted = sortKeysBuffer.contents().bindMemory(to: SIMD2<UInt32>.self, capacity: frame.tileAssignmentPaddedCapacity)
-                let headerPtr = assignment.header.contents().bindMemory(to: TileAssignmentHeaderSwift.self, capacity: 1)
-                let total = Int(headerPtr.pointee.totalAssignments)
-                var tileHistogram: [UInt32: Int] = [:]
-                var minTile: UInt32 = .max
-                var maxTile: UInt32 = 0
-                var sentinelCount = 0
-                let paddedCount = Int(headerPtr.pointee.paddedCount)
-                for i in 0..<paddedCount {
-                    let t = sorted[i].x
-                    if t == 0xFFFFFFFF { sentinelCount += 1; continue }
-                    tileHistogram[t, default: 0] += 1
-                    if t < minTile { minTile = t }
-                    if t > maxTile { maxTile = t }
-                }
-                let sample = tileHistogram.keys.sorted().prefix(8).map { "\($0):\(tileHistogram[$0]!)" }.joined(separator: ", ")
-                let tile0 = tileHistogram[0] ?? 0
-                print("[Renderer][Debug] sortedKeys tiles \(tileHistogram.count) unique min=\(minTile) max=\(maxTile) sentinel=\(sentinelCount) padded=\(paddedCount) tile0=\(tile0) sample[\(sample)]")
-            }
-        }
         
         return OrderedGaussianBuffers(
             headers: orderedBuffers.headers,
@@ -878,20 +802,6 @@ public final class Renderer: @unchecked Sendable {
         }
         commandBuffer.commit()
         commandBuffer.waitUntilCompleted()
-
-        if ProcessInfo.processInfo.environment["GAUSSIAN_RENDERER_DEBUG"] == "1" {
-            let headerPtr = ordered.headers.contents().bindMemory(to: GaussianHeader.self, capacity: ordered.tileCount)
-            var nonZero = 0
-            var sumCounts = 0
-            var maxCount = 0
-            for i in 0..<ordered.tileCount {
-                let c = Int(headerPtr[i].count)
-                sumCounts += c
-                if c > 0 { nonZero += 1 }
-                if c > maxCount { maxCount = c }
-            }
-            print("[Renderer][Debug] post-render headers nonZero=\(nonZero)/\(ordered.tileCount) sum=\(sumCounts) max=\(maxCount)")
-        }
         
         guard let outputs = frame.outputBuffers else { return -6 }
         let pixelCount = Int(params.width * params.height)

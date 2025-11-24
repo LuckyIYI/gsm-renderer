@@ -662,7 +662,8 @@ public final class Renderer: @unchecked Sendable {
                 header: assignment.header,
                 dispatchArgs: dispatchArgs,
                 radixBuffers: radixBuffers,
-                offsets: offsets
+                offsets: offsets,
+                tileCount: assignment.tileCount
             )
         } else {
              let offsets = (

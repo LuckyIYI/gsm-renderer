@@ -190,6 +190,7 @@ final class RadixIntegrationTests: XCTestCase {
             apply: DispatchSlot.radixApply.rawValue * MemoryLayout<DispatchIndirectArgsSwift>.stride,
             scatter: DispatchSlot.radixScatter.rawValue * MemoryLayout<DispatchIndirectArgsSwift>.stride
         )
+        let tileCount = Int(params.tilesX * params.tilesY)
 
         let offsetsBitonic = (
             first: DispatchSlot.bitonicFirst.rawValue * MemoryLayout<DispatchIndirectArgsSwift>.stride,
@@ -215,7 +216,8 @@ final class RadixIntegrationTests: XCTestCase {
                 header: assignment.header,
                 dispatchArgs: dispatchArgs,
                 radixBuffers: radixBuffers,
-                offsets: offsetsRadix
+                offsets: offsetsRadix,
+                tileCount: tileCount
             )
         } else {
             renderer.bitonicSortEncoder.encode(

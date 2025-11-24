@@ -45,7 +45,8 @@ final class EncoderTests: XCTestCase {
             }
             return a.key.y < b.key.y
         }
-        
+        let tileCount = 10
+
         let keyBuffer = device.makeBuffer(bytes: keys, length: count * MemoryLayout<SIMD2<UInt32>>.stride, options: .storageModeShared)!
         let indicesBuffer = device.makeBuffer(bytes: indices, length: count * MemoryLayout<Int32>.stride, options: .storageModeShared)!
         let headerBuffer = device.makeBuffer(length: MemoryLayout<TileAssignmentHeaderSwift>.stride, options: .storageModeShared)!
@@ -114,7 +115,8 @@ final class EncoderTests: XCTestCase {
             header: headerBuffer,
             dispatchArgs: dispatchArgs,
             radixBuffers: radixBuffers,
-            offsets: offsets
+            offsets: offsets,
+            tileCount: tileCount
         )
         
         commandBuffer2.commit()
@@ -289,7 +291,8 @@ final class EncoderTests: XCTestCase {
             keys[i] = SIMD2<UInt32>(tileId, depthBits)
             indices[i] = Int32(i)
         }
-        
+        let tileCount = 50
+
         // CPU Reference Sort
         struct Item {
             let key: SIMD2<UInt32>
@@ -372,7 +375,8 @@ final class EncoderTests: XCTestCase {
             header: headerBuffer,
             dispatchArgs: dispatchArgs,
             radixBuffers: radixBuffers,
-            offsets: offsets
+            offsets: offsets,
+            tileCount: tileCount
         )
         
         commandBuffer2.commit()
@@ -428,6 +432,7 @@ final class EncoderTests: XCTestCase {
             if a.0.x != b.0.x { return a.0.x < b.0.x }
             return a.0.y < b.0.y
         }
+        let tileCount = 50
 
         let keyBuffer = device.makeBuffer(bytes: keys, length: paddedCount * MemoryLayout<SIMD2<UInt32>>.stride, options: .storageModeShared)!
         let indicesBuffer = device.makeBuffer(bytes: indices, length: paddedCount * MemoryLayout<Int32>.stride, options: .storageModeShared)!
@@ -488,7 +493,8 @@ final class EncoderTests: XCTestCase {
             header: headerBuffer,
             dispatchArgs: dispatchArgs,
             radixBuffers: radixBuffers,
-            offsets: offsets
+            offsets: offsets,
+            tileCount: tileCount
         )
         sortCommand.commit()
         sortCommand.waitUntilCompleted()

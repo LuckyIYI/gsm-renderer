@@ -1634,67 +1634,92 @@ static T PartialRadixSort(const T value, threadgroup T* shared, const ushort loc
 }
 
 kernel void radixHistogramKernel(
-    device const KeyType* input_data [[buffer(0)]],
-    device uint* output_data [[buffer(1)]],
-    constant uint& current_digit [[buffer(3)]],
-    const device TileAssignmentHeader* header [[buffer(4)]],
-    uint grid_size [[threadgroups_per_grid]],
-    uint group_id [[threadgroup_position_in_grid]],
-    ushort local_id [[thread_position_in_threadgroup]]
+    device const KeyType*               input_keys     [[buffer(0)]],
+    device uint*                        hist_flat      [[buffer(1)]],
+    constant uint&                      current_digit  [[buffer(3)]],
+    const device TileAssignmentHeader*  header         [[buffer(4)]],
+    uint                                grid_size      [[threadgroups_per_grid]],
+    uint                                group_id       [[threadgroup_position_in_grid]],
+    ushort                              local_id       [[thread_position_in_threadgroup]]
 ) {
-    uint base_id = group_id * BLOCK_SIZE * GRAIN_SIZE;
+    const uint elementsPerBlock = BLOCK_SIZE * GRAIN_SIZE;
+
+    uint base_id          = group_id * elementsPerBlock;
     uint totalAssignments = header[0].totalAssignments;
-    uint bufferRemaining = (base_id < header[0].paddedCount) ? (header[0].paddedCount - base_id) : 0;
-    uint assignmentsRemaining = (base_id < totalAssignments) ? (totalAssignments - base_id) : 0;
-    uint available = min(bufferRemaining, assignmentsRemaining);
-    threadgroup uint local_histogram[RADIX];
-    for (ushort i = 0; i < (RADIX + BLOCK_SIZE - 1) / BLOCK_SIZE; ++i) {
-        uint idx = local_id + i * BLOCK_SIZE;
-        if (idx < RADIX) {
-            local_histogram[idx] = 0;
+    uint paddedCount      = header[0].paddedCount;
+
+    uint bufferRemaining   = (base_id < paddedCount)      ? (paddedCount      - base_id) : 0;
+    uint assignmentsRemain = (base_id < totalAssignments) ? (totalAssignments - base_id) : 0;
+    uint available         = min(bufferRemaining, assignmentsRemain);
+
+    // 1) Per-group local histogram in LDS
+    threadgroup uint local_hist[RADIX];
+
+    for (uint i = 0; i < (RADIX + BLOCK_SIZE - 1u) / BLOCK_SIZE; ++i) {
+        uint bin = local_id + i * BLOCK_SIZE;
+        if (bin < RADIX) {
+            local_hist[bin] = 0u;
         }
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
-    KeyType values[GRAIN_SIZE];
-    KeyType sentinel = (KeyType)(0xFFFFFFFFFFFFFFFFull);
-    LoadBlockedLocalFromGlobal(values, &input_data[base_id], local_id, available, sentinel);
+    // 2) Load keys blocked per group into registers
+    KeyType keys[GRAIN_SIZE];
+    KeyType sentinelKey = (KeyType)0;
 
-    volatile threadgroup atomic_uint* atomic_histogram = reinterpret_cast<volatile threadgroup atomic_uint*>(local_histogram);
-    for (ushort i = 0; i < GRAIN_SIZE; i++){
-        uint idx_in_group = local_id * GRAIN_SIZE + i;
-        uint global_idx = base_id + idx_in_group;
+    LoadBlockedLocalFromGlobal<GRAIN_SIZE>(
+        keys,
+        &input_keys[base_id],
+        local_id,
+        available,
+        sentinelKey);
+
+    // 3) Build local histogram using threadgroup atomics
+    volatile threadgroup atomic_uint* atomic_hist =
+        reinterpret_cast<volatile threadgroup atomic_uint*>(local_hist);
+
+    for (ushort i = 0; i < GRAIN_SIZE; ++i) {
+        uint offset_in_block = local_id * GRAIN_SIZE + i;
+        uint global_idx      = base_id + offset_in_block;
+
         if (global_idx < totalAssignments) {
-            uchar key = ValueToKeyAtDigit(values[i], current_digit);
-            atomic_fetch_add_explicit(&atomic_histogram[key], 1, memory_order_relaxed);
+            uchar bin = (uchar)ValueToKeyAtDigit(keys[i], (ushort)current_digit);
+            atomic_fetch_add_explicit(&atomic_hist[bin], 1u, memory_order_relaxed);
         }
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
-    for (ushort i = 0; i < (RADIX + BLOCK_SIZE - 1) / BLOCK_SIZE; ++i) {
-        uint key_index = local_id + i * BLOCK_SIZE;
-        if (key_index < RADIX) {
-             uint value_to_write = local_histogram[key_index];
-             output_data[grid_size * key_index + group_id] = value_to_write;
+    // 4) Write out in bin-major layout: [bin][block]
+    for (uint i = 0; i < (RADIX + BLOCK_SIZE - 1u) / BLOCK_SIZE; ++i) {
+        uint bin = local_id + i * BLOCK_SIZE;
+        if (bin < RADIX) {
+            hist_flat[bin * grid_size + group_id] = local_hist[bin];
         }
     }
 }
 
 kernel void radixScanBlocksKernel(
-    device const uint* input_data [[buffer(0)]],
-    device uint* block_sums [[buffer(1)]],
-    uint group_id [[threadgroup_position_in_grid]],
-    ushort local_id [[thread_position_in_threadgroup]]
+    device const uint*                 hist_flat   [[buffer(0)]],
+    device uint*                       block_sums  [[buffer(1)]],
+    const device TileAssignmentHeader* header      [[buffer(2)]],
+    uint                               group_id    [[threadgroup_position_in_grid]],
+    ushort                             local_id    [[thread_position_in_threadgroup]]
 ) {
     threadgroup uint shared_mem[BLOCK_SIZE];
-    uint block_base = group_id * BLOCK_SIZE;
 
-    uint idx = block_base + local_id;
-    uint val = input_data[idx];
+    const uint elementsPerBlock = BLOCK_SIZE * GRAIN_SIZE;
+    uint paddedCount   = header[0].paddedCount;
+    uint histGridSize  = (paddedCount + elementsPerBlock - 1u) / elementsPerBlock;
+    uint num_hist_elem = histGridSize * RADIX;
+
+    uint block_base = group_id * BLOCK_SIZE;
+    uint idx        = block_base + local_id;
+
+    uint val = (idx < num_hist_elem) ? hist_flat[idx] : 0u;
     shared_mem[local_id] = val;
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
-    for (uint stride = BLOCK_SIZE / 2; stride > 0; stride >>= 1) {
+    for (uint stride = BLOCK_SIZE >> 1; stride > 0; stride >>= 1) {
         if (local_id < stride) {
             shared_mem[local_id] += shared_mem[local_id + stride];
         }
@@ -1707,107 +1732,148 @@ kernel void radixScanBlocksKernel(
 }
 
 kernel void radixExclusiveScanKernel(
-    device uint* data [[buffer(0)]],
-    const device TileAssignmentHeader* header [[buffer(1)]],
-    ushort local_id [[thread_index_in_threadgroup]]
+    device uint*                       block_sums  [[buffer(0)]],
+    const device TileAssignmentHeader* header      [[buffer(1)]],
+    ushort                             local_id    [[thread_index_in_threadgroup]]
 ) {
-    // Use a single-threaded prefix for the relatively small block_sums array to avoid
-    // out-of-bounds access when the block count is less than BLOCK_SIZE.
     if (local_id != 0) {
         return;
     }
-    uint padded = header[0].paddedCount;
-    uint blockCount = (padded + (BLOCK_SIZE * GRAIN_SIZE) - 1u) / (BLOCK_SIZE * GRAIN_SIZE);
+
+    const uint elementsPerBlock = BLOCK_SIZE * GRAIN_SIZE;
+    uint paddedCount   = header[0].paddedCount;
+    uint histGridSize  = (paddedCount + elementsPerBlock - 1u) / elementsPerBlock;
+    uint num_hist_elem = histGridSize * RADIX;
+    uint num_block_sums = (num_hist_elem + BLOCK_SIZE - 1u) / BLOCK_SIZE;
+
     uint running = 0u;
-    for (uint i = 0; i < blockCount; ++i) {
-        uint v = data[i];
-        data[i] = running;
+    for (uint i = 0u; i < num_block_sums; ++i) {
+        uint v = block_sums[i];
+        block_sums[i] = running;
         running += v;
     }
 }
 
 kernel void radixApplyScanOffsetsKernel(
-    device const uint* input_data [[buffer(0)]],
-    device const uint* scanned_block_sums [[buffer(1)]],
-    device uint* output_data [[buffer(2)]],
-    threadgroup uint* shared_mem,
-    uint group_id [[threadgroup_position_in_grid]],
-    ushort local_id [[thread_position_in_threadgroup]]
+    device const uint*                 hist_flat       [[buffer(0)]],
+    device const uint*                 scanned_blocks  [[buffer(1)]],
+    device uint*                       offsets_flat    [[buffer(2)]],
+    const device TileAssignmentHeader* header          [[buffer(3)]],
+    threadgroup uint*                  shared_mem      [[threadgroup(0)]],
+    uint                               group_id        [[threadgroup_position_in_grid]],
+    ushort                             local_id        [[thread_position_in_threadgroup]]
 ) {
+    const uint elementsPerBlock = BLOCK_SIZE * GRAIN_SIZE;
+    uint paddedCount   = header[0].paddedCount;
+    uint histGridSize  = (paddedCount + elementsPerBlock - 1u) / elementsPerBlock;
+    uint num_hist_elem = histGridSize * RADIX;
+
     uint block_base = group_id * BLOCK_SIZE;
-    uint idx = block_base + local_id;
+    uint idx        = block_base + local_id;
 
-    uint val = input_data[idx];
-    uint local_scanned_val = ThreadgroupPrefixScan<SCAN_TYPE_EXCLUSIVE>(val, shared_mem, local_id, SumOp<uint>());
-    uint block_offset = (group_id > 0) ? scanned_block_sums[group_id] : 0;
+    uint val = (idx < num_hist_elem) ? hist_flat[idx] : 0u;
 
-    output_data[idx] = local_scanned_val + block_offset;
+    uint local_scanned = ThreadgroupPrefixScan<SCAN_TYPE_EXCLUSIVE>(
+        val, shared_mem, local_id, SumOp<uint>());
+
+    uint block_offset = scanned_blocks[group_id];
+
+    if (idx < num_hist_elem) {
+        offsets_flat[idx] = local_scanned + block_offset;
+    }
 }
 
 kernel void radixScatterKernel(
-    device KeyType* output_keys [[buffer(0)]],
-    device const KeyType* input_keys [[buffer(1)]],
-    device uint* output_payload [[buffer(2)]],
-    device const uint* input_payload [[buffer(3)]],
-    device const uint* offsets_data [[buffer(5)]],
-    constant uint& current_digit [[buffer(6)]],
-    const device TileAssignmentHeader* header [[buffer(7)]],
-    uint group_id [[threadgroup_position_in_grid]],
-    uint grid_size [[threadgroups_per_grid]],
-    ushort local_id [[thread_position_in_threadgroup]]
+    device KeyType*                    output_keys     [[buffer(0)]],
+    device const KeyType*              input_keys      [[buffer(1)]],
+    device uint*                       output_payload  [[buffer(2)]],
+    device const uint*                 input_payload   [[buffer(3)]],
+    device const uint*                 offsets_flat    [[buffer(5)]],
+    constant uint&                     current_digit   [[buffer(6)]],
+    const device TileAssignmentHeader* header          [[buffer(7)]],
+    uint                               group_id        [[threadgroup_position_in_grid]],
+    uint                               grid_size       [[threadgroups_per_grid]],
+    ushort                             local_id        [[thread_position_in_threadgroup]]
 ) {
-    uint base_id = group_id * BLOCK_SIZE * GRAIN_SIZE;
+    const uint elementsPerBlock = BLOCK_SIZE * GRAIN_SIZE;
+
+    uint base_id          = group_id * elementsPerBlock;
     uint totalAssignments = header[0].totalAssignments;
-    uint bufferRemaining = max(header[0].paddedCount - base_id, 0u);
-    uint assignmentsRemaining = (base_id < totalAssignments) ? (totalAssignments - base_id) : 0;
-    uint available = min(bufferRemaining, assignmentsRemaining);
-    KeyType keyValues[GRAIN_SIZE];
-    uint payloadValues[GRAIN_SIZE];
-    KeyType sentinel = (KeyType)(0xFFFFFFFFFFFFFFFFull);
-    LoadStripedLocalFromGlobal<GRAIN_SIZE>(keyValues, &input_keys[base_id], local_id, BLOCK_SIZE, available, sentinel);
-    LoadStripedLocalFromGlobal<GRAIN_SIZE>(payloadValues, &input_payload[base_id], local_id, BLOCK_SIZE, available, UINT_MAX);
-    KeyPayload values[GRAIN_SIZE];
-    for (ushort i = 0; i < GRAIN_SIZE; ++i) {
-        values[i].key = keyValues[i];
-        values[i].payload = payloadValues[i];
-    }
-    
-    threadgroup KeyPayload shared_data[BLOCK_SIZE];
+    uint paddedCount      = header[0].paddedCount;
 
-    for (ushort i = 0; i < GRAIN_SIZE; i++){
-        values[i] = PartialRadixSort(values[i], shared_data, local_id, current_digit);
-    }
-    threadgroup_barrier(mem_flags::mem_threadgroup);
+    uint bufferRemaining   = (base_id < paddedCount)      ? (paddedCount      - base_id) : 0;
+    uint assignmentsRemain = (base_id < totalAssignments) ? (totalAssignments - base_id) : 0;
+    uint available         = min(bufferRemaining, assignmentsRemain);
 
-    threadgroup uint global_offset[RADIX];
-    if (local_id < RADIX){
-        global_offset[local_id] = offsets_data[grid_size * local_id + group_id];
-    }
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-    
-    uint indexes[GRAIN_SIZE];
-    for (ushort i = 0; i < GRAIN_SIZE; i++){
-        uchar key = ValueToKeyAtDigit(values[i], current_digit);
-        uchar flag = FlagHeadDiscontinuity<BLOCK_SIZE>(key, reinterpret_cast<threadgroup uchar*>(shared_data), local_id);
-        ushort local_offset = local_id - ThreadgroupPrefixScan<SCAN_TYPE_INCLUSIVE>(flag ? (ushort)local_id : (ushort)0,
-                                                                                           reinterpret_cast<threadgroup ushort*>(shared_data),
-                                                                                           local_id,
-                                                                                           MaxOp<ushort>());
+    // 1) Load keys / payloads in striped fashion into registers
+    KeyType keys[GRAIN_SIZE];
+    uint    payloads[GRAIN_SIZE];
 
-        indexes[i] = local_offset + global_offset[key];
-        threadgroup_barrier(mem_flags::mem_threadgroup);
+    KeyType keySentinel = (KeyType)0;
 
-        flag = FlagTailDiscontinuity<BLOCK_SIZE>(key, reinterpret_cast<threadgroup uchar*>(shared_data), local_id);
-        if (flag){
-            global_offset[key] += local_offset + 1;
+    LoadStripedLocalFromGlobal<GRAIN_SIZE>(
+        keys,
+        &input_keys[base_id],
+        local_id,
+        BLOCK_SIZE,
+        available,
+        keySentinel);
+
+    LoadStripedLocalFromGlobal<GRAIN_SIZE>(
+        payloads,
+        &input_payload[base_id],
+        local_id,
+        BLOCK_SIZE,
+        available,
+        UINT_MAX);
+
+    // 2) Get per-bin global base offsets for this data block
+    threadgroup uint global_bin_base[RADIX];
+    for (uint i = 0; i < (RADIX + BLOCK_SIZE - 1u) / BLOCK_SIZE; ++i) {
+        uint bin = local_id + i * BLOCK_SIZE;
+        if (bin < RADIX) {
+            global_bin_base[bin] = offsets_flat[bin * grid_size + group_id];
         }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
     }
-    
-    for (ushort i = 0; i < GRAIN_SIZE; i++){
-        if (indexes[i] < totalAssignments && !KeyIsSentinel(values[i].key)) {
-            output_keys[indexes[i]] = values[i].key;
-            output_payload[indexes[i]] = values[i].payload;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // 3) Per-bin local counters in LDS
+    threadgroup atomic_uint local_bin_counters[RADIX];
+    for (uint i = 0; i < (RADIX + BLOCK_SIZE - 1u) / BLOCK_SIZE; ++i) {
+        uint bin = local_id + i * BLOCK_SIZE;
+        if (bin < RADIX) {
+            atomic_store_explicit(&local_bin_counters[bin], 0u, memory_order_relaxed);
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // 4) Compute destination indices
+    uint out_indices[GRAIN_SIZE];
+
+    for (ushort i = 0; i < GRAIN_SIZE; ++i) {
+        uint offset_in_block = local_id + i * BLOCK_SIZE;
+        uint global_idx      = base_id + offset_in_block;
+
+        if (global_idx >= totalAssignments) {
+            out_indices[i] = UINT_MAX;
+            continue;
+        }
+
+        KeyType k  = keys[i];
+        uchar   bin = (uchar)ValueToKeyAtDigit(k, (ushort)current_digit);
+
+        uint local_index = atomic_fetch_add_explicit(
+            &local_bin_counters[bin], 1u, memory_order_relaxed);
+
+        out_indices[i] = global_bin_base[bin] + local_index;
+    }
+
+    // 5) Scatter keys + payloads
+    for (ushort i = 0; i < GRAIN_SIZE; ++i) {
+        uint dst = out_indices[i];
+        if (dst < totalAssignments) {
+            output_keys[dst]    = keys[i];
+            output_payload[dst] = payloads[i];
         }
     }
 }

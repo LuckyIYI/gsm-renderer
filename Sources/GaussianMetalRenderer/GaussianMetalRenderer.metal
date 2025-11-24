@@ -874,8 +874,9 @@ static inline uint nextPowerOfTwo(uint value) {
     return value;
 }
 
+template <typename MeansT>
 kernel void tileBoundsKernel(
-    const device float2* means [[buffer(0)]],
+    const device MeansT* means [[buffer(0)]],
     const device float* radii [[buffer(1)]],
     const device uchar* mask [[buffer(2)]],
     device int4* bounds [[buffer(3)]],
@@ -890,7 +891,7 @@ kernel void tileBoundsKernel(
         return;
     }
 
-    float2 mean = means[idx];
+    float2 mean = float2(means[idx]);
     float radius = radii[idx];
 
     float xmin = mean.x - radius;
@@ -919,11 +920,27 @@ kernel void tileBoundsKernel(
     bounds[idx] = int4(minX, maxX, minY, maxY);
 }
 
+#define instantiate_tileBoundsKernel(name, MeansT) \
+    template [[host_name("tileBoundsKernel_" #name)]] \
+    kernel void tileBoundsKernel<MeansT>( \
+        const device MeansT* means [[buffer(0)]], \
+        const device float* radii [[buffer(1)]], \
+        const device uchar* mask [[buffer(2)]], \
+        device int4* bounds [[buffer(3)]], \
+        constant TileBoundsParams& params [[buffer(4)]], \
+        uint idx [[thread_position_in_grid]]);
 
+instantiate_tileBoundsKernel(float, float2)
+instantiate_tileBoundsKernel(half, half2)
+
+#undef instantiate_tileBoundsKernel
+
+
+template <typename DepthT>
 kernel void computeSortKeysKernel(
     const device int* tileIds [[buffer(0)]],
     const device int* tileIndices [[buffer(1)]],
-    const device float* depths [[buffer(2)]],
+    const device DepthT* depths [[buffer(2)]],
     device uint2* sortKeys [[buffer(3)]],
     device int* sortedIndices [[buffer(4)]],
     const device TileAssignmentHeader& header [[buffer(5)]],
@@ -935,7 +952,9 @@ kernel void computeSortKeysKernel(
         if (gid < totalAssignments) {
             int g = tileIndices[gid];
             uint tileId = (uint)tileIds[gid];
-            uint depthBits = as_type<uint>(depths[g]);
+            // Convert to float for consistent bit representation when sorting
+            float depthFloat = float(depths[g]);
+            uint depthBits = as_type<uint>(depthFloat);
             sortKeys[gid] = uint2(tileId, depthBits);
             sortedIndices[gid] = g;
         } else {
@@ -945,24 +964,44 @@ kernel void computeSortKeysKernel(
     }
 }
 
+#define instantiate_computeSortKeysKernel(name, DepthT) \
+    template [[host_name("computeSortKeysKernel_" #name)]] \
+    kernel void computeSortKeysKernel<DepthT>( \
+        const device int* tileIds [[buffer(0)]], \
+        const device int* tileIndices [[buffer(1)]], \
+        const device DepthT* depths [[buffer(2)]], \
+        device uint2* sortKeys [[buffer(3)]], \
+        device int* sortedIndices [[buffer(4)]], \
+        const device TileAssignmentHeader& header [[buffer(5)]], \
+        uint gid [[thread_position_in_grid]]);
+
+instantiate_computeSortKeysKernel(float, float)
+instantiate_computeSortKeysKernel(half, half)
+
+#undef instantiate_computeSortKeysKernel
+
 struct PackParams {
     uint totalAssignments;
     uint padding;
 };
 
-template <typename T, typename Vec2, typename Vec4, typename Packed3>
+// Template for packTileDataKernel:
+// InT, InVec2, InVec4, InPacked3 - Input types (from gaussian buffers)
+// OutT, OutVec2, OutVec4, OutPacked3 - Output types (to packed buffers)
+template <typename InT, typename InVec2, typename InVec4, typename InPacked3,
+          typename OutT, typename OutVec2, typename OutVec4, typename OutPacked3>
 kernel void packTileDataKernel(
     const device int* sortedIndices [[buffer(0)]],
-    const device float2* means [[buffer(1)]],
-    const device float4* conics [[buffer(2)]],
-    const device packed_float3* colors [[buffer(3)]],
-    const device float* opacities [[buffer(4)]],
-    const device float* depths [[buffer(5)]],
-    device Vec2* outMeans [[buffer(6)]],
-    device Vec4* outConics [[buffer(7)]],
-    device Packed3* outColors [[buffer(8)]],
-    device T* outOpacities [[buffer(9)]],
-    device T* outDepths [[buffer(10)]],
+    const device InVec2* means [[buffer(1)]],
+    const device InVec4* conics [[buffer(2)]],
+    const device InPacked3* colors [[buffer(3)]],
+    const device InT* opacities [[buffer(4)]],
+    const device InT* depths [[buffer(5)]],
+    device OutVec2* outMeans [[buffer(6)]],
+    device OutVec4* outConics [[buffer(7)]],
+    device OutPacked3* outColors [[buffer(8)]],
+    device OutT* outOpacities [[buffer(9)]],
+    device OutT* outDepths [[buffer(10)]],
     const device TileAssignmentHeader* header [[buffer(11)]],
     const device int* tileIndices [[buffer(12)]],
     const device int* tileIds [[buffer(13)]],
@@ -973,27 +1012,27 @@ kernel void packTileDataKernel(
     if (gid >= total) { return; }
     int src = sortedIndices[gid];
     if (src < 0) { return; }
-    outMeans[gid] = Vec2(means[src]);
-    outConics[gid] = Vec4(conics[src]);
-    outColors[gid] = Packed3(float3(colors[src]));
-    outOpacities[gid] = T(opacities[src]);
-    outDepths[gid] = T(depths[src]);
+    outMeans[gid] = OutVec2(float2(means[src]));
+    outConics[gid] = OutVec4(float4(conics[src]));
+    outColors[gid] = OutPacked3(float3(colors[src]));
+    outOpacities[gid] = OutT(float(opacities[src]));
+    outDepths[gid] = OutT(float(depths[src]));
 }
 
-#define instantiate_packTileDataKernel(name, T, Vec2, Vec4, Packed3) \
+#define instantiate_packTileDataKernel(name, InT, InVec2, InVec4, InPacked3, OutT, OutVec2, OutVec4, OutPacked3) \
     template [[host_name("packTileDataKernel_" #name)]] \
-    kernel void packTileDataKernel<T, Vec2, Vec4, Packed3>( \
+    kernel void packTileDataKernel<InT, InVec2, InVec4, InPacked3, OutT, OutVec2, OutVec4, OutPacked3>( \
         const device int* sortedIndices [[buffer(0)]], \
-        const device float2* means [[buffer(1)]], \
-        const device float4* conics [[buffer(2)]], \
-        const device packed_float3* colors [[buffer(3)]], \
-        const device float* opacities [[buffer(4)]], \
-        const device float* depths [[buffer(5)]], \
-        device Vec2* outMeans [[buffer(6)]], \
-        device Vec4* outConics [[buffer(7)]], \
-        device Packed3* outColors [[buffer(8)]], \
-        device T* outOpacities [[buffer(9)]], \
-        device T* outDepths [[buffer(10)]], \
+        const device InVec2* means [[buffer(1)]], \
+        const device InVec4* conics [[buffer(2)]], \
+        const device InPacked3* colors [[buffer(3)]], \
+        const device InT* opacities [[buffer(4)]], \
+        const device InT* depths [[buffer(5)]], \
+        device OutVec2* outMeans [[buffer(6)]], \
+        device OutVec4* outConics [[buffer(7)]], \
+        device OutPacked3* outColors [[buffer(8)]], \
+        device OutT* outOpacities [[buffer(9)]], \
+        device OutT* outDepths [[buffer(10)]], \
         const device TileAssignmentHeader* header [[buffer(11)]], \
         const device int* tileIndices [[buffer(12)]], \
         const device int* tileIds [[buffer(13)]], \
@@ -1001,8 +1040,10 @@ kernel void packTileDataKernel(
         uint gid [[thread_position_in_grid]] \
     );
 
-instantiate_packTileDataKernel(float, float, float2, float4, packed_float3)
-instantiate_packTileDataKernel(half, half, half2, half4, packed_half3)
+// float input -> float output
+instantiate_packTileDataKernel(float, float, float2, float4, packed_float3, float, float2, float4, packed_float3)
+// half input -> half output
+instantiate_packTileDataKernel(half, half, half2, half4, packed_half3, half, half2, half4, packed_half3)
 
 #undef instantiate_packTileDataKernel
 
@@ -1305,10 +1346,11 @@ kernel void encodeBitonicICB(
 //  Radix sort helpers (ported from mlx/Radix)
 ///////////////////////////////////////////////////////////////////////////////
 
+template <typename OpacityT>
 kernel void gaussianCoverageKernel(
     const device int4* bounds [[buffer(0)]],
     device uint* coverageCounts [[buffer(1)]],
-    const device float* opacities [[buffer(2)]],
+    const device OpacityT* opacities [[buffer(2)]],
     constant CoverageParams& params [[buffer(3)]],
     uint idx [[thread_position_in_grid]]
 ) {
@@ -1317,7 +1359,7 @@ kernel void gaussianCoverageKernel(
     }
     int4 rect = bounds[idx];
     // Cull negligible opacities
-    float op = opacities[idx];
+    float op = float(opacities[idx]);
     if (op < 1e-4f) {
         coverageCounts[idx] = 0u;
         return;
@@ -1328,6 +1370,20 @@ kernel void gaussianCoverageKernel(
     uint count = (width > 0 && height > 0) ? uint(width * height) : 0u;
     coverageCounts[idx] = count;
 }
+
+#define instantiate_gaussianCoverageKernel(name, OpacityT) \
+    template [[host_name("gaussianCoverageKernel_" #name)]] \
+    kernel void gaussianCoverageKernel<OpacityT>( \
+        const device int4* bounds [[buffer(0)]], \
+        device uint* coverageCounts [[buffer(1)]], \
+        const device OpacityT* opacities [[buffer(2)]], \
+        constant CoverageParams& params [[buffer(3)]], \
+        uint idx [[thread_position_in_grid]]);
+
+instantiate_gaussianCoverageKernel(float, float)
+instantiate_gaussianCoverageKernel(half, half)
+
+#undef instantiate_gaussianCoverageKernel
 
 kernel void coveragePrefixScanKernel(
     const device uint* input_data [[buffer(0)]],
@@ -1743,7 +1799,7 @@ static T SortByTwoBits(const T value, threadgroup T* shared, const ushort local_
     offset[1] = offset[0] + partial_sum[0];
     offset[2] = offset[1] + partial_sum[1];
     offset[3] = offset[2] + partial_sum[2];
-    
+
     shared[scan[mask] + offset[mask]] = value;
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
@@ -1787,10 +1843,11 @@ static T PartialRadixSort(const T value, threadgroup T* shared, const ushort loc
     const ushort range_end = (ushort)(current_bit + RadixToBits(RADIX));
     const ushort last_bit = min(range_end, key_bits);
     while (current_bit < last_bit){
-        if (last_bit - current_bit > 1){
+        ushort remaining = last_bit - current_bit;
+        if (remaining >= 2){
             result = SortByTwoBits(result, shared, local_id, current_bit);
             current_bit += 2;
-        }else{
+        } else {
             result = SortByBit(result, shared, local_id, current_bit);
             current_bit += 1;
         }
@@ -1970,32 +2027,21 @@ kernel void radixScatterKernel(
     uint assignmentsRemain = (base_id < totalAssignments) ? (totalAssignments - base_id) : 0;
     uint available         = min(bufferRemaining, assignmentsRemain);
 
-    // 1) Load keys / payloads in STRIPED fashion (not blocked)
-    // Striped: thread i loads elements i, i+BLOCK_SIZE, i+2*BLOCK_SIZE, ...
+    // Use max key as sentinel
+    constexpr KeyType keySentinel = ~(KeyType)0;
+
+    // 1) Load keys / payloads in STRIPED fashion
     KeyType keys[GRAIN_SIZE];
-    uint    payloads[GRAIN_SIZE];
+    uint payloads[GRAIN_SIZE];
+    LoadStripedLocalFromGlobal<GRAIN_SIZE>(keys, &input_keys[base_id], local_id, BLOCK_SIZE, available, keySentinel);
+    LoadStripedLocalFromGlobal<GRAIN_SIZE>(payloads, &input_payload[base_id], local_id, BLOCK_SIZE, available, UINT_MAX);
 
-    // Use max key as sentinel - sorts to the end, out of the way
-    KeyType keySentinel = ~(KeyType)0;
-
-    LoadStripedLocalFromGlobal<GRAIN_SIZE>(
-        keys,
-        &input_keys[base_id],
-        local_id,
-        BLOCK_SIZE,
-        available,
-        keySentinel);
-
-    LoadStripedLocalFromGlobal<GRAIN_SIZE>(
-        payloads,
-        &input_payload[base_id],
-        local_id,
-        BLOCK_SIZE,
-        available,
-        UINT_MAX);
-
-    // 2) Get per-bin global base offsets for this data block
+    // 2) Shared memory for bin offsets and ranking
     threadgroup uint global_bin_base[RADIX];
+    threadgroup KeyPayload tg_kp[BLOCK_SIZE];
+    threadgroup ushort tg_short[BLOCK_SIZE];
+
+    // Load global bin offsets
     for (uint i = 0; i < (RADIX + BLOCK_SIZE - 1u) / BLOCK_SIZE; ++i) {
         uint bin = local_id + i * BLOCK_SIZE;
         if (bin < RADIX) {
@@ -2004,53 +2050,36 @@ kernel void radixScatterKernel(
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
-    // Shared memory for sorting operations
-    threadgroup KeyPayload tg_kp[BLOCK_SIZE];
-    threadgroup ushort tg_short[BLOCK_SIZE];
-
-    // 3) Process one element per thread at a time (GRAIN_SIZE chunks)
-    // Each chunk: sort by bin, compute local offsets, scatter
+    // 3) Process chunks with optimized ranking
     for (ushort chunk = 0; chunk < GRAIN_SIZE; ++chunk) {
-        uint global_idx = base_id + local_id + chunk * BLOCK_SIZE;
-
         KeyPayload kp;
         kp.key = keys[chunk];
         kp.payload = payloads[chunk];
 
-        // Partial radix sort: reorders elements so same-bin elements are contiguous
+        // Partial radix sort: groups same-bin elements together, preserving relative order
         kp = PartialRadixSort(kp, tg_kp, local_id, (ushort)current_digit);
 
         // Extract bin after sorting
         ushort my_bin = ValueToKeyAtDigit(kp.key, (ushort)current_digit);
 
-        // Head discontinuity: is this thread first with this bin?
-        uchar head_flag = FlagHeadDiscontinuity<BLOCK_SIZE>((ushort)my_bin, tg_short, local_id);
-
-        // Inclusive max scan to find run start position
-        ushort flag_pos = head_flag ? local_id : 0;
+        // Head discontinuity + max scan to find run start
+        uchar head_flag = FlagHeadDiscontinuity<BLOCK_SIZE>(my_bin, tg_short, local_id);
         ushort run_start = ThreadgroupPrefixScan<SCAN_TYPE_INCLUSIVE>(
-            flag_pos, tg_short, local_id, MaxOp<ushort>());
-
-        // Local offset within run
+            head_flag ? local_id : (ushort)0, tg_short, local_id, MaxOp<ushort>());
         ushort local_offset = local_id - run_start;
 
-        // Tail discontinuity: is this thread last with this bin?
-        uchar tail_flag = FlagTailDiscontinuity<BLOCK_SIZE>((ushort)my_bin, tg_short, local_id);
+        // Tail discontinuity for offset updates
+        uchar tail_flag = FlagTailDiscontinuity<BLOCK_SIZE>(my_bin, tg_short, local_id);
 
-        // After PartialRadixSort, elements are redistributed among threads.
-        // Check validity via payload (UINT_MAX = invalid sentinel)
+        // Check validity and scatter
         bool is_valid = (kp.payload != UINT_MAX);
-
-        // Scatter to output (only valid elements)
         if (is_valid) {
             uint dst = global_bin_base[my_bin] + local_offset;
             output_keys[dst] = kp.key;
             output_payload[dst] = kp.payload;
         }
 
-        // Update global offsets for threads at run boundaries (only for valid elements)
-        // Sentinels sort to the end, so they're in their own "bin" (bin 255 all 1s) and
-        // won't interfere with valid elements' offset updates
+        // Update global offsets at run boundaries
         if (tail_flag && is_valid) {
             global_bin_base[my_bin] += local_offset + 1;
         }

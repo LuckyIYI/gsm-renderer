@@ -142,6 +142,12 @@ public struct ClearParamsSwift {
     public var whiteBackground: UInt32
 }
 
+public struct ClearTextureParamsSwift {
+    public var width: UInt32
+    public var height: UInt32
+    public var whiteBackground: UInt32
+}
+
 public struct RenderDispatchParamsSwift {
     public var tileCount: UInt32
     public var totalAssignments: UInt32
@@ -151,13 +157,87 @@ public struct RenderDispatchParamsSwift {
 // MARK: - Buffer Sets
 
 public struct GaussianInputBuffers {
-    public let means: MTLBuffer
-    public let radii: MTLBuffer
-    public let mask: MTLBuffer
-    public let depths: MTLBuffer
-    public let conics: MTLBuffer
-    public let colors: MTLBuffer
-    public let opacities: MTLBuffer
+    public let means: MTLBuffer      // float2
+    public let radii: MTLBuffer      // float (always float for tile bounds)
+    public let mask: MTLBuffer       // uchar
+    public let depths: MTLBuffer     // float
+    public let conics: MTLBuffer     // float4
+    public let colors: MTLBuffer     // packed_float3
+    public let opacities: MTLBuffer  // float
+}
+
+/// Half-precision gaussian input buffers for the half16 pipeline.
+/// Note: radii stays float for accurate tile bounds computation.
+public struct GaussianInputBuffersHalf {
+    public let means: MTLBuffer      // half2
+    public let radii: MTLBuffer      // float (always float for tile bounds)
+    public let mask: MTLBuffer       // uchar
+    public let depths: MTLBuffer     // half
+    public let conics: MTLBuffer     // half4
+    public let colors: MTLBuffer     // packed_half3
+    public let opacities: MTLBuffer  // half
+}
+
+/// Unified gaussian input buffers supporting both precisions
+public enum GaussianInputBuffersUnified {
+    case float32(GaussianInputBuffers)
+    case float16(GaussianInputBuffersHalf)
+
+    public var precision: Precision {
+        switch self {
+        case .float32: return .float32
+        case .float16: return .float16
+        }
+    }
+
+    public var means: MTLBuffer {
+        switch self {
+        case .float32(let b): return b.means
+        case .float16(let b): return b.means
+        }
+    }
+
+    public var radii: MTLBuffer {
+        switch self {
+        case .float32(let b): return b.radii
+        case .float16(let b): return b.radii
+        }
+    }
+
+    public var mask: MTLBuffer {
+        switch self {
+        case .float32(let b): return b.mask
+        case .float16(let b): return b.mask
+        }
+    }
+
+    public var depths: MTLBuffer {
+        switch self {
+        case .float32(let b): return b.depths
+        case .float16(let b): return b.depths
+        }
+    }
+
+    public var conics: MTLBuffer {
+        switch self {
+        case .float32(let b): return b.conics
+        case .float16(let b): return b.conics
+        }
+    }
+
+    public var colors: MTLBuffer {
+        switch self {
+        case .float32(let b): return b.colors
+        case .float16(let b): return b.colors
+        }
+    }
+
+    public var opacities: MTLBuffer {
+        switch self {
+        case .float32(let b): return b.opacities
+        case .float16(let b): return b.opacities
+        }
+    }
 }
 
 public struct TileAssignmentBuffers {
@@ -233,6 +313,12 @@ public struct RenderOutputBuffers {
     public let alphaOutGPU: MTLBuffer
 }
 
+public struct RenderOutputTextures {
+    public let color: MTLTexture
+    public let depth: MTLTexture
+    public let alpha: MTLTexture
+}
+
 public struct RenderSubmission {
     public let commandBuffer: MTLCommandBuffer
     public let outputs: RenderOutputBuffers
@@ -260,6 +346,53 @@ public struct WorldGaussianBuffers {
         self.harmonics = harmonics
         self.opacities = opacities
         self.shComponents = shComponents
+    }
+}
+
+/// Half-precision world gaussian buffers for native float16 input data.
+/// Layout: positions (half3), scales (half3), rotations (half4), harmonics (half), opacities (half)
+public struct WorldGaussianBuffersHalf {
+    public let positions: MTLBuffer    // half3 packed as 3 x UInt16
+    public let scales: MTLBuffer       // half3 packed as 3 x UInt16
+    public let rotations: MTLBuffer    // half4 packed as 4 x UInt16
+    public let harmonics: MTLBuffer    // half (SH coefficients)
+    public let opacities: MTLBuffer    // half
+    public let shComponents: Int
+
+    public init(
+        positions: MTLBuffer,
+        scales: MTLBuffer,
+        rotations: MTLBuffer,
+        harmonics: MTLBuffer,
+        opacities: MTLBuffer,
+        shComponents: Int
+    ) {
+        self.positions = positions
+        self.scales = scales
+        self.rotations = rotations
+        self.harmonics = harmonics
+        self.opacities = opacities
+        self.shComponents = shComponents
+    }
+}
+
+/// Unified wrapper for world gaussian buffers supporting both precisions.
+public enum WorldGaussianBuffersUnified {
+    case float32(WorldGaussianBuffers)
+    case float16(WorldGaussianBuffersHalf)
+
+    public var precision: Precision {
+        switch self {
+        case .float32: return .float32
+        case .float16: return .float16
+        }
+    }
+
+    public var shComponents: Int {
+        switch self {
+        case .float32(let b): return b.shComponents
+        case .float16(let b): return b.shComponents
+        }
     }
 }
 

@@ -46,6 +46,8 @@ final class FrameResources {
     
     // Output Buffers
     var outputBuffers: RenderOutputBuffers?
+    // Output Textures (Alternative)
+    var outputTextures: RenderOutputTextures?
     
     init(device: MTLDevice) {
         let dispatchLength = 4096
@@ -61,7 +63,7 @@ final class FrameResources {
 public final class Renderer: @unchecked Sendable {
     public static let shared = Renderer()
 
-    let device: MTLDevice
+    public let device: MTLDevice
     let queue: MTLCommandQueue
     let library: MTLLibrary
     private var nextFrameCapturePath: String?
@@ -100,13 +102,20 @@ public final class Renderer: @unchecked Sendable {
     private var gaussianConicsCache: MTLBuffer?
     private var gaussianColorsCache: MTLBuffer?
     private var gaussianOpacitiesCache: MTLBuffer?
-        
+
+    // Half-precision gaussian buffers cache (for half16 pipeline)
+    private var gaussianMeansHalfCache: MTLBuffer?
+    private var gaussianDepthsHalfCache: MTLBuffer?
+    private var gaussianConicsHalfCache: MTLBuffer?
+    private var gaussianColorsHalfCache: MTLBuffer?
+    private var gaussianOpacitiesHalfCache: MTLBuffer?
+
     private let sortAlgorithm: SortAlgorithm
     private let precision: Precision
     private let effectivePrecision: Precision
     public var precisionSetting: Precision { self.effectivePrecision }
 
-    public init(precision: Precision = .float32, useIndirectBitonic: Bool = true, sortAlgorithm: SortAlgorithm = .radix) {
+    public init(precision: Precision = .float32, useIndirectBitonic: Bool = false, sortAlgorithm: SortAlgorithm = .radix) {
         guard let device = MTLCreateSystemDefaultDevice() else {
             fatalError("Metal device unavailable")
         }
@@ -298,18 +307,20 @@ public final class Renderer: @unchecked Sendable {
             params: params
         )
         
+        // renderRaw always uses float32 precision because inputs are float32 pointers
         guard let assignment = self.buildTileAssignmentsGPU(
             commandBuffer: commandBuffer,
             gaussianCount: count,
             gaussianBuffers: inputs,
             params: params,
             frame: frame,
-            estimatedAssignments: estimatedAssignments
+            estimatedAssignments: estimatedAssignments,
+            precision: .float32
         ) else {
             self.releaseFrame(index: slotIndex)
             return -3
         }
-        
+
         guard let ordered = self.buildOrderedGaussians(
             commandBuffer: commandBuffer,
             gaussianCount: count,
@@ -317,12 +328,12 @@ public final class Renderer: @unchecked Sendable {
             gaussianBuffers: inputs,
             params: params,
             frame: frame,
-            precision: self.effectivePrecision
+            precision: .float32  // Always float32 for renderRaw (float input buffers)
         ) else {
             self.releaseFrame(index: slotIndex)
             return -4
         }
-        
+
         return self.encodeAndRunRenderWithFrame(
             commandBuffer: commandBuffer,
             ordered: ordered,
@@ -379,7 +390,8 @@ public final class Renderer: @unchecked Sendable {
             gaussianCount: count,
             worldBuffers: worldBuffers,
             cameraUniforms: cameraUniforms,
-            gaussianBuffers: gaussianBuffers
+            gaussianBuffers: gaussianBuffers,
+            precision: self.effectivePrecision
         )
         
         guard let assignment = self.buildTileAssignmentsGPU(commandBuffer: commandBuffer, gaussianCount: count, gaussianBuffers: gaussianBuffers, params: params, frame: frame) else {
@@ -418,19 +430,17 @@ public final class Renderer: @unchecked Sendable {
         
         return result
     }
-    
-        public func encodeRender(
+    public func encodeRender(
         commandBuffer: MTLCommandBuffer,
         gaussianCount: Int,
         worldBuffers: WorldGaussianBuffers,
         cameraUniforms: CameraUniformsSwift,
         params: RenderParams
     ) -> RenderOutputBuffers? {
-        
         guard let (frame, slotIndex) = self.acquireFrame(width: Int(params.width), height: Int(params.height)) else {
             return nil
         }
-    
+
         if let capturePath = self.nextFrameCapturePath {
             let descriptor = MTLCaptureDescriptor()
             descriptor.captureObject = self.device
@@ -452,7 +462,8 @@ public final class Renderer: @unchecked Sendable {
             gaussianCount: gaussianCount,
             worldBuffers: worldBuffers,
             cameraUniforms: cameraUniforms,
-            gaussianBuffers: gaussianBuffers
+            gaussianBuffers: gaussianBuffers,
+            precision: self.effectivePrecision
         )
 
         guard let assignment = self.buildTileAssignmentsGPU(commandBuffer: commandBuffer, gaussianCount: gaussianCount, gaussianBuffers: gaussianBuffers, params: params, frame: frame) else {
@@ -500,6 +511,261 @@ public final class Renderer: @unchecked Sendable {
         return frame.outputBuffers
     }
     
+    // New API for Texture-based rendering
+    public func encodeRenderToTextures(
+        commandBuffer: MTLCommandBuffer,
+        gaussianCount: Int,
+        worldBuffers: WorldGaussianBuffers,
+        cameraUniforms: CameraUniformsSwift,
+        params: RenderParams
+    ) -> RenderOutputTextures? {
+        guard let (frame, slotIndex) = self.acquireFrame(width: Int(params.width), height: Int(params.height)) else {
+            return nil
+        }
+
+        if let capturePath = self.nextFrameCapturePath {
+            let descriptor = MTLCaptureDescriptor()
+            descriptor.captureObject = self.device
+            descriptor.destination = .gpuTraceDocument
+            descriptor.outputURL = URL(fileURLWithPath: capturePath)
+            let manager = MTLCaptureManager.shared()
+            try? manager.startCapture(with: descriptor)
+            self.nextFrameCapturePath = nil
+        }
+
+        guard let gaussianBuffers = self.prepareGaussianBuffers(count: gaussianCount) else {
+            self.releaseFrame(index: slotIndex)
+            if MTLCaptureManager.shared().isCapturing { MTLCaptureManager.shared().stopCapture() }
+            return nil
+        }
+
+        self.projectEncoder.encodeForRender(
+            commandBuffer: commandBuffer,
+            gaussianCount: gaussianCount,
+            worldBuffers: worldBuffers,
+            cameraUniforms: cameraUniforms,
+            gaussianBuffers: gaussianBuffers,
+            precision: self.effectivePrecision
+        )
+
+        guard let assignment = self.buildTileAssignmentsGPU(commandBuffer: commandBuffer, gaussianCount: gaussianCount, gaussianBuffers: gaussianBuffers, params: params, frame: frame) else {
+            self.releaseFrame(index: slotIndex)
+            if MTLCaptureManager.shared().isCapturing { MTLCaptureManager.shared().stopCapture() }
+            return nil
+        }
+
+        guard let ordered = self.buildOrderedGaussians(
+            commandBuffer: commandBuffer,
+            gaussianCount: gaussianCount,
+            assignment: assignment,
+            gaussianBuffers: gaussianBuffers,
+            params: params,
+            frame: frame,
+            precision: self.effectivePrecision
+        ) else {
+            self.releaseFrame(index: slotIndex)
+            if MTLCaptureManager.shared().isCapturing { MTLCaptureManager.shared().stopCapture() }
+            return nil
+        }
+
+        // Submit render to textures
+        guard let textures = frame.outputTextures, let dispatchArgs = frame.dispatchArgs else {
+            self.releaseFrame(index: slotIndex)
+            if MTLCaptureManager.shared().isCapturing { MTLCaptureManager.shared().stopCapture() }
+            return nil
+        }
+        
+        self.renderEncoder.encodeDirect(
+            commandBuffer: commandBuffer,
+            orderedBuffers: ordered,
+            outputTextures: textures,
+            params: params,
+            dispatchArgs: dispatchArgs,
+            dispatchOffset: DispatchSlot.renderTiles.rawValue * MemoryLayout<DispatchIndirectArgsSwift>.stride,
+            precision: self.effectivePrecision
+        )
+
+        commandBuffer.addCompletedHandler { [weak self] _ in
+            self?.releaseFrame(index: slotIndex)
+            if MTLCaptureManager.shared().isCapturing { MTLCaptureManager.shared().stopCapture() }
+        }
+
+        return textures
+    }
+
+    /// New API for half-precision input rendering directly to textures.
+    /// This is the fastest path for GSViewer: half16 world data → texture output.
+    public func encodeRenderToTextureHalf(
+        commandBuffer: MTLCommandBuffer,
+        gaussianCount: Int,
+        worldBuffers: WorldGaussianBuffersHalf,
+        cameraUniforms: CameraUniformsSwift,
+        params: RenderParams
+    ) -> RenderOutputTextures? {
+        guard let (frame, slotIndex) = self.acquireFrame(width: Int(params.width), height: Int(params.height)) else {
+            return nil
+        }
+
+        if let capturePath = self.nextFrameCapturePath {
+            let descriptor = MTLCaptureDescriptor()
+            descriptor.captureObject = self.device
+            descriptor.destination = .gpuTraceDocument
+            descriptor.outputURL = URL(fileURLWithPath: capturePath)
+            let manager = MTLCaptureManager.shared()
+            try? manager.startCapture(with: descriptor)
+            self.nextFrameCapturePath = nil
+        }
+
+        // Prepare gaussian buffers with half-precision layout
+        guard let gaussianBuffers = self.prepareGaussianBuffersHalf(count: gaussianCount) else {
+            self.releaseFrame(index: slotIndex)
+            if MTLCaptureManager.shared().isCapturing { MTLCaptureManager.shared().stopCapture() }
+            return nil
+        }
+
+        // Project from half world data to half gaussian data
+        self.projectEncoder.encodeForRenderHalf(
+            commandBuffer: commandBuffer,
+            gaussianCount: gaussianCount,
+            worldBuffers: worldBuffers,
+            cameraUniforms: cameraUniforms,
+            gaussianBuffers: gaussianBuffers
+        )
+
+        guard let assignment = self.buildTileAssignmentsGPU(
+            commandBuffer: commandBuffer,
+            gaussianCount: gaussianCount,
+            gaussianBuffers: gaussianBuffers,
+            params: params,
+            frame: frame,
+            precision: .float16  // Half precision for this path
+        ) else {
+            self.releaseFrame(index: slotIndex)
+            if MTLCaptureManager.shared().isCapturing { MTLCaptureManager.shared().stopCapture() }
+            return nil
+        }
+
+        guard let ordered = self.buildOrderedGaussians(
+            commandBuffer: commandBuffer,
+            gaussianCount: gaussianCount,
+            assignment: assignment,
+            gaussianBuffers: gaussianBuffers,
+            params: params,
+            frame: frame,
+            precision: .float16  // Always half for this path
+        ) else {
+            self.releaseFrame(index: slotIndex)
+            if MTLCaptureManager.shared().isCapturing { MTLCaptureManager.shared().stopCapture() }
+            return nil
+        }
+
+        guard let textures = frame.outputTextures, let dispatchArgs = frame.dispatchArgs else {
+            self.releaseFrame(index: slotIndex)
+            if MTLCaptureManager.shared().isCapturing { MTLCaptureManager.shared().stopCapture() }
+            return nil
+        }
+
+        self.renderEncoder.encodeDirect(
+            commandBuffer: commandBuffer,
+            orderedBuffers: ordered,
+            outputTextures: textures,
+            params: params,
+            dispatchArgs: dispatchArgs,
+            dispatchOffset: DispatchSlot.renderTiles.rawValue * MemoryLayout<DispatchIndirectArgsSwift>.stride,
+            precision: .float16
+        )
+
+        commandBuffer.addCompletedHandler { [weak self] _ in
+            self?.releaseFrame(index: slotIndex)
+            if MTLCaptureManager.shared().isCapturing { MTLCaptureManager.shared().stopCapture() }
+        }
+
+        return textures
+    }
+
+    /// Render to user-provided texture (most direct path).
+    /// Allows GSViewer to pass its own drawable texture for zero-copy rendering.
+    public func encodeRenderToTargetTexture(
+        commandBuffer: MTLCommandBuffer,
+        gaussianCount: Int,
+        worldBuffers: WorldGaussianBuffersHalf,
+        cameraUniforms: CameraUniformsSwift,
+        params: RenderParams,
+        targetColor: MTLTexture,
+        targetDepth: MTLTexture?,
+        targetAlpha: MTLTexture?
+    ) -> Bool {
+        guard let (frame, slotIndex) = self.acquireFrame(width: Int(params.width), height: Int(params.height)) else {
+            return false
+        }
+
+        guard let gaussianBuffers = self.prepareGaussianBuffersHalf(count: gaussianCount) else {
+            self.releaseFrame(index: slotIndex)
+            return false
+        }
+
+        self.projectEncoder.encodeForRenderHalf(
+            commandBuffer: commandBuffer,
+            gaussianCount: gaussianCount,
+            worldBuffers: worldBuffers,
+            cameraUniforms: cameraUniforms,
+            gaussianBuffers: gaussianBuffers
+        )
+
+        guard let assignment = self.buildTileAssignmentsGPU(
+            commandBuffer: commandBuffer,
+            gaussianCount: gaussianCount,
+            gaussianBuffers: gaussianBuffers,
+            params: params,
+            frame: frame,
+            precision: .float16  // Half precision for this path
+        ) else {
+            self.releaseFrame(index: slotIndex)
+            return false
+        }
+
+        guard let ordered = self.buildOrderedGaussians(
+            commandBuffer: commandBuffer,
+            gaussianCount: gaussianCount,
+            assignment: assignment,
+            gaussianBuffers: gaussianBuffers,
+            params: params,
+            frame: frame,
+            precision: .float16
+        ) else {
+            self.releaseFrame(index: slotIndex)
+            return false
+        }
+
+        guard let dispatchArgs = frame.dispatchArgs else {
+            self.releaseFrame(index: slotIndex)
+            return false
+        }
+
+        // Use user's target textures
+        let outputTextures = RenderOutputTextures(
+            color: targetColor,
+            depth: targetDepth ?? frame.outputTextures!.depth,
+            alpha: targetAlpha ?? frame.outputTextures!.alpha
+        )
+
+        self.renderEncoder.encodeDirect(
+            commandBuffer: commandBuffer,
+            orderedBuffers: ordered,
+            outputTextures: outputTextures,
+            params: params,
+            dispatchArgs: dispatchArgs,
+            dispatchOffset: DispatchSlot.renderTiles.rawValue * MemoryLayout<DispatchIndirectArgsSwift>.stride,
+            precision: .float16
+        )
+
+        commandBuffer.addCompletedHandler { [weak self] _ in
+            self?.releaseFrame(index: slotIndex)
+        }
+
+        return true
+    }
+
     // MARK: - Helper Methods
     
     private func estimateAssignmentCapacity(
@@ -539,7 +805,8 @@ public final class Renderer: @unchecked Sendable {
         gaussianBuffers: GaussianInputBuffers,
         params: RenderParams,
         frame: FrameResources,
-        estimatedAssignments: Int? = nil
+        estimatedAssignments: Int? = nil,
+        precision: Precision = .float32
     ) -> TileAssignmentBuffers? {
         let tileCount = Int(params.tilesX * params.tilesY)
         let perTileLimit = (params.maxPerTile == 0) ? UInt32(max(gaussianCount, 1)) : params.maxPerTile
@@ -551,13 +818,14 @@ public final class Renderer: @unchecked Sendable {
         guard self.prepareTileBuilderResources(frame: frame, gaussianCount: gaussianCount, tileCount: tileCount, maxPerTile: Int(perTileLimit), forcedCapacity: forcedCapacity) else {
             return nil
         }
-        
+
         self.tileBoundsEncoder.encode(
             commandBuffer: commandBuffer,
             gaussianBuffers: gaussianBuffers,
             boundsBuffer: frame.boundsBuffer!,
             params: params,
-            gaussianCount: gaussianCount
+            gaussianCount: gaussianCount,
+            precision: precision
         )
         
         self.coverageEncoder.encode(
@@ -568,7 +836,8 @@ public final class Renderer: @unchecked Sendable {
             coverageBuffer: frame.coverageBuffer!,
             offsetsBuffer: frame.offsetsBuffer!,
             partialSumsBuffer: frame.partialSumsBuffer!,
-            tileAssignmentHeader: frame.tileAssignmentHeader!
+            tileAssignmentHeader: frame.tileAssignmentHeader!,
+            precision: precision
         )
         
         
@@ -631,7 +900,8 @@ public final class Renderer: @unchecked Sendable {
             sortedIndices: sortedIndicesBuffer,
             header: assignment.header,
             dispatchArgs: dispatchArgs,
-            dispatchOffset: DispatchSlot.sortKeys.rawValue * MemoryLayout<DispatchIndirectArgsSwift>.stride
+            dispatchOffset: DispatchSlot.sortKeys.rawValue * MemoryLayout<DispatchIndirectArgsSwift>.stride,
+            precision: precision
         )
 
         if self.sortAlgorithm == .radix {
@@ -787,7 +1057,7 @@ public final class Renderer: @unchecked Sendable {
             params: params,
             frame: frame,
             slotIndex: slotIndex,
-            precision: self.effectivePrecision
+            precision: ordered.precision  // Use the precision the buffers were packed with
         ) else { return -5 }
 
         if !cpuReadback {
@@ -964,7 +1234,41 @@ public final class Renderer: @unchecked Sendable {
             opacities: opacities
         )
     }
-    
+
+    /// Prepare gaussian buffers with half-precision layout for the half16 pipeline.
+    /// Note: radii and mask remain the same size (float and uchar).
+    internal func prepareGaussianBuffersHalf(count: Int) -> GaussianInputBuffers? {
+        let shared: MTLResourceOptions = .storageModeShared
+        // Half precision sizes
+        let meansLen = count * 4      // half2 = 4 bytes
+        let radiiLen = count * 4      // float (stays float for tile bounds accuracy)
+        let maskLen = count           // uchar
+        let depthsLen = count * 2     // half = 2 bytes
+        let conicsLen = count * 8     // half4 = 8 bytes
+        let colorsLen = count * 6     // half3 = 6 bytes
+        let opacitiesLen = count * 2  // half = 2 bytes
+
+        guard
+            let means = self.ensureBuffer(&self.gaussianMeansHalfCache, length: meansLen, options: shared, label: "GaussianMeansHalf"),
+            let radii = self.ensureBuffer(&self.gaussianRadiiCache, length: radiiLen, options: shared, label: "GaussianRadii"),
+            let mask = self.ensureBuffer(&self.gaussianMaskCache, length: maskLen, options: shared, label: "GaussianMask"),
+            let depths = self.ensureBuffer(&self.gaussianDepthsHalfCache, length: depthsLen, options: shared, label: "GaussianDepthsHalf"),
+            let conics = self.ensureBuffer(&self.gaussianConicsHalfCache, length: conicsLen, options: shared, label: "GaussianConicsHalf"),
+            let colors = self.ensureBuffer(&self.gaussianColorsHalfCache, length: colorsLen, options: shared, label: "GaussianColorsHalf"),
+            let opacities = self.ensureBuffer(&self.gaussianOpacitiesHalfCache, length: opacitiesLen, options: shared, label: "GaussianOpacitiesHalf")
+        else { return nil }
+
+        return GaussianInputBuffers(
+            means: means,
+            radii: radii,
+            mask: mask,
+            depths: depths,
+            conics: conics,
+            colors: colors,
+            opacities: opacities
+        )
+    }
+
     internal func prepareTileBuilderResources(frame: FrameResources, gaussianCount: Int, tileCount: Int, maxPerTile: Int, forcedCapacity: Int) -> Bool {
         let totalAssignments = max(forcedCapacity, 1)
         let paddedCapacity = self.nextPowerOfTwo(value: totalAssignments)
@@ -1037,20 +1341,46 @@ public final class Renderer: @unchecked Sendable {
     private func prepareRenderOutputResources(frame: FrameResources, width: Int, height: Int) -> Bool {
         let pixelCount = max(1, width * height)
         
+        // 1. Buffers (Standard)
         if let out = frame.outputBuffers, out.colorOutGPU.length >= pixelCount * 12, out.depthOutGPU.length >= pixelCount * 4, out.alphaOutGPU.length >= pixelCount * 4 {
-             return true
+             // Good
+        } else {
+            guard
+                let color = self.device.makeBuffer(length: pixelCount * 12, options: .storageModeShared),
+                let depth = self.device.makeBuffer(length: pixelCount * 4, options: .storageModeShared),
+                let alpha = self.device.makeBuffer(length: pixelCount * 4, options: .storageModeShared)
+            else { return false }
+            
+            color.label = "RenderColorOutput"
+            depth.label = "RenderDepthOutput"
+            alpha.label = "RenderAlphaOutput"
+            frame.outputBuffers = RenderOutputBuffers(colorOutGPU: color, depthOutGPU: depth, alphaOutGPU: alpha)
         }
         
-        guard
-            let color = self.device.makeBuffer(length: pixelCount * 12, options: .storageModeShared),
-            let depth = self.device.makeBuffer(length: pixelCount * 4, options: .storageModeShared),
-            let alpha = self.device.makeBuffer(length: pixelCount * 4, options: .storageModeShared)
-        else { return false }
-        
-        color.label = "RenderColorOutput"
-        depth.label = "RenderDepthOutput"
-        alpha.label = "RenderAlphaOutput"
-        frame.outputBuffers = RenderOutputBuffers(colorOutGPU: color, depthOutGPU: depth, alphaOutGPU: alpha)
+        // 2. Textures (Alternative)
+        let currentW = frame.outputTextures?.color.width ?? 0
+        let currentH = frame.outputTextures?.color.height ?? 0
+        if currentW != width || currentH != height {
+            // Create new textures
+            let desc = MTLTextureDescriptor.texture2DDescriptor(pixelFormat: .rgba16Float, width: width, height: height, mipmapped: false)
+            desc.usage = [.shaderWrite, .shaderRead]
+            desc.storageMode = .private
+            
+            guard let colorTex = self.device.makeTexture(descriptor: desc) else { return false }
+            colorTex.label = "OutputColorTex"
+            
+            let descF32 = MTLTextureDescriptor.texture2DDescriptor(pixelFormat: .r32Float, width: width, height: height, mipmapped: false)
+            descF32.usage = [.shaderWrite, .shaderRead]
+            descF32.storageMode = .private
+            
+            guard let depthTex = self.device.makeTexture(descriptor: descF32) else { return false }
+            depthTex.label = "OutputDepthTex"
+            
+            guard let alphaTex = self.device.makeTexture(descriptor: descF32) else { return false }
+            alphaTex.label = "OutputAlphaTex"
+            
+            frame.outputTextures = RenderOutputTextures(color: colorTex, depth: depthTex, alpha: alphaTex)
+        }
         
         return true
     }

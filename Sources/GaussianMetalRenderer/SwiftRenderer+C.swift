@@ -326,7 +326,8 @@ public func gaussian_renderer_render_world(
         gaussianCount: count,
         worldBuffers: worldBuffers,
         cameraUniforms: cameraUniforms,
-        gaussianBuffers: gaussianBuffers
+        gaussianBuffers: gaussianBuffers,
+        precision: .float32
     )
     
     guard let assignment = Renderer.shared.buildTileAssignmentsGPU(commandBuffer: commandBuffer, gaussianCount: count, gaussianBuffers: gaussianBuffers, params: params, frame: frame) else {
@@ -714,7 +715,8 @@ public func gaussian_renderer_debug_dump_tile_pipeline_buffers(
         gaussianCount: count,
         worldBuffers: worldBuffers,
         cameraUniforms: cameraUniforms,
-        gaussianBuffers: gaussianBuffers
+        gaussianBuffers: gaussianBuffers,
+        precision: .float32
     )
     
     // 2. Build Tile Assignments (Bounds, Coverage, Scatter)

@@ -2,13 +2,21 @@ import Metal
 
 final class SortKeyGenEncoder {
     private let pipeline: MTLComputePipelineState
+    private let pipelineHalf: MTLComputePipelineState?
     let threadgroupSize: Int
 
     init(device: MTLDevice, library: MTLLibrary) throws {
-        guard let function = library.makeFunction(name: "computeSortKeysKernel") else {
-            fatalError("computeSortKeysKernel not found")
+        guard let function = library.makeFunction(name: "computeSortKeysKernel_float") else {
+            fatalError("computeSortKeysKernel_float not found")
         }
         self.pipeline = try device.makeComputePipelineState(function: function)
+
+        if let functionHalf = library.makeFunction(name: "computeSortKeysKernel_half") {
+            self.pipelineHalf = try? device.makeComputePipelineState(function: functionHalf)
+        } else {
+            self.pipelineHalf = nil
+        }
+
         self.threadgroupSize = max(1, min(pipeline.maxTotalThreadsPerThreadgroup, 256))
     }
 
@@ -21,12 +29,17 @@ final class SortKeyGenEncoder {
         sortedIndices: MTLBuffer,
         header: MTLBuffer,
         dispatchArgs: MTLBuffer,
-        dispatchOffset: Int
+        dispatchOffset: Int,
+        precision: Precision = .float32
     ) {
         guard let encoder = commandBuffer.makeComputeCommandEncoder() else { return }
         encoder.label = "SortKeys"
 
-        encoder.setComputePipelineState(self.pipeline)
+        if precision == .float16, let halfPipe = self.pipelineHalf {
+            encoder.setComputePipelineState(halfPipe)
+        } else {
+            encoder.setComputePipelineState(self.pipeline)
+        }
         encoder.setBuffer(tileIds, offset: 0, index: 0)
         encoder.setBuffer(tileIndices, offset: 0, index: 1)
         encoder.setBuffer(depths, offset: 0, index: 2)

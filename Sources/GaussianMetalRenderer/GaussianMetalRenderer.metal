@@ -897,6 +897,161 @@ instantiate_renderTilesDirect(half, half, half2, half4, packed_half3)
 #undef instantiate_renderTilesDirect
 
 ///////////////////////////////////////////////////////////////////////////////
+// MULTI-PIXEL RENDERING: 4x2 pixels per thread for reduced divergence
+// Tile size: 32x16 (optimal for multi-pixel blending)
+// Threadgroup: 8x8 = 64 threads, each handling 4x2 = 8 pixels
+// Minimal shared memory (just tile params), direct global memory loads
+// Based on: https://tellusim.com/3dgs-blog/
+///////////////////////////////////////////////////////////////////////////////
+
+kernel void renderTilesMultiPixel(
+    const device GaussianHeader* headers [[buffer(0)]],
+    const device half2* means [[buffer(1)]],
+    const device half4* conics [[buffer(2)]],
+    const device packed_half3* colors [[buffer(3)]],
+    const device half* opacities [[buffer(4)]],
+    const device half* depths [[buffer(5)]],
+    texture2d<float, access::write> colorTex [[texture(0)]],
+    texture2d<float, access::write> depthTex [[texture(1)]],
+    texture2d<float, access::write> alphaTex [[texture(2)]],
+    constant RenderParams& params [[buffer(9)]],
+    const device uint* activeTiles [[buffer(10)]],
+    uint2 localPos [[thread_position_in_threadgroup]],
+    uint2 tgPos [[threadgroup_position_in_grid]],
+    uint localIdx [[thread_index_in_threadgroup]]
+) {
+    // Shared tile parameters (only 2 values, like Tellusim)
+    threadgroup uint tileGaussians;
+    threadgroup uint dataOffset;
+
+    // Load tile parameters once
+    if (localIdx == 0) {
+        uint tileId = activeTiles[tgPos.x];
+        GaussianHeader header = headers[tileId];
+        tileGaussians = header.count;
+        dataOffset = header.offset;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // Map threadgroup to tile
+    uint tileId = activeTiles[tgPos.x];
+    uint tileX = tileId % params.tilesX;
+    uint tileY = tileId / params.tilesX;
+
+    // Pixel base position (32x16 tile, 8x8 threads, 4x2 pixels per thread)
+    uint baseX = tileX * 32 + localPos.x * 4;
+    uint baseY = tileY * 16 + localPos.y * 2;
+
+    // Pixel coordinates as float for computation
+    float px0 = float(baseX);
+    float px1 = float(baseX + 1);
+    float px2 = float(baseX + 2);
+    float px3 = float(baseX + 3);
+    float py0 = float(baseY);
+    float py1 = float(baseY + 1);
+
+    // Accumulators in registers
+    half trans00 = 1.0h, trans10 = 1.0h, trans20 = 1.0h, trans30 = 1.0h;
+    half trans01 = 1.0h, trans11 = 1.0h, trans21 = 1.0h, trans31 = 1.0h;
+
+    half3 color00 = half3(0), color10 = half3(0), color20 = half3(0), color30 = half3(0);
+    half3 color01 = half3(0), color11 = half3(0), color21 = half3(0), color31 = half3(0);
+
+    // Process all gaussians
+    uint count = tileGaussians;
+    uint start = dataOffset;
+
+    for (uint i = 0; i < count; i++) {
+        uint gIdx = start + i;
+
+        // Load gaussian data from global memory (cached across threads)
+        half2 mean = means[gIdx];
+        half4 conic = conics[gIdx];  // conic already has -0.5 factor in .x, .z; .y has the cross term
+        half4 colorOpacity = half4(half3(colors[gIdx]), min(opacities[gIdx], half(0.99h)));
+
+        // Direction vectors (pixel - mean)
+        half2 d00 = half2(px0, py0) - mean;
+        half2 d10 = half2(px1, py0) - mean;
+        half2 d20 = half2(px2, py0) - mean;
+        half2 d30 = half2(px3, py0) - mean;
+        half2 d01 = half2(px0, py1) - mean;
+        half2 d11 = half2(px1, py1) - mean;
+        half2 d21 = half2(px2, py1) - mean;
+        half2 d31 = half2(px3, py1) - mean;
+
+        // Power = dx*dx*conic.x + dy*dy*conic.z + 2*dx*dy*conic.y (with -0.5 baked in)
+        // Using dot product: conic.xzy dot (dx*dx, dy*dy, dx*dy)
+        half p00 = d00.x*d00.x*conic.x + d00.y*d00.y*conic.z + 2.0h*d00.x*d00.y*conic.y;
+        half p10 = d10.x*d10.x*conic.x + d10.y*d10.y*conic.z + 2.0h*d10.x*d10.y*conic.y;
+        half p20 = d20.x*d20.x*conic.x + d20.y*d20.y*conic.z + 2.0h*d20.x*d20.y*conic.y;
+        half p30 = d30.x*d30.x*conic.x + d30.y*d30.y*conic.z + 2.0h*d30.x*d30.y*conic.y;
+        half p01 = d01.x*d01.x*conic.x + d01.y*d01.y*conic.z + 2.0h*d01.x*d01.y*conic.y;
+        half p11 = d11.x*d11.x*conic.x + d11.y*d11.y*conic.z + 2.0h*d11.x*d11.y*conic.y;
+        half p21 = d21.x*d21.x*conic.x + d21.y*d21.y*conic.z + 2.0h*d21.x*d21.y*conic.y;
+        half p31 = d31.x*d31.x*conic.x + d31.y*d31.y*conic.z + 2.0h*d31.x*d31.y*conic.y;
+
+        // Alpha = opacity * exp(power), clamped to 1
+        half a00 = min(colorOpacity.w * exp(-0.5h * p00), half(1.0h));
+        half a10 = min(colorOpacity.w * exp(-0.5h * p10), half(1.0h));
+        half a20 = min(colorOpacity.w * exp(-0.5h * p20), half(1.0h));
+        half a30 = min(colorOpacity.w * exp(-0.5h * p30), half(1.0h));
+        half a01 = min(colorOpacity.w * exp(-0.5h * p01), half(1.0h));
+        half a11 = min(colorOpacity.w * exp(-0.5h * p11), half(1.0h));
+        half a21 = min(colorOpacity.w * exp(-0.5h * p21), half(1.0h));
+        half a31 = min(colorOpacity.w * exp(-0.5h * p31), half(1.0h));
+
+        // Blend: color += gaussian_color * alpha * transparency
+        color00 += colorOpacity.xyz * (a00 * trans00);
+        color10 += colorOpacity.xyz * (a10 * trans10);
+        color20 += colorOpacity.xyz * (a20 * trans20);
+        color30 += colorOpacity.xyz * (a30 * trans30);
+        color01 += colorOpacity.xyz * (a01 * trans01);
+        color11 += colorOpacity.xyz * (a11 * trans11);
+        color21 += colorOpacity.xyz * (a21 * trans21);
+        color31 += colorOpacity.xyz * (a31 * trans31);
+
+        // Update transparency
+        trans00 *= (1.0h - a00);
+        trans10 *= (1.0h - a10);
+        trans20 *= (1.0h - a20);
+        trans30 *= (1.0h - a30);
+        trans01 *= (1.0h - a01);
+        trans11 *= (1.0h - a11);
+        trans21 *= (1.0h - a21);
+        trans31 *= (1.0h - a31);
+
+        // Early exit when all pixels are saturated
+        half maxTrans0 = max(max(trans00, trans10), max(trans20, trans30));
+        half maxTrans1 = max(max(trans01, trans11), max(trans21, trans31));
+        if (max(maxTrans0, maxTrans1) < half(1.0h/255.0h)) break;
+    }
+
+    // Apply white background if needed
+    half bg = (params.whiteBackground != 0) ? half(1.0h) : half(0.0h);
+    color00 += half3(trans00 * bg);
+    color10 += half3(trans10 * bg);
+    color20 += half3(trans20 * bg);
+    color30 += half3(trans30 * bg);
+    color01 += half3(trans01 * bg);
+    color11 += half3(trans11 * bg);
+    color21 += half3(trans21 * bg);
+    color31 += half3(trans31 * bg);
+
+    // Write all 8 pixels (single bounds check like Tellusim)
+    if (all(uint2(baseX + 3, baseY + 1) < uint2(params.width, params.height))) {
+        // All 8 pixels in bounds - write all
+        colorTex.write(float4(float3(color00), float(trans00)), uint2(baseX + 0, baseY + 0));
+        colorTex.write(float4(float3(color10), float(trans10)), uint2(baseX + 1, baseY + 0));
+        colorTex.write(float4(float3(color20), float(trans20)), uint2(baseX + 2, baseY + 0));
+        colorTex.write(float4(float3(color30), float(trans30)), uint2(baseX + 3, baseY + 0));
+        colorTex.write(float4(float3(color01), float(trans01)), uint2(baseX + 0, baseY + 1));
+        colorTex.write(float4(float3(color11), float(trans11)), uint2(baseX + 1, baseY + 1));
+        colorTex.write(float4(float3(color21), float(trans21)), uint2(baseX + 2, baseY + 1));
+        colorTex.write(float4(float3(color31), float(trans31)), uint2(baseX + 3, baseY + 1));
+    }
+}
+
+///////////////////////////////////////////////////////////////////////////////
 struct ClearParams {
     uint pixelCount;
     uint whiteBackground;
@@ -2280,6 +2435,7 @@ kernel void radixExclusiveScanKernel(
         local_sum += val;
     }
 
+    // Scan the per-thread sums using helper (exclusive scan of 256 values)
     uint scanned_sum = ThreadgroupPrefixScan<SCAN_TYPE_EXCLUSIVE>(local_sum, shared_mem, lid, SumOp<uint>());
 
     // Write back: each element gets scanned_sum + prefix of local values

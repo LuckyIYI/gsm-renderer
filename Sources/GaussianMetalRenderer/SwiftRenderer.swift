@@ -115,7 +115,17 @@ public final class Renderer: @unchecked Sendable {
     private let effectivePrecision: Precision
     public var precisionSetting: Precision { self.effectivePrecision }
 
-    public init(precision: Precision = .float32, useIndirectBitonic: Bool = false, sortAlgorithm: SortAlgorithm = .radix) {
+    /// Enable multi-pixel rendering (4x2 pixels per thread, 64 threads per 32x16 tile)
+    /// This can improve performance by reducing thread divergence and memory loads
+    /// When enabled, caller should use tileWidth=32, tileHeight=16 in RenderParams
+    public let useMultiPixelRendering: Bool
+    public var isMultiPixelAvailable: Bool { self.renderEncoder.isMultiPixelAvailable }
+
+    /// Recommended tile size for current rendering mode
+    public var recommendedTileWidth: UInt32 { useMultiPixelRendering ? 32 : 16 }
+    public var recommendedTileHeight: UInt32 { useMultiPixelRendering ? 16 : 16 }
+
+    public init(precision: Precision = .float32, useIndirectBitonic: Bool = false, sortAlgorithm: SortAlgorithm = .radix, useMultiPixelRendering: Bool = false) {
         guard let device = MTLCreateSystemDefaultDevice() else {
             fatalError("Metal device unavailable")
         }
@@ -160,6 +170,7 @@ public final class Renderer: @unchecked Sendable {
         }
         self.precision = precision
         self.sortAlgorithm = sortAlgorithm
+        self.useMultiPixelRendering = useMultiPixelRendering
 
         // Initialize frame slots
         for _ in 0..<maxInFlightFrames {
@@ -575,15 +586,27 @@ public final class Renderer: @unchecked Sendable {
             return nil
         }
 
-        self.renderEncoder.encodeDirect(
-            commandBuffer: commandBuffer,
-            orderedBuffers: ordered,
-            outputTextures: textures,
-            params: params,
-            dispatchArgs: dispatchArgs,
-            dispatchOffset: DispatchSlot.renderTiles.rawValue * MemoryLayout<DispatchIndirectArgsSwift>.stride,
-            precision: self.effectivePrecision
-        )
+        // Use multi-pixel if enabled and available
+        if self.useMultiPixelRendering && self.renderEncoder.isMultiPixelAvailable {
+            _ = self.renderEncoder.encodeMultiPixel(
+                commandBuffer: commandBuffer,
+                orderedBuffers: ordered,
+                outputTextures: textures,
+                params: params,
+                dispatchArgs: dispatchArgs,
+                dispatchOffset: DispatchSlot.renderTiles.rawValue * MemoryLayout<DispatchIndirectArgsSwift>.stride
+            )
+        } else {
+            self.renderEncoder.encodeDirect(
+                commandBuffer: commandBuffer,
+                orderedBuffers: ordered,
+                outputTextures: textures,
+                params: params,
+                dispatchArgs: dispatchArgs,
+                dispatchOffset: DispatchSlot.renderTiles.rawValue * MemoryLayout<DispatchIndirectArgsSwift>.stride,
+                precision: self.effectivePrecision
+            )
+        }
 
         commandBuffer.addCompletedHandler { [weak self] _ in
             self?.releaseFrame(index: slotIndex)
@@ -665,15 +688,27 @@ public final class Renderer: @unchecked Sendable {
             return nil
         }
 
-        self.renderEncoder.encodeDirect(
-            commandBuffer: commandBuffer,
-            orderedBuffers: ordered,
-            outputTextures: textures,
-            params: params,
-            dispatchArgs: dispatchArgs,
-            dispatchOffset: DispatchSlot.renderTiles.rawValue * MemoryLayout<DispatchIndirectArgsSwift>.stride,
-            precision: .float16
-        )
+        // Use multi-pixel if enabled and available
+        if self.useMultiPixelRendering && self.renderEncoder.isMultiPixelAvailable {
+            _ = self.renderEncoder.encodeMultiPixel(
+                commandBuffer: commandBuffer,
+                orderedBuffers: ordered,
+                outputTextures: textures,
+                params: params,
+                dispatchArgs: dispatchArgs,
+                dispatchOffset: DispatchSlot.renderTiles.rawValue * MemoryLayout<DispatchIndirectArgsSwift>.stride
+            )
+        } else {
+            self.renderEncoder.encodeDirect(
+                commandBuffer: commandBuffer,
+                orderedBuffers: ordered,
+                outputTextures: textures,
+                params: params,
+                dispatchArgs: dispatchArgs,
+                dispatchOffset: DispatchSlot.renderTiles.rawValue * MemoryLayout<DispatchIndirectArgsSwift>.stride,
+                precision: .float16
+            )
+        }
 
         commandBuffer.addCompletedHandler { [weak self] _ in
             self?.releaseFrame(index: slotIndex)
@@ -749,15 +784,27 @@ public final class Renderer: @unchecked Sendable {
             alpha: targetAlpha ?? frame.outputTextures!.alpha
         )
 
-        self.renderEncoder.encodeDirect(
-            commandBuffer: commandBuffer,
-            orderedBuffers: ordered,
-            outputTextures: outputTextures,
-            params: params,
-            dispatchArgs: dispatchArgs,
-            dispatchOffset: DispatchSlot.renderTiles.rawValue * MemoryLayout<DispatchIndirectArgsSwift>.stride,
-            precision: .float16
-        )
+        // Use multi-pixel if enabled and available
+        if self.useMultiPixelRendering && self.renderEncoder.isMultiPixelAvailable {
+            _ = self.renderEncoder.encodeMultiPixel(
+                commandBuffer: commandBuffer,
+                orderedBuffers: ordered,
+                outputTextures: outputTextures,
+                params: params,
+                dispatchArgs: dispatchArgs,
+                dispatchOffset: DispatchSlot.renderTiles.rawValue * MemoryLayout<DispatchIndirectArgsSwift>.stride
+            )
+        } else {
+            self.renderEncoder.encodeDirect(
+                commandBuffer: commandBuffer,
+                orderedBuffers: ordered,
+                outputTextures: outputTextures,
+                params: params,
+                dispatchArgs: dispatchArgs,
+                dispatchOffset: DispatchSlot.renderTiles.rawValue * MemoryLayout<DispatchIndirectArgsSwift>.stride,
+                precision: .float16
+            )
+        }
 
         commandBuffer.addCompletedHandler { [weak self] _ in
             self?.releaseFrame(index: slotIndex)

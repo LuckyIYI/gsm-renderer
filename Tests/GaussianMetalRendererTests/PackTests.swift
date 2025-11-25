@@ -99,7 +99,6 @@ final class PackTests: XCTestCase {
             gaussianBuffers: dummyGaussian,
             orderedBuffers: dummyOrdered,
             assignment: dummyAssignment,
-            totalAssignments: count,
             dispatchArgs: dispatchArgs,
             dispatchOffset: 0,
             activeTileIndices: activeTileIndices,

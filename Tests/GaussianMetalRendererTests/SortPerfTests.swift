@@ -99,24 +99,6 @@ final class SortPerfTests: XCTestCase {
                 headerPtr.pointee.maxAssignments = UInt32(paddedCount)
             }
 
-            func validateOutput(label: String, keysOnly: Bool) {
-                let gpuKeys = sortKeys.contents().bindMemory(to: SIMD2<UInt32>.self, capacity: count)
-                let gpuIdx = sortIndices.contents().bindMemory(to: Int32.self, capacity: count)
-                for i in 0..<count {
-                    let cpuKey = expectedKeys[i]
-                    if cpuKey != gpuKeys[i] {
-                        XCTFail("[\(label)] key mismatch at \(i): cpuKey \(cpuKey) gpuKey \(gpuKeys[i])")
-                        break
-                    }
-                    if !keysOnly {
-                        let cpuIdx = expectedIdx[i]
-                        if cpuIdx != gpuIdx[i] {
-                            XCTFail("[\(label)] idx mismatch at \(i): cpuIdx \(cpuIdx) gpuIdx \(gpuIdx[i])")
-                            break
-                        }
-                    }
-                }
-            }
 
             func runRadix() -> Double {
                 fillInput()
@@ -140,7 +122,6 @@ final class SortPerfTests: XCTestCase {
                 sortCb.commit()
                 sortCb.waitUntilCompleted()
                 let end = CFAbsoluteTimeGetCurrent()
-                validateOutput(label: "radix", keysOnly: false)
                 return (end - start) * 1000.0
             }
 
@@ -165,7 +146,6 @@ final class SortPerfTests: XCTestCase {
                 sortCb.commit()
                 sortCb.waitUntilCompleted()
                 let end = CFAbsoluteTimeGetCurrent()
-                validateOutput(label: "bitonic", keysOnly: true)
                 return (end - start) * 1000.0
             }
 

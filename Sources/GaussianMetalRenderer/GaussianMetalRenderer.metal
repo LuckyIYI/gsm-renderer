@@ -1110,11 +1110,15 @@ struct TileBoundsParams {
 
 struct CoverageParams {
     uint gaussianCount;
+    uint tileWidth;   // For precise intersection (optional, 0 = use AABB only)
+    uint tileHeight;  // For precise intersection
 };
 
 struct ScatterParams {
     uint gaussianCount;
     uint tilesX;
+    uint tileWidth;   // For precise intersection
+    uint tileHeight;  // For precise intersection
 };
 
 struct ScatterDispatchParams {
@@ -1250,6 +1254,89 @@ instantiate_tileBoundsKernel(half, half2)
 
 #undef instantiate_tileBoundsKernel
 
+///////////////////////////////////////////////////////////////////////////////
+// FlashGS-style Precise Ellipse-Tile Intersection
+// Eliminates tiles in AABB that don't actually intersect the gaussian ellipse
+///////////////////////////////////////////////////////////////////////////////
+
+// Check if point is inside ellipse: (p - center)^T * conic * (p - center) <= qMax
+inline bool ellipseContainsPoint(float2 center, float3 conic, float qMax, float2 p) {
+    float2 d = p - center;
+    float q = d.x * d.x * conic.x + 2.0f * d.x * d.y * conic.y + d.y * d.y * conic.z;
+    return q <= qMax;
+}
+
+// Check if ellipse intersects line segment p0->p1
+// Solves quadratic for t where ellipse intersects parametric line p(t) = p0 + t*(p1-p0)
+inline bool ellipseIntersectsEdge(float2 center, float3 conic, float qMax, float2 p0, float2 p1) {
+    float2 dir = p1 - p0;
+    float2 c = p0 - center;
+
+    // Quadratic coefficients: a*t^2 + b*t + c0 = 0
+    float a = conic.x * dir.x * dir.x + 2.0f * conic.y * dir.x * dir.y + conic.z * dir.y * dir.y;
+    float b = 2.0f * (conic.x * c.x * dir.x + conic.y * (c.x * dir.y + c.y * dir.x) + conic.z * c.y * dir.y);
+    float c0 = conic.x * c.x * c.x + 2.0f * conic.y * c.x * c.y + conic.z * c.y * c.y - qMax;
+
+    // Handle near-linear case
+    if (abs(a) < 1e-6f) {
+        if (abs(b) < 1e-6f) return false;
+        float t = -c0 / b;
+        return t >= 0.0f && t <= 1.0f;
+    }
+
+    float disc = b * b - 4.0f * a * c0;
+    if (disc < 0.0f) return false;
+
+    float sqrtDisc = sqrt(disc);
+    float inv2a = 0.5f / a;
+    float t0 = (-b - sqrtDisc) * inv2a;
+    float t1 = (-b + sqrtDisc) * inv2a;
+
+    // Check if either root is in [0, 1]
+    return (t0 >= 0.0f && t0 <= 1.0f) || (t1 >= 0.0f && t1 <= 1.0f) ||
+           (t0 < 0.0f && t1 > 1.0f);  // Edge fully inside ellipse
+}
+
+// Full ellipse-tile intersection test
+inline bool ellipseIntersectsTile(float2 center, float3 conic, float qMax,
+                                   float tileMinX, float tileMinY, float tileMaxX, float tileMaxY) {
+    // Corners
+    float2 p0 = float2(tileMinX, tileMinY);
+    float2 p1 = float2(tileMaxX, tileMinY);
+    float2 p2 = float2(tileMaxX, tileMaxY);
+    float2 p3 = float2(tileMinX, tileMaxY);
+
+    // 1) Any corner inside ellipse?
+    if (ellipseContainsPoint(center, conic, qMax, p0) ||
+        ellipseContainsPoint(center, conic, qMax, p1) ||
+        ellipseContainsPoint(center, conic, qMax, p2) ||
+        ellipseContainsPoint(center, conic, qMax, p3)) {
+        return true;
+    }
+
+    // 2) Ellipse center inside tile?
+    if (center.x >= tileMinX && center.x <= tileMaxX &&
+        center.y >= tileMinY && center.y <= tileMaxY) {
+        return true;
+    }
+
+    // 3) Ellipse intersects any edge?
+    if (ellipseIntersectsEdge(center, conic, qMax, p0, p1)) return true;
+    if (ellipseIntersectsEdge(center, conic, qMax, p1, p2)) return true;
+    if (ellipseIntersectsEdge(center, conic, qMax, p2, p3)) return true;
+    if (ellipseIntersectsEdge(center, conic, qMax, p3, p0)) return true;
+
+    return false;
+}
+
+// Opacity-aware threshold: we only care about the gaussian where weight >= tau
+// weight = alpha * exp(-0.5 * q) >= tau  =>  q <= -2 * ln(tau / alpha)
+inline float computeQMax(float alpha, float tau) {
+    if (alpha <= tau) return 0.0f;
+    return -2.0f * log(tau / alpha);
+}
+
+///////////////////////////////////////////////////////////////////////////////
 
 template <typename DepthT>
 kernel void computeSortKeysKernel(
@@ -1700,6 +1787,183 @@ instantiate_gaussianCoverageKernel(half, half)
 
 #undef instantiate_gaussianCoverageKernel
 
+///////////////////////////////////////////////////////////////////////////////
+// FlashGS Precise Coverage Kernel - counts only tiles with actual ellipse intersection
+// Parallel version: one threadgroup per gaussian, threads cooperatively test tiles
+///////////////////////////////////////////////////////////////////////////////
+
+// tau = minimum opacity threshold for visibility (typically 1/255 = 0.00392)
+constant float FLASHGS_TAU = 1.0f / 255.0f;
+
+// Threadgroup size for parallel precise kernels
+constant uint PRECISE_TG_SIZE = 32u;  // Single SIMD group - fastest (pure simd_sum, no barriers)
+
+// Only use precise intersection for AABBs larger than this threshold
+constant uint PRECISE_THRESHOLD_TILES = 16u;
+
+// SIMD-optimized ellipse point test - tests 4 points at once
+// Returns bitmask of which points are inside (bit 0-3)
+inline uint ellipseContainsPoints4(float2 center, float3 conic, float qMax,
+                                    float4 px, float4 py) {
+    float4 dx = px - center.x;
+    float4 dy = py - center.y;
+    float4 q = dx * dx * conic.x + 2.0f * dx * dy * conic.y + dy * dy * conic.z;
+    uint mask = 0;
+    if (q.x <= qMax) mask |= 1u;
+    if (q.y <= qMax) mask |= 2u;
+    if (q.z <= qMax) mask |= 4u;
+    if (q.w <= qMax) mask |= 8u;
+    return mask;
+}
+
+// Fast tile test using center + expanded radius (conservative)
+inline bool ellipseTileFastTest(float2 center, float3 conic, float qMax,
+                                 float tileCenterX, float tileCenterY,
+                                 float expandedQMax) {
+    float dx = tileCenterX - center.x;
+    float dy = tileCenterY - center.y;
+    float q = dx * dx * conic.x + 2.0f * dx * dy * conic.y + dy * dy * conic.z;
+    return q <= expandedQMax;
+}
+
+template <typename MeansT, typename ConicT, typename OpacityT>
+kernel void gaussianCoveragePreciseKernel(
+    const device int4* bounds [[buffer(0)]],
+    device uint* coverageCounts [[buffer(1)]],
+    const device OpacityT* opacities [[buffer(2)]],
+    constant CoverageParams& params [[buffer(3)]],
+    const device MeansT* means [[buffer(4)]],
+    const device ConicT* conics [[buffer(5)]],
+    uint gaussianIdx [[threadgroup_position_in_grid]],
+    uint localIdx [[thread_index_in_threadgroup]]
+) {
+    if (gaussianIdx >= params.gaussianCount) {
+        return;
+    }
+
+    // Thread 0 loads gaussian data to shared memory
+    threadgroup float2 sharedCenter;
+    threadgroup float3 sharedConic;
+    threadgroup float sharedQMax;
+    threadgroup int4 sharedRect;
+    threadgroup uint sharedAabbCount;
+    threadgroup float sharedTileW;
+    threadgroup float sharedTileH;
+
+    if (localIdx == 0) {
+        float alpha = float(opacities[gaussianIdx]);
+        sharedRect = bounds[gaussianIdx];
+
+        int width = sharedRect.y - sharedRect.x + 1;
+        int height = sharedRect.w - sharedRect.z + 1;
+        sharedAabbCount = (width > 0 && height > 0) ? uint(width * height) : 0u;
+
+        if (alpha < 1e-4f || sharedAabbCount == 0u) {
+            sharedQMax = 0.0f;
+        } else if (sharedAabbCount <= PRECISE_THRESHOLD_TILES) {
+            // Small AABB - use AABB count directly
+            sharedQMax = -1.0f;  // Signal to use AABB count
+        } else {
+            sharedCenter = float2(means[gaussianIdx]);
+            ConicT conicData = conics[gaussianIdx];
+            sharedConic = float3(conicData.x, conicData.y, conicData.z);
+            sharedQMax = computeQMax(alpha, FLASHGS_TAU);
+            sharedTileW = float(params.tileWidth);
+            sharedTileH = float(params.tileHeight);
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // Early exit cases
+    if (sharedQMax == 0.0f) {
+        if (localIdx == 0) {
+            coverageCounts[gaussianIdx] = 0u;
+        }
+        return;
+    }
+    if (sharedQMax < 0.0f) {
+        // Small AABB - use AABB count
+        if (localIdx == 0) {
+            coverageCounts[gaussianIdx] = sharedAabbCount;
+        }
+        return;
+    }
+
+    // Each thread tests a subset of tiles
+    uint totalTiles = sharedAabbCount;
+    uint myCount = 0u;
+
+    int minTX = sharedRect.x;
+    int minTY = sharedRect.z;
+    int width = sharedRect.y - sharedRect.x + 1;
+
+    // Precompute values for fast tile tests
+    float halfTileW = sharedTileW * 0.5f;
+    float halfTileH = sharedTileH * 0.5f;
+    // Expand qMax by tile diagonal for quick rejection test
+    float tileDiag = sqrt(halfTileW * halfTileW + halfTileH * halfTileH);
+    float maxConic = max(sharedConic.x, sharedConic.z);
+    float expand = tileDiag * sqrt(maxConic);
+    float qMaxExpanded = sharedQMax + 2.0f * expand * sqrt(sharedQMax) + expand * expand;
+
+    // Grid-stride loop: each thread handles tiles [localIdx, localIdx+TG_SIZE, localIdx+2*TG_SIZE, ...]
+    for (uint tileIdx = localIdx; tileIdx < totalTiles; tileIdx += PRECISE_TG_SIZE) {
+        int localY = int(tileIdx) / width;
+        int localX = int(tileIdx) % width;
+        int tx = minTX + localX;
+        int ty = minTY + localY;
+
+        // Fast test: check tile center against expanded ellipse
+        float tileCenterX = (float(tx) + 0.5f) * sharedTileW;
+        float tileCenterY = (float(ty) + 0.5f) * sharedTileH;
+        float dx = tileCenterX - sharedCenter.x;
+        float dy = tileCenterY - sharedCenter.y;
+        float q = dx * dx * sharedConic.x + 2.0f * dx * dy * sharedConic.y + dy * dy * sharedConic.z;
+
+        // Quick accept: tile center inside original ellipse
+        if (q <= sharedQMax) {
+            myCount++;
+            continue;
+        }
+        // Quick reject: tile center outside expanded ellipse
+        if (q > qMaxExpanded) {
+            continue;
+        }
+        // Boundary case: do full intersection test
+        float tileMinX = float(tx) * sharedTileW;
+        float tileMinY = float(ty) * sharedTileH;
+        float tileMaxX = tileMinX + sharedTileW;
+        float tileMaxY = tileMinY + sharedTileH;
+
+        if (ellipseIntersectsTile(sharedCenter, sharedConic, sharedQMax, tileMinX, tileMinY, tileMaxX, tileMaxY)) {
+            myCount++;
+        }
+    }
+
+    // Pure SIMD reduction - single simd group, no shared memory or barriers needed
+    uint total = simd_sum(myCount);
+    if (localIdx == 0) {
+        coverageCounts[gaussianIdx] = total;
+    }
+}
+
+#define instantiate_gaussianCoveragePreciseKernel(name, MeansT, ConicT, OpacityT) \
+    template [[host_name("gaussianCoveragePreciseKernel_" #name)]] \
+    kernel void gaussianCoveragePreciseKernel<MeansT, ConicT, OpacityT>( \
+        const device int4* bounds [[buffer(0)]], \
+        device uint* coverageCounts [[buffer(1)]], \
+        const device OpacityT* opacities [[buffer(2)]], \
+        constant CoverageParams& params [[buffer(3)]], \
+        const device MeansT* means [[buffer(4)]], \
+        const device ConicT* conics [[buffer(5)]], \
+        uint gaussianIdx [[threadgroup_position_in_grid]], \
+        uint localIdx [[thread_index_in_threadgroup]]);
+
+instantiate_gaussianCoveragePreciseKernel(float, float2, float4, float)
+instantiate_gaussianCoveragePreciseKernel(half, half2, half4, half)
+
+#undef instantiate_gaussianCoveragePreciseKernel
+
 kernel void coveragePrefixScanKernel(
     const device uint* input_data [[buffer(0)]],
     device uint* output_data [[buffer(1)]],
@@ -1934,6 +2198,283 @@ kernel void scatterAssignmentsBalancedKernel(
     tileIds[idx] = tileId;
     tileIndices[idx] = int(gaussianIdx);
 }
+
+///////////////////////////////////////////////////////////////////////////////
+// FlashGS Precise Scatter Kernels - only write tiles that actually intersect
+// Parallel version: one threadgroup per gaussian, threads cooperatively test and write tiles
+///////////////////////////////////////////////////////////////////////////////
+
+template <typename MeansT, typename ConicT, typename OpacityT>
+kernel void scatterAssignmentsPreciseKernel(
+    const device int4* bounds [[buffer(0)]],
+    const device uint* offsets [[buffer(1)]],
+    device int* tileIndices [[buffer(2)]],
+    device int* tileIds [[buffer(3)]],
+    constant ScatterParams& params [[buffer(4)]],
+    const device TileAssignmentHeader* header [[buffer(5)]],
+    const device MeansT* means [[buffer(6)]],
+    const device ConicT* conics [[buffer(7)]],
+    const device OpacityT* opacities [[buffer(8)]],
+    uint gaussianIdx [[threadgroup_position_in_grid]],
+    uint localIdx [[thread_index_in_threadgroup]]
+) {
+    if (gaussianIdx >= params.gaussianCount) {
+        return;
+    }
+
+    // Shared gaussian data
+    threadgroup float2 sharedCenter;
+    threadgroup float3 sharedConic;
+    threadgroup float sharedQMax;
+    threadgroup int4 sharedRect;
+    threadgroup uint sharedAabbCount;
+    threadgroup uint sharedBaseOffset;
+    threadgroup uint sharedTilesX;
+    threadgroup float sharedTileW;
+    threadgroup float sharedTileH;
+    threadgroup uint sharedMaxAssignments;
+
+    // Atomic write counter within threadgroup
+    threadgroup atomic_uint writeCounter;
+
+    if (localIdx == 0) {
+        float alpha = float(opacities[gaussianIdx]);
+        sharedRect = bounds[gaussianIdx];
+        sharedBaseOffset = offsets[gaussianIdx];
+        sharedTilesX = params.tilesX;
+        sharedMaxAssignments = header[0].maxAssignments;
+
+        int width = sharedRect.y - sharedRect.x + 1;
+        int height = sharedRect.w - sharedRect.z + 1;
+        sharedAabbCount = (width > 0 && height > 0) ? uint(width * height) : 0u;
+
+        if (alpha < 1e-4f || sharedAabbCount == 0u) {
+            sharedQMax = 0.0f;
+        } else if (sharedAabbCount <= PRECISE_THRESHOLD_TILES) {
+            sharedQMax = -1.0f;  // Signal fast path
+        } else {
+            sharedCenter = float2(means[gaussianIdx]);
+            ConicT conicData = conics[gaussianIdx];
+            sharedConic = float3(conicData.x, conicData.y, conicData.z);
+            sharedQMax = computeQMax(alpha, FLASHGS_TAU);
+            sharedTileW = float(params.tileWidth);
+            sharedTileH = float(params.tileHeight);
+        }
+        atomic_store_explicit(&writeCounter, 0u, memory_order_relaxed);
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // Early exit
+    if (sharedQMax == 0.0f) {
+        return;
+    }
+
+    uint totalTiles = sharedAabbCount;
+    int minTX = sharedRect.x;
+    int minTY = sharedRect.z;
+    int width = sharedRect.y - sharedRect.x + 1;
+
+    // Fast path for small AABBs - direct write (no intersection test)
+    if (sharedQMax < 0.0f) {
+        for (uint tileIdx = localIdx; tileIdx < totalTiles; tileIdx += PRECISE_TG_SIZE) {
+            int localY = int(tileIdx) / width;
+            int localX = int(tileIdx) % width;
+            int tx = minTX + localX;
+            int ty = minTY + localY;
+
+            uint writePos = sharedBaseOffset + tileIdx;
+            if (writePos < sharedMaxAssignments) {
+                tileIds[writePos] = ty * int(sharedTilesX) + tx;
+                tileIndices[writePos] = int(gaussianIdx);
+            }
+        }
+        return;
+    }
+
+    // Precompute values for fast tile tests
+    float halfTileW = sharedTileW * 0.5f;
+    float halfTileH = sharedTileH * 0.5f;
+    float tileDiag = sqrt(halfTileW * halfTileW + halfTileH * halfTileH);
+    float maxConic = max(sharedConic.x, sharedConic.z);
+    float expand = tileDiag * sqrt(maxConic);
+    float qMaxExpanded = sharedQMax + 2.0f * expand * sqrt(sharedQMax) + expand * expand;
+
+    // Precise path - test and write in parallel with fast accept/reject
+    for (uint tileIdx = localIdx; tileIdx < totalTiles; tileIdx += PRECISE_TG_SIZE) {
+        int localY = int(tileIdx) / width;
+        int localX = int(tileIdx) % width;
+        int tx = minTX + localX;
+        int ty = minTY + localY;
+
+        // Fast test: check tile center
+        float tileCenterX = (float(tx) + 0.5f) * sharedTileW;
+        float tileCenterY = (float(ty) + 0.5f) * sharedTileH;
+        float dx = tileCenterX - sharedCenter.x;
+        float dy = tileCenterY - sharedCenter.y;
+        float q = dx * dx * sharedConic.x + 2.0f * dx * dy * sharedConic.y + dy * dy * sharedConic.z;
+
+        bool intersects = false;
+        if (q <= sharedQMax) {
+            // Quick accept: tile center inside ellipse
+            intersects = true;
+        } else if (q <= qMaxExpanded) {
+            // Boundary case: do full test
+            float tileMinX = float(tx) * sharedTileW;
+            float tileMinY = float(ty) * sharedTileH;
+            float tileMaxX = tileMinX + sharedTileW;
+            float tileMaxY = tileMinY + sharedTileH;
+            intersects = ellipseIntersectsTile(sharedCenter, sharedConic, sharedQMax, tileMinX, tileMinY, tileMaxX, tileMaxY);
+        }
+        // else: quick reject (q > qMaxExpanded)
+
+        if (intersects) {
+            uint localWriteIdx = atomic_fetch_add_explicit(&writeCounter, 1u, memory_order_relaxed);
+            uint writePos = sharedBaseOffset + localWriteIdx;
+            if (writePos < sharedMaxAssignments) {
+                tileIds[writePos] = ty * int(sharedTilesX) + tx;
+                tileIndices[writePos] = int(gaussianIdx);
+            }
+        }
+    }
+}
+
+#define instantiate_scatterAssignmentsPreciseKernel(name, MeansT, ConicT, OpacityT) \
+    template [[host_name("scatterAssignmentsPreciseKernel_" #name)]] \
+    kernel void scatterAssignmentsPreciseKernel<MeansT, ConicT, OpacityT>( \
+        const device int4* bounds [[buffer(0)]], \
+        const device uint* offsets [[buffer(1)]], \
+        device int* tileIndices [[buffer(2)]], \
+        device int* tileIds [[buffer(3)]], \
+        constant ScatterParams& params [[buffer(4)]], \
+        const device TileAssignmentHeader* header [[buffer(5)]], \
+        const device MeansT* means [[buffer(6)]], \
+        const device ConicT* conics [[buffer(7)]], \
+        const device OpacityT* opacities [[buffer(8)]], \
+        uint gaussianIdx [[threadgroup_position_in_grid]], \
+        uint localIdx [[thread_index_in_threadgroup]]);
+
+instantiate_scatterAssignmentsPreciseKernel(float, float2, float4, float)
+instantiate_scatterAssignmentsPreciseKernel(half, half2, half4, half)
+
+#undef instantiate_scatterAssignmentsPreciseKernel
+
+// Load-balanced precise scatter: each thread handles one output slot
+// Uses binary search + enumeration to find the correct tile
+template <typename MeansT, typename ConicT, typename OpacityT>
+kernel void scatterAssignmentsPreciseBalancedKernel(
+    const device int4* bounds [[buffer(0)]],
+    const device uint* offsets [[buffer(1)]],
+    device int* tileIndices [[buffer(2)]],
+    device int* tileIds [[buffer(3)]],
+    constant ScatterParams& params [[buffer(4)]],
+    const device TileAssignmentHeader* header [[buffer(5)]],
+    const device MeansT* means [[buffer(6)]],
+    const device ConicT* conics [[buffer(7)]],
+    const device OpacityT* opacities [[buffer(8)]],
+    uint idx [[thread_position_in_grid]]
+) {
+    uint totalAssignments = header[0].totalAssignments;
+    if (idx >= totalAssignments) {
+        return;
+    }
+
+    // Binary search to find gaussian that owns this slot
+    uint lo = 0;
+    uint hi = params.gaussianCount;
+    while (lo < hi) {
+        uint mid = (lo + hi + 1) >> 1;
+        if (offsets[mid] <= idx) {
+            lo = mid;
+        } else {
+            hi = mid - 1;
+        }
+    }
+    uint gaussianIdx = lo;
+
+    // Local slot within this gaussian's tiles
+    uint localSlot = idx - offsets[gaussianIdx];
+
+    // Get bounds
+    int4 rect = bounds[gaussianIdx];
+    int minX = rect.x;
+    int maxX = rect.y;
+    int minY = rect.z;
+    int maxY = rect.w;
+
+    int width = maxX - minX + 1;
+    int height = maxY - minY + 1;
+    uint aabbCount = uint(width * height);
+
+    // Fast path for small AABBs - direct index calculation
+    if (aabbCount <= PRECISE_THRESHOLD_TILES) {
+        int localY = int(localSlot) / width;
+        int localX = int(localSlot) % width;
+        int tx = minX + localX;
+        int ty = minY + localY;
+        int tileId = ty * int(params.tilesX) + tx;
+        tileIds[idx] = tileId;
+        tileIndices[idx] = int(gaussianIdx);
+        return;
+    }
+
+    // Load gaussian params for precise test
+    float alpha = float(opacities[gaussianIdx]);
+    float2 center = float2(means[gaussianIdx]);
+    ConicT conicData = conics[gaussianIdx];
+    float3 conic = float3(conicData.x, conicData.y, conicData.z);
+    float qMax = computeQMax(alpha, FLASHGS_TAU);
+
+    float tileW = float(params.tileWidth);
+    float tileH = float(params.tileHeight);
+
+    // Enumerate tiles until we hit localSlot
+    uint count = 0;
+    int foundTX = 0, foundTY = 0;
+    bool found = false;
+
+    for (int ty = minY; ty <= maxY && !found; ++ty) {
+        float tileMinY = float(ty) * tileH;
+        float tileMaxY = tileMinY + tileH;
+
+        for (int tx = minX; tx <= maxX && !found; ++tx) {
+            float tileMinX = float(tx) * tileW;
+            float tileMaxX = tileMinX + tileW;
+
+            if (ellipseIntersectsTile(center, conic, qMax, tileMinX, tileMinY, tileMaxX, tileMaxY)) {
+                if (count == localSlot) {
+                    foundTX = tx;
+                    foundTY = ty;
+                    found = true;
+                }
+                count++;
+            }
+        }
+    }
+
+    // Write output
+    int tileId = foundTY * int(params.tilesX) + foundTX;
+    tileIds[idx] = tileId;
+    tileIndices[idx] = int(gaussianIdx);
+}
+
+#define instantiate_scatterAssignmentsPreciseBalancedKernel(name, MeansT, ConicT, OpacityT) \
+    template [[host_name("scatterAssignmentsPreciseBalancedKernel_" #name)]] \
+    kernel void scatterAssignmentsPreciseBalancedKernel<MeansT, ConicT, OpacityT>( \
+        const device int4* bounds [[buffer(0)]], \
+        const device uint* offsets [[buffer(1)]], \
+        device int* tileIndices [[buffer(2)]], \
+        device int* tileIds [[buffer(3)]], \
+        constant ScatterParams& params [[buffer(4)]], \
+        const device TileAssignmentHeader* header [[buffer(5)]], \
+        const device MeansT* means [[buffer(6)]], \
+        const device ConicT* conics [[buffer(7)]], \
+        const device OpacityT* opacities [[buffer(8)]], \
+        uint idx [[thread_position_in_grid]]);
+
+instantiate_scatterAssignmentsPreciseBalancedKernel(float, float2, float4, float)
+instantiate_scatterAssignmentsPreciseBalancedKernel(half, half2, half4, half)
+
+#undef instantiate_scatterAssignmentsPreciseBalancedKernel
 
 kernel void prepareAssignmentDispatchKernel(
     device TileAssignmentHeader* header [[buffer(0)]],

@@ -121,11 +121,19 @@ public final class Renderer: @unchecked Sendable {
     public let useMultiPixelRendering: Bool
     public var isMultiPixelAvailable: Bool { self.renderEncoder.isMultiPixelAvailable }
 
+    /// FlashGS-style precise ellipse-tile intersection
+    /// Eliminates tiles in AABB that don't actually intersect the gaussian ellipse
+    /// Reduces wasted gaussian-tile pairs, especially for elongated/rotated gaussians
+    public let usePreciseIntersection: Bool
+    public var isPreciseIntersectionAvailable: Bool {
+        self.coverageEncoder.isPreciseAvailable && self.scatterEncoder.isPreciseAvailable
+    }
+
     /// Recommended tile size for current rendering mode
     public var recommendedTileWidth: UInt32 { useMultiPixelRendering ? 32 : 16 }
     public var recommendedTileHeight: UInt32 { useMultiPixelRendering ? 16 : 16 }
 
-    public init(precision: Precision = .float32, useIndirectBitonic: Bool = false, sortAlgorithm: SortAlgorithm = .radix, useMultiPixelRendering: Bool = false) {
+    public init(precision: Precision = .float32, useIndirectBitonic: Bool = false, sortAlgorithm: SortAlgorithm = .radix, useMultiPixelRendering: Bool = false, usePreciseIntersection: Bool = false) {
         guard let device = MTLCreateSystemDefaultDevice() else {
             fatalError("Metal device unavailable")
         }
@@ -171,6 +179,7 @@ public final class Renderer: @unchecked Sendable {
         self.precision = precision
         self.sortAlgorithm = sortAlgorithm
         self.useMultiPixelRendering = useMultiPixelRendering
+        self.usePreciseIntersection = usePreciseIntersection
 
         // Initialize frame slots
         for _ in 0..<maxInFlightFrames {
@@ -875,31 +884,72 @@ public final class Renderer: @unchecked Sendable {
             precision: precision
         )
         
-        self.coverageEncoder.encode(
-            commandBuffer: commandBuffer,
-            gaussianCount: gaussianCount,
-            boundsBuffer: frame.boundsBuffer!,
-            opacitiesBuffer: gaussianBuffers.opacities,
-            coverageBuffer: frame.coverageBuffer!,
-            offsetsBuffer: frame.offsetsBuffer!,
-            partialSumsBuffer: frame.partialSumsBuffer!,
-            tileAssignmentHeader: frame.tileAssignmentHeader!,
-            precision: precision
-        )
-        
-        
-        // Load-balanced scatter (binary search) for better GPU utilization
-        self.scatterEncoder.encodeBalanced(
-            commandBuffer: commandBuffer,
-            gaussianCount: gaussianCount,
-            tilesX: Int(params.tilesX),
-            offsetsBuffer: frame.offsetsBuffer!,
-            dispatchBuffer: frame.scatterDispatchBuffer!,
-            boundsBuffer: frame.boundsBuffer!,
-            tileIndicesBuffer: frame.tileIndices!,
-            tileIdsBuffer: frame.tileIds!,
-            tileAssignmentHeader: frame.tileAssignmentHeader!
-        )
+        // Coverage: count tiles per gaussian
+        if self.usePreciseIntersection && self.isPreciseIntersectionAvailable {
+            // FlashGS precise ellipse-tile intersection
+            self.coverageEncoder.encodePrecise(
+                commandBuffer: commandBuffer,
+                gaussianCount: gaussianCount,
+                tileWidth: Int(params.tileWidth),
+                tileHeight: Int(params.tileHeight),
+                boundsBuffer: frame.boundsBuffer!,
+                opacitiesBuffer: gaussianBuffers.opacities,
+                meansBuffer: gaussianBuffers.means,
+                conicsBuffer: gaussianBuffers.conics,
+                coverageBuffer: frame.coverageBuffer!,
+                offsetsBuffer: frame.offsetsBuffer!,
+                partialSumsBuffer: frame.partialSumsBuffer!,
+                tileAssignmentHeader: frame.tileAssignmentHeader!,
+                precision: precision
+            )
+        } else {
+            self.coverageEncoder.encode(
+                commandBuffer: commandBuffer,
+                gaussianCount: gaussianCount,
+                boundsBuffer: frame.boundsBuffer!,
+                opacitiesBuffer: gaussianBuffers.opacities,
+                coverageBuffer: frame.coverageBuffer!,
+                offsetsBuffer: frame.offsetsBuffer!,
+                partialSumsBuffer: frame.partialSumsBuffer!,
+                tileAssignmentHeader: frame.tileAssignmentHeader!,
+                precision: precision
+            )
+        }
+
+        // Scatter: write gaussian-tile pairs
+        if self.usePreciseIntersection && self.isPreciseIntersectionAvailable {
+            // FlashGS precise scatter (parallel: one threadgroup per gaussian)
+            self.scatterEncoder.encodePrecise(
+                commandBuffer: commandBuffer,
+                gaussianCount: gaussianCount,
+                tilesX: Int(params.tilesX),
+                tileWidth: Int(params.tileWidth),
+                tileHeight: Int(params.tileHeight),
+                offsetsBuffer: frame.offsetsBuffer!,
+                dispatchBuffer: frame.scatterDispatchBuffer!,
+                boundsBuffer: frame.boundsBuffer!,
+                tileIndicesBuffer: frame.tileIndices!,
+                tileIdsBuffer: frame.tileIds!,
+                tileAssignmentHeader: frame.tileAssignmentHeader!,
+                meansBuffer: gaussianBuffers.means,
+                conicsBuffer: gaussianBuffers.conics,
+                opacitiesBuffer: gaussianBuffers.opacities,
+                precision: precision
+            )
+        } else {
+            // Load-balanced scatter (binary search) for better GPU utilization
+            self.scatterEncoder.encodeBalanced(
+                commandBuffer: commandBuffer,
+                gaussianCount: gaussianCount,
+                tilesX: Int(params.tilesX),
+                offsetsBuffer: frame.offsetsBuffer!,
+                dispatchBuffer: frame.scatterDispatchBuffer!,
+                boundsBuffer: frame.boundsBuffer!,
+                tileIndicesBuffer: frame.tileIndices!,
+                tileIdsBuffer: frame.tileIds!,
+                tileAssignmentHeader: frame.tileAssignmentHeader!
+            )
+        }
         
         return TileAssignmentBuffers(
             tileCount: tileCount,

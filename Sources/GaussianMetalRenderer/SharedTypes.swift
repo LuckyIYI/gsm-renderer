@@ -110,11 +110,15 @@ public struct TileBoundsParamsSwift {
 
 public struct CoverageParamsSwift {
     public var gaussianCount: UInt32
+    public var tileWidth: UInt32 = 0   // For precise intersection (optional, 0 = use AABB only)
+    public var tileHeight: UInt32 = 0  // For precise intersection
 }
 
 public struct ScatterParamsSwift {
     public var gaussianCount: UInt32
     public var tilesX: UInt32
+    public var tileWidth: UInt32 = 0   // For precise intersection
+    public var tileHeight: UInt32 = 0  // For precise intersection
 }
 
 public struct ScatterDispatchParamsSwift {

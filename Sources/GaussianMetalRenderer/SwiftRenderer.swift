@@ -841,7 +841,8 @@ public final class Renderer: @unchecked Sendable {
         )
         
         
-        self.scatterEncoder.encode(
+        // Load-balanced scatter (binary search) for better GPU utilization
+        self.scatterEncoder.encodeBalanced(
             commandBuffer: commandBuffer,
             gaussianCount: gaussianCount,
             tilesX: Int(params.tilesX),

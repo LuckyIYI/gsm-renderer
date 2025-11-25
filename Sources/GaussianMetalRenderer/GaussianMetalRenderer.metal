@@ -582,6 +582,8 @@ kernel void renderTiles(
     threadgroup half3 shColors[RENDER_BATCH_SIZE_BUF];
     threadgroup half shOpacities[RENDER_BATCH_SIZE_BUF];
     threadgroup half shDepths[RENDER_BATCH_SIZE_BUF];
+    // Per-simd-group done flags (8 simd groups in 16x16 tile)
+    threadgroup bool simdDoneFlags[8];
 
     uint activeCount = activeTileCount[0];
     uint activeIdx = tileCoord.x;
@@ -611,6 +613,15 @@ kernel void renderTiles(
     GaussianHeader header = headers[tileId];
     uint start = header.offset;
     uint count = header.count;
+
+    // Get simd group index (0-7 for 256 threads)
+    uint simdGroupIdx = threadIdx / 32;
+
+    // Initialize done flags
+    if (threadIdx < 8) {
+        simdDoneFlags[threadIdx] = false;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
 
     // Process gaussians in batches using shared memory
     for (uint batch = 0; batch < count; batch += RENDER_BATCH_SIZE_BUF) {
@@ -663,7 +674,20 @@ kernel void renderTiles(
             }
         }
 
+        // Check if all simd groups are done (tile-level early exit)
+        bool pixelDone = (trans < 1e-3f) || !inBounds;
+        bool simdDone = simd_all(pixelDone);
+        if (simdDone && simd_is_first()) {
+            simdDoneFlags[simdGroupIdx] = true;
+        }
         threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        // Check all flags (small unrolled loop)
+        bool allDone = simdDoneFlags[0] && simdDoneFlags[1] && simdDoneFlags[2] && simdDoneFlags[3] &&
+                       simdDoneFlags[4] && simdDoneFlags[5] && simdDoneFlags[6] && simdDoneFlags[7];
+        if (allDone) {
+            break;
+        }
     }
 
     if (inBounds) {
@@ -732,6 +756,8 @@ kernel void renderTilesDirect(
     threadgroup half3 shColors[RENDER_BATCH_SIZE_BUF];
     threadgroup half shOpacities[RENDER_BATCH_SIZE_BUF];
     threadgroup half shDepths[RENDER_BATCH_SIZE_BUF];
+    // Per-simd-group done flags (8 simd groups in 16x16 tile)
+    threadgroup bool simdDoneFlags[8];
 
     // Map threadgroup index to tile via activeTiles indirection
     uint tileId = activeTiles[tgPos.x];
@@ -756,6 +782,15 @@ kernel void renderTilesDirect(
     GaussianHeader header = headers[tileId];
     uint start = header.offset;
     uint count = header.count;
+
+    // Get simd group index (0-7 for 256 threads)
+    uint simdGroupIdx = threadIdx / 32;
+
+    // Initialize done flags
+    if (threadIdx < 8) {
+        simdDoneFlags[threadIdx] = false;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
 
     // Process gaussians in batches using shared memory
     for (uint batch = 0; batch < count; batch += RENDER_BATCH_SIZE_BUF) {
@@ -809,8 +844,20 @@ kernel void renderTilesDirect(
             }
         }
 
-        // Sync before loading next batch
+        // Check if all simd groups are done (tile-level early exit)
+        bool pixelDone = (trans < 1e-3f) || !inBounds;
+        bool simdDone = simd_all(pixelDone);
+        if (simdDone && simd_is_first()) {
+            simdDoneFlags[simdGroupIdx] = true;
+        }
         threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        // Check all flags (small unrolled loop)
+        bool allDone = simdDoneFlags[0] && simdDoneFlags[1] && simdDoneFlags[2] && simdDoneFlags[3] &&
+                       simdDoneFlags[4] && simdDoneFlags[5] && simdDoneFlags[6] && simdDoneFlags[7];
+        if (allDone) {
+            break;
+        }
     }
 
     if (inBounds) {
@@ -1625,6 +1672,24 @@ kernel void scatterDispatchKernel(
     dispatchArgs[2] = 1u;
 }
 
+// Dispatch kernel for load-balanced scatter - reads totalAssignments from header
+kernel void scatterBalancedDispatchKernel(
+    const device TileAssignmentHeader* header [[buffer(0)]],
+    device uint* dispatchArgs [[buffer(1)]],
+    constant uint& threadgroupWidth [[buffer(2)]],
+    uint gid [[thread_position_in_grid]]
+) {
+    if (gid != 0) {
+        return;
+    }
+    uint totalAssignments = header[0].totalAssignments;
+    uint width = max(threadgroupWidth, 1u);
+    uint groups = (totalAssignments + width - 1u) / width;
+    dispatchArgs[0] = groups;
+    dispatchArgs[1] = 1u;
+    dispatchArgs[2] = 1u;
+}
+
 kernel void scatterAssignmentsKernel(
     const device int4* bounds [[buffer(0)]],
     const device uint* offsets [[buffer(1)]],
@@ -1660,6 +1725,59 @@ kernel void scatterAssignmentsKernel(
             writeIndex++;
         }
     }
+}
+
+// Load-balanced scatter: each thread handles exactly one output slot
+// Uses binary search to find owning gaussian - perfect load balancing
+kernel void scatterAssignmentsBalancedKernel(
+    const device int4* bounds [[buffer(0)]],
+    const device uint* offsets [[buffer(1)]],  // Exclusive prefix sum, offsets[count] = total
+    device int* tileIndices [[buffer(2)]],
+    device int* tileIds [[buffer(3)]],
+    constant ScatterParams& params [[buffer(4)]],
+    const device TileAssignmentHeader* header [[buffer(5)]],
+    uint idx [[thread_position_in_grid]]
+) {
+    uint totalAssignments = header[0].totalAssignments;
+    if (idx >= totalAssignments) {
+        return;
+    }
+
+    // Binary search to find gaussian that owns this slot
+    // Find largest gaussianIdx where offsets[gaussianIdx] <= idx
+    uint lo = 0;
+    uint hi = params.gaussianCount;
+    while (lo < hi) {
+        uint mid = (lo + hi + 1) >> 1;
+        if (offsets[mid] <= idx) {
+            lo = mid;
+        } else {
+            hi = mid - 1;
+        }
+    }
+    uint gaussianIdx = lo;
+
+    // Local slot within this gaussian's tiles
+    uint localSlot = idx - offsets[gaussianIdx];
+
+    // Get bounds for this gaussian
+    int4 rect = bounds[gaussianIdx];
+    int minX = rect.x;
+    int maxX = rect.y;
+    int minY = rect.z;
+    // maxY unused but available in rect.w
+
+    // Convert local slot to (tx, ty)
+    int width = maxX - minX + 1;
+    int localY = int(localSlot) / width;
+    int localX = int(localSlot) % width;
+    int tx = minX + localX;
+    int ty = minY + localY;
+
+    // Write output
+    int tileId = ty * int(params.tilesX) + tx;
+    tileIds[idx] = tileId;
+    tileIndices[idx] = int(gaussianIdx);
 }
 
 kernel void prepareAssignmentDispatchKernel(
@@ -2066,14 +2184,15 @@ kernel void radixScanBlocksKernel(
     }
 }
 
-kernel void radixExclusiveScanKernel(
+// Parallel exclusive scan - 256 threads, up to 8192 elements
+#define SCAN_GRAIN 32
+
+kernel void radixExclusiveScanKernel2(
     device uint*                       block_sums  [[buffer(0)]],
     const device TileAssignmentHeader* header      [[buffer(1)]],
-    ushort                             local_id    [[thread_index_in_threadgroup]]
+    ushort                             lid         [[thread_position_in_threadgroup]]
 ) {
-    if (local_id != 0) {
-        return;
-    }
+    threadgroup uint shared[BLOCK_SIZE];
 
     const uint elementsPerBlock = BLOCK_SIZE * GRAIN_SIZE;
     uint paddedCount   = header[0].paddedCount;
@@ -2081,13 +2200,99 @@ kernel void radixExclusiveScanKernel(
     uint num_hist_elem = histGridSize * RADIX;
     uint num_block_sums = (num_hist_elem + BLOCK_SIZE - 1u) / BLOCK_SIZE;
 
-    uint running = 0u;
-    for (uint i = 0u; i < num_block_sums; ++i) {
-        uint v = block_sums[i];
-        block_sums[i] = running;
-        running += v;
+    uint elems_per_thread = (num_block_sums + BLOCK_SIZE - 1u) / BLOCK_SIZE;
+    elems_per_thread = min(elems_per_thread, (uint)SCAN_GRAIN);
+
+    // Load and sum (array sized for max SCAN_GRAIN elements per thread)
+    uint local_vals[SCAN_GRAIN];
+    uint local_sum = 0u;
+    uint thread_base = lid * elems_per_thread;
+
+    for (uint i = 0u; i < elems_per_thread; ++i) {
+        uint idx = thread_base + i;
+        uint val = (idx < num_block_sums) ? block_sums[idx] : 0u;
+        local_vals[i] = val;
+        local_sum += val;
+    }
+
+    // Blelloch scan of per-thread sums
+    shared[lid] = local_sum;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    for (uint s = 1u; s < BLOCK_SIZE; s *= 2u) {
+        uint idx = (lid + 1u) * s * 2u - 1u;
+        if (idx < BLOCK_SIZE) shared[idx] += shared[idx - s];
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    if (lid == 0u) shared[BLOCK_SIZE - 1u] = 0u;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    for (uint s = BLOCK_SIZE / 2u; s > 0u; s /= 2u) {
+        uint idx = (lid + 1u) * s * 2u - 1u;
+        if (idx < BLOCK_SIZE) {
+            uint t = shared[idx - s];
+            shared[idx - s] = shared[idx];
+            shared[idx] += t;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    // Write back
+    uint running = shared[lid];
+    for (uint i = 0u; i < elems_per_thread; ++i) {
+        uint idx = thread_base + i;
+        if (idx < num_block_sums) {
+            block_sums[idx] = running;
+            running += local_vals[i];
+        }
     }
 }
+
+// Parallel exclusive scan using helper - 256 threads, up to 8192 elements
+// Each thread handles SCAN_GRAIN elements, sums them, scans sums, then applies back
+kernel void radixExclusiveScanKernel(
+    device uint*                       block_sums  [[buffer(0)]],
+    const device TileAssignmentHeader* header      [[buffer(1)]],
+    threadgroup uint*                  shared_mem  [[threadgroup(0)]],
+    ushort                             lid         [[thread_position_in_threadgroup]]
+) {
+
+    const uint elementsPerBlock = BLOCK_SIZE * GRAIN_SIZE;
+    uint paddedCount   = header[0].paddedCount;
+    uint histGridSize  = (paddedCount + elementsPerBlock - 1u) / elementsPerBlock;
+    uint num_hist_elem = histGridSize * RADIX;
+    uint num_block_sums = (num_hist_elem + BLOCK_SIZE - 1u) / BLOCK_SIZE;
+
+    // Calculate elements per thread (up to SCAN_GRAIN)
+    uint elems_per_thread = (num_block_sums + BLOCK_SIZE - 1u) / BLOCK_SIZE;
+    elems_per_thread = min(elems_per_thread, (uint)SCAN_GRAIN);
+
+    // Load multiple elements and compute local sum
+    uint local_vals[SCAN_GRAIN];
+    uint local_sum = 0u;
+    uint thread_base = lid * elems_per_thread;
+
+    for (uint i = 0u; i < elems_per_thread; ++i) {
+        uint idx = thread_base + i;
+        uint val = (idx < num_block_sums) ? block_sums[idx] : 0u;
+        local_vals[i] = val;
+        local_sum += val;
+    }
+
+    uint scanned_sum = ThreadgroupPrefixScan<SCAN_TYPE_EXCLUSIVE>(local_sum, shared_mem, lid, SumOp<uint>());
+
+    // Write back: each element gets scanned_sum + prefix of local values
+    uint running = scanned_sum;
+    for (uint i = 0u; i < elems_per_thread; ++i) {
+        uint idx = thread_base + i;
+        if (idx < num_block_sums) {
+            block_sums[idx] = running;
+            running += local_vals[i];
+        }
+    }
+}
+
 
 kernel void radixApplyScanOffsetsKernel(
     device const uint*                 hist_flat       [[buffer(0)]],

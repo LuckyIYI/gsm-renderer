@@ -185,19 +185,20 @@ final class RadixSortEncoder {
             encoder.endEncoding()
         }
         
-        // C. Exclusive scan of block sums (single threadgroup, 1 thread)
+        // C. Exclusive scan of block sums (using ThreadgroupPrefixScan helper)
         if let encoder = commandBuffer.makeComputeCommandEncoder() {
             encoder.label = "RadixExclusive_\(digit)"
             encoder.setComputePipelineState(exclusiveScanPipeline)
             encoder.setBuffer(radixBuffers.blockSums, offset: 0, index: 0)
             encoder.setBuffer(header, offset: 0, index: 1)
-            
-            let tg = MTLSize(width: 1, height: 1, depth: 1)
-            encoder.dispatchThreadgroups(
-                indirectBuffer: dispatchArgs,
-                indirectBufferOffset: offsets.exclusive,
-                threadsPerThreadgroup: tg
-            )
+
+            // Allocate threadgroup memory for prefix scan
+            encoder.setThreadgroupMemoryLength(blockSize * MemoryLayout<UInt32>.stride, index: 0)
+
+            // Dispatch one threadgroup with 256 threads
+            let threadsPerScanGroup = MTLSize(width: blockSize, height: 1, depth: 1)
+            let threadgroupsScan = MTLSize(width: 1, height: 1, depth: 1)
+            encoder.dispatchThreadgroups(threadgroupsScan, threadsPerThreadgroup: threadsPerScanGroup)
             encoder.endEncoding()
         }
         

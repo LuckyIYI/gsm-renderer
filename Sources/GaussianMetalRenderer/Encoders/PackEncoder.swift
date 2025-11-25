@@ -36,7 +36,6 @@ final class PackEncoder {
         gaussianBuffers: GaussianInputBuffers,
         orderedBuffers: OrderedBufferSet,
         assignment: TileAssignmentBuffers,
-        totalAssignments: Int,
         dispatchArgs: MTLBuffer,
         dispatchOffset: Int,
         activeTileIndices: MTLBuffer,
@@ -66,11 +65,6 @@ final class PackEncoder {
             encoder.setBuffer(assignment.tileIndices, offset: 0, index: 12)
             encoder.setBuffer(assignment.tileIds, offset: 0, index: 13)
             
-            var packParams = PackParamsSwift(
-                totalAssignments: UInt32(totalAssignments),
-                padding: 0
-            )
-            encoder.setBytes(&packParams, length: MemoryLayout<PackParamsSwift>.stride, index: 14)
             
             let tg = MTLSize(width: self.packThreadgroupSize, height: 1, depth: 1)
             encoder.dispatchThreadgroups(
@@ -86,8 +80,7 @@ final class PackEncoder {
             assignment: assignment,
             orderedHeaders: orderedBuffers.headers,
             activeTileIndices: activeTileIndices,
-            activeTileCount: activeTileCount,
-            totalAssignments: totalAssignments
+            activeTileCount: activeTileCount
         )
     }
 
@@ -98,8 +91,7 @@ final class PackEncoder {
         assignment: TileAssignmentBuffers,
         orderedHeaders: MTLBuffer,
         activeTileIndices: MTLBuffer,
-        activeTileCount: MTLBuffer,
-        totalAssignments: Int
+        activeTileCount: MTLBuffer
     ) {
         // Reset active tile count before header/compaction pass.
         if let blit = commandBuffer.makeBlitCommandEncoder() {
@@ -110,15 +102,12 @@ final class PackEncoder {
         // Headers From Sorted
         if let encoder = commandBuffer.makeComputeCommandEncoder() {
             encoder.label = "HeadersFromSorted"
-            var headerParams = HeaderFromSortedParamsSwift(
-                tileCount: UInt32(assignment.tileCount),
-                totalAssignments: UInt32(totalAssignments)
-            )
+            var tileCount = UInt32(assignment.tileCount)
             encoder.setComputePipelineState(self.headerFromSortedPipeline)
             encoder.setBuffer(sortedKeys, offset: 0, index: 0)
             encoder.setBuffer(orderedHeaders, offset: 0, index: 1)
             encoder.setBuffer(assignment.header, offset: 0, index: 2)
-            encoder.setBytes(&headerParams, length: MemoryLayout<HeaderFromSortedParamsSwift>.stride, index: 3)
+            encoder.setBytes(&tileCount, length: MemoryLayout<UInt32>.size, index: 3)
 
             let threads = MTLSize(width: assignment.tileCount, height: 1, depth: 1)
             let tgWidth = self.headerFromSortedPipeline.threadExecutionWidth

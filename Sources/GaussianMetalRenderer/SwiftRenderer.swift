@@ -977,9 +977,7 @@ public final class Renderer: @unchecked Sendable {
               let sortedIndicesBuffer = self.ensureBuffer(&frame.sortedIndices, length: frame.tileAssignmentPaddedCapacity * MemoryLayout<Int32>.stride, options: .storageModePrivate, label: "SortedIndices")
         else { return nil }
 
-        let headerPtr = assignment.header.contents().bindMemory(to: TileAssignmentHeaderSwift.self, capacity: 1)
-        let totalAssignments = Int(headerPtr.pointee.totalAssignments)
-        let paddedCount = Int(headerPtr.pointee.paddedCount)
+        let paddedCount = frame.tileAssignmentPaddedCapacity
 
         guard let dispatchArgs = frame.dispatchArgs else { return nil }
 
@@ -1067,7 +1065,6 @@ public final class Renderer: @unchecked Sendable {
             gaussianBuffers: gaussianBuffers,
             orderedBuffers: orderedBuffers,
             assignment: assignment,
-            totalAssignments: totalAssignments,
             dispatchArgs: dispatchArgs,
             dispatchOffset: DispatchSlot.pack.rawValue * MemoryLayout<DispatchIndirectArgsSwift>.stride,
             activeTileIndices: frame.activeTileIndices!,

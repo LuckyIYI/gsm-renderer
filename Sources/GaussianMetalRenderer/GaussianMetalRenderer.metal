@@ -333,23 +333,25 @@ inline float2x2 projectCovariance(
     float width,
     float height
 ) {
-    float tz = safeDepthComponent(viewPos.z);
-    float tanHalfY = height / max(2.0f * max(focalY, 1e-4f), 1e-4f);
-    float tanHalfX = width / max(2.0f * max(focalX, 1e-4f), 1e-4f);
-    float clampX = clamp(tz, -tanHalfX * 1.3f, tanHalfX * 1.3f);
-    float clampY = clamp(tz, -tanHalfY * 1.3f, tanHalfY * 1.3f);
-    float tx = viewPos.x / clampX * tz;
-    float ty = viewPos.y / clampY * tz;
-    float invTZ = 1.0f / tz;
-    float invTZ2 = invTZ * invTZ;
-    float3 row0 = float3(focalX * invTZ, 0.0f, -tx * invTZ2 * focalX);
-    float3 row1 = float3(0.0f, focalY * invTZ, -ty * invTZ2 * focalY);
-    float3 row2 = float3(0.0f);
-    float3x3 J = transpose(matrixFromRows(row0, row1, row2));
-    float3x3 temp = J * viewRotation;
-    temp = temp * cov3d;
-    temp = temp * transpose(viewRotation);
-    float3x3 covFull = temp * transpose(J);
+    float tanHalfFovX = width / max(2.0f * max(focalX, 1e-4f), 1e-4f);
+    float tanHalfFovY = height / max(2.0f * max(focalY, 1e-4f), 1e-4f);
+    float limX = 1.3f * tanHalfFovX;
+    float limY = 1.3f * tanHalfFovY;
+
+    float invZ = 1.0f / max(1e-4f, viewPos.z);
+    float invZ2 = invZ * invZ;
+
+    float x = clamp(viewPos.x * invZ, -limX, limX) * viewPos.z;
+    float y = clamp(viewPos.y * invZ, -limY, limY) * viewPos.z;
+
+    float3 col0 = float3(focalX * invZ, 0.0f, 0.0f);
+    float3 col1 = float3(0.0f, focalY * invZ, 0.0f);
+    float3 col2 = float3(-(focalX * x) * invZ2, -(focalY * y) * invZ2, 0.0f);
+    float3x3 J = float3x3(col0, col1, col2);
+
+    float3x3 T = J * viewRotation;
+    float3x3 covFull = T * cov3d * transpose(T);
+
     float2x2 cov2d = float2x2(
         covFull[0][0], covFull[0][1],
         covFull[1][0], covFull[1][1]
@@ -1176,10 +1178,6 @@ struct BitonicParams {
     uint total;
 };
 
-struct HeaderFromSortedParams {
-    uint tileCount;
-    uint totalAssignments;
-};
 
 static inline uint nextPowerOfTwo(uint value) {
     value = max(value, 1u);
@@ -1407,7 +1405,6 @@ kernel void packTileDataKernel(
     const device TileAssignmentHeader* header [[buffer(11)]],
     const device int* tileIndices [[buffer(12)]],
     const device int* tileIds [[buffer(13)]],
-    constant PackParams& params [[buffer(14)]],
     uint gid [[thread_position_in_grid]]
 ) {
     uint total = header->totalAssignments;
@@ -1438,7 +1435,6 @@ kernel void packTileDataKernel(
         const device TileAssignmentHeader* header [[buffer(11)]], \
         const device int* tileIndices [[buffer(12)]], \
         const device int* tileIds [[buffer(13)]], \
-        constant PackParams& params [[buffer(14)]], \
         uint gid [[thread_position_in_grid]] \
     );
 
@@ -1453,10 +1449,10 @@ kernel void buildHeadersFromSortedKernel(
     const device uint2* sortedKeys [[buffer(0)]],
     device GaussianHeader* headers [[buffer(1)]],
     const device TileAssignmentHeader* headerInfo [[buffer(2)]],
-    constant HeaderFromSortedParams& params [[buffer(3)]],
+    constant uint& tileCount [[buffer(3)]],
     uint tile [[thread_position_in_grid]]
 ) {
-    if (tile >= params.tileCount) {
+    if (tile >= tileCount) {
         return;
     }
     uint total = headerInfo->totalAssignments;

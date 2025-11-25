@@ -126,11 +126,6 @@ public struct ScatterDispatchParamsSwift {
     public var gaussianCount: UInt32
 }
 
-public struct HeaderFromSortedParamsSwift {
-    public var tileCount: UInt32
-    public var totalAssignments: UInt32
-}
-
 public struct PackParamsSwift {
     public var totalAssignments: UInt32
     public var padding: UInt32 = 0

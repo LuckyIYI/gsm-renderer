@@ -92,9 +92,10 @@ final class RenderEncoder {
         dispatchOffset: Int,
         precision: Precision
     ) {
+        // Indirect dispatch for active tiles only - no overdispatch
         self.prepareDispatch(commandBuffer: commandBuffer, activeTileCount: orderedBuffers.activeTileCount, dispatchArgs: dispatchArgs)
         self.clearTextures(commandBuffer: commandBuffer, outputTextures: outputTextures, params: params)
-        
+
         if let encoder = commandBuffer.makeComputeCommandEncoder() {
             encoder.label = "RenderTilesDirect"
             if precision == .float16, let halfPipe = self.renderDirectPipelineHalf {
@@ -108,17 +109,18 @@ final class RenderEncoder {
             encoder.setBuffer(orderedBuffers.colors, offset: 0, index: 3)
             encoder.setBuffer(orderedBuffers.opacities, offset: 0, index: 4)
             encoder.setBuffer(orderedBuffers.depths, offset: 0, index: 5)
-            
+
             encoder.setTexture(outputTextures.color, index: 0)
             encoder.setTexture(outputTextures.depth, index: 1)
             encoder.setTexture(outputTextures.alpha, index: 2)
-            
+
             var p = params
             encoder.setBytes(&p, length: MemoryLayout<RenderParams>.stride, index: 9)
-            
+
+            // Active tiles buffer for indirection
             encoder.setBuffer(orderedBuffers.activeTileIndices, offset: 0, index: 10)
-            encoder.setBuffer(orderedBuffers.activeTileCount, offset: 0, index: 11)
-            
+
+            // Indirect dispatch: one 16x16 threadgroup per active tile
             let w = Int(params.tileWidth)
             let h = Int(params.tileHeight)
             let tg = MTLSize(width: w, height: h, depth: 1)

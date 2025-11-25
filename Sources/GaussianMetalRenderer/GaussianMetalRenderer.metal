@@ -255,7 +255,6 @@ struct RenderParams {
     uint activeTileCount;
     uint gaussianCount;
 };
-
 struct GaussianHeader {
     uint offset;
     uint count;
@@ -434,6 +433,14 @@ kernel void projectGaussiansImpl(
     float px = ((ndcX + 1.0f) * camera.width - 1.0f) * 0.5f;
     float py = ((ndcY + 1.0f) * camera.height - 1.0f) * 0.5f;
 
+    // Early filter: skip zero/tiny opacity gaussians
+    float opacity = float(opacities[gid]);
+    if (opacity < 1e-4f) {
+        outMask[gid] = 0;
+        outRadii[gid] = 0.0f;
+        return;
+    }
+
     float3 scale = float3(scales[gid]);
     float4 quat = float4(rotations[gid]);
     float3x3 cov3d = buildCovariance3D(scale, quat);
@@ -446,6 +453,13 @@ kernel void projectGaussiansImpl(
     float2x2 cov2d = projectCovariance(cov3d, viewPos4.xyz, viewRot, camera.focalX, camera.focalY, camera.width, camera.height);
     float4 conic = invertCovariance2D(cov2d);
     float radius = radiusFromCovariance(cov2d);
+
+    // Filter degenerate gaussians: tiny radius means near-singular covariance
+    if (radius < 0.5f) {
+        outMask[gid] = 0;
+        outRadii[gid] = 0.0f;
+        return;
+    }
 
     // Compute SH color
     float3 color = float3(0.0f);
@@ -525,6 +539,25 @@ instantiate_projectGaussians(half_input, packed_half3, half, half4, half2, half4
 
 #undef instantiate_projectGaussians
 
+// Fast exp approximation for Gaussian weight calculation
+// Uses Schraudolph's method - accurate enough for alpha blending
+inline float fast_exp_neg(float x) {
+    // x should be negative (from -0.5 * quad)
+    // Clamp to prevent overflow
+    x = max(x, -10.0f);  // exp(-10) ≈ 0, below our threshold anyway
+    // Schraudolph's approximation: exp(x) via bit manipulation
+    // f = 2^(x * log2(e)) = 2^(x * 1.4427)
+    // Scale factor: 2^23 / ln(2) = 12102203.16
+    // Bias: 127 * 2^23 = 1065353216, adjusted = 1064866805
+    union { float f; int i; } u;
+    u.i = int(12102203.0f * x + 1064866805.0f);
+    return u.f;
+}
+
+// Batch size for shared memory loading (buffer version)
+constant uint RENDER_BATCH_SIZE_BUF = 32;
+
+// HYBRID PRECISION: half for per-gaussian math, float for accumulation
 template <typename T, typename Vec2, typename Vec4, typename Packed3>
 kernel void renderTiles(
     const device GaussianHeader* headers [[buffer(0)]],
@@ -540,8 +573,16 @@ kernel void renderTiles(
     const device uint* activeTiles [[buffer(10)]],
     const device uint* activeTileCount [[buffer(11)]],
     uint3 localPos3 [[thread_position_in_threadgroup]],
-    uint3 tileCoord [[threadgroup_position_in_grid]]
+    uint3 tileCoord [[threadgroup_position_in_grid]],
+    uint threadIdx [[thread_index_in_threadgroup]]
 ) {
+    // Shared memory in half precision - saves bandwidth
+    threadgroup half2 shMeans[RENDER_BATCH_SIZE_BUF];
+    threadgroup half4 shConics[RENDER_BATCH_SIZE_BUF];
+    threadgroup half3 shColors[RENDER_BATCH_SIZE_BUF];
+    threadgroup half shOpacities[RENDER_BATCH_SIZE_BUF];
+    threadgroup half shDepths[RENDER_BATCH_SIZE_BUF];
+
     uint activeCount = activeTileCount[0];
     uint activeIdx = tileCoord.x;
     if (activeIdx >= activeCount) { return; }
@@ -556,42 +597,75 @@ kernel void renderTiles(
     uint px = tileX * tileWidth + localX;
     uint py = tileY * tileHeight + localY;
     bool inBounds = (px < params.width) && (py < params.height);
+
+    // Pixel position in half (sufficient for coordinates up to 2048)
+    half hx = half(px);
+    half hy = half(py);
+
+    // Accumulation in float for stability
     float3 accumColor = float3(0.0f);
     float accumDepth = 0.0f;
     float accumAlpha = 0.0f;
     float trans = 1.0f;
+
     GaussianHeader header = headers[tileId];
     uint start = header.offset;
     uint count = header.count;
-    if (count == 0) { return; }
-    for (uint i = 0; i < count; ++i) {
-        uint gIdx = start + i;
-        if (inBounds) {
-            float2 mean = float2(means[gIdx]);
-            float4 conic = float4(conics[gIdx]);
-            float3 color = float3(colors[gIdx]);
-            float baseOpacity = metal::min(float(opacities[gIdx]), 0.99f);
-            if (baseOpacity > 0.0f) {
-                float fx = float(px);
-                float fy = float(py);
-                float dx = fx - mean.x;
-                float dy = fy - mean.y;
-                float quad = dx * dx * conic.x + dy * dy * conic.z + 2.0f * dx * dy * conic.y;
-                if (quad < 20.0f && (conic.x != 0.0f || conic.z != 0.0f)) {
-                    float weight = metal::exp(-0.5f * quad);
-                    float alpha = weight * baseOpacity;
-                    if (alpha > 1e-4f) {
-                        float contrib = trans * alpha;
-                        trans *= (1.0f - alpha);
-                        accumAlpha += contrib;
-                        accumColor += color * contrib;
-                        accumDepth += float(depths[gIdx]) * contrib;
-                        if (trans < 1e-3f) { break; }
-                    }
-                }
+
+    // Process gaussians in batches using shared memory
+    for (uint batch = 0; batch < count; batch += RENDER_BATCH_SIZE_BUF) {
+        uint batchCount = min(RENDER_BATCH_SIZE_BUF, count - batch);
+
+        // Cooperative loading (half)
+        if (threadIdx < batchCount) {
+            uint gIdx = start + batch + threadIdx;
+            shMeans[threadIdx] = half2(means[gIdx]);
+            shConics[threadIdx] = half4(conics[gIdx]);
+            shColors[threadIdx] = half3(colors[gIdx]);
+            shOpacities[threadIdx] = min(half(opacities[gIdx]), half(0.99h));
+            shDepths[threadIdx] = half(depths[gIdx]);
+        }
+
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        // Process all gaussians in this batch - BRANCHLESS half precision math
+        // Opacity > 0 guaranteed by projection filtering
+        if (inBounds && trans > 1e-3f) {
+            for (uint i = 0; i < batchCount; ++i) {
+                half2 mean = shMeans[i];
+                half4 conic = shConics[i];
+
+                // Half precision gaussian evaluation
+                // Clamp dx/dy to prevent half overflow (250^2 = 62500 < 65504 max half)
+                half dx = clamp(hx - mean.x, half(-250.0h), half(250.0h));
+                half dy = clamp(hy - mean.y, half(-250.0h), half(250.0h));
+                half quad = dx * dx * conic.x + dy * dy * conic.z + 2.0h * dx * dy * conic.y;
+
+                // Branchless: clamp quad (already bounded by dx/dy clamp, but be safe)
+                half clampedQuad = min(quad, half(20.0h));
+                half weight = exp(-0.5h * clampedQuad);
+                half hAlpha = weight * shOpacities[i];
+
+                // Branchless mask: zero out if quad >= 20 or alpha too small
+                half mask = half(quad < 20.0h) * half(hAlpha > 1e-4h);
+                hAlpha *= mask;
+
+                // Convert to float for stable accumulation
+                float alpha = float(hAlpha);
+                float contrib = trans * alpha;
+                trans *= (1.0f - alpha);
+                accumAlpha += contrib;
+                accumColor += float3(shColors[i]) * contrib;
+                accumDepth += float(shDepths[i]) * contrib;
+
+                // Early exit when fully opaque (this branch is worth keeping)
+                if (trans < 1e-3f) { break; }
             }
         }
+
+        threadgroup_barrier(mem_flags::mem_threadgroup);
     }
+
     if (inBounds) {
         if (params.whiteBackground != 0) {
             accumColor += float3(trans);
@@ -622,7 +696,8 @@ kernel void renderTiles(
         const device uint* activeTiles [[buffer(10)]], \
         const device uint* activeTileCount [[buffer(11)]], \
         uint3 localPos3 [[thread_position_in_threadgroup]], \
-        uint3 tileCoord [[threadgroup_position_in_grid]] \
+        uint3 tileCoord [[threadgroup_position_in_grid]], \
+        uint threadIdx [[thread_index_in_threadgroup]] \
     );
 
 instantiate_renderTiles(float, float, float2, float4, packed_float3)
@@ -630,7 +705,10 @@ instantiate_renderTiles(half, half, half2, half4, packed_half3)
 
 #undef instantiate_renderTiles
 
-// Texture-based rendering template
+// Texture-based rendering template - indirect dispatch for active tiles only
+// Dispatch as: dispatchThreadgroups(indirectBuffer, threadsPerThreadgroup: (16, 16, 1))
+// Each 16x16 threadgroup = one active tile, no overdispatch
+// HYBRID PRECISION: half for per-gaussian math, float for accumulation
 template <typename T, typename Vec2, typename Vec4, typename Packed3>
 kernel void renderTilesDirect(
     const device GaussianHeader* headers [[buffer(0)]],
@@ -644,71 +722,105 @@ kernel void renderTilesDirect(
     texture2d<float, access::write> alphaTex [[texture(2)]],
     constant RenderParams& params [[buffer(9)]],
     const device uint* activeTiles [[buffer(10)]],
-    const device uint* activeTileCount [[buffer(11)]],
     uint3 localPos3 [[thread_position_in_threadgroup]],
-    uint3 tileCoord [[threadgroup_position_in_grid]]
+    uint3 tgPos [[threadgroup_position_in_grid]],
+    uint threadIdx [[thread_index_in_threadgroup]]
 ) {
-    uint activeCount = activeTileCount[0];
-    uint activeIdx = tileCoord.x;
-    if (activeIdx >= activeCount) { return; }
-    uint tileId = activeTiles[activeIdx];
-    uint tilesX = params.tilesX;
-    uint tileWidth = params.tileWidth;
-    uint tileHeight = params.tileHeight;
-    uint localX = localPos3.x;
-    uint localY = localPos3.y;
-    uint tileX = tileId % tilesX;
-    uint tileY = tileId / tilesX;
-    uint px = tileX * tileWidth + localX;
-    uint py = tileY * tileHeight + localY;
+    // Shared memory in half precision - saves bandwidth
+    threadgroup half2 shMeans[RENDER_BATCH_SIZE_BUF];
+    threadgroup half4 shConics[RENDER_BATCH_SIZE_BUF];
+    threadgroup half3 shColors[RENDER_BATCH_SIZE_BUF];
+    threadgroup half shOpacities[RENDER_BATCH_SIZE_BUF];
+    threadgroup half shDepths[RENDER_BATCH_SIZE_BUF];
+
+    // Map threadgroup index to tile via activeTiles indirection
+    uint tileId = activeTiles[tgPos.x];
+    uint tileX = tileId % params.tilesX;
+    uint tileY = tileId / params.tilesX;
+
+    // Compute pixel coordinates from tile position + local offset
+    uint px = tileX * params.tileWidth + localPos3.x;
+    uint py = tileY * params.tileHeight + localPos3.y;
     bool inBounds = (px < params.width) && (py < params.height);
+
+    // Pixel position in half (sufficient for coordinates up to 2048)
+    half hx = half(px);
+    half hy = half(py);
+
+    // Accumulation in float for stability
     float3 accumColor = float3(0.0f);
     float accumDepth = 0.0f;
     float accumAlpha = 0.0f;
     float trans = 1.0f;
+
     GaussianHeader header = headers[tileId];
     uint start = header.offset;
     uint count = header.count;
-    
-    if (count > 0) {
-        for (uint i = 0; i < count; ++i) {
-            uint gIdx = start + i;
-            if (inBounds) {
-                float2 mean = float2(means[gIdx]);
-                float4 conic = float4(conics[gIdx]);
-                float3 color = float3(colors[gIdx]);
-                float baseOpacity = metal::min(float(opacities[gIdx]), 0.99f);
-                if (baseOpacity > 0.0f) {
-                    float fx = float(px);
-                    float fy = float(py);
-                    float dx = fx - mean.x;
-                    float dy = fy - mean.y;
-                    float quad = dx * dx * conic.x + dy * dy * conic.z + 2.0f * dx * dy * conic.y;
-                    if (quad < 20.0f && (conic.x != 0.0f || conic.z != 0.0f)) {
-                        float weight = metal::exp(-0.5f * quad);
-                        float alpha = weight * baseOpacity;
-                        if (alpha > 1e-4f) {
-                            float contrib = trans * alpha;
-                            trans *= (1.0f - alpha);
-                            accumAlpha += contrib;
-                            accumColor += color * contrib;
-                            accumDepth += float(depths[gIdx]) * contrib;
-                            if (trans < 1e-3f) { break; }
-                        }
-                    }
-                }
+
+    // Process gaussians in batches using shared memory
+    for (uint batch = 0; batch < count; batch += RENDER_BATCH_SIZE_BUF) {
+        // Cooperative loading: threads load gaussians into shared memory (half)
+        uint batchCount = min(RENDER_BATCH_SIZE_BUF, count - batch);
+
+        if (threadIdx < batchCount) {
+            uint gIdx = start + batch + threadIdx;
+            shMeans[threadIdx] = half2(means[gIdx]);
+            shConics[threadIdx] = half4(conics[gIdx]);
+            shColors[threadIdx] = half3(colors[gIdx]);
+            shOpacities[threadIdx] = min(half(opacities[gIdx]), half(0.99h));
+            shDepths[threadIdx] = half(depths[gIdx]);
+        }
+
+        // Ensure all threads have loaded their data
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        // Process all gaussians in this batch - BRANCHLESS half precision math
+        // Opacity > 0 guaranteed by projection filtering
+        if (inBounds && trans > 1e-3f) {
+            for (uint i = 0; i < batchCount; ++i) {
+                half2 mean = shMeans[i];
+                half4 conic = shConics[i];
+
+                // Half precision gaussian evaluation
+                // Clamp dx/dy to prevent half overflow (250^2 = 62500 < 65504 max half)
+                half dx = clamp(hx - mean.x, half(-250.0h), half(250.0h));
+                half dy = clamp(hy - mean.y, half(-250.0h), half(250.0h));
+                half quad = dx * dx * conic.x + dy * dy * conic.z + 2.0h * dx * dy * conic.y;
+
+                // Branchless: clamp quad (already bounded by dx/dy clamp, but be safe)
+                half clampedQuad = min(quad, half(20.0h));
+                half weight = exp(-0.5h * clampedQuad);
+                half hAlpha = weight * shOpacities[i];
+
+                // Branchless mask: zero out if quad >= 20 or alpha too small
+                half mask = half(quad < 20.0h) * half(hAlpha > 1e-4h);
+                hAlpha *= mask;
+
+                // Convert to float for stable accumulation
+                float alpha = float(hAlpha);
+                float contrib = trans * alpha;
+                trans *= (1.0f - alpha);
+                accumAlpha += contrib;
+                accumColor += float3(shColors[i]) * contrib;
+                accumDepth += float(shDepths[i]) * contrib;
+
+                // Early exit when fully opaque (this branch is worth keeping)
+                if (trans < 1e-3f) { break; }
             }
         }
+
+        // Sync before loading next batch
+        threadgroup_barrier(mem_flags::mem_threadgroup);
     }
-    
+
     if (inBounds) {
         if (params.whiteBackground != 0) {
             accumColor += float3(trans);
         }
-        
+
         uint2 coords = uint2(px, py);
         colorTex.write(float4(accumColor, 1.0f), coords);
-        depthTex.write(float4(accumDepth, 0, 0, 0), coords); 
+        depthTex.write(float4(accumDepth, 0, 0, 0), coords);
         alphaTex.write(float4(accumAlpha, 0, 0, 0), coords);
     }
 }
@@ -727,9 +839,9 @@ kernel void renderTilesDirect(
         texture2d<float, access::write> alphaTex [[texture(2)]], \
         constant RenderParams& params [[buffer(9)]], \
         const device uint* activeTiles [[buffer(10)]], \
-        const device uint* activeTileCount [[buffer(11)]], \
         uint3 localPos3 [[thread_position_in_threadgroup]], \
-        uint3 tileCoord [[threadgroup_position_in_grid]] \
+        uint3 tgPos [[threadgroup_position_in_grid]], \
+        uint threadIdx [[thread_index_in_threadgroup]] \
     );
 
 instantiate_renderTilesDirect(float, float, float2, float4, packed_float3)
@@ -737,6 +849,7 @@ instantiate_renderTilesDirect(half, half, half2, half4, packed_half3)
 
 #undef instantiate_renderTilesDirect
 
+///////////////////////////////////////////////////////////////////////////////
 struct ClearParams {
     uint pixelCount;
     uint whiteBackground;

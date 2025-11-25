@@ -18,7 +18,7 @@ final class FrameResources {
     var tileAssignmentMaxAssignments: Int = 0
     // Capacity-based power-of-two padding for buffer sizing (GPU will set actual paddedCount per frame).
     var tileAssignmentPaddedCapacity: Int = 1
-    
+
     // Ordered Buffers
     var orderedHeaders: MTLBuffer?
     var packedMeans: MTLBuffer?
@@ -28,11 +28,11 @@ final class FrameResources {
     var packedDepths: MTLBuffer?
     var activeTileIndices: MTLBuffer?
     var activeTileCount: MTLBuffer?
-    
+
     // Sort Buffers
     var sortKeys: MTLBuffer?
     var sortedIndices: MTLBuffer?
-    
+
     // Radix Buffers
     var radixHistogram: MTLBuffer?
     var radixBlockSums: MTLBuffer?
@@ -40,10 +40,10 @@ final class FrameResources {
     var radixFusedKeys: MTLBuffer?
     var radixKeysScratch: MTLBuffer?
     var radixPayloadScratch: MTLBuffer?
-    
+
     // Dispatch Args (Per-frame to avoid race on indirect dispatch)
     var dispatchArgs: MTLBuffer?
-    
+
     // Output Buffers
     var outputBuffers: RenderOutputBuffers?
     // Output Textures (Alternative)
@@ -574,7 +574,7 @@ public final class Renderer: @unchecked Sendable {
             if MTLCaptureManager.shared().isCapturing { MTLCaptureManager.shared().stopCapture() }
             return nil
         }
-        
+
         self.renderEncoder.encodeDirect(
             commandBuffer: commandBuffer,
             orderedBuffers: ordered,
@@ -1333,7 +1333,7 @@ public final class Renderer: @unchecked Sendable {
             self.ensureBuffer(&frame.packedOpacities, length: assignmentCount * strideForOpacities(), options: .storageModePrivate, label: "PackedOpacities") != nil,
             self.ensureBuffer(&frame.packedDepths, length: assignmentCount * strideForDepths(), options: .storageModePrivate, label: "PackedDepths") != nil,
             self.ensureBuffer(&frame.activeTileIndices, length: headerCount * 4, options: .storageModePrivate, label: "ActiveTileIndices") != nil,
-            let _ = self.ensureBuffer(&frame.activeTileCount, length: 4, options: .storageModePrivate, label: "ActiveTileCount")
+            let _ = self.ensureBuffer(&frame.activeTileCount, length: 4, options: .storageModeShared, label: "ActiveTileCount")
         else { return false }
         return true
     }
@@ -1420,8 +1420,6 @@ public final class Renderer: @unchecked Sendable {
             frameInUse[index] = false
         }
     }
-    
-    
     internal func ensureRadixBuffers(frame: FrameResources, paddedCapacity: Int) -> Bool {
         let valuesPerGroup = self.radixSortEncoder.blockSize * self.radixSortEncoder.grainSize
         let gridSize = max(1, (paddedCapacity + valuesPerGroup - 1) / valuesPerGroup)

@@ -291,6 +291,10 @@ public final class Renderer: @unchecked Sendable {
     // Fused pipeline encoder (optional - for interleaved data optimization)
     var fusedPipelineEncoder: FusedPipelineEncoder?
 
+    // Fused coverage+scatter encoder (eliminates prefix scan)
+    var fusedCoverageScatterEncoder: FusedCoverageScatterEncoder?
+    public let useFusedCoverageScatter: Bool
+
     // Reset tile builder state pipeline (replaces blit for lower overhead)
     private let resetTileBuilderStatePipeline: MTLComputePipelineState
     
@@ -336,7 +340,8 @@ public final class Renderer: @unchecked Sendable {
     /// This can improve performance by reducing thread divergence and memory loads
     /// When enabled, caller should use tileWidth=32, tileHeight=16 in RenderParams
     public let useMultiPixelRendering: Bool
-    public var isMultiPixelAvailable: Bool { self.renderEncoder.isMultiPixelAvailable }
+    /// Multi-pixel rendering is always available through the fused pipeline
+    public var isMultiPixelAvailable: Bool { true }
 
     /// FlashGS-style precise ellipse-tile intersection
     /// Eliminates tiles in AABB that don't actually intersect the gaussian ellipse
@@ -348,7 +353,7 @@ public final class Renderer: @unchecked Sendable {
 
     /// Fused pipeline: interleaved data structures for cache-efficient rendering
     /// Uses single struct reads instead of 5 scattered buffer reads
-    public let useFusedPipeline: Bool
+    // useFusedPipeline is always enabled - fused pipeline is always better
 
     /// Residency set for efficient GPU memory management (macOS 15+ / iOS 18+)
     /// Attached to command queue for minimal CPU overhead
@@ -370,7 +375,7 @@ public final class Renderer: @unchecked Sendable {
         sortAlgorithm: SortAlgorithm = .radix,
         useMultiPixelRendering: Bool = false,
         usePreciseIntersection: Bool = false,
-        useFusedPipeline: Bool = false,
+        useFusedCoverageScatter: Bool = true,  // Fused coverage+scatter (eliminates prefix scan)
         useHeapAllocation: Bool = false,  // Disabled by default - placement heap has issues
         textureOnly: Bool = false,  // Skip buffer output allocation to save ~20MB
         limits: RendererLimits = RendererLimits(maxGaussians: 1_000_000, maxWidth: 2048, maxHeight: 2048)
@@ -411,13 +416,17 @@ public final class Renderer: @unchecked Sendable {
                 packThreadgroupSize: UInt32(self.packEncoder.packThreadgroupSize),
                 bitonicThreadgroupSize: UInt32(self.bitonicSortEncoder.unitSize),
                 radixBlockSize: UInt32(self.radixSortEncoder.blockSize),
-                radixGrainSize: UInt32(self.radixSortEncoder.grainSize)
+                radixGrainSize: UInt32(self.radixSortEncoder.grainSize),
+                maxAssignments: 0  // Set dynamically at encode time
             )
             self.dispatchEncoder = try DispatchEncoder(device: device, library: library, config: config)
 
-            // Fused pipeline encoder (optional optimization)
-            if useFusedPipeline {
-                self.fusedPipelineEncoder = try FusedPipelineEncoder(device: device, library: library)
+            // Fused pipeline encoder (always enabled - better performance)
+            self.fusedPipelineEncoder = try FusedPipelineEncoder(device: device, library: library)
+
+            // Fused coverage+scatter encoder (eliminates prefix scan)
+            if useFusedCoverageScatter && usePreciseIntersection {
+                self.fusedCoverageScatterEncoder = try FusedCoverageScatterEncoder(device: device, library: library)
             }
 
             // Reset tile builder state pipeline (replaces blit for lower overhead)
@@ -433,7 +442,7 @@ public final class Renderer: @unchecked Sendable {
         self.sortAlgorithm = sortAlgorithm
         self.useMultiPixelRendering = useMultiPixelRendering
         self.usePreciseIntersection = usePreciseIntersection
-        self.useFusedPipeline = useFusedPipeline
+        self.useFusedCoverageScatter = useFusedCoverageScatter && usePreciseIntersection
         self.useHeapAllocation = useHeapAllocation
         self.limits = limits
 
@@ -452,7 +461,7 @@ public final class Renderer: @unchecked Sendable {
         self.frameLayout = Renderer.computeLayout(
             limits: limits,
             sortAlgorithm: sortAlgorithm,
-            useFusedPipeline: useFusedPipeline,
+            useFusedPipeline: true,  // Always enabled
             precision: .float32,
             device: device,
             radixSortEncoder: self.radixSortEncoder
@@ -605,10 +614,9 @@ public final class Renderer: @unchecked Sendable {
             add("RadixPayload", paddedAssignments * MemoryLayout<UInt32>.stride)
         }
 
-        if useFusedPipeline {
-            add("InterleavedGaussians", gaussianCount * strideForInterleaved())
-            add("PackedGaussiansFused", maxAssignments * strideForInterleaved())
-        }
+        // Fused pipeline buffers (always enabled)
+        add("InterleavedGaussians", gaussianCount * strideForInterleaved())
+        add("PackedGaussiansFused", maxAssignments * strideForInterleaved())
 
         func heapSize(for allocations: [(label: String, length: Int, options: MTLResourceOptions)]) -> Int {
             var offset = 0
@@ -773,14 +781,7 @@ public final class Renderer: @unchecked Sendable {
             self.releaseFrame(index: slotIndex)
             return -1 
         }
-        
-        let estimatedAssignments = self.estimateAssignmentCapacity(
-            gaussianCount: count,
-            meansPtr: meansPtr,
-            radiiPtr: radiiPtr,
-            params: params
-        )
-        
+
         // renderRaw always uses float32 precision because inputs are float32 pointers
         guard let assignment = self.buildTileAssignmentsGPU(
             commandBuffer: commandBuffer,
@@ -788,7 +789,6 @@ public final class Renderer: @unchecked Sendable {
             gaussianBuffers: inputs,
             params: params,
             frame: frame,
-            estimatedAssignments: estimatedAssignments,
             precision: .float32
         ) else {
             self.releaseFrame(index: slotIndex)
@@ -1050,38 +1050,19 @@ public final class Renderer: @unchecked Sendable {
         let textures = frame.outputTextures
         let dispatchArgs = frame.dispatchArgs
 
-        // Select render path: fused > multi-pixel > standard
-        if self.useFusedPipeline, let fusedEncoder = self.fusedPipelineEncoder, ordered.packedGaussiansFused != nil {
-            // Fused render: single-struct reads for cache efficiency
-            fusedEncoder.encodeCompleteFusedRender(
-                commandBuffer: commandBuffer,
-                orderedBuffers: ordered,
-                outputTextures: textures,
-                params: params,
-                dispatchArgs: dispatchArgs,
-                dispatchOffset: DispatchSlot.renderTiles.rawValue * MemoryLayout<DispatchIndirectArgsSwift>.stride,
-                precision: self.effectivePrecision
-            )
-        } else if self.useMultiPixelRendering && self.renderEncoder.isMultiPixelAvailable {
-            _ = self.renderEncoder.encodeMultiPixel(
-                commandBuffer: commandBuffer,
-                orderedBuffers: ordered,
-                outputTextures: textures,
-                params: params,
-                dispatchArgs: dispatchArgs,
-                dispatchOffset: DispatchSlot.renderTiles.rawValue * MemoryLayout<DispatchIndirectArgsSwift>.stride
-            )
-        } else {
-            self.renderEncoder.encodeDirect(
-                commandBuffer: commandBuffer,
-                orderedBuffers: ordered,
-                outputTextures: textures,
-                params: params,
-                dispatchArgs: dispatchArgs,
-                dispatchOffset: DispatchSlot.renderTiles.rawValue * MemoryLayout<DispatchIndirectArgsSwift>.stride,
-                precision: self.effectivePrecision
-            )
+        // Fused render: single-struct reads for cache efficiency
+        guard let fusedEncoder = self.fusedPipelineEncoder, ordered.packedGaussiansFused != nil else {
+            fatalError("[encodeRenderToTextures] Fused pipeline unavailable")
         }
+        fusedEncoder.encodeCompleteFusedRender(
+            commandBuffer: commandBuffer,
+            orderedBuffers: ordered,
+            outputTextures: textures,
+            params: params,
+            dispatchArgs: dispatchArgs,
+            dispatchOffset: DispatchSlot.renderTiles.rawValue * MemoryLayout<DispatchIndirectArgsSwift>.stride,
+            precision: self.effectivePrecision
+        )
 
         commandBuffer.addCompletedHandler { [weak self] _ in
             self?.releaseFrame(index: slotIndex)
@@ -1162,37 +1143,19 @@ public final class Renderer: @unchecked Sendable {
         let textures = frame.outputTextures
         let dispatchArgs = frame.dispatchArgs
 
-        // Select render path: fused > multi-pixel > standard
-        if self.useFusedPipeline, let fusedEncoder = self.fusedPipelineEncoder, ordered.packedGaussiansFused != nil {
-            fusedEncoder.encodeCompleteFusedRender(
-                commandBuffer: commandBuffer,
-                orderedBuffers: ordered,
-                outputTextures: textures,
-                params: params,
-                dispatchArgs: dispatchArgs,
-                dispatchOffset: DispatchSlot.renderTiles.rawValue * MemoryLayout<DispatchIndirectArgsSwift>.stride,
-                precision: .float16
-            )
-        } else if self.useMultiPixelRendering && self.renderEncoder.isMultiPixelAvailable {
-            _ = self.renderEncoder.encodeMultiPixel(
-                commandBuffer: commandBuffer,
-                orderedBuffers: ordered,
-                outputTextures: textures,
-                params: params,
-                dispatchArgs: dispatchArgs,
-                dispatchOffset: DispatchSlot.renderTiles.rawValue * MemoryLayout<DispatchIndirectArgsSwift>.stride
-            )
-        } else {
-            self.renderEncoder.encodeDirect(
-                commandBuffer: commandBuffer,
-                orderedBuffers: ordered,
-                outputTextures: textures,
-                params: params,
-                dispatchArgs: dispatchArgs,
-                dispatchOffset: DispatchSlot.renderTiles.rawValue * MemoryLayout<DispatchIndirectArgsSwift>.stride,
-                precision: .float16
-            )
+        // Fused render: single-struct reads for cache efficiency
+        guard let fusedEncoder = self.fusedPipelineEncoder, ordered.packedGaussiansFused != nil else {
+            fatalError("[encodeRenderToTextureHalf] Fused pipeline unavailable")
         }
+        fusedEncoder.encodeCompleteFusedRender(
+            commandBuffer: commandBuffer,
+            orderedBuffers: ordered,
+            outputTextures: textures,
+            params: params,
+            dispatchArgs: dispatchArgs,
+            dispatchOffset: DispatchSlot.renderTiles.rawValue * MemoryLayout<DispatchIndirectArgsSwift>.stride,
+            precision: .float16
+        )
 
         commandBuffer.addCompletedHandler { [weak self] _ in
             self?.releaseFrame(index: slotIndex)
@@ -1269,37 +1232,19 @@ public final class Renderer: @unchecked Sendable {
             alpha: targetAlpha ?? frame.outputTextures.alpha
         )
 
-        // Select render path: fused > multi-pixel > standard
-        if self.useFusedPipeline, let fusedEncoder = self.fusedPipelineEncoder, ordered.packedGaussiansFused != nil {
-            fusedEncoder.encodeCompleteFusedRender(
-                commandBuffer: commandBuffer,
-                orderedBuffers: ordered,
-                outputTextures: outputTextures,
-                params: params,
-                dispatchArgs: dispatchArgs,
-                dispatchOffset: DispatchSlot.renderTiles.rawValue * MemoryLayout<DispatchIndirectArgsSwift>.stride,
-                precision: .float16
-            )
-        } else if self.useMultiPixelRendering && self.renderEncoder.isMultiPixelAvailable {
-            _ = self.renderEncoder.encodeMultiPixel(
-                commandBuffer: commandBuffer,
-                orderedBuffers: ordered,
-                outputTextures: outputTextures,
-                params: params,
-                dispatchArgs: dispatchArgs,
-                dispatchOffset: DispatchSlot.renderTiles.rawValue * MemoryLayout<DispatchIndirectArgsSwift>.stride
-            )
-        } else {
-            self.renderEncoder.encodeDirect(
-                commandBuffer: commandBuffer,
-                orderedBuffers: ordered,
-                outputTextures: outputTextures,
-                params: params,
-                dispatchArgs: dispatchArgs,
-                dispatchOffset: DispatchSlot.renderTiles.rawValue * MemoryLayout<DispatchIndirectArgsSwift>.stride,
-                precision: .float16
-            )
+        // Fused render: single-struct reads for cache efficiency
+        guard let fusedEncoder = self.fusedPipelineEncoder, ordered.packedGaussiansFused != nil else {
+            fatalError("[encodeRenderToTargetTexture] Fused pipeline unavailable")
         }
+        fusedEncoder.encodeCompleteFusedRender(
+            commandBuffer: commandBuffer,
+            orderedBuffers: ordered,
+            outputTextures: outputTextures,
+            params: params,
+            dispatchArgs: dispatchArgs,
+            dispatchOffset: DispatchSlot.renderTiles.rawValue * MemoryLayout<DispatchIndirectArgsSwift>.stride,
+            precision: .float16
+        )
 
         commandBuffer.addCompletedHandler { [weak self] _ in
             self?.releaseFrame(index: slotIndex)
@@ -1309,37 +1254,6 @@ public final class Renderer: @unchecked Sendable {
     }
 
     // MARK: - Helper Methods
-    
-    private func estimateAssignmentCapacity(
-        gaussianCount: Int,
-        meansPtr: UnsafePointer<Float>,
-        radiiPtr: UnsafePointer<Float>,
-        params: RenderParams
-    ) -> Int {
-        guard gaussianCount > 0 else { return 1 }
-        let tilesX = Int(params.tilesX)
-        let tilesY = Int(params.tilesY)
-        let tileW = Float(params.tileWidth)
-        let tileH = Float(params.tileHeight)
-        var total = 0
-        for i in 0..<gaussianCount {
-            let mx = meansPtr[i * 2 + 0]
-            let my = meansPtr[i * 2 + 1]
-            let r = radiiPtr[i]
-            let minX = max(0, Int(floor((mx - r) / tileW)))
-            let maxX = min(tilesX - 1, Int(ceil((mx + r) / tileW)))
-            let minY = max(0, Int(floor((my - r) / tileH)))
-            let maxY = min(tilesY - 1, Int(ceil((my + r) / tileH)))
-            if maxX < minX || maxY < minY { continue }
-            let spanX = maxX - minX + 1
-            let spanY = maxY - minY + 1
-            total += spanX * spanY
-        }
-        // Clamp to a reasonable upper bound to avoid runaway allocations.
-        let conservativeCap = Int(params.tilesX * params.tilesY) * max(1, Int(params.maxPerTile == 0 ? UInt32(gaussianCount) : params.maxPerTile))
-        let estimate = min(total, conservativeCap)
-        return max(estimate, gaussianCount)
-    }
 
     private func validateLimits(gaussianCount: Int, params: RenderParams) -> Bool {
         let tileCount = Int(params.tilesX * params.tilesY)
@@ -1367,7 +1281,6 @@ public final class Renderer: @unchecked Sendable {
         gaussianBuffers: GaussianInputBuffers,
         params: RenderParams,
         frame: FrameResources,
-        estimatedAssignments: Int? = nil,
         precision: Precision = .float32
     ) -> TileAssignmentBuffers? {
         // CRASH on failures - silent returns cause black screens!
@@ -1395,9 +1308,27 @@ public final class Renderer: @unchecked Sendable {
             precision: precision
         )
         
-        // Coverage: count tiles per gaussian
-        if self.usePreciseIntersection && self.isPreciseIntersectionAvailable {
-            // FlashGS precise ellipse-tile intersection
+        // Fused coverage+scatter: single pass with atomic allocation (eliminates prefix scan)
+        if self.useFusedCoverageScatter, let fusedEncoder = self.fusedCoverageScatterEncoder {
+            fusedEncoder.encode(
+                commandBuffer: commandBuffer,
+                gaussianCount: gaussianCount,
+                tileWidth: Int(params.tileWidth),
+                tileHeight: Int(params.tileHeight),
+                tilesX: Int(params.tilesX),
+                maxAssignments: frame.tileAssignmentMaxAssignments,
+                boundsBuffer: frame.boundsBuffer,
+                coverageBuffer: frame.coverageBuffer,
+                opacitiesBuffer: gaussianBuffers.opacities,
+                meansBuffer: gaussianBuffers.means,
+                conicsBuffer: gaussianBuffers.conics,
+                tileIndicesBuffer: frame.tileIndices,
+                tileIdsBuffer: frame.tileIds,
+                tileAssignmentHeader: frame.tileAssignmentHeader,
+                precision: precision
+            )
+        } else if self.usePreciseIntersection && self.isPreciseIntersectionAvailable {
+            // Fallback: separate coverage + scatter with prefix scan
             self.coverageEncoder.encodePrecise(
                 commandBuffer: commandBuffer,
                 gaussianCount: gaussianCount,
@@ -1413,23 +1344,6 @@ public final class Renderer: @unchecked Sendable {
                 tileAssignmentHeader: frame.tileAssignmentHeader,
                 precision: precision
             )
-        } else {
-            self.coverageEncoder.encode(
-                commandBuffer: commandBuffer,
-                gaussianCount: gaussianCount,
-                boundsBuffer: frame.boundsBuffer,
-                opacitiesBuffer: gaussianBuffers.opacities,
-                coverageBuffer: frame.coverageBuffer,
-                offsetsBuffer: frame.offsetsBuffer,
-                partialSumsBuffer: frame.partialSumsBuffer,
-                tileAssignmentHeader: frame.tileAssignmentHeader,
-                precision: precision
-            )
-        }
-
-        // Scatter: write gaussian-tile pairs
-        if self.usePreciseIntersection && self.isPreciseIntersectionAvailable {
-            // FlashGS precise scatter (parallel: one threadgroup per gaussian)
             self.scatterEncoder.encodePrecise(
                 commandBuffer: commandBuffer,
                 gaussianCount: gaussianCount,
@@ -1448,7 +1362,18 @@ public final class Renderer: @unchecked Sendable {
                 precision: precision
             )
         } else {
-            // Load-balanced scatter (binary search) for better GPU utilization
+            // Non-precise fallback: AABB coverage + balanced scatter
+            self.coverageEncoder.encode(
+                commandBuffer: commandBuffer,
+                gaussianCount: gaussianCount,
+                boundsBuffer: frame.boundsBuffer,
+                opacitiesBuffer: gaussianBuffers.opacities,
+                coverageBuffer: frame.coverageBuffer,
+                offsetsBuffer: frame.offsetsBuffer,
+                partialSumsBuffer: frame.partialSumsBuffer,
+                tileAssignmentHeader: frame.tileAssignmentHeader,
+                precision: precision
+            )
             self.scatterEncoder.encodeBalanced(
                 commandBuffer: commandBuffer,
                 gaussianCount: gaussianCount,
@@ -1498,7 +1423,8 @@ public final class Renderer: @unchecked Sendable {
         self.dispatchEncoder.encode(
             commandBuffer: commandBuffer,
             header: assignment.header,
-            dispatchArgs: dispatchArgs
+            dispatchArgs: dispatchArgs,
+            maxAssignments: frame.tileAssignmentMaxAssignments
         )
         
         self.sortKeyGenEncoder.encode(
@@ -1574,7 +1500,6 @@ public final class Renderer: @unchecked Sendable {
 
         // Check if we can use texture-only fused path (skip redundant standard pack payload)
         let canUseFusedOnly = textureOnlyFused &&
-                              self.useFusedPipeline &&
                               self.fusedPipelineEncoder != nil &&
                               frame.interleavedGaussians != nil &&
                               frame.packedGaussiansFused != nil

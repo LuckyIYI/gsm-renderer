@@ -208,7 +208,6 @@ final class RenderTests: XCTestCase {
                 sortAlgorithm: .radix,
                 useMultiPixelRendering: false,
                 usePreciseIntersection: false,
-                useFusedPipeline: false,
                 useHeapAllocation: useHeap
             )
             

@@ -68,8 +68,7 @@ final class SortStageTimingTests: XCTestCase {
                     gaussianCount: count,
                     gaussianBuffers: inputs,
                     params: params,
-                    frame: frame,
-                    estimatedAssignments: nil
+                    frame: frame
                 ) else {
                     XCTFail("Tile assignment failed")
                     return (.infinity, 0, 0)
@@ -91,7 +90,8 @@ final class SortStageTimingTests: XCTestCase {
                 renderer.dispatchEncoder.encode(
                     commandBuffer: cbSort,
                     header: assignment.header,
-                    dispatchArgs: frame.dispatchArgs
+                    dispatchArgs: frame.dispatchArgs,
+                    maxAssignments: frame.tileAssignmentMaxAssignments
                 )
 
                 renderer.sortKeyGenEncoder.encode(

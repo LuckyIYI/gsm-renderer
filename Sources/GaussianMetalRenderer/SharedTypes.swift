@@ -80,6 +80,7 @@ public struct AssignmentDispatchConfigSwift {
     public var bitonicThreadgroupSize: UInt32
     public var radixBlockSize: UInt32
     public var radixGrainSize: UInt32
+    public var maxAssignments: UInt32  // Clamp totalAssignments to this value
 }
 
 public enum DispatchSlot: Int, CaseIterable {
@@ -121,9 +122,26 @@ public struct ScatterParamsSwift {
     public var tileHeight: UInt32 = 0  // For precise intersection
 }
 
-public struct ScatterDispatchParamsSwift {
-    public var threadgroupWidth: UInt32
+public struct FusedCoverageScatterParamsSwift {
     public var gaussianCount: UInt32
+    public var tileWidth: UInt32
+    public var tileHeight: UInt32
+    public var tilesX: UInt32
+    public var maxAssignments: UInt32
+
+    public init(
+        gaussianCount: UInt32,
+        tileWidth: UInt32,
+        tileHeight: UInt32,
+        tilesX: UInt32,
+        maxAssignments: UInt32
+    ) {
+        self.gaussianCount = gaussianCount
+        self.tileWidth = tileWidth
+        self.tileHeight = tileHeight
+        self.tilesX = tilesX
+        self.maxAssignments = maxAssignments
+    }
 }
 
 public struct PackParamsSwift {

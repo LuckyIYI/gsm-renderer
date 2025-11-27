@@ -32,7 +32,6 @@ final class FusedPipelineTests: XCTestCase {
         let standardRenderer = Renderer(
             precision: .float32,
             sortAlgorithm: .radix,
-            useFusedPipeline: false,
             limits: limits
         )
 
@@ -40,7 +39,6 @@ final class FusedPipelineTests: XCTestCase {
         let fusedRenderer = Renderer(
             precision: .float32,
             sortAlgorithm: .radix,
-            useFusedPipeline: true,
             limits: limits
         )
 
@@ -172,8 +170,7 @@ final class FusedPipelineTests: XCTestCase {
     func testFusedHalfPrecision() throws {
         let fusedRenderer = Renderer(
             precision: .float16,
-            sortAlgorithm: .radix,
-            useFusedPipeline: true
+            sortAlgorithm: .radix
         )
 
         XCTAssertTrue(fusedRenderer.isFusedPipelineAvailable, "Fused pipeline should be available")
@@ -251,8 +248,7 @@ final class FusedPipelineTests: XCTestCase {
     func testFusedAtScale() throws {
         let fusedRenderer = Renderer(
             precision: .float32,
-            sortAlgorithm: .radix,
-            useFusedPipeline: true
+            sortAlgorithm: .radix
         )
 
         // Large scale test
@@ -355,13 +351,11 @@ final class FusedPipelineTests: XCTestCase {
         let standardRenderer = Renderer(
             precision: .float32,
             sortAlgorithm: .radix,
-            useFusedPipeline: false,
             limits: largeLimits
         )
         let fusedRenderer = Renderer(
             precision: .float32,
             sortAlgorithm: .radix,
-            useFusedPipeline: true,
             limits: largeLimits
         )
 
@@ -519,8 +513,8 @@ final class FusedPipelineTests: XCTestCase {
 
     /// Test at 4M scale
     func testFusedAt4MScale() throws {
-        let standardRenderer = Renderer(precision: .float32, sortAlgorithm: .radix, useFusedPipeline: false, limits: largeLimits)
-        let fusedRenderer = Renderer(precision: .float32, sortAlgorithm: .radix, useFusedPipeline: true, limits: largeLimits)
+        let standardRenderer = Renderer(precision: .float32, sortAlgorithm: .radix, limits: largeLimits)
+        let fusedRenderer = Renderer(precision: .float32, sortAlgorithm: .radix, limits: largeLimits)
 
         let gaussianCount = 4_000_000
         let imageWidth: UInt32 = 1024
@@ -610,13 +604,11 @@ final class FusedPipelineTests: XCTestCase {
         let standardRenderer = Renderer(
             precision: .float32,
             sortAlgorithm: .radix,
-            useFusedPipeline: false,
             limits: limits
         )
         let fusedRenderer = Renderer(
             precision: .float32,
             sortAlgorithm: .radix,
-            useFusedPipeline: true,
             limits: limits
         )
 
@@ -767,8 +759,8 @@ final class FusedPipelineTests: XCTestCase {
     func testFused32x16AtScale() throws {
         // Reduced maxPerTile to keep heap within device limits
         let limits = RendererLimits(maxGaussians: 1_000_000, maxWidth: 1024, maxHeight: 1024, tileWidth: 32, tileHeight: 16, maxPerTile: 512)
-        let standardRenderer = Renderer(precision: .float32, sortAlgorithm: .radix, useFusedPipeline: false, limits: limits)
-        let fusedRenderer = Renderer(precision: .float32, sortAlgorithm: .radix, useFusedPipeline: true, limits: limits)
+        let standardRenderer = Renderer(precision: .float32, sortAlgorithm: .radix, limits: limits)
+        let fusedRenderer = Renderer(precision: .float32, sortAlgorithm: .radix, limits: limits)
 
         let gaussianCount = 500_000
         let imageWidth: UInt32 = 1024
@@ -872,13 +864,11 @@ final class FusedPipelineTests: XCTestCase {
 
         let standardRenderer = Renderer(
             precision: .float16,
-            sortAlgorithm: .radix,
-            useFusedPipeline: false
+            sortAlgorithm: .radix
         )
         let fusedRenderer = Renderer(
             precision: .float16,
-            sortAlgorithm: .radix,
-            useFusedPipeline: true
+            sortAlgorithm: .radix
         )
 
         XCTAssertTrue(fusedRenderer.isFusedPipelineAvailable, "Fused pipeline should be available")
@@ -989,12 +979,13 @@ final class FusedPipelineTests: XCTestCase {
             var stdWallTimes: [Double] = []
             var fusedWallTimes: [Double] = []
 
+            let nilFloatPtr: UnsafeMutablePointer<Float>? = nil
             for _ in 0..<iterations {
                 let t0 = CFAbsoluteTimeGetCurrent()
                 _ = standardRenderer.renderRaw(
                     gaussianCount: gaussianCount, meansPtr: &means, conicsPtr: &conics,
                     colorsPtr: &colors, opacityPtr: &opacities, depthsPtr: &depths, radiiPtr: &radii,
-                    colorOutPtr: nil, depthOutPtr: nil, alphaOutPtr: &alphaOut, params: params
+                    colorOutPtr: nilFloatPtr, depthOutPtr: nilFloatPtr, alphaOutPtr: &alphaOut, params: params
                 )
                 stdWallTimes.append((CFAbsoluteTimeGetCurrent() - t0) * 1000)
 
@@ -1002,7 +993,7 @@ final class FusedPipelineTests: XCTestCase {
                 _ = fusedRenderer.renderRaw(
                     gaussianCount: gaussianCount, meansPtr: &means, conicsPtr: &conics,
                     colorsPtr: &colors, opacityPtr: &opacities, depthsPtr: &depths, radiiPtr: &radii,
-                    colorOutPtr: nil, depthOutPtr: nil, alphaOutPtr: &alphaOut, params: params
+                    colorOutPtr: nilFloatPtr, depthOutPtr: nilFloatPtr, alphaOutPtr: &alphaOut, params: params
                 )
                 fusedWallTimes.append((CFAbsoluteTimeGetCurrent() - t1) * 1000)
             }

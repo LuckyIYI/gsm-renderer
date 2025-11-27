@@ -1,28 +1,20 @@
 import Metal
 
+/// Encoder for buffer-based rendering (for Python/MLX readback)
+/// Texture-based rendering uses FusedPipelineEncoder instead
 final class RenderEncoder {
     private let renderPipeline: MTLComputePipelineState
     private let renderPipelineHalf: MTLComputePipelineState?
 
-    private let renderDirectPipeline: MTLComputePipelineState
-    private let renderDirectPipelineHalf: MTLComputePipelineState?
-
-    // Multi-pixel: each thread handles 4x2 pixels, 4x8 threadgroup = 32 threads for 16x16 tile
-    private let renderMultiPixelPipeline: MTLComputePipelineState?
-
     private let prepareDispatchPipeline: MTLComputePipelineState
     private let clearPipeline: MTLComputePipelineState
-    private let clearTexturesPipeline: MTLComputePipelineState
 
     init(device: MTLDevice, library: MTLLibrary) throws {
         guard
             let renderFn = library.makeFunction(name: "renderTiles_float"),
             let renderHalfFn = library.makeFunction(name: "renderTiles_half"),
-            let renderDirectFn = library.makeFunction(name: "renderTilesDirect_float"),
-            let renderDirectHalfFn = library.makeFunction(name: "renderTilesDirect_half"),
             let prepFn = library.makeFunction(name: "prepareRenderDispatchKernel"),
-            let clearFn = library.makeFunction(name: "clearRenderTargetsKernel"),
-            let clearTexFn = library.makeFunction(name: "clearRenderTexturesKernel")
+            let clearFn = library.makeFunction(name: "clearRenderTargetsKernel")
         else {
             fatalError("Render functions missing")
         }
@@ -30,19 +22,8 @@ final class RenderEncoder {
         self.renderPipeline = try device.makeComputePipelineState(function: renderFn)
         self.renderPipelineHalf = try? device.makeComputePipelineState(function: renderHalfFn)
 
-        self.renderDirectPipeline = try device.makeComputePipelineState(function: renderDirectFn)
-        self.renderDirectPipelineHalf = try? device.makeComputePipelineState(function: renderDirectHalfFn)
-
-        // Multi-pixel kernel (optional - may not exist in older shader builds)
-        if let multiPixelFn = library.makeFunction(name: "renderTilesMultiPixel") {
-            self.renderMultiPixelPipeline = try? device.makeComputePipelineState(function: multiPixelFn)
-        } else {
-            self.renderMultiPixelPipeline = nil
-        }
-
         self.prepareDispatchPipeline = try device.makeComputePipelineState(function: prepFn)
         self.clearPipeline = try device.makeComputePipelineState(function: clearFn)
-        self.clearTexturesPipeline = try device.makeComputePipelineState(function: clearTexFn)
     }
 
     func encode(
@@ -93,117 +74,6 @@ final class RenderEncoder {
         }
     }
     
-    func encodeDirect(
-        commandBuffer: MTLCommandBuffer,
-        orderedBuffers: OrderedGaussianBuffers,
-        outputTextures: RenderOutputTextures,
-        params: RenderParams,
-        dispatchArgs: MTLBuffer,
-        dispatchOffset: Int,
-        precision: Precision
-    ) {
-        // Indirect dispatch for active tiles only - no overdispatch
-        self.prepareDispatch(commandBuffer: commandBuffer, activeTileCount: orderedBuffers.activeTileCount, dispatchArgs: dispatchArgs)
-        self.clearTextures(commandBuffer: commandBuffer, outputTextures: outputTextures, params: params)
-
-        if let encoder = commandBuffer.makeComputeCommandEncoder() {
-            encoder.label = "RenderTilesDirect"
-            if precision == .float16, let halfPipe = self.renderDirectPipelineHalf {
-                encoder.setComputePipelineState(halfPipe)
-            } else {
-                encoder.setComputePipelineState(self.renderDirectPipeline)
-            }
-            encoder.setBuffer(orderedBuffers.headers, offset: 0, index: 0)
-            encoder.setBuffer(orderedBuffers.means, offset: 0, index: 1)
-            encoder.setBuffer(orderedBuffers.conics, offset: 0, index: 2)
-            encoder.setBuffer(orderedBuffers.colors, offset: 0, index: 3)
-            encoder.setBuffer(orderedBuffers.opacities, offset: 0, index: 4)
-            encoder.setBuffer(orderedBuffers.depths, offset: 0, index: 5)
-
-            encoder.setTexture(outputTextures.color, index: 0)
-            encoder.setTexture(outputTextures.depth, index: 1)
-            encoder.setTexture(outputTextures.alpha, index: 2)
-
-            var p = params
-            encoder.setBytes(&p, length: MemoryLayout<RenderParams>.stride, index: 9)
-
-            // Active tiles buffer for indirection
-            encoder.setBuffer(orderedBuffers.activeTileIndices, offset: 0, index: 10)
-
-            // Indirect dispatch: one 16x16 threadgroup per active tile
-            let w = Int(params.tileWidth)
-            let h = Int(params.tileHeight)
-            let tg = MTLSize(width: w, height: h, depth: 1)
-            encoder.dispatchThreadgroups(
-                indirectBuffer: dispatchArgs,
-                indirectBufferOffset: dispatchOffset,
-                threadsPerThreadgroup: tg
-            )
-            encoder.endEncoding()
-        }
-    }
-
-    /// Multi-pixel rendering: each thread handles 4x2 = 8 pixels
-    /// Uses 8x8 = 64 threads per 32x16 tile (vs 256 threads in standard 16x16 mode)
-    /// This reduces thread divergence and data loading overhead
-    /// REQUIRES: tileWidth=32, tileHeight=16 in RenderParams
-    func encodeMultiPixel(
-        commandBuffer: MTLCommandBuffer,
-        orderedBuffers: OrderedGaussianBuffers,
-        outputTextures: RenderOutputTextures,
-        params: RenderParams,
-        dispatchArgs: MTLBuffer,
-        dispatchOffset: Int
-    ) -> Bool {
-        guard let multiPixelPipeline = self.renderMultiPixelPipeline else {
-            return false  // Multi-pixel not available, caller should fall back to encodeDirect
-        }
-
-        // Assert correct tile sizes for multi-pixel mode
-        assert(params.tileWidth == 32 && params.tileHeight == 16,
-               "Multi-pixel mode requires tileWidth=32, tileHeight=16. Got \(params.tileWidth)x\(params.tileHeight)")
-
-        // Indirect dispatch for active tiles only
-        self.prepareDispatch(commandBuffer: commandBuffer, activeTileCount: orderedBuffers.activeTileCount, dispatchArgs: dispatchArgs)
-        self.clearTextures(commandBuffer: commandBuffer, outputTextures: outputTextures, params: params)
-
-        if let encoder = commandBuffer.makeComputeCommandEncoder() {
-            encoder.label = "RenderTilesMultiPixel"
-            encoder.setComputePipelineState(multiPixelPipeline)
-
-            encoder.setBuffer(orderedBuffers.headers, offset: 0, index: 0)
-            encoder.setBuffer(orderedBuffers.means, offset: 0, index: 1)
-            encoder.setBuffer(orderedBuffers.conics, offset: 0, index: 2)
-            encoder.setBuffer(orderedBuffers.colors, offset: 0, index: 3)
-            encoder.setBuffer(orderedBuffers.opacities, offset: 0, index: 4)
-            encoder.setBuffer(orderedBuffers.depths, offset: 0, index: 5)
-
-            encoder.setTexture(outputTextures.color, index: 0)
-            encoder.setTexture(outputTextures.depth, index: 1)
-            encoder.setTexture(outputTextures.alpha, index: 2)
-
-            var p = params
-            encoder.setBytes(&p, length: MemoryLayout<RenderParams>.stride, index: 9)
-
-            encoder.setBuffer(orderedBuffers.activeTileIndices, offset: 0, index: 10)
-
-            // Multi-pixel: 8x8 = 64 threads per 32x16 tile (each thread handles 4x2 pixels)
-            let tg = MTLSize(width: 8, height: 8, depth: 1)
-            encoder.dispatchThreadgroups(
-                indirectBuffer: dispatchArgs,
-                indirectBufferOffset: dispatchOffset,
-                threadsPerThreadgroup: tg
-            )
-            encoder.endEncoding()
-        }
-        return true
-    }
-
-    /// Check if multi-pixel rendering is available
-    var isMultiPixelAvailable: Bool {
-        return renderMultiPixelPipeline != nil
-    }
-
     private func prepareDispatch(commandBuffer: MTLCommandBuffer, activeTileCount: MTLBuffer, dispatchArgs: MTLBuffer) {
         if let encoder = commandBuffer.makeComputeCommandEncoder() {
             encoder.label = "PrepareRenderDispatch"
@@ -259,33 +129,4 @@ final class RenderEncoder {
         }
     }
     
-    private func clearTextures(commandBuffer: MTLCommandBuffer, outputTextures: RenderOutputTextures, params: RenderParams) {
-        if let encoder = commandBuffer.makeComputeCommandEncoder() {
-            encoder.label = "ClearTextures"
-            encoder.setComputePipelineState(self.clearTexturesPipeline)
-            encoder.setTexture(outputTextures.color, index: 0)
-            encoder.setTexture(outputTextures.depth, index: 1)
-            encoder.setTexture(outputTextures.alpha, index: 2)
-            
-            var clearParams = ClearTextureParamsSwift(
-                width: params.width,
-                height: params.height,
-                whiteBackground: params.whiteBackground
-            )
-            encoder.setBytes(&clearParams, length: MemoryLayout<ClearTextureParamsSwift>.stride, index: 0)
-            
-            let w = Int(params.width)
-            let h = Int(params.height)
-            
-            // Use 16x16 threadgroups for 2D dispatch
-            let threadsPerThreadgroup = MTLSize(width: 16, height: 16, depth: 1)
-            let threadgroups = MTLSize(
-                width: (w + 15) / 16,
-                height: (h + 15) / 16,
-                depth: 1
-            )
-            encoder.dispatchThreadgroups(threadgroups, threadsPerThreadgroup: threadsPerThreadgroup)
-            encoder.endEncoding()
-        }
-    }
 }

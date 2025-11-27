@@ -23,7 +23,8 @@ final class SortPerfTests: XCTestCase {
                 packThreadgroupSize: UInt32(blockSize),
                 bitonicThreadgroupSize: UInt32(blockSize),
                 radixBlockSize: UInt32(blockSize),
-                radixGrainSize: UInt32(grainSize)
+                radixGrainSize: UInt32(grainSize),
+                maxAssignments: 0  // Set dynamically at encode time
             )
         )
     }
@@ -103,7 +104,7 @@ final class SortPerfTests: XCTestCase {
             func runRadix() -> Double {
                 fillInput()
                 guard let cb = queue.makeCommandBuffer() else { return .infinity }
-                dispatchEncoder.encode(commandBuffer: cb, header: headerBuffer, dispatchArgs: dispatchArgs)
+                dispatchEncoder.encode(commandBuffer: cb, header: headerBuffer, dispatchArgs: dispatchArgs, maxAssignments: paddedCount)
                 cb.commit()
                 cb.waitUntilCompleted()
 
@@ -128,7 +129,7 @@ final class SortPerfTests: XCTestCase {
             func runBitonic() -> Double {
                 fillInput()
                 guard let cb = queue.makeCommandBuffer() else { return .infinity }
-                dispatchEncoder.encode(commandBuffer: cb, header: headerBuffer, dispatchArgs: dispatchArgs)
+                dispatchEncoder.encode(commandBuffer: cb, header: headerBuffer, dispatchArgs: dispatchArgs, maxAssignments: paddedCount)
                 cb.commit()
                 cb.waitUntilCompleted()
 

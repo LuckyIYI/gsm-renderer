@@ -25,20 +25,23 @@ final class EncoderTests: XCTestCase {
         var keys = [SIMD2<UInt32>](repeating: .zero, count: count)
         var indices = [Int32](repeating: 0, count: count)
 
-        // Use deterministic values for debugging
+        // Use deterministic values with 16-bit depth (half precision)
+        // The radix sort now uses 16-bit depth quantization
         for i in 0..<count {
             let tileId = UInt32(i % 10)  // Tiles 0-9 in order
             let depth = Float(i)  // Simple increasing depth
-            let depthBits = depth.bitPattern
+            // Convert to half precision (matches GPU fuseSortKeysKernel)
+            let halfDepth = Float16(depth)
+            let depthBits = UInt32(halfDepth.bitPattern)
             keys[i] = SIMD2<UInt32>(tileId, depthBits)
             indices[i] = Int32(i)
         }
-        
+
         struct Item {
             let key: SIMD2<UInt32>
             let index: Int32
         }
-        
+
         let items = zip(keys, indices).map { Item(key: $0, index: $1) }
         let sortedItems = items.sorted { a, b in
             if a.key.x != b.key.x {
@@ -54,6 +57,7 @@ final class EncoderTests: XCTestCase {
         
         let dispatchArgs = device.makeBuffer(length: 1024, options: .storageModeShared)!
 
+        let maxAssignments = count * 10
         let dispatchEncoder = try DispatchEncoder(
             device: device,
             library: library,
@@ -64,7 +68,8 @@ final class EncoderTests: XCTestCase {
                 packThreadgroupSize: 256,
                 bitonicThreadgroupSize: 256,
                 radixBlockSize: 256,
-                radixGrainSize: 4
+                radixGrainSize: 4,
+                maxAssignments: UInt32(maxAssignments)
             )
         )
 
@@ -104,7 +109,7 @@ final class EncoderTests: XCTestCase {
         
         let commandBuffer = queue.makeCommandBuffer()!
 
-        dispatchEncoder.encode(commandBuffer: commandBuffer, header: headerBuffer, dispatchArgs: dispatchArgs)
+        dispatchEncoder.encode(commandBuffer: commandBuffer, header: headerBuffer, dispatchArgs: dispatchArgs, maxAssignments: maxAssignments)
         commandBuffer.commit()
         commandBuffer.waitUntilCompleted()
 
@@ -262,11 +267,12 @@ final class EncoderTests: XCTestCase {
         let headerBuffer = device.makeBuffer(length: MemoryLayout<TileAssignmentHeaderSwift>.stride, options: .storageModeShared)!
         
         let dispatchArgs = device.makeBuffer(length: 4096, options: .storageModePrivate)!
-        
+        let maxAssignments = count * 10
+
         // Config for dispatch
         let dispatchEncoder = try DispatchEncoder(
-            device: device, 
-            library: library, 
+            device: device,
+            library: library,
             config: AssignmentDispatchConfigSwift(
                 sortThreadgroupSize: 256,
                 fuseThreadgroupSize: 256,
@@ -275,10 +281,11 @@ final class EncoderTests: XCTestCase {
                 // Match the encoder's chosen threadgroup size to keep indirect dispatch in sync.
                 bitonicThreadgroupSize: UInt32(encoder.unitSize),
                 radixBlockSize: 256,
-                radixGrainSize: 4
+                radixGrainSize: 4,
+                maxAssignments: UInt32(maxAssignments)
             )
         )
-        
+
         let headerPtr = headerBuffer.contents().bindMemory(to: TileAssignmentHeaderSwift.self, capacity: 1)
         headerPtr.pointee.totalAssignments = UInt32(count)
         var padded = 1
@@ -290,15 +297,15 @@ final class EncoderTests: XCTestCase {
             general: DispatchSlot.bitonicGeneral.rawValue * MemoryLayout<DispatchIndirectArgsSwift>.stride,
             final: DispatchSlot.bitonicFinal.rawValue * MemoryLayout<DispatchIndirectArgsSwift>.stride
         )
-        
+
         let commandBuffer = queue.makeCommandBuffer()!
-        
-        dispatchEncoder.encode(commandBuffer: commandBuffer, header: headerBuffer, dispatchArgs: dispatchArgs)
+
+        dispatchEncoder.encode(commandBuffer: commandBuffer, header: headerBuffer, dispatchArgs: dispatchArgs, maxAssignments: maxAssignments)
         commandBuffer.commit()
         commandBuffer.waitUntilCompleted()
-        
+
         let commandBuffer2 = queue.makeCommandBuffer()!
-        
+
         encoder.encode(
             commandBuffer: commandBuffer2,
             sortKeys: keyBuffer,
@@ -533,15 +540,18 @@ final class EncoderTests: XCTestCase {
         let encoder = try RadixSortEncoder(device: device, library: library)
 
         let count = 131_072
-        
+
         var keys = [SIMD2<UInt32>](repeating: .zero, count: count)
         var indices = [Int32](repeating: 0, count: count)
-        
-        // Deterministic seed or random? Random is fine for sorting.
+
+        // Deterministic seed for reproducibility
+        srand48(42)
         for i in 0..<count {
-            let tileId = UInt32.random(in: 0..<50) // More tiles
-            let depth = Float.random(in: 0.1...100.0)
-            let depthBits = depth.bitPattern
+            let tileId = UInt32(drand48() * 50) // More tiles
+            let depth = Float(drand48() * 100.0 + 0.1)
+            // Convert to half precision (matches GPU fuseSortKeysKernel)
+            let halfDepth = Float16(depth)
+            let depthBits = UInt32(halfDepth.bitPattern)
             keys[i] = SIMD2<UInt32>(tileId, depthBits)
             indices[i] = Int32(i)
         }
@@ -552,7 +562,7 @@ final class EncoderTests: XCTestCase {
             let key: SIMD2<UInt32>
             let index: Int32
         }
-        
+
         let items = zip(keys, indices).map { Item(key: $0, index: $1) }
         let sortedItems = items.sorted { a, b in
             if a.key.x != b.key.x {
@@ -566,10 +576,11 @@ final class EncoderTests: XCTestCase {
         let headerBuffer = device.makeBuffer(length: MemoryLayout<TileAssignmentHeaderSwift>.stride, options: .storageModeShared)!
         
         let dispatchArgs = device.makeBuffer(length: 4096, options: .storageModePrivate)!
-        
+        let maxAssignments = count * 10
+
         let dispatchEncoder = try DispatchEncoder(
-            device: device, 
-            library: library, 
+            device: device,
+            library: library,
             config: AssignmentDispatchConfigSwift(
                 sortThreadgroupSize: 256,
                 fuseThreadgroupSize: 256,
@@ -577,13 +588,14 @@ final class EncoderTests: XCTestCase {
                 packThreadgroupSize: 256,
                 bitonicThreadgroupSize: 256,
                 radixBlockSize: 256,
-                radixGrainSize: 4
+                radixGrainSize: 4,
+                maxAssignments: UInt32(maxAssignments)
             )
         )
-        
+
         let headerPtr = headerBuffer.contents().bindMemory(to: TileAssignmentHeaderSwift.self, capacity: 1)
         headerPtr.pointee.totalAssignments = UInt32(count)
-        
+
         let valuesPerGroup = 256 * 4
         let gridSize = max(1, (count + valuesPerGroup - 1) / valuesPerGroup)
         let histogramCount = gridSize * 256
@@ -613,15 +625,15 @@ final class EncoderTests: XCTestCase {
             apply: DispatchSlot.radixApply.rawValue * MemoryLayout<DispatchIndirectArgsSwift>.stride,
             scatter: DispatchSlot.radixScatter.rawValue * MemoryLayout<DispatchIndirectArgsSwift>.stride
         )
-        
+
         let commandBuffer = queue.makeCommandBuffer()!
-        
-        dispatchEncoder.encode(commandBuffer: commandBuffer, header: headerBuffer, dispatchArgs: dispatchArgs)
+
+        dispatchEncoder.encode(commandBuffer: commandBuffer, header: headerBuffer, dispatchArgs: dispatchArgs, maxAssignments: maxAssignments)
         commandBuffer.commit()
         commandBuffer.waitUntilCompleted()
-        
+
         let commandBuffer2 = queue.makeCommandBuffer()!
-        
+
         encoder.encode(
             commandBuffer: commandBuffer2,
             keyBuffer: keyBuffer,
@@ -672,13 +684,19 @@ final class EncoderTests: XCTestCase {
         var paddedCount = 1
         while paddedCount < count { paddedCount <<= 1 }
 
-        var keys = [SIMD2<UInt32>](repeating: SIMD2<UInt32>(0xFFFFFFFF, 0xFFFFFFFF), count: paddedCount)
+        // Use max half value (0xFFFF) for sentinel keys instead of max uint32
+        var keys = [SIMD2<UInt32>](repeating: SIMD2<UInt32>(0xFFFFFFFF, 0xFFFF), count: paddedCount)
         var indices = [Int32](repeating: -1, count: paddedCount)
 
+        // Deterministic seed for reproducibility
+        srand48(123)
         for i in 0..<count {
-            let tileId = UInt32.random(in: 0..<50)
-            let depth = Float.random(in: 0.1...100.0)
-            keys[i] = SIMD2<UInt32>(tileId, depth.bitPattern)
+            let tileId = UInt32(drand48() * 50)
+            let depth = Float(drand48() * 100.0 + 0.1)
+            // Convert to half precision (matches GPU fuseSortKeysKernel)
+            let halfDepth = Float16(depth)
+            let depthBits = UInt32(halfDepth.bitPattern)
+            keys[i] = SIMD2<UInt32>(tileId, depthBits)
             indices[i] = Int32(i)
         }
 
@@ -696,6 +714,7 @@ final class EncoderTests: XCTestCase {
         let headerPtr = headerBuffer.contents().bindMemory(to: TileAssignmentHeaderSwift.self, capacity: 1)
         headerPtr.pointee.totalAssignments = UInt32(count)
         headerPtr.pointee.paddedCount = UInt32(paddedCount)
+        let maxAssignments = paddedCount * 2
 
         let dispatchEncoder = try DispatchEncoder(
             device: device,
@@ -707,7 +726,8 @@ final class EncoderTests: XCTestCase {
                 packThreadgroupSize: 256,
                 bitonicThreadgroupSize: 256,
                 radixBlockSize: 256,
-                radixGrainSize: 4
+                radixGrainSize: 4,
+                maxAssignments: UInt32(maxAssignments)
             )
         )
 
@@ -735,7 +755,7 @@ final class EncoderTests: XCTestCase {
         )
 
         let commandBuffer = queue.makeCommandBuffer()!
-        dispatchEncoder.encode(commandBuffer: commandBuffer, header: headerBuffer, dispatchArgs: dispatchArgs)
+        dispatchEncoder.encode(commandBuffer: commandBuffer, header: headerBuffer, dispatchArgs: dispatchArgs, maxAssignments: maxAssignments)
         commandBuffer.commit()
         commandBuffer.waitUntilCompleted()
 

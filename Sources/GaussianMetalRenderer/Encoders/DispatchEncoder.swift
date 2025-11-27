@@ -15,18 +15,20 @@ final class DispatchEncoder {
     func encode(
         commandBuffer: MTLCommandBuffer,
         header: MTLBuffer,
-        dispatchArgs: MTLBuffer
+        dispatchArgs: MTLBuffer,
+        maxAssignments: Int
     ) {
         guard let encoder = commandBuffer.makeComputeCommandEncoder() else { return }
         encoder.label = "PrepareDispatch"
-        
+
         encoder.setComputePipelineState(self.pipeline)
         encoder.setBuffer(header, offset: 0, index: 0)
         encoder.setBuffer(dispatchArgs, offset: 0, index: 1)
-        
+
         var cfg = self.config
+        cfg.maxAssignments = UInt32(maxAssignments)
         encoder.setBytes(&cfg, length: MemoryLayout<AssignmentDispatchConfigSwift>.stride, index: 2)
-        
+
         let threads = MTLSize(width: 1, height: 1, depth: 1)
         encoder.dispatchThreads(threads, threadsPerThreadgroup: threads)
         encoder.endEncoding()

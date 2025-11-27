@@ -114,17 +114,17 @@ final class FrameResources {
     let activeTileIndices: MTLBuffer
     let activeTileCount: MTLBuffer
 
-    // Sort Buffers
+    // Sort Buffers (used by both bitonic and radix)
     let sortKeys: MTLBuffer
     let sortedIndices: MTLBuffer
 
-    // Radix Buffers
-    let radixHistogram: MTLBuffer
-    let radixBlockSums: MTLBuffer
-    let radixScannedHistogram: MTLBuffer
-    let radixFusedKeys: MTLBuffer
-    let radixKeysScratch: MTLBuffer
-    let radixPayloadScratch: MTLBuffer
+    // Radix Sort Buffers (nil when using bitonic)
+    let radixHistogram: MTLBuffer?
+    let radixBlockSums: MTLBuffer?
+    let radixScannedHistogram: MTLBuffer?
+    let radixFusedKeys: MTLBuffer?
+    let radixKeysScratch: MTLBuffer?
+    let radixPayloadScratch: MTLBuffer?
 
     // Fused Pipeline Buffers (interleaved data for cache efficiency)
     let interleavedGaussians: MTLBuffer?
@@ -133,14 +133,14 @@ final class FrameResources {
     // Dispatch Args (Per-frame to avoid race on indirect dispatch)
     let dispatchArgs: MTLBuffer
 
-    // Output Buffers
-    var outputBuffers: RenderOutputBuffers
+    // Output Buffers (nil when textureOnly mode)
+    var outputBuffers: RenderOutputBuffers?
     // Output Textures (Alternative)
     var outputTextures: RenderOutputTextures
 
     let device: MTLDevice
 
-    init(device: MTLDevice, layout: FrameResourceLayout, residencySetProvider: (() -> (any MTLResidencySet)?)?, useHeap: Bool) {
+    init(device: MTLDevice, layout: FrameResourceLayout, residencySetProvider: (() -> (any MTLResidencySet)?)?, useHeap: Bool, textureOnly: Bool = false) {
         self.device = device
         self.heapAllocator = HeapAllocator(device: device, residencySetProvider: residencySetProvider)
         self.tileAssignmentMaxAssignments = layout.maxAssignments
@@ -216,26 +216,35 @@ final class FrameResources {
         self.activeTileCount = buffer("ActiveTileCount")
         self.sortKeys = buffer("SortKeys")
         self.sortedIndices = buffer("SortedIndices")
-        self.radixHistogram = buffer("RadixHist")
-        self.radixBlockSums = buffer("RadixBlockSums")
-        self.radixScannedHistogram = buffer("RadixScanned")
-        self.radixFusedKeys = buffer("RadixFused")
-        self.radixKeysScratch = buffer("RadixScratch")
-        self.radixPayloadScratch = buffer("RadixPayload")
-        self.interleavedGaussians = layout.heapAllocations.contains(where: { $0.label == "InterleavedGaussians" }) ? buffer("InterleavedGaussians") : nil
-        self.packedGaussiansFused = layout.heapAllocations.contains(where: { $0.label == "PackedGaussiansFused" }) ? buffer("PackedGaussiansFused") : nil
 
-        // Output buffers
+        // Conditionally allocate radix/fused buffers based on config
+        func optionalBuffer(_ label: String) -> MTLBuffer? {
+            layout.heapAllocations.contains(where: { $0.label == label }) ? buffer(label) : nil
+        }
+        self.radixHistogram = optionalBuffer("RadixHist")
+        self.radixBlockSums = optionalBuffer("RadixBlockSums")
+        self.radixScannedHistogram = optionalBuffer("RadixScanned")
+        self.radixFusedKeys = optionalBuffer("RadixFused")
+        self.radixKeysScratch = optionalBuffer("RadixScratch")
+        self.radixPayloadScratch = optionalBuffer("RadixPayload")
+        self.interleavedGaussians = optionalBuffer("InterleavedGaussians")
+        self.packedGaussiansFused = optionalBuffer("PackedGaussiansFused")
+
+        // Output buffers (skipped in textureOnly mode to save ~20MB)
         let pixelBytes = layout.pixelCapacity
-        guard
-            let color = device.makeBuffer(length: pixelBytes * 12, options: .storageModeShared),
-            let depth = device.makeBuffer(length: pixelBytes * 4, options: .storageModeShared),
-            let alpha = device.makeBuffer(length: pixelBytes * 4, options: .storageModeShared)
-        else { fatalError("Failed to allocate output buffers") }
-        color.label = "RenderColorOutput"
-        depth.label = "RenderDepthOutput"
-        alpha.label = "RenderAlphaOutput"
-        self.outputBuffers = RenderOutputBuffers(colorOutGPU: color, depthOutGPU: depth, alphaOutGPU: alpha)
+        if textureOnly {
+            self.outputBuffers = nil
+        } else {
+            guard
+                let color = device.makeBuffer(length: pixelBytes * 12, options: .storageModeShared),
+                let depth = device.makeBuffer(length: pixelBytes * 4, options: .storageModeShared),
+                let alpha = device.makeBuffer(length: pixelBytes * 4, options: .storageModeShared)
+            else { fatalError("Failed to allocate output buffers") }
+            color.label = "RenderColorOutput"
+            depth.label = "RenderDepthOutput"
+            alpha.label = "RenderAlphaOutput"
+            self.outputBuffers = RenderOutputBuffers(colorOutGPU: color, depthOutGPU: depth, alphaOutGPU: alpha)
+        }
 
         // Output textures sized to limits
         let texDesc = MTLTextureDescriptor.texture2DDescriptor(pixelFormat: .rgba16Float, width: layout.limits.maxWidth, height: layout.limits.maxHeight, mipmapped: false)
@@ -360,6 +369,7 @@ public final class Renderer: @unchecked Sendable {
         usePreciseIntersection: Bool = false,
         useFusedPipeline: Bool = false,
         useHeapAllocation: Bool = false,  // Disabled by default - placement heap has issues
+        textureOnly: Bool = false,  // Skip buffer output allocation to save ~20MB
         limits: RendererLimits = RendererLimits(maxGaussians: 1_000_000, maxWidth: 2048, maxHeight: 2048)
     ) {
         precondition(limits.maxGaussians <= Renderer.supportedMaxGaussians, "Renderer supports up to 10,000,000 gaussians; requested \(limits.maxGaussians)")
@@ -445,13 +455,16 @@ public final class Renderer: @unchecked Sendable {
                 device: device,
                 layout: self.frameLayout,
                 residencySetProvider: { [weak self] in self?.residencySet },
-                useHeap: useHeapAllocation
+                useHeap: useHeapAllocation,
+                textureOnly: textureOnly
             )
             self.frameResources.append(frame)
             self.frameInUse.append(false)
         }
 
-        // Preallocate shared CPU-visible caches up to the configured limits
+        // Preallocate shared CPU-visible caches - ONLY allocate what's needed for precision mode
+        // textureOnly + float16: skip world caches and float32 gaussian caches (~150MB saved)
+        // float32: skip float16 gaussian caches (~22MB saved)
         let shared: MTLResourceOptions = .storageModeShared
         func makeShared(_ length: Int, _ label: String) -> MTLBuffer {
             guard let buf = device.makeBuffer(length: length, options: shared) else {
@@ -462,26 +475,39 @@ public final class Renderer: @unchecked Sendable {
         }
 
         let g = limits.maxGaussians
-        self.worldPositionsCache = makeShared(g * MemoryLayout<SIMD3<Float>>.stride, "WorldPositions")
-        self.worldScalesCache = makeShared(g * MemoryLayout<SIMD3<Float>>.stride, "WorldScales")
-        self.worldRotationsCache = makeShared(g * MemoryLayout<SIMD4<Float>>.stride, "WorldRotations")
-        // SH coeffs worst-case: 9 coefficients (l=2) *3 channels -> 27 floats
-        self.worldHarmonicsCache = makeShared(g * MemoryLayout<Float>.stride * 27, "WorldHarmonics")
-        self.worldOpacitiesCache = makeShared(g * MemoryLayout<Float>.stride, "WorldOpacities")
 
-        self.gaussianMeansCache = makeShared(g * 8, "GaussianMeans")
+        // World caches only needed for world->gaussian projection (not textureOnly mode)
+        if !textureOnly {
+            self.worldPositionsCache = makeShared(g * MemoryLayout<SIMD3<Float>>.stride, "WorldPositions")
+            self.worldScalesCache = makeShared(g * MemoryLayout<SIMD3<Float>>.stride, "WorldScales")
+            self.worldRotationsCache = makeShared(g * MemoryLayout<SIMD4<Float>>.stride, "WorldRotations")
+            // SH coeffs worst-case: 9 coefficients (l=2) *3 channels -> 27 floats = 108MB!
+            self.worldHarmonicsCache = makeShared(g * MemoryLayout<Float>.stride * 27, "WorldHarmonics")
+            self.worldOpacitiesCache = makeShared(g * MemoryLayout<Float>.stride, "WorldOpacities")
+        }
+
+        // Float32 gaussian input caches - needed for renderRaw (always takes float32 input)
+        // Skip only in textureOnly mode where renderRaw isn't available
+        if !textureOnly {
+            self.gaussianMeansCache = makeShared(g * 8, "GaussianMeans")
+            self.gaussianDepthsCache = makeShared(g * 4, "GaussianDepths")
+            self.gaussianConicsCache = makeShared(g * 16, "GaussianConics")
+            self.gaussianColorsCache = makeShared(g * 12, "GaussianColors")
+            self.gaussianOpacitiesCache = makeShared(g * 4, "GaussianOpacities")
+        }
+
+        // Half precision caches - only allocate for float16 pipeline
+        if precision == .float16 {
+            self.gaussianMeansHalfCache = makeShared(g * 4, "GaussianMeansHalf")
+            self.gaussianDepthsHalfCache = makeShared(g * 2, "GaussianDepthsHalf")
+            self.gaussianConicsHalfCache = makeShared(g * 8, "GaussianConicsHalf")
+            self.gaussianColorsHalfCache = makeShared(g * 6, "GaussianColorsHalf")
+            self.gaussianOpacitiesHalfCache = makeShared(g * 2, "GaussianOpacitiesHalf")
+        }
+
+        // Radii and Mask always float (used for tile bounds in all modes)
         self.gaussianRadiiCache = makeShared(g * 4, "GaussianRadii")
         self.gaussianMaskCache = makeShared(g, "GaussianMask")
-        self.gaussianDepthsCache = makeShared(g * 4, "GaussianDepths")
-        self.gaussianConicsCache = makeShared(g * 16, "GaussianConics")
-        self.gaussianColorsCache = makeShared(g * 12, "GaussianColors")
-        self.gaussianOpacitiesCache = makeShared(g * 4, "GaussianOpacities")
-
-        self.gaussianMeansHalfCache = makeShared(g * 4, "GaussianMeansHalf")
-        self.gaussianDepthsHalfCache = makeShared(g * 2, "GaussianDepthsHalf")
-        self.gaussianConicsHalfCache = makeShared(g * 8, "GaussianConicsHalf")
-        self.gaussianColorsHalfCache = makeShared(g * 6, "GaussianColorsHalf")
-        self.gaussianOpacitiesHalfCache = makeShared(g * 2, "GaussianOpacitiesHalf")
     }
     
     func triggerCapture(path: String) {
@@ -553,18 +579,22 @@ public final class Renderer: @unchecked Sendable {
         add("PackedDepths", maxAssignments * strideForDepths())
         add("ActiveTileIndices", tileCount * MemoryLayout<UInt32>.stride)
 
+        // Sort key/index buffers (used by both bitonic and radix)
         add("SortKeys", paddedAssignments * MemoryLayout<SIMD2<UInt32>>.stride)
         add("SortedIndices", paddedAssignments * MemoryLayout<Int32>.stride)
 
-        let valuesPerGroup = radixSortEncoder.blockSize * radixSortEncoder.grainSize
-        let gridSize = max(1, (paddedAssignments + valuesPerGroup - 1) / valuesPerGroup)
-        let histogramCount = gridSize * radixSortEncoder.radix
-        add("RadixHist", histogramCount * MemoryLayout<UInt32>.stride)
-        add("RadixBlockSums", gridSize * MemoryLayout<UInt32>.stride)
-        add("RadixScanned", histogramCount * MemoryLayout<UInt32>.stride)
-        add("RadixFused", paddedAssignments * MemoryLayout<UInt64>.stride)
-        add("RadixScratch", paddedAssignments * MemoryLayout<UInt64>.stride)
-        add("RadixPayload", paddedAssignments * MemoryLayout<UInt32>.stride)
+        // Radix-specific buffers only when using radix sort
+        if sortAlgorithm == .radix {
+            let valuesPerGroup = radixSortEncoder.blockSize * radixSortEncoder.grainSize
+            let gridSize = max(1, (paddedAssignments + valuesPerGroup - 1) / valuesPerGroup)
+            let histogramCount = gridSize * radixSortEncoder.radix
+            add("RadixHist", histogramCount * MemoryLayout<UInt32>.stride)
+            add("RadixBlockSums", gridSize * MemoryLayout<UInt32>.stride)
+            add("RadixScanned", histogramCount * MemoryLayout<UInt32>.stride)
+            add("RadixFused", paddedAssignments * MemoryLayout<UInt64>.stride)
+            add("RadixScratch", paddedAssignments * MemoryLayout<UInt64>.stride)
+            add("RadixPayload", paddedAssignments * MemoryLayout<UInt32>.stride)
+        }
 
         if useFusedPipeline {
             add("InterleavedGaussians", gaussianCount * strideForInterleaved())
@@ -1477,12 +1507,12 @@ public final class Renderer: @unchecked Sendable {
 
         if self.sortAlgorithm == .radix {
              let radixBuffers = RadixBufferSet(
-                histogram: frame.radixHistogram,
-                blockSums: frame.radixBlockSums,
-                scannedHistogram: frame.radixScannedHistogram,
-                fusedKeys: frame.radixFusedKeys,
-                scratchKeys: frame.radixKeysScratch,
-                scratchPayload: frame.radixPayloadScratch
+                histogram: frame.radixHistogram!,
+                blockSums: frame.radixBlockSums!,
+                scannedHistogram: frame.radixScannedHistogram!,
+                fusedKeys: frame.radixFusedKeys!,
+                scratchKeys: frame.radixKeysScratch!,
+                scratchPayload: frame.radixPayloadScratch!
             )
             
             let offsets = (
@@ -1622,10 +1652,13 @@ public final class Renderer: @unchecked Sendable {
         slotIndex: Int,
         precision: Precision
     ) -> Bool {
+        guard let outputBuffers = frame.outputBuffers else {
+            fatalError("[encodeRenderToBuffers] outputBuffers is nil - did you create the renderer with textureOnly: true?")
+        }
         self.renderEncoder.encode(
             commandBuffer: commandBuffer,
             orderedBuffers: ordered,
-            outputBuffers: frame.outputBuffers,
+            outputBuffers: outputBuffers,
             params: params,
             dispatchArgs: frame.dispatchArgs,
             dispatchOffset: DispatchSlot.renderTiles.rawValue * MemoryLayout<DispatchIndirectArgsSwift>.stride,
@@ -1702,9 +1735,12 @@ public final class Renderer: @unchecked Sendable {
         }
 
         let pixelCount = Int(params.width * params.height)
-        if let p = colorOutPtr { memcpy(p, frame.outputBuffers.colorOutGPU.contents(), pixelCount * 12) }
-        if let p = depthOutPtr { memcpy(p, frame.outputBuffers.depthOutGPU.contents(), pixelCount * 4) }
-        if let p = alphaOutPtr { memcpy(p, frame.outputBuffers.alphaOutGPU.contents(), pixelCount * 4) }
+        guard let outputBuffers = frame.outputBuffers else {
+            fatalError("[renderRaw] outputBuffers is nil - did you create the renderer with textureOnly: true?")
+        }
+        if let p = colorOutPtr { memcpy(p, outputBuffers.colorOutGPU.contents(), pixelCount * 12) }
+        if let p = depthOutPtr { memcpy(p, outputBuffers.depthOutGPU.contents(), pixelCount * 4) }
+        if let p = alphaOutPtr { memcpy(p, outputBuffers.alphaOutGPU.contents(), pixelCount * 4) }
 
         return 0
     }

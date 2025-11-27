@@ -109,12 +109,12 @@ final class SortStageTimingTests: XCTestCase {
                 let elapsed = timeMillis {
                     if algorithm == .radix {
                         let radixBuffers = RadixBufferSet(
-                            histogram: frame.radixHistogram,
-                            blockSums: frame.radixBlockSums,
-                            scannedHistogram: frame.radixScannedHistogram,
-                            fusedKeys: frame.radixFusedKeys,
-                            scratchKeys: frame.radixKeysScratch,
-                            scratchPayload: frame.radixPayloadScratch
+                            histogram: frame.radixHistogram!,
+                            blockSums: frame.radixBlockSums!,
+                            scannedHistogram: frame.radixScannedHistogram!,
+                            fusedKeys: frame.radixFusedKeys!,
+                            scratchKeys: frame.radixKeysScratch!,
+                            scratchPayload: frame.radixPayloadScratch!
                         )
                         let offsets = (
                             fuse: DispatchSlot.fuseKeys.rawValue * MemoryLayout<DispatchIndirectArgsSwift>.stride,

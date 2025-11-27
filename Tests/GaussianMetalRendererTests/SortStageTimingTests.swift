@@ -50,8 +50,7 @@ final class SortStageTimingTests: XCTestCase {
 
             func runSort(algorithm: SortAlgorithm) -> (ms: Double, assignments: Int, padded: Int) {
                 guard let (frame, slot) = renderer.acquireFrame(width: Int(params.width), height: Int(params.height)),
-                      let inputs = prepareInputs(),
-                      let dispatchArgs = frame.dispatchArgs else {
+                      let inputs = prepareInputs() else {
                     XCTFail("Setup failed")
                     return (.infinity, 0, 0)
                 }
@@ -80,13 +79,8 @@ final class SortStageTimingTests: XCTestCase {
                 cbAssign.waitUntilCompleted()
 
                 // Sort buffers
-                guard
-                    let sortKeysBuffer = renderer.ensureBuffer(&frame.sortKeys, length: frame.tileAssignmentPaddedCapacity * MemoryLayout<SIMD2<UInt32>>.stride, options: .storageModePrivate, label: "SortKeys"),
-                    let sortedIndicesBuffer = renderer.ensureBuffer(&frame.sortedIndices, length: frame.tileAssignmentPaddedCapacity * MemoryLayout<Int32>.stride, options: .storageModePrivate, label: "SortedIndices")
-                else {
-                    XCTFail("Sort buffers missing")
-                    return (.infinity, 0, 0)
-                }
+                let sortKeysBuffer = frame.sortKeys
+                let sortedIndicesBuffer = frame.sortedIndices
 
                 // Dispatch prep + keygen + sort
                 guard let cbSort = renderer.queue.makeCommandBuffer() else {
@@ -97,7 +91,7 @@ final class SortStageTimingTests: XCTestCase {
                 renderer.dispatchEncoder.encode(
                     commandBuffer: cbSort,
                     header: assignment.header,
-                    dispatchArgs: dispatchArgs
+                    dispatchArgs: frame.dispatchArgs
                 )
 
                 renderer.sortKeyGenEncoder.encode(
@@ -108,20 +102,19 @@ final class SortStageTimingTests: XCTestCase {
                     sortKeys: sortKeysBuffer,
                     sortedIndices: sortedIndicesBuffer,
                     header: assignment.header,
-                    dispatchArgs: dispatchArgs,
+                    dispatchArgs: frame.dispatchArgs,
                     dispatchOffset: DispatchSlot.sortKeys.rawValue * MemoryLayout<DispatchIndirectArgsSwift>.stride
                 )
 
                 let elapsed = timeMillis {
                     if algorithm == .radix {
-                        _ = renderer.ensureRadixBuffers(frame: frame, paddedCapacity: frame.tileAssignmentPaddedCapacity)
                         let radixBuffers = RadixBufferSet(
-                            histogram: frame.radixHistogram!,
-                            blockSums: frame.radixBlockSums!,
-                            scannedHistogram: frame.radixScannedHistogram!,
-                            fusedKeys: frame.radixFusedKeys!,
-                            scratchKeys: frame.radixKeysScratch!,
-                            scratchPayload: frame.radixPayloadScratch!
+                            histogram: frame.radixHistogram,
+                            blockSums: frame.radixBlockSums,
+                            scannedHistogram: frame.radixScannedHistogram,
+                            fusedKeys: frame.radixFusedKeys,
+                            scratchKeys: frame.radixKeysScratch,
+                            scratchPayload: frame.radixPayloadScratch
                         )
                         let offsets = (
                             fuse: DispatchSlot.fuseKeys.rawValue * MemoryLayout<DispatchIndirectArgsSwift>.stride,
@@ -137,10 +130,10 @@ final class SortStageTimingTests: XCTestCase {
                             keyBuffer: sortKeysBuffer,
                             sortedIndices: sortedIndicesBuffer,
                             header: assignment.header,
-                            dispatchArgs: dispatchArgs,
+                            dispatchArgs: frame.dispatchArgs,
                             radixBuffers: radixBuffers,
                             offsets: offsets,
-                            tileCount: Int(params.tilesX * params.tilesY)
+                            tileCount: assignment.tileCount
                         )
                     } else {
                         let offsets = (
@@ -153,7 +146,7 @@ final class SortStageTimingTests: XCTestCase {
                             sortKeys: sortKeysBuffer,
                             sortedIndices: sortedIndicesBuffer,
                             header: assignment.header,
-                            dispatchArgs: dispatchArgs,
+                            dispatchArgs: frame.dispatchArgs,
                             offsets: offsets,
                             paddedCapacity: Int(frame.tileAssignmentPaddedCapacity)
                         )

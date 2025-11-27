@@ -14,7 +14,6 @@ final class BitonicSortEncoder {
     private var passTypeBuffer: MTLBuffer?
     private var firstParamsBuffer: MTLBuffer?
     private var generalParamsBuffer: MTLBuffer?
-    private var debugParamsBuffer: MTLBuffer?
     private let firstParamStride = 256
     private let generalParamStride = 256
     private var icbMaxCommands: Int = 0
@@ -198,10 +197,7 @@ final class BitonicSortEncoder {
         let generalBytes = commandCount * generalParamStride
         self.firstParamsBuffer = device.makeBuffer(length: firstBytes, options: .storageModeShared)
         self.generalParamsBuffer = device.makeBuffer(length: generalBytes, options: .storageModeShared)
-        self.debugParamsBuffer = device.makeBuffer(length: commandCount * MemoryLayout<SIMD4<UInt32>>.stride,
-                                                   options: .storageModeShared)
-        self.passTypeBuffer = device.makeBuffer(length: commandCount * MemoryLayout<UInt32>.stride,
-                                                options: .storageModeShared)
+        self.passTypeBuffer = device.makeBuffer(length: commandCount * MemoryLayout<UInt32>.stride, options: .storageModeShared)
 
         self.buildScheduleForCapacity(maxPaddedCapacity)
     }
@@ -288,10 +284,6 @@ final class BitonicSortEncoder {
             enc.setBytes(&first,   length: 4, index: 6)
             enc.setBytes(&gen,     length: 4, index: 7)
             enc.setBytes(&fin,     length: 4, index: 8)
-            if let dbg = debugParams ?? self.debugParamsBuffer {
-                enc.setBuffer(dbg, offset: 0, index: 10)
-                enc.useResource(dbg, usage: .write)
-            }
 
             enc.useResource(icb,          usage: .write)
             enc.useResource(dispatchArgs, usage: .read)

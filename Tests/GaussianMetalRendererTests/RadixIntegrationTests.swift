@@ -47,8 +47,15 @@ final class RadixIntegrationTests: XCTestCase {
             gaussianCount: UInt32(count)
         )
 
-        let bitonicRenderer = Renderer(useIndirectBitonic: false, sortAlgorithm: .bitonic)
-        let radixRenderer = Renderer(useIndirectBitonic: false, sortAlgorithm: .radix)
+        let limits = RendererLimits(
+            maxGaussians: count,
+            maxWidth: Int(width),
+            maxHeight: Int(height),
+            tileWidth: Int(tile),
+            tileHeight: Int(tile)
+        )
+        let bitonicRenderer = Renderer(useIndirectBitonic: false, sortAlgorithm: .bitonic, limits: limits)
+        let radixRenderer = Renderer(useIndirectBitonic: false, sortAlgorithm: .radix, limits: limits)
 
         let pixelCount = Int(width * height)
         var bitonicColor = [Float](repeating: 0, count: pixelCount * 3)

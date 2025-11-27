@@ -290,6 +290,9 @@ public struct OrderedGaussianBuffers {
     public let activeTileIndices: MTLBuffer
     public let activeTileCount: MTLBuffer
     public let precision: Precision
+
+    // Fused pipeline buffers (optional - for cache-efficient rendering)
+    public let packedGaussiansFused: MTLBuffer?
 }
 
 public struct SortBufferSet {

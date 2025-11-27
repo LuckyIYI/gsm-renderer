@@ -7,6 +7,7 @@ let package = Package(
     name: "GaussianMetalRenderer",
     platforms: [
         .macOS(.v15),
+        .iOS(.v18)
     ],
     products: [
         .library(

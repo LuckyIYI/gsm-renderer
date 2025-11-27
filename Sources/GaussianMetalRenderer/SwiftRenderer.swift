@@ -2,66 +2,265 @@ import Foundation
 import simd
 @preconcurrency import Metal
 
+public struct RendererLimits: Sendable {
+    public let maxGaussians: Int
+    public let maxWidth: Int
+    public let maxHeight: Int
+    public let tileWidth: Int
+    public let tileHeight: Int
+    public let maxPerTile: Int
+
+    public var maxTileCount: Int {
+        let tilesX = (maxWidth + tileWidth - 1) / tileWidth
+        let tilesY = (maxHeight + tileHeight - 1) / tileHeight
+        return max(1, tilesX * tilesY)
+    }
+
+    public init(maxGaussians: Int, maxWidth: Int, maxHeight: Int, tileWidth: Int = 32, tileHeight: Int = 16, maxPerTile: Int? = nil) {
+        self.maxGaussians = max(1, maxGaussians)
+        self.maxWidth = max(1, maxWidth)
+        self.maxHeight = max(1, maxHeight)
+        self.tileWidth = max(1, tileWidth)
+        self.tileHeight = max(1, tileHeight)
+        // Default to a sane per-tile cap to prevent runaway heap sizing when callers omit it.
+        // 256 per tile is reasonable: 16K tiles × 256 = 4M assignments = ~200MB (not 3GB!)
+        self.maxPerTile = max(1, maxPerTile ?? 256)
+    }
+}
 
 // MARK: - Frame Resources
 
+/// Placement heap allocator with optional residency management
+final class HeapAllocator {
+    private let device: MTLDevice
+    var residencySetProvider: (() -> (any MTLResidencySet)?)?
+    private(set) var heap: MTLHeap?
+    private(set) var heapSize: Int = 0
+    private var currentOffset: Int = 0
+
+    init(device: MTLDevice, residencySetProvider: (() -> (any MTLResidencySet)?)? = nil) {
+        self.device = device
+        self.residencySetProvider = residencySetProvider
+    }
+
+    func createHeap(size: Int, label: String) -> Bool {
+        guard size > 0 else { return false }
+        let descriptor = MTLHeapDescriptor()
+        descriptor.type = .placement
+        descriptor.storageMode = .private
+        descriptor.hazardTrackingMode = .tracked
+        descriptor.size = size
+
+        guard let newHeap = device.makeHeap(descriptor: descriptor) else { return false }
+        newHeap.label = label
+        heap = newHeap
+        heapSize = size
+        currentOffset = 0
+
+        if let resSet = residencySetProvider?() {
+            resSet.addAllocation(newHeap)
+            resSet.commit()
+        }
+        return true
+    }
+
+    func allocateBuffer(length: Int, options: MTLResourceOptions, label: String?) -> MTLBuffer? {
+        guard let heap else { return nil }
+        let sa = device.heapBufferSizeAndAlign(length: length, options: options)
+        let align = max(Int(sa.align), 1)
+        currentOffset = (currentOffset + align - 1) & ~(align - 1)
+        guard currentOffset + Int(sa.size) <= heapSize else { return nil }
+        guard let buffer = heap.makeBuffer(length: length, options: options, offset: currentOffset) else { return nil }
+        buffer.label = label
+        currentOffset += Int(sa.size)
+        return buffer
+    }
+}
+
+struct FrameResourceLayout {
+    let limits: RendererLimits
+    let maxAssignments: Int
+    let paddedAssignments: Int
+    let heapAllocations: [(label: String, length: Int, options: MTLResourceOptions)]
+    let sharedAllocations: [(label: String, length: Int, options: MTLResourceOptions)]
+    let heapSize: Int
+    let pixelCapacity: Int
+    let precisionStride: Int
+}
+
 final class FrameResources {
+    // Placement heap allocator for efficient buffer allocation
+    let heapAllocator: HeapAllocator
+
     // Tile Builder Buffers
-    var boundsBuffer: MTLBuffer?
-    var coverageBuffer: MTLBuffer?
-    var offsetsBuffer: MTLBuffer?
-    var partialSumsBuffer: MTLBuffer?
-    var scatterDispatchBuffer: MTLBuffer?
-    var tileAssignmentHeader: MTLBuffer?
-    var tileIndices: MTLBuffer?
-    var tileIds: MTLBuffer?
-    var tileAssignmentMaxAssignments: Int = 0
-    // Capacity-based power-of-two padding for buffer sizing (GPU will set actual paddedCount per frame).
-    var tileAssignmentPaddedCapacity: Int = 1
+    let boundsBuffer: MTLBuffer
+    let coverageBuffer: MTLBuffer
+    let offsetsBuffer: MTLBuffer
+    let partialSumsBuffer: MTLBuffer
+    let scatterDispatchBuffer: MTLBuffer
+    let tileAssignmentHeader: MTLBuffer
+    let tileIndices: MTLBuffer
+    let tileIds: MTLBuffer
+    var tileAssignmentMaxAssignments: Int
+    var tileAssignmentPaddedCapacity: Int
 
     // Ordered Buffers
-    var orderedHeaders: MTLBuffer?
-    var packedMeans: MTLBuffer?
-    var packedConics: MTLBuffer?
-    var packedColors: MTLBuffer?
-    var packedOpacities: MTLBuffer?
-    var packedDepths: MTLBuffer?
-    var activeTileIndices: MTLBuffer?
-    var activeTileCount: MTLBuffer?
+    let orderedHeaders: MTLBuffer
+    let packedMeans: MTLBuffer
+    let packedConics: MTLBuffer
+    let packedColors: MTLBuffer
+    let packedOpacities: MTLBuffer
+    let packedDepths: MTLBuffer
+    let activeTileIndices: MTLBuffer
+    let activeTileCount: MTLBuffer
 
     // Sort Buffers
-    var sortKeys: MTLBuffer?
-    var sortedIndices: MTLBuffer?
+    let sortKeys: MTLBuffer
+    let sortedIndices: MTLBuffer
 
     // Radix Buffers
-    var radixHistogram: MTLBuffer?
-    var radixBlockSums: MTLBuffer?
-    var radixScannedHistogram: MTLBuffer?
-    var radixFusedKeys: MTLBuffer?
-    var radixKeysScratch: MTLBuffer?
-    var radixPayloadScratch: MTLBuffer?
+    let radixHistogram: MTLBuffer
+    let radixBlockSums: MTLBuffer
+    let radixScannedHistogram: MTLBuffer
+    let radixFusedKeys: MTLBuffer
+    let radixKeysScratch: MTLBuffer
+    let radixPayloadScratch: MTLBuffer
+
+    // Fused Pipeline Buffers (interleaved data for cache efficiency)
+    let interleavedGaussians: MTLBuffer?
+    let packedGaussiansFused: MTLBuffer?
 
     // Dispatch Args (Per-frame to avoid race on indirect dispatch)
-    var dispatchArgs: MTLBuffer?
+    let dispatchArgs: MTLBuffer
 
     // Output Buffers
-    var outputBuffers: RenderOutputBuffers?
+    var outputBuffers: RenderOutputBuffers
     // Output Textures (Alternative)
-    var outputTextures: RenderOutputTextures?
-    
-    init(device: MTLDevice) {
-        let dispatchLength = 4096
-        if let buf = device.makeBuffer(length: dispatchLength, options: .storageModePrivate) {
-            buf.label = "FrameDispatchArgs"
-            self.dispatchArgs = buf
+    var outputTextures: RenderOutputTextures
+
+    let device: MTLDevice
+
+    init(device: MTLDevice, layout: FrameResourceLayout, residencySetProvider: (() -> (any MTLResidencySet)?)?, useHeap: Bool) {
+        self.device = device
+        self.heapAllocator = HeapAllocator(device: device, residencySetProvider: residencySetProvider)
+        self.tileAssignmentMaxAssignments = layout.maxAssignments
+        self.tileAssignmentPaddedCapacity = layout.paddedAssignments
+
+        guard let dispatchArgs = device.makeBuffer(length: 4096, options: .storageModePrivate) else {
+            fatalError("Failed to allocate dispatch args")
         }
+        dispatchArgs.label = "FrameDispatchArgs"
+        self.dispatchArgs = dispatchArgs
+
+        func makeDeviceBuffer(_ req: (label: String, length: Int, options: MTLResourceOptions)) -> MTLBuffer {
+            guard let buf = device.makeBuffer(length: req.length, options: req.options) else {
+                fatalError("Failed to allocate buffer \(req.label)")
+            }
+            buf.label = req.label
+            return buf
+        }
+
+        var heapBuffers: [String: MTLBuffer] = [:]
+        let heapActive = useHeap
+        if heapActive {
+            guard heapAllocator.createHeap(size: layout.heapSize, label: "FrameResourcesHeap") else {
+                fatalError("Failed to create placement heap of size \(layout.heapSize)")
+            }
+            for req in layout.heapAllocations {
+                guard let buf = heapAllocator.allocateBuffer(length: req.length, options: req.options, label: req.label) else {
+                    fatalError("Failed to allocate \(req.label) from heap")
+                }
+                heapBuffers[req.label] = buf
+            }
+        }
+
+        func buffer(_ label: String) -> MTLBuffer {
+            if let buf = heapBuffers[label] { return buf }
+            if let match = layout.sharedAllocations.first(where: { $0.label == label }) {
+                return makeDeviceBuffer(match)
+            }
+            if let match = layout.heapAllocations.first(where: { $0.label == label }) {
+                if heapActive {
+                    fatalError("Heap allocation for \(label) missing; heap failed or overflowed")
+                }
+                return makeDeviceBuffer(match)
+            }
+            fatalError("Unknown buffer label \(label)")
+        }
+
+        // Assign buffers
+        self.boundsBuffer = buffer("Bounds")
+        self.coverageBuffer = buffer("Coverage")
+        self.offsetsBuffer = buffer("Offsets")
+        self.partialSumsBuffer = buffer("PartialSums")
+        self.scatterDispatchBuffer = buffer("ScatterDispatch")
+        self.tileAssignmentHeader = buffer("TileHeader")
+
+        // Initialize TileHeader constants ONCE at setup (not during render)
+        // TileHeader is .storageModeShared so this CPU write at init is allowed
+        let headerPtr = self.tileAssignmentHeader.contents().bindMemory(to: TileAssignmentHeaderSwift.self, capacity: 1)
+        headerPtr.pointee.maxAssignments = UInt32(layout.maxAssignments)
+        headerPtr.pointee.paddedCount = UInt32(layout.paddedAssignments)
+        headerPtr.pointee.totalAssignments = 0
+        headerPtr.pointee.overflow = 0
+
+        self.tileIndices = buffer("TileIndices")
+        self.tileIds = buffer("TileIds")
+        self.orderedHeaders = buffer("OrderedHeaders")
+        self.packedMeans = buffer("PackedMeans")
+        self.packedConics = buffer("PackedConics")
+        self.packedColors = buffer("PackedColors")
+        self.packedOpacities = buffer("PackedOpacities")
+        self.packedDepths = buffer("PackedDepths")
+        self.activeTileIndices = buffer("ActiveTileIndices")
+        self.activeTileCount = buffer("ActiveTileCount")
+        self.sortKeys = buffer("SortKeys")
+        self.sortedIndices = buffer("SortedIndices")
+        self.radixHistogram = buffer("RadixHist")
+        self.radixBlockSums = buffer("RadixBlockSums")
+        self.radixScannedHistogram = buffer("RadixScanned")
+        self.radixFusedKeys = buffer("RadixFused")
+        self.radixKeysScratch = buffer("RadixScratch")
+        self.radixPayloadScratch = buffer("RadixPayload")
+        self.interleavedGaussians = layout.heapAllocations.contains(where: { $0.label == "InterleavedGaussians" }) ? buffer("InterleavedGaussians") : nil
+        self.packedGaussiansFused = layout.heapAllocations.contains(where: { $0.label == "PackedGaussiansFused" }) ? buffer("PackedGaussiansFused") : nil
+
+        // Output buffers
+        let pixelBytes = layout.pixelCapacity
+        guard
+            let color = device.makeBuffer(length: pixelBytes * 12, options: .storageModeShared),
+            let depth = device.makeBuffer(length: pixelBytes * 4, options: .storageModeShared),
+            let alpha = device.makeBuffer(length: pixelBytes * 4, options: .storageModeShared)
+        else { fatalError("Failed to allocate output buffers") }
+        color.label = "RenderColorOutput"
+        depth.label = "RenderDepthOutput"
+        alpha.label = "RenderAlphaOutput"
+        self.outputBuffers = RenderOutputBuffers(colorOutGPU: color, depthOutGPU: depth, alphaOutGPU: alpha)
+
+        // Output textures sized to limits
+        let texDesc = MTLTextureDescriptor.texture2DDescriptor(pixelFormat: .rgba16Float, width: layout.limits.maxWidth, height: layout.limits.maxHeight, mipmapped: false)
+        texDesc.usage = [.shaderWrite, .shaderRead]
+        texDesc.storageMode = .private
+        guard let colorTex = device.makeTexture(descriptor: texDesc) else { fatalError("Failed to allocate color texture") }
+        colorTex.label = "OutputColorTex"
+
+        let depthDesc = MTLTextureDescriptor.texture2DDescriptor(pixelFormat: .r32Float, width: layout.limits.maxWidth, height: layout.limits.maxHeight, mipmapped: false)
+        depthDesc.usage = [.shaderWrite, .shaderRead]
+        depthDesc.storageMode = .private
+        guard let depthTex = device.makeTexture(descriptor: depthDesc),
+              let alphaTex = device.makeTexture(descriptor: depthDesc) else { fatalError("Failed to allocate depth/alpha textures") }
+        depthTex.label = "OutputDepthTex"
+        alphaTex.label = "OutputAlphaTex"
+        self.outputTextures = RenderOutputTextures(color: colorTex, depth: depthTex, alpha: alphaTex)
     }
 }
 
 // MARK: - Renderer
 
 public final class Renderer: @unchecked Sendable {
-    public static let shared = Renderer()
+    public static let shared = Renderer(limits: RendererLimits(maxGaussians: 1_000_000, maxWidth: 1024, maxHeight: 1024))
+
+    private static let supportedMaxGaussians = 10_000_000
 
     public let device: MTLDevice
     let queue: MTLCommandQueue
@@ -79,9 +278,12 @@ public final class Renderer: @unchecked Sendable {
     let renderEncoder: RenderEncoder
     let projectEncoder: ProjectEncoder
     let dispatchEncoder: DispatchEncoder
+
+    // Fused pipeline encoder (optional - for interleaved data optimization)
+    var fusedPipelineEncoder: FusedPipelineEncoder?
     
     // Frame Resources (Single Buffering for now)
-    private var frameResources: [FrameResources?] = []
+    private var frameResources: [FrameResources] = []
     private var frameInUse: [Bool] = []
     private var frameCursor: Int = 0
     private let maxInFlightFrames = 1 // Enforce single buffering initially
@@ -115,6 +317,9 @@ public final class Renderer: @unchecked Sendable {
     private let effectivePrecision: Precision
     public var precisionSetting: Precision { self.effectivePrecision }
 
+    /// Last GPU execution time in seconds (from command buffer GPUStartTime/GPUEndTime)
+    public private(set) var lastGPUTime: Double?
+
     /// Enable multi-pixel rendering (4x2 pixels per thread, 64 threads per 32x16 tile)
     /// This can improve performance by reducing thread divergence and memory loads
     /// When enabled, caller should use tileWidth=32, tileHeight=16 in RenderParams
@@ -129,11 +334,35 @@ public final class Renderer: @unchecked Sendable {
         self.coverageEncoder.isPreciseAvailable && self.scatterEncoder.isPreciseAvailable
     }
 
+    /// Fused pipeline: interleaved data structures for cache-efficient rendering
+    /// Uses single struct reads instead of 5 scattered buffer reads
+    public let useFusedPipeline: Bool
+
+    /// Residency set for efficient GPU memory management (macOS 15+ / iOS 18+)
+    /// Attached to command queue for minimal CPU overhead
+    private var residencySet: (any MTLResidencySet)?
+
+    /// Use heap allocation for frame buffers (reduces TLB misses)
+    public let useHeapAllocation: Bool
+    private let limits: RendererLimits
+    let frameLayout: FrameResourceLayout  // internal for tests
+    public var isFusedPipelineAvailable: Bool { self.fusedPipelineEncoder != nil }
+
     /// Recommended tile size for current rendering mode
     public var recommendedTileWidth: UInt32 { useMultiPixelRendering ? 32 : 16 }
     public var recommendedTileHeight: UInt32 { useMultiPixelRendering ? 16 : 16 }
 
-    public init(precision: Precision = .float32, useIndirectBitonic: Bool = false, sortAlgorithm: SortAlgorithm = .radix, useMultiPixelRendering: Bool = false, usePreciseIntersection: Bool = false) {
+    public init(
+        precision: Precision = .float32,
+        useIndirectBitonic: Bool = false,
+        sortAlgorithm: SortAlgorithm = .radix,
+        useMultiPixelRendering: Bool = false,
+        usePreciseIntersection: Bool = false,
+        useFusedPipeline: Bool = false,
+        useHeapAllocation: Bool = false,  // Disabled by default - placement heap has issues
+        limits: RendererLimits = RendererLimits(maxGaussians: 1_000_000, maxWidth: 2048, maxHeight: 2048)
+    ) {
+        precondition(limits.maxGaussians <= Renderer.supportedMaxGaussians, "Renderer supports up to 10,000,000 gaussians; requested \(limits.maxGaussians)")
         guard let device = MTLCreateSystemDefaultDevice() else {
             fatalError("Metal device unavailable")
         }
@@ -142,7 +371,7 @@ public final class Renderer: @unchecked Sendable {
             fatalError("Failed to create command queue")
         }
         self.queue = queue
-        
+
         do {
             let currentFileURL = URL(fileURLWithPath: #filePath)
             let moduleDir = currentFileURL.deletingLastPathComponent()
@@ -151,7 +380,7 @@ public final class Renderer: @unchecked Sendable {
 
             self.library = library
             self.effectivePrecision = precision
-            
+
             self.tileBoundsEncoder = try TileBoundsEncoder(device: device, library: library)
             self.coverageEncoder = try CoverageEncoder(device: device, library: library)
             self.scatterEncoder = try ScatterEncoder(device: device, library: library)
@@ -161,7 +390,7 @@ public final class Renderer: @unchecked Sendable {
             self.packEncoder = try PackEncoder(device: device, library: library)
             self.renderEncoder = try RenderEncoder(device: device, library: library)
             self.projectEncoder = try ProjectEncoder(device: device, library: library)
-            
+
             let config = AssignmentDispatchConfigSwift(
                 sortThreadgroupSize: UInt32(self.sortKeyGenEncoder.threadgroupSize),
                 fuseThreadgroupSize: UInt32(self.radixSortEncoder.fuseThreadgroupSize),
@@ -172,7 +401,12 @@ public final class Renderer: @unchecked Sendable {
                 radixGrainSize: UInt32(self.radixSortEncoder.grainSize)
             )
             self.dispatchEncoder = try DispatchEncoder(device: device, library: library, config: config)
-            
+
+            // Fused pipeline encoder (optional optimization)
+            if useFusedPipeline {
+                self.fusedPipelineEncoder = try FusedPipelineEncoder(device: device, library: library)
+            }
+
         } catch {
             fatalError("Failed to load library or initialize encoders: \(error)")
         }
@@ -180,16 +414,189 @@ public final class Renderer: @unchecked Sendable {
         self.sortAlgorithm = sortAlgorithm
         self.useMultiPixelRendering = useMultiPixelRendering
         self.usePreciseIntersection = usePreciseIntersection
+        self.useFusedPipeline = useFusedPipeline
+        self.useHeapAllocation = useHeapAllocation
+        self.limits = limits
 
-        // Initialize frame slots
+        do {
+            let descriptor = MTLResidencySetDescriptor()
+            descriptor.label = "GaussianRendererResidencySet"
+            descriptor.initialCapacity = 64
+            let resSet = try device.makeResidencySet(descriptor: descriptor)
+            self.residencySet = resSet
+            queue.addResidencySet(resSet)
+        } catch {
+            self.residencySet = nil
+        }
+
+        // Compute layout once using max precision for safety
+        self.frameLayout = Renderer.computeLayout(
+            limits: limits,
+            sortAlgorithm: sortAlgorithm,
+            useFusedPipeline: useFusedPipeline,
+            precision: .float32,
+            device: device,
+            radixSortEncoder: self.radixSortEncoder
+        )
+
+        // Initialize frame slots with fully allocated resources
         for _ in 0..<maxInFlightFrames {
-            self.frameResources.append(nil)
+            let frame = FrameResources(
+                device: device,
+                layout: self.frameLayout,
+                residencySetProvider: { [weak self] in self?.residencySet },
+                useHeap: useHeapAllocation
+            )
+            self.frameResources.append(frame)
             self.frameInUse.append(false)
         }
+
+        // Preallocate shared CPU-visible caches up to the configured limits
+        let shared: MTLResourceOptions = .storageModeShared
+        func makeShared(_ length: Int, _ label: String) -> MTLBuffer {
+            guard let buf = device.makeBuffer(length: length, options: shared) else {
+                fatalError("Failed to allocate shared buffer \(label)")
+            }
+            buf.label = label
+            return buf
+        }
+
+        let g = limits.maxGaussians
+        self.worldPositionsCache = makeShared(g * MemoryLayout<SIMD3<Float>>.stride, "WorldPositions")
+        self.worldScalesCache = makeShared(g * MemoryLayout<SIMD3<Float>>.stride, "WorldScales")
+        self.worldRotationsCache = makeShared(g * MemoryLayout<SIMD4<Float>>.stride, "WorldRotations")
+        // SH coeffs worst-case: 9 coefficients (l=2) *3 channels -> 27 floats
+        self.worldHarmonicsCache = makeShared(g * MemoryLayout<Float>.stride * 27, "WorldHarmonics")
+        self.worldOpacitiesCache = makeShared(g * MemoryLayout<Float>.stride, "WorldOpacities")
+
+        self.gaussianMeansCache = makeShared(g * 8, "GaussianMeans")
+        self.gaussianRadiiCache = makeShared(g * 4, "GaussianRadii")
+        self.gaussianMaskCache = makeShared(g, "GaussianMask")
+        self.gaussianDepthsCache = makeShared(g * 4, "GaussianDepths")
+        self.gaussianConicsCache = makeShared(g * 16, "GaussianConics")
+        self.gaussianColorsCache = makeShared(g * 12, "GaussianColors")
+        self.gaussianOpacitiesCache = makeShared(g * 4, "GaussianOpacities")
+
+        self.gaussianMeansHalfCache = makeShared(g * 4, "GaussianMeansHalf")
+        self.gaussianDepthsHalfCache = makeShared(g * 2, "GaussianDepthsHalf")
+        self.gaussianConicsHalfCache = makeShared(g * 8, "GaussianConicsHalf")
+        self.gaussianColorsHalfCache = makeShared(g * 6, "GaussianColorsHalf")
+        self.gaussianOpacitiesHalfCache = makeShared(g * 2, "GaussianOpacitiesHalf")
     }
     
     func triggerCapture(path: String) {
         self.nextFrameCapturePath = path
+    }
+
+    private static func computeLayout(
+        limits: RendererLimits,
+        sortAlgorithm: SortAlgorithm,
+        useFusedPipeline: Bool,
+        precision: Precision,
+        device: MTLDevice,
+        radixSortEncoder: RadixSortEncoder
+    ) -> FrameResourceLayout {
+        let gaussianCount = limits.maxGaussians
+        let tileCount = limits.maxTileCount
+        // Clamp maxAssignments to a realistic bound to avoid huge heaps when tileCount * maxPerTile
+        // is unreasonably large. But we must always allocate at least tileCount * maxPerTile since
+        // that's the minimum needed by any valid render.
+        let tileCapacity = tileCount * limits.maxPerTile
+        let gaussianCapacity = gaussianCount * 8  // each Gaussian in ~8 tiles max
+        // Use the smaller of unclamped and gaussianCapacity, but never below tileCapacity
+        let unclamped = max(gaussianCount, tileCapacity)
+        let maxAssignments = max(tileCapacity, min(unclamped, gaussianCapacity))
+        let paddedAssignments: Int = {
+            if sortAlgorithm == .radix {
+                let block = radixSortEncoder.blockSize * radixSortEncoder.grainSize
+                return ((maxAssignments + block - 1) / block) * block
+            } else {
+                var value = 1
+                while value < maxAssignments { value <<= 1 }
+                return value
+            }
+        }()
+
+        let strideForPrecision: Int = (precision == .float16) ? 2 : 4
+        let half2Stride = MemoryLayout<UInt16>.stride * 2
+        let half4Stride = MemoryLayout<UInt16>.stride * 4
+        func strideForMeans() -> Int { precision == .float16 ? half2Stride : 8 }
+        func strideForConics() -> Int { precision == .float16 ? half4Stride : 16 }
+        func strideForColors() -> Int { precision == .float16 ? MemoryLayout<UInt16>.stride * 3 : 12 }
+        func strideForOpacities() -> Int { precision == .float16 ? MemoryLayout<UInt16>.stride : 4 }
+        func strideForDepths() -> Int { precision == .float16 ? MemoryLayout<UInt16>.stride : 4 }
+        func strideForInterleaved() -> Int { precision == .float16 ? 24 : 48 }
+
+        let prefixBlockSize = 256
+        let prefixGrainSize = 4
+        let elementsPerGroup = prefixBlockSize * prefixGrainSize
+        let groups = (gaussianCount + elementsPerGroup - 1) / elementsPerGroup
+
+        var heapAllocations: [(label: String, length: Int, options: MTLResourceOptions)] = []
+        func add(_ label: String, _ length: Int, _ opts: MTLResourceOptions = .storageModePrivate) {
+            heapAllocations.append((label, max(1, length), opts))
+        }
+
+        add("Bounds", gaussianCount * MemoryLayout<SIMD4<Int32>>.stride)
+        add("Coverage", gaussianCount * MemoryLayout<UInt32>.stride)
+        add("Offsets", (gaussianCount + 1) * MemoryLayout<UInt32>.stride)
+        add("PartialSums", max(groups, 1) * MemoryLayout<UInt32>.stride)
+        add("ScatterDispatch", 3 * MemoryLayout<UInt32>.stride)
+        add("TileIndices", paddedAssignments * MemoryLayout<Int32>.stride)
+        add("TileIds", paddedAssignments * MemoryLayout<Int32>.stride)
+
+        add("OrderedHeaders", tileCount * MemoryLayout<GaussianHeader>.stride)
+        add("PackedMeans", maxAssignments * strideForMeans())
+        add("PackedConics", maxAssignments * strideForConics())
+        add("PackedColors", maxAssignments * strideForColors())
+        add("PackedOpacities", maxAssignments * strideForOpacities())
+        add("PackedDepths", maxAssignments * strideForDepths())
+        add("ActiveTileIndices", tileCount * MemoryLayout<UInt32>.stride)
+
+        add("SortKeys", paddedAssignments * MemoryLayout<SIMD2<UInt32>>.stride)
+        add("SortedIndices", paddedAssignments * MemoryLayout<Int32>.stride)
+
+        let valuesPerGroup = radixSortEncoder.blockSize * radixSortEncoder.grainSize
+        let gridSize = max(1, (paddedAssignments + valuesPerGroup - 1) / valuesPerGroup)
+        let histogramCount = gridSize * radixSortEncoder.radix
+        add("RadixHist", histogramCount * MemoryLayout<UInt32>.stride)
+        add("RadixBlockSums", gridSize * MemoryLayout<UInt32>.stride)
+        add("RadixScanned", histogramCount * MemoryLayout<UInt32>.stride)
+        add("RadixFused", paddedAssignments * MemoryLayout<UInt64>.stride)
+        add("RadixScratch", paddedAssignments * MemoryLayout<UInt64>.stride)
+        add("RadixPayload", paddedAssignments * MemoryLayout<UInt32>.stride)
+
+        if useFusedPipeline {
+            add("InterleavedGaussians", gaussianCount * strideForInterleaved())
+            add("PackedGaussiansFused", maxAssignments * strideForInterleaved())
+        }
+
+        func heapSize(for allocations: [(label: String, length: Int, options: MTLResourceOptions)]) -> Int {
+            var offset = 0
+            for req in allocations {
+                let sa = device.heapBufferSizeAndAlign(length: req.length, options: req.options)
+                let align = max(Int(sa.align), 1)
+                offset = (offset + align - 1) & ~(align - 1)
+                offset += Int(sa.size)
+            }
+            return (offset + 65535) & ~65535
+        }
+
+        let sharedAllocations: [(label: String, length: Int, options: MTLResourceOptions)] = [
+            ("TileHeader", MemoryLayout<TileAssignmentHeaderSwift>.stride, .storageModeShared),
+            ("ActiveTileCount", MemoryLayout<UInt32>.stride, .storageModeShared)
+        ]
+
+        return FrameResourceLayout(
+            limits: limits,
+            maxAssignments: maxAssignments,
+            paddedAssignments: paddedAssignments,
+            heapAllocations: heapAllocations,
+            sharedAllocations: sharedAllocations,
+            heapSize: heapSize(for: heapAllocations),
+            pixelCapacity: limits.maxWidth * limits.maxHeight,
+            precisionStride: strideForPrecision
+        )
     }
 
     // MARK: - Render Methods
@@ -219,6 +626,8 @@ public final class Renderer: @unchecked Sendable {
         let headers = UnsafeBufferPointer(start: headersPtr, count: headerCount)
         guard let last = headers.last else { return 0 }
         let totalAssignments = Int(last.offset + last.count)
+        guard totalAssignments <= limits.maxGaussians else { return -5 }
+        guard self.validateLimits(gaussianCount: totalAssignments, params: params) else { return -5 }
         
         guard
             let headersBuf = makeBuf(headersPtr, headerCount),
@@ -250,7 +659,8 @@ public final class Renderer: @unchecked Sendable {
             tileCount: headerCount,
             activeTileIndices: activeTileIndices,
             activeTileCount: activeTileCount,
-            precision: .float32
+            precision: .float32,
+            packedGaussiansFused: nil
         )
         
         guard let commandBuffer = self.queue.makeCommandBuffer() else { return -1 }
@@ -284,25 +694,30 @@ public final class Renderer: @unchecked Sendable {
         }
         
         let count = gaussianCount
+        guard self.validateLimits(gaussianCount: count, params: params) else { return -5 }
         
         // Acquire a frame for rendering
         guard let (frame, slotIndex) = self.acquireFrame(width: Int(params.width), height: Int(params.height)) else { return -5 }
 
-        // Create temporary buffers for input (these are world buffers, not frame resources)
         guard
-            let meansBuffer = makeBuffer(ptr: meansPtr, count: count * 2),
-            let conicsBuffer = makeBuffer(ptr: conicsPtr, count: count * 4),
-            let colorsBuffer = makeBuffer(ptr: colorsPtr, count: count * 3),
-            let opacityBuffer = makeBuffer(ptr: opacityPtr, count: count),
-            let depthsBuffer = makeBuffer(ptr: depthsPtr, count: count),
-            let radiiBuffer = makeBuffer(ptr: radiiPtr, count: count),
-            let maskBuffer = self.device.makeBuffer(length: count, options: .storageModeShared)
+            let meansBuffer = self.gaussianMeansCache,
+            let conicsBuffer = self.gaussianConicsCache,
+            let colorsBuffer = self.gaussianColorsCache,
+            let opacityBuffer = self.gaussianOpacitiesCache,
+            let depthsBuffer = self.gaussianDepthsCache,
+            let radiiBuffer = self.gaussianRadiiCache,
+            let maskBuffer = self.gaussianMaskCache
         else {
             self.releaseFrame(index: slotIndex)
             return -2
         }
-        
-        // Initialize mask to 1 (valid)
+
+        memcpy(meansBuffer.contents(), meansPtr, count * 2 * MemoryLayout<Float>.stride)
+        memcpy(conicsBuffer.contents(), conicsPtr, count * 4 * MemoryLayout<Float>.stride)
+        memcpy(colorsBuffer.contents(), colorsPtr, count * 3 * MemoryLayout<Float>.stride)
+        memcpy(opacityBuffer.contents(), opacityPtr, count * MemoryLayout<Float>.stride)
+        memcpy(depthsBuffer.contents(), depthsPtr, count * MemoryLayout<Float>.stride)
+        memcpy(radiiBuffer.contents(), radiiPtr, count * MemoryLayout<Float>.stride)
         memset(maskBuffer.contents(), 1, count)
         
         let inputs = GaussianInputBuffers(
@@ -388,9 +803,10 @@ public final class Renderer: @unchecked Sendable {
              let manager = MTLCaptureManager.shared()
              try? manager.startCapture(with: descriptor)
              self.nextFrameCapturePath = nil
-         }
+        }
 
         let count = gaussianCount
+        guard self.validateLimits(gaussianCount: count, params: params) else { return -5 }
         
         // Acquire a frame for rendering
         guard let (frame, slotIndex) = self.acquireFrame(width: Int(params.width), height: Int(params.height)) else { return -5 }
@@ -457,6 +873,7 @@ public final class Renderer: @unchecked Sendable {
         cameraUniforms: CameraUniformsSwift,
         params: RenderParams
     ) -> RenderOutputBuffers? {
+        guard self.validateLimits(gaussianCount: gaussianCount, params: params) else { return nil }
         guard let (frame, slotIndex) = self.acquireFrame(width: Int(params.width), height: Int(params.height)) else {
             return nil
         }
@@ -539,8 +956,13 @@ public final class Renderer: @unchecked Sendable {
         cameraUniforms: CameraUniformsSwift,
         params: RenderParams
     ) -> RenderOutputTextures? {
+        // validateLimits now crashes with descriptive message on failure
+        guard self.validateLimits(gaussianCount: gaussianCount, params: params) else {
+            fatalError("[encodeRenderToTextures] validateLimits failed - should have crashed with details")
+        }
+
         guard let (frame, slotIndex) = self.acquireFrame(width: Int(params.width), height: Int(params.height)) else {
-            return nil
+            fatalError("[encodeRenderToTextures] acquireFrame failed for \(params.width)x\(params.height)")
         }
 
         if let capturePath = self.nextFrameCapturePath {
@@ -554,9 +976,7 @@ public final class Renderer: @unchecked Sendable {
         }
 
         guard let gaussianBuffers = self.prepareGaussianBuffers(count: gaussianCount) else {
-            self.releaseFrame(index: slotIndex)
-            if MTLCaptureManager.shared().isCapturing { MTLCaptureManager.shared().stopCapture() }
-            return nil
+            fatalError("[encodeRenderToTextures] prepareGaussianBuffers failed for count \(gaussianCount)")
         }
 
         self.projectEncoder.encodeForRender(
@@ -568,12 +988,12 @@ public final class Renderer: @unchecked Sendable {
             precision: self.effectivePrecision
         )
 
+        // buildTileAssignmentsGPU now crashes with descriptive message on failure
         guard let assignment = self.buildTileAssignmentsGPU(commandBuffer: commandBuffer, gaussianCount: gaussianCount, gaussianBuffers: gaussianBuffers, params: params, frame: frame) else {
-            self.releaseFrame(index: slotIndex)
-            if MTLCaptureManager.shared().isCapturing { MTLCaptureManager.shared().stopCapture() }
-            return nil
+            fatalError("[encodeRenderToTextures] buildTileAssignmentsGPU failed - should have crashed with details")
         }
 
+        // buildOrderedGaussians now crashes with descriptive message on failure
         guard let ordered = self.buildOrderedGaussians(
             commandBuffer: commandBuffer,
             gaussianCount: gaussianCount,
@@ -581,22 +1001,29 @@ public final class Renderer: @unchecked Sendable {
             gaussianBuffers: gaussianBuffers,
             params: params,
             frame: frame,
-            precision: self.effectivePrecision
+            precision: self.effectivePrecision,
+            textureOnlyFused: true  // Skip redundant pack for texture render
         ) else {
-            self.releaseFrame(index: slotIndex)
-            if MTLCaptureManager.shared().isCapturing { MTLCaptureManager.shared().stopCapture() }
-            return nil
+            fatalError("[encodeRenderToTextures] buildOrderedGaussians failed - should have crashed with details")
         }
 
         // Submit render to textures
-        guard let textures = frame.outputTextures, let dispatchArgs = frame.dispatchArgs else {
-            self.releaseFrame(index: slotIndex)
-            if MTLCaptureManager.shared().isCapturing { MTLCaptureManager.shared().stopCapture() }
-            return nil
-        }
+        let textures = frame.outputTextures
+        let dispatchArgs = frame.dispatchArgs
 
-        // Use multi-pixel if enabled and available
-        if self.useMultiPixelRendering && self.renderEncoder.isMultiPixelAvailable {
+        // Select render path: fused > multi-pixel > standard
+        if self.useFusedPipeline, let fusedEncoder = self.fusedPipelineEncoder, ordered.packedGaussiansFused != nil {
+            // Fused render: single-struct reads for cache efficiency
+            fusedEncoder.encodeCompleteFusedRender(
+                commandBuffer: commandBuffer,
+                orderedBuffers: ordered,
+                outputTextures: textures,
+                params: params,
+                dispatchArgs: dispatchArgs,
+                dispatchOffset: DispatchSlot.renderTiles.rawValue * MemoryLayout<DispatchIndirectArgsSwift>.stride,
+                precision: self.effectivePrecision
+            )
+        } else if self.useMultiPixelRendering && self.renderEncoder.isMultiPixelAvailable {
             _ = self.renderEncoder.encodeMultiPixel(
                 commandBuffer: commandBuffer,
                 orderedBuffers: ordered,
@@ -634,8 +1061,13 @@ public final class Renderer: @unchecked Sendable {
         cameraUniforms: CameraUniformsSwift,
         params: RenderParams
     ) -> RenderOutputTextures? {
+        // validateLimits now crashes with descriptive message on failure
+        guard self.validateLimits(gaussianCount: gaussianCount, params: params) else {
+            fatalError("[encodeRenderToTextureHalf] validateLimits failed - should have crashed with details")
+        }
+
         guard let (frame, slotIndex) = self.acquireFrame(width: Int(params.width), height: Int(params.height)) else {
-            return nil
+            fatalError("[encodeRenderToTextureHalf] acquireFrame failed for \(params.width)x\(params.height)")
         }
 
         if let capturePath = self.nextFrameCapturePath {
@@ -650,9 +1082,7 @@ public final class Renderer: @unchecked Sendable {
 
         // Prepare gaussian buffers with half-precision layout
         guard let gaussianBuffers = self.prepareGaussianBuffersHalf(count: gaussianCount) else {
-            self.releaseFrame(index: slotIndex)
-            if MTLCaptureManager.shared().isCapturing { MTLCaptureManager.shared().stopCapture() }
-            return nil
+            fatalError("[encodeRenderToTextureHalf] prepareGaussianBuffersHalf failed for count \(gaussianCount)")
         }
 
         // Project from half world data to half gaussian data
@@ -664,6 +1094,7 @@ public final class Renderer: @unchecked Sendable {
             gaussianBuffers: gaussianBuffers
         )
 
+        // buildTileAssignmentsGPU now crashes with descriptive message on failure
         guard let assignment = self.buildTileAssignmentsGPU(
             commandBuffer: commandBuffer,
             gaussianCount: gaussianCount,
@@ -672,11 +1103,10 @@ public final class Renderer: @unchecked Sendable {
             frame: frame,
             precision: .float16  // Half precision for this path
         ) else {
-            self.releaseFrame(index: slotIndex)
-            if MTLCaptureManager.shared().isCapturing { MTLCaptureManager.shared().stopCapture() }
-            return nil
+            fatalError("[encodeRenderToTextureHalf] buildTileAssignmentsGPU failed - should have crashed with details")
         }
 
+        // buildOrderedGaussians now crashes with descriptive message on failure
         guard let ordered = self.buildOrderedGaussians(
             commandBuffer: commandBuffer,
             gaussianCount: gaussianCount,
@@ -684,21 +1114,27 @@ public final class Renderer: @unchecked Sendable {
             gaussianBuffers: gaussianBuffers,
             params: params,
             frame: frame,
-            precision: .float16  // Always half for this path
+            precision: .float16,  // Always half for this path
+            textureOnlyFused: true  // Skip redundant pack for texture render
         ) else {
-            self.releaseFrame(index: slotIndex)
-            if MTLCaptureManager.shared().isCapturing { MTLCaptureManager.shared().stopCapture() }
-            return nil
+            fatalError("[encodeRenderToTextureHalf] buildOrderedGaussians failed - should have crashed with details")
         }
 
-        guard let textures = frame.outputTextures, let dispatchArgs = frame.dispatchArgs else {
-            self.releaseFrame(index: slotIndex)
-            if MTLCaptureManager.shared().isCapturing { MTLCaptureManager.shared().stopCapture() }
-            return nil
-        }
+        let textures = frame.outputTextures
+        let dispatchArgs = frame.dispatchArgs
 
-        // Use multi-pixel if enabled and available
-        if self.useMultiPixelRendering && self.renderEncoder.isMultiPixelAvailable {
+        // Select render path: fused > multi-pixel > standard
+        if self.useFusedPipeline, let fusedEncoder = self.fusedPipelineEncoder, ordered.packedGaussiansFused != nil {
+            fusedEncoder.encodeCompleteFusedRender(
+                commandBuffer: commandBuffer,
+                orderedBuffers: ordered,
+                outputTextures: textures,
+                params: params,
+                dispatchArgs: dispatchArgs,
+                dispatchOffset: DispatchSlot.renderTiles.rawValue * MemoryLayout<DispatchIndirectArgsSwift>.stride,
+                precision: .float16
+            )
+        } else if self.useMultiPixelRendering && self.renderEncoder.isMultiPixelAvailable {
             _ = self.renderEncoder.encodeMultiPixel(
                 commandBuffer: commandBuffer,
                 orderedBuffers: ordered,
@@ -739,6 +1175,9 @@ public final class Renderer: @unchecked Sendable {
         targetDepth: MTLTexture?,
         targetAlpha: MTLTexture?
     ) -> Bool {
+        guard self.validateLimits(gaussianCount: gaussianCount, params: params) else {
+            return false
+        }
         guard let (frame, slotIndex) = self.acquireFrame(width: Int(params.width), height: Int(params.height)) else {
             return false
         }
@@ -775,26 +1214,34 @@ public final class Renderer: @unchecked Sendable {
             gaussianBuffers: gaussianBuffers,
             params: params,
             frame: frame,
-            precision: .float16
+            precision: .float16,
+            textureOnlyFused: true  // Skip redundant pack for texture render
         ) else {
             self.releaseFrame(index: slotIndex)
             return false
         }
 
-        guard let dispatchArgs = frame.dispatchArgs else {
-            self.releaseFrame(index: slotIndex)
-            return false
-        }
+        let dispatchArgs = frame.dispatchArgs
 
         // Use user's target textures
         let outputTextures = RenderOutputTextures(
             color: targetColor,
-            depth: targetDepth ?? frame.outputTextures!.depth,
-            alpha: targetAlpha ?? frame.outputTextures!.alpha
+            depth: targetDepth ?? frame.outputTextures.depth,
+            alpha: targetAlpha ?? frame.outputTextures.alpha
         )
 
-        // Use multi-pixel if enabled and available
-        if self.useMultiPixelRendering && self.renderEncoder.isMultiPixelAvailable {
+        // Select render path: fused > multi-pixel > standard
+        if self.useFusedPipeline, let fusedEncoder = self.fusedPipelineEncoder, ordered.packedGaussiansFused != nil {
+            fusedEncoder.encodeCompleteFusedRender(
+                commandBuffer: commandBuffer,
+                orderedBuffers: ordered,
+                outputTextures: outputTextures,
+                params: params,
+                dispatchArgs: dispatchArgs,
+                dispatchOffset: DispatchSlot.renderTiles.rawValue * MemoryLayout<DispatchIndirectArgsSwift>.stride,
+                precision: .float16
+            )
+        } else if self.useMultiPixelRendering && self.renderEncoder.isMultiPixelAvailable {
             _ = self.renderEncoder.encodeMultiPixel(
                 commandBuffer: commandBuffer,
                 orderedBuffers: ordered,
@@ -854,6 +1301,26 @@ public final class Renderer: @unchecked Sendable {
         let estimate = min(total, conservativeCap)
         return max(estimate, gaussianCount)
     }
+
+    private func validateLimits(gaussianCount: Int, params: RenderParams) -> Bool {
+        let tileCount = Int(params.tilesX * params.tilesY)
+
+        // CRASH on validation failures - silent returns cause black screens!
+        precondition(gaussianCount <= limits.maxGaussians,
+            "gaussianCount (\(gaussianCount)) exceeds limits.maxGaussians (\(limits.maxGaussians))")
+        precondition(tileCount <= limits.maxTileCount,
+            "tileCount (\(tileCount)) exceeds limits.maxTileCount (\(limits.maxTileCount))")
+        precondition(Int(params.tileWidth) == limits.tileWidth,
+            "params.tileWidth (\(params.tileWidth)) != limits.tileWidth (\(limits.tileWidth)) - did you forget to set tileWidth in RendererLimits for multi-pixel rendering?")
+        precondition(Int(params.tileHeight) == limits.tileHeight,
+            "params.tileHeight (\(params.tileHeight)) != limits.tileHeight (\(limits.tileHeight)) - did you forget to set tileHeight in RendererLimits for multi-pixel rendering?")
+        precondition(Int(params.width) <= limits.maxWidth,
+            "params.width (\(params.width)) exceeds limits.maxWidth (\(limits.maxWidth))")
+        precondition(Int(params.height) <= limits.maxHeight,
+            "params.height (\(params.height)) exceeds limits.maxHeight (\(limits.maxHeight))")
+
+        return true
+    }
     
     internal func buildTileAssignmentsGPU(
         commandBuffer: MTLCommandBuffer,
@@ -864,21 +1331,26 @@ public final class Renderer: @unchecked Sendable {
         estimatedAssignments: Int? = nil,
         precision: Precision = .float32
     ) -> TileAssignmentBuffers? {
+        // CRASH on failures - silent returns cause black screens!
+        precondition(gaussianCount <= limits.maxGaussians,
+            "[buildTileAssignmentsGPU] gaussianCount (\(gaussianCount)) > limits.maxGaussians (\(limits.maxGaussians))")
+
         let tileCount = Int(params.tilesX * params.tilesY)
-        let perTileLimit = (params.maxPerTile == 0) ? UInt32(max(gaussianCount, 1)) : params.maxPerTile
-        let baseCapacity = max(tileCount * Int(perTileLimit), 1)
-        let estimated = max(estimatedAssignments ?? 0, gaussianCount)
-        // Keep a small headroom on the estimate and ensure we never go below the per-tile contract.
-        let estimatedWithMargin = Int(Double(estimated) * 1.2)
-        let forcedCapacity = max(baseCapacity, estimatedWithMargin)
-        guard self.prepareTileBuilderResources(frame: frame, gaussianCount: gaussianCount, tileCount: tileCount, maxPerTile: Int(perTileLimit), forcedCapacity: forcedCapacity) else {
-            return nil
-        }
+        precondition(tileCount <= limits.maxTileCount,
+            "[buildTileAssignmentsGPU] tileCount (\(tileCount)) > limits.maxTileCount (\(limits.maxTileCount))")
+
+        let perTileLimit = (params.maxPerTile == 0) ? UInt32(limits.maxPerTile) : min(params.maxPerTile, UInt32(limits.maxPerTile))
+        let baseCapacity = max(tileCount * Int(perTileLimit), gaussianCount)
+
+        precondition(baseCapacity <= frame.tileAssignmentMaxAssignments,
+            "[buildTileAssignmentsGPU] baseCapacity (\(baseCapacity)) > frame.tileAssignmentMaxAssignments (\(frame.tileAssignmentMaxAssignments)) - increase limits.maxPerTile or reduce tile count")
+
+        resetTileBuilderState(commandBuffer: commandBuffer, frame: frame)
 
         self.tileBoundsEncoder.encode(
             commandBuffer: commandBuffer,
             gaussianBuffers: gaussianBuffers,
-            boundsBuffer: frame.boundsBuffer!,
+            boundsBuffer: frame.boundsBuffer,
             params: params,
             gaussianCount: gaussianCount,
             precision: precision
@@ -892,26 +1364,26 @@ public final class Renderer: @unchecked Sendable {
                 gaussianCount: gaussianCount,
                 tileWidth: Int(params.tileWidth),
                 tileHeight: Int(params.tileHeight),
-                boundsBuffer: frame.boundsBuffer!,
+                boundsBuffer: frame.boundsBuffer,
                 opacitiesBuffer: gaussianBuffers.opacities,
                 meansBuffer: gaussianBuffers.means,
                 conicsBuffer: gaussianBuffers.conics,
-                coverageBuffer: frame.coverageBuffer!,
-                offsetsBuffer: frame.offsetsBuffer!,
-                partialSumsBuffer: frame.partialSumsBuffer!,
-                tileAssignmentHeader: frame.tileAssignmentHeader!,
+                coverageBuffer: frame.coverageBuffer,
+                offsetsBuffer: frame.offsetsBuffer,
+                partialSumsBuffer: frame.partialSumsBuffer,
+                tileAssignmentHeader: frame.tileAssignmentHeader,
                 precision: precision
             )
         } else {
             self.coverageEncoder.encode(
                 commandBuffer: commandBuffer,
                 gaussianCount: gaussianCount,
-                boundsBuffer: frame.boundsBuffer!,
+                boundsBuffer: frame.boundsBuffer,
                 opacitiesBuffer: gaussianBuffers.opacities,
-                coverageBuffer: frame.coverageBuffer!,
-                offsetsBuffer: frame.offsetsBuffer!,
-                partialSumsBuffer: frame.partialSumsBuffer!,
-                tileAssignmentHeader: frame.tileAssignmentHeader!,
+                coverageBuffer: frame.coverageBuffer,
+                offsetsBuffer: frame.offsetsBuffer,
+                partialSumsBuffer: frame.partialSumsBuffer,
+                tileAssignmentHeader: frame.tileAssignmentHeader,
                 precision: precision
             )
         }
@@ -925,12 +1397,12 @@ public final class Renderer: @unchecked Sendable {
                 tilesX: Int(params.tilesX),
                 tileWidth: Int(params.tileWidth),
                 tileHeight: Int(params.tileHeight),
-                offsetsBuffer: frame.offsetsBuffer!,
-                dispatchBuffer: frame.scatterDispatchBuffer!,
-                boundsBuffer: frame.boundsBuffer!,
-                tileIndicesBuffer: frame.tileIndices!,
-                tileIdsBuffer: frame.tileIds!,
-                tileAssignmentHeader: frame.tileAssignmentHeader!,
+                offsetsBuffer: frame.offsetsBuffer,
+                dispatchBuffer: frame.scatterDispatchBuffer,
+                boundsBuffer: frame.boundsBuffer,
+                tileIndicesBuffer: frame.tileIndices,
+                tileIdsBuffer: frame.tileIds,
+                tileAssignmentHeader: frame.tileAssignmentHeader,
                 meansBuffer: gaussianBuffers.means,
                 conicsBuffer: gaussianBuffers.conics,
                 opacitiesBuffer: gaussianBuffers.opacities,
@@ -942,21 +1414,21 @@ public final class Renderer: @unchecked Sendable {
                 commandBuffer: commandBuffer,
                 gaussianCount: gaussianCount,
                 tilesX: Int(params.tilesX),
-                offsetsBuffer: frame.offsetsBuffer!,
-                dispatchBuffer: frame.scatterDispatchBuffer!,
-                boundsBuffer: frame.boundsBuffer!,
-                tileIndicesBuffer: frame.tileIndices!,
-                tileIdsBuffer: frame.tileIds!,
-                tileAssignmentHeader: frame.tileAssignmentHeader!
+                offsetsBuffer: frame.offsetsBuffer,
+                dispatchBuffer: frame.scatterDispatchBuffer,
+                boundsBuffer: frame.boundsBuffer,
+                tileIndicesBuffer: frame.tileIndices,
+                tileIdsBuffer: frame.tileIds,
+                tileAssignmentHeader: frame.tileAssignmentHeader
             )
         }
         
         return TileAssignmentBuffers(
             tileCount: tileCount,
             maxAssignments: frame.tileAssignmentMaxAssignments,
-            tileIndices: frame.tileIndices!,
-            tileIds: frame.tileIds!,
-            header: frame.tileAssignmentHeader!
+            tileIndices: frame.tileIndices,
+            tileIds: frame.tileIds,
+            header: frame.tileAssignmentHeader
         )
     }
     
@@ -968,18 +1440,21 @@ public final class Renderer: @unchecked Sendable {
         gaussianBuffers: GaussianInputBuffers,
         params: RenderParams,
         frame: FrameResources,
-        precision: Precision
+        precision: Precision,
+        textureOnlyFused: Bool = false  // When true, skip standard pack payload for fused texture render
     ) -> OrderedGaussianBuffers? {
-        let maxAssignments = assignment.maxAssignments
-        guard self.prepareOrderedBuffers(frame: frame, maxAssignments: maxAssignments, tileCount: assignment.tileCount, precision: precision) else { return nil }
-        
-        guard let sortKeysBuffer = self.ensureBuffer(&frame.sortKeys, length: frame.tileAssignmentPaddedCapacity * MemoryLayout<SIMD2<UInt32>>.stride, options: .storageModePrivate, label: "SortKeys"),
-              let sortedIndicesBuffer = self.ensureBuffer(&frame.sortedIndices, length: frame.tileAssignmentPaddedCapacity * MemoryLayout<Int32>.stride, options: .storageModePrivate, label: "SortedIndices")
-        else { return nil }
+        // CRASH on failures - silent returns cause black screens!
+        precondition(gaussianCount <= limits.maxGaussians,
+            "[buildOrderedGaussians] gaussianCount (\(gaussianCount)) > limits.maxGaussians (\(limits.maxGaussians))")
+        precondition(assignment.maxAssignments <= frame.tileAssignmentMaxAssignments,
+            "[buildOrderedGaussians] assignment.maxAssignments (\(assignment.maxAssignments)) > frame.tileAssignmentMaxAssignments (\(frame.tileAssignmentMaxAssignments))")
+
+        let sortKeysBuffer = frame.sortKeys
+        let sortedIndicesBuffer = frame.sortedIndices
 
         let paddedCount = frame.tileAssignmentPaddedCapacity
 
-        guard let dispatchArgs = frame.dispatchArgs else { return nil }
+        let dispatchArgs = frame.dispatchArgs
 
         self.dispatchEncoder.encode(
             commandBuffer: commandBuffer,
@@ -1001,14 +1476,13 @@ public final class Renderer: @unchecked Sendable {
         )
 
         if self.sortAlgorithm == .radix {
-            _ = self.ensureRadixBuffers(frame: frame, paddedCapacity: paddedCount)
              let radixBuffers = RadixBufferSet(
-                histogram: frame.radixHistogram!,
-                blockSums: frame.radixBlockSums!,
-                scannedHistogram: frame.radixScannedHistogram!,
-                fusedKeys: frame.radixFusedKeys!,
-                scratchKeys: frame.radixKeysScratch!,
-                scratchPayload: frame.radixPayloadScratch!
+                histogram: frame.radixHistogram,
+                blockSums: frame.radixBlockSums,
+                scannedHistogram: frame.radixScannedHistogram,
+                fusedKeys: frame.radixFusedKeys,
+                scratchKeys: frame.radixKeysScratch,
+                scratchPayload: frame.radixPayloadScratch
             )
             
             let offsets = (
@@ -1050,28 +1524,80 @@ public final class Renderer: @unchecked Sendable {
         }
         
         let orderedBuffers = OrderedBufferSet(
-            headers: frame.orderedHeaders!,
-            means: frame.packedMeans!,
-            conics: frame.packedConics!,
-            colors: frame.packedColors!,
-            opacities: frame.packedOpacities!,
-            depths: frame.packedDepths!
+            headers: frame.orderedHeaders,
+            means: frame.packedMeans,
+            conics: frame.packedConics,
+            colors: frame.packedColors,
+            opacities: frame.packedOpacities,
+            depths: frame.packedDepths
         )
-        
-        self.packEncoder.encode(
-            commandBuffer: commandBuffer,
-            sortedIndices: sortedIndicesBuffer,
-            sortedKeys: sortKeysBuffer,
-            gaussianBuffers: gaussianBuffers,
-            orderedBuffers: orderedBuffers,
-            assignment: assignment,
-            dispatchArgs: dispatchArgs,
-            dispatchOffset: DispatchSlot.pack.rawValue * MemoryLayout<DispatchIndirectArgsSwift>.stride,
-            activeTileIndices: frame.activeTileIndices!,
-            activeTileCount: frame.activeTileCount!,
-            precision: precision
-        )
-        
+        frame.activeTileCount.contents().storeBytes(of: UInt32(0), as: UInt32.self)
+
+        // Check if we can use texture-only fused path (skip redundant standard pack payload)
+        let canUseFusedOnly = textureOnlyFused &&
+                              self.useFusedPipeline &&
+                              self.fusedPipelineEncoder != nil &&
+                              frame.interleavedGaussians != nil &&
+                              frame.packedGaussiansFused != nil
+
+        var fusedBuffer: MTLBuffer? = nil
+
+        if canUseFusedOnly {
+            // Texture-only fused path: skip standard pack payload, only build headers + fused data
+            self.packEncoder.encodeHeadersAndActiveTiles(
+                commandBuffer: commandBuffer,
+                sortedKeys: sortKeysBuffer,
+                assignment: assignment,
+                orderedHeaders: orderedBuffers.headers,
+                activeTileIndices: frame.activeTileIndices,
+                activeTileCount: frame.activeTileCount
+            )
+
+            let fusedEncoder = self.fusedPipelineEncoder!
+            let interleavedBuffer = frame.interleavedGaussians!
+            let packedFusedBuffer = frame.packedGaussiansFused!
+
+            // 1. Interleave gaussian data into single struct per gaussian
+            fusedEncoder.encodeInterleave(
+                commandBuffer: commandBuffer,
+                gaussianBuffers: gaussianBuffers,
+                interleavedOutput: interleavedBuffer,
+                gaussianCount: gaussianCount,
+                precision: precision
+            )
+
+            // 2. Pack using interleaved data (single struct read for texture render)
+            fusedEncoder.encodePackFused(
+                commandBuffer: commandBuffer,
+                sortedIndices: sortedIndicesBuffer,
+                interleavedGaussians: interleavedBuffer,
+                packedOutput: packedFusedBuffer,
+                header: assignment.header,
+                dispatchArgs: dispatchArgs,
+                dispatchOffset: DispatchSlot.pack.rawValue * MemoryLayout<DispatchIndirectArgsSwift>.stride,
+                precision: precision
+            )
+
+            fusedBuffer = packedFusedBuffer
+        } else {
+            // Standard path: full pack with separated buffers (needed for buffer render)
+            // Don't run fused pack here - it's not used for buffer render
+            self.packEncoder.encode(
+                commandBuffer: commandBuffer,
+                sortedIndices: sortedIndicesBuffer,
+                sortedKeys: sortKeysBuffer,
+                gaussianBuffers: gaussianBuffers,
+                orderedBuffers: orderedBuffers,
+                assignment: assignment,
+                dispatchArgs: dispatchArgs,
+                dispatchOffset: DispatchSlot.pack.rawValue * MemoryLayout<DispatchIndirectArgsSwift>.stride,
+                activeTileIndices: frame.activeTileIndices,
+                activeTileCount: frame.activeTileCount,
+                precision: precision
+            )
+            // fusedBuffer stays nil - buffer render uses separated buffers
+        }
+
         return OrderedGaussianBuffers(
             headers: orderedBuffers.headers,
             means: orderedBuffers.means,
@@ -1080,9 +1606,10 @@ public final class Renderer: @unchecked Sendable {
             opacities: orderedBuffers.opacities,
             depths: orderedBuffers.depths,
             tileCount: assignment.tileCount,
-            activeTileIndices: frame.activeTileIndices!,
-            activeTileCount: frame.activeTileCount!,
-            precision: precision
+            activeTileIndices: frame.activeTileIndices,
+            activeTileCount: frame.activeTileCount,
+            precision: precision,
+            packedGaussiansFused: fusedBuffer
         )
     }
         
@@ -1095,14 +1622,12 @@ public final class Renderer: @unchecked Sendable {
         slotIndex: Int,
         precision: Precision
     ) -> Bool {
-        guard let outputs = frame.outputBuffers, let dispatchArgs = frame.dispatchArgs else { return false }
-        
         self.renderEncoder.encode(
             commandBuffer: commandBuffer,
             orderedBuffers: ordered,
-            outputBuffers: outputs,
+            outputBuffers: frame.outputBuffers,
             params: params,
-            dispatchArgs: dispatchArgs,
+            dispatchArgs: frame.dispatchArgs,
             dispatchOffset: DispatchSlot.renderTiles.rawValue * MemoryLayout<DispatchIndirectArgsSwift>.stride,
             precision: precision
         )
@@ -1168,91 +1693,24 @@ public final class Renderer: @unchecked Sendable {
         }
         commandBuffer.commit()
         commandBuffer.waitUntilCompleted()
-        
-        guard let outputs = frame.outputBuffers else { return -6 }
+
+        // Capture GPU execution time from command buffer timestamps
+        let gpuStart = commandBuffer.gpuStartTime
+        let gpuEnd = commandBuffer.gpuEndTime
+        if gpuStart > 0 && gpuEnd > gpuStart {
+            self.lastGPUTime = gpuEnd - gpuStart
+        }
+
         let pixelCount = Int(params.width * params.height)
-        if let p = colorOutPtr { memcpy(p, outputs.colorOutGPU.contents(), pixelCount * 12) }
-        if let p = depthOutPtr { memcpy(p, outputs.depthOutGPU.contents(), pixelCount * 4) }
-        if let p = alphaOutPtr { memcpy(p, outputs.alphaOutGPU.contents(), pixelCount * 4) }
+        if let p = colorOutPtr { memcpy(p, frame.outputBuffers.colorOutGPU.contents(), pixelCount * 12) }
+        if let p = depthOutPtr { memcpy(p, frame.outputBuffers.depthOutGPU.contents(), pixelCount * 4) }
+        if let p = alphaOutPtr { memcpy(p, frame.outputBuffers.alphaOutGPU.contents(), pixelCount * 4) }
 
         return 0
     }
     
-    func projectWorldDebug(
-        gaussianCount: Int,
-        worldBuffers: WorldGaussianBuffers,
-        cameraUniforms: CameraUniformsSwift,
-        meansOutPtr: UnsafeMutablePointer<Float>?,
-        conicsOutPtr: UnsafeMutablePointer<Float>?,
-        colorsOutPtr: UnsafeMutablePointer<Float>?,
-        opacitiesOutPtr: UnsafeMutablePointer<Float>?,
-        depthsOutPtr: UnsafeMutablePointer<Float>?,
-        radiiOutPtr: UnsafeMutablePointer<Float>?,
-        maskOutPtr: UnsafeMutablePointer<UInt8>?
-    ) -> Int32 {
-        // Setup staging buffers for readback
-        guard let commandBuffer = self.queue.makeCommandBuffer() else { return -1 }
-        
-        // We need buffers to project into. We can use temporary buffers.
-        func makeTmp(_ len: Int) -> MTLBuffer? { self.device.makeBuffer(length: len, options: .storageModeShared) }
-        
-        guard
-            let meansOut = makeTmp(gaussianCount * 8), // 2 floats? No projection debug might need 2 or 4.
-            let conicsOut = makeTmp(gaussianCount * 16),
-            let colorsOut = makeTmp(gaussianCount * 12),
-            let opacitiesOut = makeTmp(gaussianCount * 4),
-            let depthsOut = makeTmp(gaussianCount * 4),
-            let radiiOut = makeTmp(gaussianCount * 4),
-            let maskOut = makeTmp(gaussianCount)
-        else { return -2 }
-        
-        let projBuffers = ProjectionReadbackBuffers(
-            meansOut: meansOut,
-            conicsOut: conicsOut,
-            colorsOut: colorsOut,
-            opacitiesOut: opacitiesOut,
-            depthsOut: depthsOut,
-            radiiOut: radiiOut,
-            maskOut: maskOut
-        )
-        
-        self.projectEncoder.encode(
-            commandBuffer: commandBuffer,
-            gaussianCount: gaussianCount,
-            worldBuffers: worldBuffers,
-            cameraUniforms: cameraUniforms,
-            projectionBuffers: projBuffers
-        )
-        
-        commandBuffer.commit()
-        commandBuffer.waitUntilCompleted()
-        
-        // Copy back to pointers
-        if let p = meansOutPtr { memcpy(p, meansOut.contents(), gaussianCount * 8) }
-        if let p = conicsOutPtr { memcpy(p, conicsOut.contents(), gaussianCount * 16) }
-        if let p = colorsOutPtr { memcpy(p, colorsOut.contents(), gaussianCount * 12) }
-        if let p = opacitiesOutPtr { memcpy(p, opacitiesOut.contents(), gaussianCount * 4) }
-        if let p = depthsOutPtr { memcpy(p, depthsOut.contents(), gaussianCount * 4) }
-        if let p = radiiOutPtr { memcpy(p, radiiOut.contents(), gaussianCount * 4) }
-        if let p = maskOutPtr { memcpy(p, maskOut.contents(), gaussianCount) }
-        
-        return 0
-    }
-    
     // MARK: - Resource Management
-    
-    internal func ensureBuffer(_ cache: inout MTLBuffer?, length: Int, options: MTLResourceOptions, label: String) -> MTLBuffer? {
-        if let existing = cache, existing.length >= length {
-            return existing
-        }
-        guard let newBuf = self.device.makeBuffer(length: length, options: options) else {
-            return nil
-        }
-        newBuf.label = label
-        cache = newBuf
-        return newBuf
-    }
-    
+
     func prepareWorldBuffers(
         count: Int,
         meansPtr: UnsafePointer<Float>,
@@ -1262,22 +1720,15 @@ public final class Renderer: @unchecked Sendable {
         opacitiesPtr: UnsafePointer<Float>,
         shComponents: Int
     ) -> WorldGaussianBuffers? {
-        let shared: MTLResourceOptions = .storageModeShared
-        let positionLength = count * MemoryLayout<SIMD3<Float>>.stride
-        let scaleLength = positionLength
-        let rotationLength = count * MemoryLayout<SIMD4<Float>>.stride
-        let opacityLength = count * MemoryLayout<Float>.stride
-        let coeffs = max(shComponents, 0)
-        let harmonicsLength = count * MemoryLayout<Float>.stride * (coeffs == 0 ? 3 : coeffs * 3)
-        
+        guard count <= limits.maxGaussians else { return nil }
         guard
-            let positions = self.ensureBuffer(&self.worldPositionsCache, length: positionLength, options: shared, label: "WorldPositions"),
-            let scales = self.ensureBuffer(&self.worldScalesCache, length: scaleLength, options: shared, label: "WorldScales"),
-            let rotations = self.ensureBuffer(&self.worldRotationsCache, length: rotationLength, options: shared, label: "WorldRotations"),
-            let harmonics = self.ensureBuffer(&self.worldHarmonicsCache, length: harmonicsLength, options: shared, label: "WorldHarmonics"),
-            let opacities = self.ensureBuffer(&self.worldOpacitiesCache, length: opacityLength, options: shared, label: "WorldOpacities")
+            let positions = self.worldPositionsCache,
+            let scales = self.worldScalesCache,
+            let rotations = self.worldRotationsCache,
+            let harmonics = self.worldHarmonicsCache,
+            let opacities = self.worldOpacitiesCache
         else { return nil }
-        
+
         let positionDest = positions.contents().bindMemory(to: SIMD3<Float>.self, capacity: count)
         let scalesDest = scales.contents().bindMemory(to: SIMD3<Float>.self, capacity: count)
         for i in 0..<count {
@@ -1285,10 +1736,17 @@ public final class Renderer: @unchecked Sendable {
             positionDest[i] = SIMD3(meansPtr[base + 0], meansPtr[base + 1], meansPtr[base + 2])
             scalesDest[i] = SIMD3(scalesPtr[base + 0], scalesPtr[base + 1], scalesPtr[base + 2])
         }
+
+        let rotationLength = count * MemoryLayout<SIMD4<Float>>.stride
+        let coeffs = max(shComponents, 0)
+        let harmonicsLength = count * MemoryLayout<Float>.stride * (coeffs == 0 ? 3 : coeffs * 3)
+        let opacityLength = count * MemoryLayout<Float>.stride
+        guard harmonicsLength <= harmonics.length else { return nil }
+
         memcpy(rotations.contents(), rotationsPtr, rotationLength)
         memcpy(harmonics.contents(), harmonicsPtr, harmonicsLength)
         memcpy(opacities.contents(), opacitiesPtr, opacityLength)
-        
+
         return WorldGaussianBuffers(
             positions: positions,
             scales: scales,
@@ -1300,25 +1758,17 @@ public final class Renderer: @unchecked Sendable {
     }
     
     internal func prepareGaussianBuffers(count: Int) -> GaussianInputBuffers? {
-        let shared: MTLResourceOptions = .storageModeShared
-        let meansLen = count * 8
-        let radiiLen = count * 4
-        let maskLen = count
-        let depthsLen = count * 4
-        let conicsLen = count * 16
-        let colorsLen = count * 12
-        let opacitiesLen = count * 4
-        
+        guard count <= limits.maxGaussians else { return nil }
         guard
-            let means = self.ensureBuffer(&self.gaussianMeansCache, length: meansLen, options: shared, label: "GaussianMeans"),
-            let radii = self.ensureBuffer(&self.gaussianRadiiCache, length: radiiLen, options: shared, label: "GaussianRadii"),
-            let mask = self.ensureBuffer(&self.gaussianMaskCache, length: maskLen, options: shared, label: "GaussianMask"),
-            let depths = self.ensureBuffer(&self.gaussianDepthsCache, length: depthsLen, options: shared, label: "GaussianDepths"),
-            let conics = self.ensureBuffer(&self.gaussianConicsCache, length: conicsLen, options: shared, label: "GaussianConics"),
-            let colors = self.ensureBuffer(&self.gaussianColorsCache, length: colorsLen, options: shared, label: "GaussianColors"),
-            let opacities = self.ensureBuffer(&self.gaussianOpacitiesCache, length: opacitiesLen, options: shared, label: "GaussianOpacities")
+            let means = self.gaussianMeansCache,
+            let radii = self.gaussianRadiiCache,
+            let mask = self.gaussianMaskCache,
+            let depths = self.gaussianDepthsCache,
+            let conics = self.gaussianConicsCache,
+            let colors = self.gaussianColorsCache,
+            let opacities = self.gaussianOpacitiesCache
         else { return nil }
-        
+
         return GaussianInputBuffers(
             means: means,
             radii: radii,
@@ -1330,27 +1780,16 @@ public final class Renderer: @unchecked Sendable {
         )
     }
 
-    /// Prepare gaussian buffers with half-precision layout for the half16 pipeline.
-    /// Note: radii and mask remain the same size (float and uchar).
     internal func prepareGaussianBuffersHalf(count: Int) -> GaussianInputBuffers? {
-        let shared: MTLResourceOptions = .storageModeShared
-        // Half precision sizes
-        let meansLen = count * 4      // half2 = 4 bytes
-        let radiiLen = count * 4      // float (stays float for tile bounds accuracy)
-        let maskLen = count           // uchar
-        let depthsLen = count * 2     // half = 2 bytes
-        let conicsLen = count * 8     // half4 = 8 bytes
-        let colorsLen = count * 6     // half3 = 6 bytes
-        let opacitiesLen = count * 2  // half = 2 bytes
-
+        guard count <= limits.maxGaussians else { return nil }
         guard
-            let means = self.ensureBuffer(&self.gaussianMeansHalfCache, length: meansLen, options: shared, label: "GaussianMeansHalf"),
-            let radii = self.ensureBuffer(&self.gaussianRadiiCache, length: radiiLen, options: shared, label: "GaussianRadii"),
-            let mask = self.ensureBuffer(&self.gaussianMaskCache, length: maskLen, options: shared, label: "GaussianMask"),
-            let depths = self.ensureBuffer(&self.gaussianDepthsHalfCache, length: depthsLen, options: shared, label: "GaussianDepthsHalf"),
-            let conics = self.ensureBuffer(&self.gaussianConicsHalfCache, length: conicsLen, options: shared, label: "GaussianConicsHalf"),
-            let colors = self.ensureBuffer(&self.gaussianColorsHalfCache, length: colorsLen, options: shared, label: "GaussianColorsHalf"),
-            let opacities = self.ensureBuffer(&self.gaussianOpacitiesHalfCache, length: opacitiesLen, options: shared, label: "GaussianOpacitiesHalf")
+            let means = self.gaussianMeansHalfCache,
+            let radii = self.gaussianRadiiCache,
+            let mask = self.gaussianMaskCache,
+            let depths = self.gaussianDepthsHalfCache,
+            let conics = self.gaussianConicsHalfCache,
+            let colors = self.gaussianColorsHalfCache,
+            let opacities = self.gaussianOpacitiesHalfCache
         else { return nil }
 
         return GaussianInputBuffers(
@@ -1364,145 +1803,36 @@ public final class Renderer: @unchecked Sendable {
         )
     }
 
-    internal func prepareTileBuilderResources(frame: FrameResources, gaussianCount: Int, tileCount: Int, maxPerTile: Int, forcedCapacity: Int) -> Bool {
-        let totalAssignments = max(forcedCapacity, 1)
-        let paddedCapacity = self.nextPowerOfTwo(value: totalAssignments)
-        frame.tileAssignmentMaxAssignments = totalAssignments
-        frame.tileAssignmentPaddedCapacity = paddedCapacity
-
-        let boundsBytes = gaussianCount * MemoryLayout<SIMD4<Int32>>.stride
-        let coverageBytes = gaussianCount * MemoryLayout<UInt32>.stride
-        let offsetsBytes = (gaussianCount + 1) * MemoryLayout<UInt32>.stride
-        
-        let prefixBlockSize = 256
-        let prefixGrainSize = 4
-        let elementsPerGroup = prefixBlockSize * prefixGrainSize
-        let groups = (gaussianCount + elementsPerGroup - 1) / elementsPerGroup
-        let partialSumsBytes = max(groups, 1) * MemoryLayout<UInt32>.stride
-        let dispatchBytes = 3 * MemoryLayout<UInt32>.stride
-
-        let headerBytes = MemoryLayout<TileAssignmentHeaderSwift>.stride
-        let tileIndexBytes = paddedCapacity * MemoryLayout<Int32>.stride
-        let tileIdBytes = paddedCapacity * MemoryLayout<Int32>.stride
-
-        guard
-            let _ = self.ensureBuffer(&frame.boundsBuffer, length: boundsBytes, options: .storageModePrivate, label: "Bounds"),
-            let _ = self.ensureBuffer(&frame.coverageBuffer, length: coverageBytes, options: .storageModePrivate, label: "Coverage"),
-            let _ = self.ensureBuffer(&frame.offsetsBuffer, length: offsetsBytes, options: .storageModePrivate, label: "Offsets"),
-            let _ = self.ensureBuffer(&frame.partialSumsBuffer, length: partialSumsBytes, options: .storageModePrivate, label: "PartialSums"),
-            let _ = self.ensureBuffer(&frame.scatterDispatchBuffer, length: dispatchBytes, options: .storageModePrivate, label: "ScatterDispatch"),
-            let _ = self.ensureBuffer(&frame.tileAssignmentHeader, length: headerBytes, options: .storageModeShared, label: "TileHeader"),
-            let _ = self.ensureBuffer(&frame.tileIndices, length: tileIndexBytes, options: .storageModePrivate, label: "TileIndices"),
-            let _ = self.ensureBuffer(&frame.tileIds, length: tileIdBytes, options: .storageModePrivate, label: "TileIds")
-        else {
-            return false
+    private func resetTileBuilderState(commandBuffer: MTLCommandBuffer, frame: FrameResources) {
+        // GPU-only reset: use blit encoder to zero the counters
+        // TileHeader layout: [totalAssignments: UInt32, maxAssignments: UInt32, paddedCount: UInt32, overflow: UInt32]
+        // We only need to reset totalAssignments (offset 0) and overflow (offset 12)
+        // maxAssignments and paddedCount are constants set once at init
+        guard let blit = commandBuffer.makeBlitCommandEncoder() else {
+            fatalError("[resetTileBuilderState] Failed to create blit encoder")
         }
-        
-        // Initialize header
-        let headerPtr = frame.tileAssignmentHeader!.contents().bindMemory(to: TileAssignmentHeaderSwift.self, capacity: 1)
-        headerPtr.pointee.maxAssignments = UInt32(totalAssignments)
-        headerPtr.pointee.paddedCount = UInt32(frame.tileAssignmentPaddedCapacity)
-        headerPtr.pointee.totalAssignments = UInt32(0)
-        headerPtr.pointee.overflow = 0
-        
-        return true
+        blit.label = "ResetTileBuilderState"
+        // Zero totalAssignments (first 4 bytes)
+        blit.fill(buffer: frame.tileAssignmentHeader, range: 0..<4, value: 0)
+        // Zero overflow (bytes 12-16)
+        blit.fill(buffer: frame.tileAssignmentHeader, range: 12..<16, value: 0)
+        blit.endEncoding()
     }
-    
-    internal func prepareOrderedBuffers(frame: FrameResources, maxAssignments: Int, tileCount: Int, precision: Precision) -> Bool {
-        let assignmentCount = max(1, maxAssignments)
-        let headerCount = max(1, tileCount)
-        
-        let half2Stride = MemoryLayout<UInt16>.stride * 2 // half2
-        let half4Stride = MemoryLayout<UInt16>.stride * 4 // half4
-        func strideForMeans() -> Int { precision == .float16 ? half2Stride : 8 }
-        func strideForConics() -> Int { precision == .float16 ? half4Stride : 16 }
-        func strideForColors() -> Int { precision == .float16 ? MemoryLayout<UInt16>.stride * 3 : 12 }
-        func strideForOpacities() -> Int { precision == .float16 ? MemoryLayout<UInt16>.stride : 4 }
-        func strideForDepths() -> Int { precision == .float16 ? MemoryLayout<UInt16>.stride : 4 }
-        
-        guard
-            self.ensureBuffer(&frame.orderedHeaders, length: headerCount * MemoryLayout<GaussianHeader>.stride, options: .storageModePrivate, label: "OrderedHeaders") != nil,
-            self.ensureBuffer(&frame.packedMeans, length: assignmentCount * strideForMeans(), options: .storageModePrivate, label: "PackedMeans") != nil,
-            self.ensureBuffer(&frame.packedConics, length: assignmentCount * strideForConics(), options: .storageModePrivate, label: "PackedConics") != nil,
-            self.ensureBuffer(&frame.packedColors, length: assignmentCount * strideForColors(), options: .storageModePrivate, label: "PackedColors") != nil,
-            self.ensureBuffer(&frame.packedOpacities, length: assignmentCount * strideForOpacities(), options: .storageModePrivate, label: "PackedOpacities") != nil,
-            self.ensureBuffer(&frame.packedDepths, length: assignmentCount * strideForDepths(), options: .storageModePrivate, label: "PackedDepths") != nil,
-            self.ensureBuffer(&frame.activeTileIndices, length: headerCount * 4, options: .storageModePrivate, label: "ActiveTileIndices") != nil,
-            let _ = self.ensureBuffer(&frame.activeTileCount, length: 4, options: .storageModeShared, label: "ActiveTileCount")
-        else { return false }
-        return true
-    }
-    
-    private func prepareRenderOutputResources(frame: FrameResources, width: Int, height: Int) -> Bool {
-        let pixelCount = max(1, width * height)
-        
-        // 1. Buffers (Standard)
-        if let out = frame.outputBuffers, out.colorOutGPU.length >= pixelCount * 12, out.depthOutGPU.length >= pixelCount * 4, out.alphaOutGPU.length >= pixelCount * 4 {
-             // Good
-        } else {
-            guard
-                let color = self.device.makeBuffer(length: pixelCount * 12, options: .storageModeShared),
-                let depth = self.device.makeBuffer(length: pixelCount * 4, options: .storageModeShared),
-                let alpha = self.device.makeBuffer(length: pixelCount * 4, options: .storageModeShared)
-            else { return false }
-            
-            color.label = "RenderColorOutput"
-            depth.label = "RenderDepthOutput"
-            alpha.label = "RenderAlphaOutput"
-            frame.outputBuffers = RenderOutputBuffers(colorOutGPU: color, depthOutGPU: depth, alphaOutGPU: alpha)
-        }
-        
-        // 2. Textures (Alternative)
-        let currentW = frame.outputTextures?.color.width ?? 0
-        let currentH = frame.outputTextures?.color.height ?? 0
-        if currentW != width || currentH != height {
-            // Create new textures
-            let desc = MTLTextureDescriptor.texture2DDescriptor(pixelFormat: .rgba16Float, width: width, height: height, mipmapped: false)
-            desc.usage = [.shaderWrite, .shaderRead]
-            desc.storageMode = .private
-            
-            guard let colorTex = self.device.makeTexture(descriptor: desc) else { return false }
-            colorTex.label = "OutputColorTex"
-            
-            let descF32 = MTLTextureDescriptor.texture2DDescriptor(pixelFormat: .r32Float, width: width, height: height, mipmapped: false)
-            descF32.usage = [.shaderWrite, .shaderRead]
-            descF32.storageMode = .private
-            
-            guard let depthTex = self.device.makeTexture(descriptor: descF32) else { return false }
-            depthTex.label = "OutputDepthTex"
-            
-            guard let alphaTex = self.device.makeTexture(descriptor: descF32) else { return false }
-            alphaTex.label = "OutputAlphaTex"
-            
-            frame.outputTextures = RenderOutputTextures(color: colorTex, depth: depthTex, alpha: alphaTex)
-        }
-        
-        return true
-    }
-    
+
     internal func acquireFrame(width: Int, height: Int) -> (FrameResources, Int)? {
+        guard width <= limits.maxWidth, height <= limits.maxHeight else { return nil }
         frameLock.lock()
         defer { frameLock.unlock() }
-        
+
         let available = min(maxInFlightFrames, frameResources.count)
         guard available > 0 else { return nil }
-        
+
         for _ in 0..<available {
             let idx = frameCursor % available
             frameCursor = (frameCursor + 1) % max(available, 1)
             if frameInUse[idx] == false {
                 frameInUse[idx] = true
-                if frameResources[idx] == nil {
-                    frameResources[idx] = FrameResources(device: self.device)
-                }
-                let frame = frameResources[idx]!
-                if prepareRenderOutputResources(frame: frame, width: width, height: height),
-                   prepareTileBuilderResources(frame: frame, gaussianCount: 1, tileCount: 1, maxPerTile: 1, forcedCapacity: 1) { // Default minimal values to prevent nil
-                    return (frame, idx)
-                }
-                // Fail to prepare output -> release
-                frameInUse[idx] = false
-                return nil
+                return (frameResources[idx], idx)
             }
         }
         return nil
@@ -1515,26 +1845,26 @@ public final class Renderer: @unchecked Sendable {
             frameInUse[index] = false
         }
     }
-    internal func ensureRadixBuffers(frame: FrameResources, paddedCapacity: Int) -> Bool {
-        let valuesPerGroup = self.radixSortEncoder.blockSize * self.radixSortEncoder.grainSize
-        let gridSize = max(1, (paddedCapacity + valuesPerGroup - 1) / valuesPerGroup)
-        let histogramCount = gridSize * self.radixSortEncoder.radix
-        let blockBytes = gridSize * 4
-        let fusedKeyBytes = paddedCapacity * 8
-        
-        _ = self.ensureBuffer(&frame.radixHistogram, length: histogramCount * 4, options: .storageModePrivate, label: "RadixHist")
-        _ = self.ensureBuffer(&frame.radixBlockSums, length: blockBytes, options: .storageModePrivate, label: "RadixBlockSums")
-        _ = self.ensureBuffer(&frame.radixScannedHistogram, length: histogramCount * 4, options: .storageModePrivate, label: "RadixScanned")
-        _ = self.ensureBuffer(&frame.radixFusedKeys, length: fusedKeyBytes, options: .storageModePrivate, label: "RadixFused")
-        _ = self.ensureBuffer(&frame.radixKeysScratch, length: fusedKeyBytes, options: .storageModePrivate, label: "RadixScratch")
-        _ = self.ensureBuffer(&frame.radixPayloadScratch, length: paddedCapacity * 4, options: .storageModePrivate, label: "RadixPayload")
-        return true
+
+    // MARK: - Debug/Test helpers
+    internal func debugHeapSizeBytes() -> Int? {
+        return frameResources.first?.heapAllocator.heap?.size
     }
-    
+
     func makeBuffer<T>(ptr: UnsafePointer<T>, count: Int) -> MTLBuffer? {
         self.device.makeBuffer(bytes: ptr, length: count * MemoryLayout<T>.stride, options: .storageModeShared)
     }
     
+    /// Choose padded assignment capacity based on sort algorithm to avoid over-allocation.
+    private func paddedAssignmentCapacity(for totalAssignments: Int) -> Int {
+        guard totalAssignments > 0 else { return 1 }
+        if self.sortAlgorithm == .radix {
+            let block = self.radixSortEncoder.blockSize * self.radixSortEncoder.grainSize
+            return ((totalAssignments + block - 1) / block) * block
+        } else {
+            return self.nextPowerOfTwo(value: totalAssignments)
+        }
+    }
     internal func nextPowerOfTwo(value: Int) -> Int {
         var result = 1
         while result < value {
@@ -1542,7 +1872,4 @@ public final class Renderer: @unchecked Sendable {
         }
         return result
     }
-    
-    // MARK: - Debug Methods
-
 }

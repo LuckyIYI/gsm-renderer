@@ -260,6 +260,50 @@ struct GaussianHeader {
     uint count;
 };
 
+// =============================================================================
+// INTERLEAVED DATA STRUCTURES - Cache-efficient single-struct access
+// =============================================================================
+
+/// Interleaved gaussian render data (half16) - 24 bytes, aligned
+/// Combines all per-gaussian data for single-read cache efficiency
+struct GaussianRenderData {
+    half2         mean;       // 4 bytes
+    half4         conic;      // 8 bytes
+    packed_half3  color;      // 6 bytes
+    half          opacity;    // 2 bytes
+    half          depth;      // 2 bytes
+    ushort        _pad;       // 2 bytes (alignment to 24)
+};
+
+/// Interleaved gaussian render data (float32) - 48 bytes
+struct GaussianRenderDataF32 {
+    float2         mean;      // 8 bytes
+    float4         conic;     // 16 bytes
+    packed_float3  color;     // 12 bytes
+    float          opacity;   // 4 bytes
+    float          depth;     // 4 bytes
+    uint           _pad;      // 4 bytes (alignment to 48)
+};
+
+/// Packed gaussian for render stage - matches GaussianRenderData layout
+struct PackedGaussian {
+    half2         mean;       // 4 bytes
+    half4         conic;      // 8 bytes
+    packed_half3  color;      // 6 bytes
+    half          opacity;    // 2 bytes
+    half          depth;      // 2 bytes
+    ushort        _pad;       // 2 bytes
+};
+
+struct PackedGaussianF32 {
+    float2         mean;      // 8 bytes
+    float4         conic;     // 16 bytes
+    packed_float3  color;     // 12 bytes
+    float          opacity;   // 4 bytes
+    float          depth;     // 4 bytes
+    uint           _pad;      // 4 bytes
+};
+
 inline float3x3 matrixFromRows(float3 r0, float3 r1, float3 r2) {
     return float3x3(
         float3(r0.x, r1.x, r2.x),
@@ -1685,7 +1729,6 @@ kernel void encodeBitonicICB(
     constant uint& generalOffset [[buffer(7)]],
     constant uint& finalOffset [[buffer(8)]],
     device uint* firstParams [[buffer(9)]],
-    device uint4* debugParams [[buffer(10)]],
     uint tid [[thread_position_in_grid]]
 ) {
     const uint firstStride = 256u;
@@ -1728,11 +1771,6 @@ kernel void encodeBitonicICB(
             } else if (t == 2u) {
                 tgCount = uint3(finalGroupsX, 1, 1);
             }
-            if (debugParams != nullptr && slot < maxCommands) {
-                debugParams[slot] = uint4(t, pc, passesNeeded, tgCount.x);
-            }
-        } else if (debugParams != nullptr && slot < maxCommands) {
-            debugParams[slot] = uint4(3u, 0u, passesNeeded, 0u);
         }
 
         cmd.concurrent_dispatch_threadgroups(tgCount, tgSize);
@@ -2493,17 +2531,20 @@ kernel void prepareAssignmentDispatchKernel(
     uint radixBlockSize = max(config.radixBlockSize, 1u);
     uint radixGrainSize = max(config.radixGrainSize, 1u);
 
-    uint sortGroups = (padded > 0u) ? ((padded + sortTG - 1u) / sortTG) : 0u;
+    // Sort key generation uses total (radix) or padded (bitonic)
+    // For radix path: use total count to avoid processing padding
+    uint sortGroups = (total > 0u) ? ((total + sortTG - 1u) / sortTG) : 0u;
     dispatchArgs[DispatchSlotSortKeys].threadgroupsPerGridX = sortGroups;
     dispatchArgs[DispatchSlotSortKeys].threadgroupsPerGridY = 1u;
     dispatchArgs[DispatchSlotSortKeys].threadgroupsPerGridZ = 1u;
 
-    uint fuseGroups = (padded > 0u) ? ((padded + fuseTG - 1u) / fuseTG) : 0u;
+    // Fuse/unpack use total count for radix path
+    uint fuseGroups = (total > 0u) ? ((total + fuseTG - 1u) / fuseTG) : 0u;
     dispatchArgs[DispatchSlotFuseKeys].threadgroupsPerGridX = fuseGroups;
     dispatchArgs[DispatchSlotFuseKeys].threadgroupsPerGridY = 1u;
     dispatchArgs[DispatchSlotFuseKeys].threadgroupsPerGridZ = 1u;
 
-    uint unpackGroups = (padded > 0u) ? ((padded + unpackTG - 1u) / unpackTG) : 0u;
+    uint unpackGroups = (total > 0u) ? ((total + unpackTG - 1u) / unpackTG) : 0u;
     dispatchArgs[DispatchSlotUnpackKeys].threadgroupsPerGridX = unpackGroups;
     dispatchArgs[DispatchSlotUnpackKeys].threadgroupsPerGridY = 1u;
     dispatchArgs[DispatchSlotUnpackKeys].threadgroupsPerGridZ = 1u;
@@ -2522,8 +2563,10 @@ kernel void prepareAssignmentDispatchKernel(
     dispatchArgs[DispatchSlotBitonicGeneral] = dispatchArgs[DispatchSlotBitonicFirst];
     dispatchArgs[DispatchSlotBitonicFinal] = dispatchArgs[DispatchSlotBitonicFirst];
 
+    // Radix sort can work on exact count (unlike bitonic which needs power-of-two)
+    // This saves ~40% work when paddedCount >> totalAssignments
     uint valuesPerGroup = max(radixBlockSize * radixGrainSize, 1u);
-    uint radixGrid = (padded > 0u) ? ((padded + valuesPerGroup - 1u) / valuesPerGroup) : 0u;
+    uint radixGrid = (total > 0u) ? ((total + valuesPerGroup - 1u) / valuesPerGroup) : 0u;
     uint histogramGroups = radixGrid;
     uint applyGroups = radixGrid;
     uint scatterGroups = radixGrid;
@@ -3117,4 +3160,675 @@ kernel void unpackSortKeysKernel(
     uint tile = uint(fused >> 32);
     uint depthBits = uint(fused & 0xFFFFFFFFull);
     output_keys[gid] = uint2(tile, depthBits);
+}
+
+// =============================================================================
+// FUSED PIPELINE KERNELS - Interleaved data for cache efficiency
+// =============================================================================
+
+/// Interleave separate gaussian buffers into single struct (half16)
+kernel void interleaveGaussianDataKernel_half(
+    const device half2*         means       [[buffer(0)]],
+    const device half4*         conics      [[buffer(1)]],
+    const device packed_half3*  colors      [[buffer(2)]],
+    const device half*          opacities   [[buffer(3)]],
+    const device half*          depths      [[buffer(4)]],
+    device GaussianRenderData*  output      [[buffer(5)]],
+    constant uint&              count       [[buffer(6)]],
+    uint                        gid         [[thread_position_in_grid]]
+) {
+    if (gid >= count) return;
+
+    GaussianRenderData g;
+    g.mean     = means[gid];
+    g.conic    = conics[gid];
+    g.color    = colors[gid];
+    g.opacity  = opacities[gid];
+    g.depth    = depths[gid];
+    g._pad     = 0;
+
+    output[gid] = g;
+}
+
+/// Interleave separate gaussian buffers into single struct (float32)
+kernel void interleaveGaussianDataKernel_float(
+    const device float2*         means       [[buffer(0)]],
+    const device float4*         conics      [[buffer(1)]],
+    const device packed_float3*  colors      [[buffer(2)]],
+    const device float*          opacities   [[buffer(3)]],
+    const device float*          depths      [[buffer(4)]],
+    device GaussianRenderDataF32* output     [[buffer(5)]],
+    constant uint&               count       [[buffer(6)]],
+    uint                         gid         [[thread_position_in_grid]]
+) {
+    if (gid >= count) return;
+
+    GaussianRenderDataF32 g;
+    g.mean     = means[gid];
+    g.conic    = conics[gid];
+    g.color    = colors[gid];
+    g.opacity  = opacities[gid];
+    g.depth    = depths[gid];
+    g._pad     = 0;
+
+    output[gid] = g;
+}
+
+/// Pack fused gaussians using sorted indices (half16)
+/// Single struct read instead of 5 scattered reads
+kernel void packFusedKernel_half(
+    const device int*                sortedIndices   [[buffer(0)]],
+    const device GaussianRenderData* gaussians       [[buffer(1)]],
+    device PackedGaussian*           output          [[buffer(2)]],
+    const device TileAssignmentHeader* header        [[buffer(3)]],
+    uint                             gid             [[thread_position_in_grid]]
+) {
+    uint total = header->totalAssignments;
+    if (gid >= total) return;
+
+    int srcIdx = sortedIndices[gid];
+    if (srcIdx < 0) return;  // Invalid/padding entry
+
+    GaussianRenderData src = gaussians[srcIdx];
+
+    // Direct copy - same layout
+    PackedGaussian dst;
+    dst.mean    = src.mean;
+    dst.conic   = src.conic;
+    dst.color   = src.color;
+    dst.opacity = src.opacity;
+    dst.depth   = src.depth;
+    dst._pad    = 0;
+
+    output[gid] = dst;
+}
+
+/// Pack fused gaussians using sorted indices (float32)
+kernel void packFusedKernel_float(
+    const device int*                  sortedIndices   [[buffer(0)]],
+    const device GaussianRenderDataF32* gaussians      [[buffer(1)]],
+    device PackedGaussianF32*          output          [[buffer(2)]],
+    const device TileAssignmentHeader* header          [[buffer(3)]],
+    uint                               gid             [[thread_position_in_grid]]
+) {
+    uint total = header->totalAssignments;
+    if (gid >= total) return;
+
+    int srcIdx = sortedIndices[gid];
+    if (srcIdx < 0) return;  // Invalid/padding entry
+
+    GaussianRenderDataF32 src = gaussians[srcIdx];
+
+    PackedGaussianF32 dst;
+    dst.mean    = src.mean;
+    dst.conic   = src.conic;
+    dst.color   = src.color;
+    dst.opacity = src.opacity;
+    dst.depth   = src.depth;
+    dst._pad    = 0;
+
+    output[gid] = dst;
+}
+
+/// Fused render kernel - reads interleaved PackedGaussian structs (half16)
+/// Single load per gaussian instead of 5 scattered loads
+#define RENDER_FUSED_BATCH_SIZE 32
+
+kernel void renderTilesFused_half(
+    const device GaussianHeader*    headers         [[buffer(0)]],
+    const device PackedGaussian*    gaussians       [[buffer(1)]],
+    const device uint*              activeTiles     [[buffer(2)]],
+    const device uint*              activeTileCount [[buffer(3)]],
+    texture2d<half, access::write>  colorOut        [[texture(0)]],
+    texture2d<float, access::write> depthOut        [[texture(1)]],
+    texture2d<float, access::write> alphaOut        [[texture(2)]],
+    constant RenderParams&          params          [[buffer(4)]],
+    uint2                           group_id        [[threadgroup_position_in_grid]],
+    uint2                           local_id        [[thread_position_in_threadgroup]]
+) {
+    threadgroup PackedGaussian shGaussians[RENDER_FUSED_BATCH_SIZE];
+
+    uint tileIdx = group_id.x;
+    if (tileIdx >= *activeTileCount) return;
+
+    uint tile = activeTiles[tileIdx];
+    GaussianHeader hdr = headers[tile];
+
+    uint tileX = tile % params.tilesX;
+    uint tileY = tile / params.tilesX;
+    uint px = tileX * params.tileWidth + local_id.x;
+    uint py = tileY * params.tileHeight + local_id.y;
+
+    bool inBounds = (px < params.width) && (py < params.height);
+
+    half hx = half(px);
+    half hy = half(py);
+
+    float3 accumColor = float3(0);
+    float accumAlpha = 0;
+    float accumDepth = 0;
+    float trans = 1.0f;
+
+    uint start = hdr.offset;
+    uint count = hdr.count;
+
+    for (uint batch = 0; batch < count; batch += RENDER_FUSED_BATCH_SIZE) {
+        uint batchCount = min(uint(RENDER_FUSED_BATCH_SIZE), count - batch);
+
+        // Cooperative loading - single struct read per gaussian
+        uint tid = local_id.y * params.tileWidth + local_id.x;
+        if (tid < batchCount) {
+            shGaussians[tid] = gaussians[start + batch + tid];
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        // Process batch
+        if (inBounds) {
+            for (uint i = 0; i < batchCount && trans > 1e-3f; i++) {
+                PackedGaussian g = shGaussians[i];
+
+                half dx = clamp(hx - g.mean.x, half(-250.0h), half(250.0h));
+                half dy = clamp(hy - g.mean.y, half(-250.0h), half(250.0h));
+                half quad = dx * dx * g.conic.x + dy * dy * g.conic.z + 2.0h * dx * dy * g.conic.y;
+
+                if (quad >= 20.0h) continue;
+
+                half weight = exp(-0.5h * quad);
+                half hAlpha = min(half(0.99h), g.opacity * weight);
+                if (hAlpha < 1e-4h) continue;
+
+                float alpha = float(hAlpha);
+                float contrib = trans * alpha;
+                trans *= (1.0f - alpha);
+
+                accumColor += float3(g.color) * contrib;
+                accumDepth += float(g.depth) * contrib;
+                accumAlpha += contrib;
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    if (inBounds) {
+        float3 bg = params.whiteBackground ? float3(1) : float3(0);
+        float3 finalColor = accumColor + trans * bg;
+        float finalAlpha = 1.0f - trans;
+
+        colorOut.write(half4(half3(finalColor), half(finalAlpha)), uint2(px, py));
+        depthOut.write(float4(accumDepth, 0, 0, 0), uint2(px, py));
+        alphaOut.write(float4(finalAlpha, 0, 0, 0), uint2(px, py));
+    }
+}
+
+/// Fused render kernel (float32)
+kernel void renderTilesFused_float(
+    const device GaussianHeader*    headers         [[buffer(0)]],
+    const device PackedGaussianF32* gaussians       [[buffer(1)]],
+    const device uint*              activeTiles     [[buffer(2)]],
+    const device uint*              activeTileCount [[buffer(3)]],
+    texture2d<half, access::write>  colorOut        [[texture(0)]],
+    texture2d<float, access::write> depthOut        [[texture(1)]],
+    texture2d<float, access::write> alphaOut        [[texture(2)]],
+    constant RenderParams&          params          [[buffer(4)]],
+    uint2                           group_id        [[threadgroup_position_in_grid]],
+    uint2                           local_id        [[thread_position_in_threadgroup]]
+) {
+    threadgroup PackedGaussianF32 shGaussians[RENDER_FUSED_BATCH_SIZE];
+
+    uint tileIdx = group_id.x;
+    if (tileIdx >= *activeTileCount) return;
+
+    uint tile = activeTiles[tileIdx];
+    GaussianHeader hdr = headers[tile];
+
+    uint tileX = tile % params.tilesX;
+    uint tileY = tile / params.tilesX;
+    uint px = tileX * params.tileWidth + local_id.x;
+    uint py = tileY * params.tileHeight + local_id.y;
+
+    bool inBounds = (px < params.width) && (py < params.height);
+
+    float3 accumColor = float3(0);
+    float accumAlpha = 0;
+    float accumDepth = 0;
+    float trans = 1.0f;
+
+    uint start = hdr.offset;
+    uint count = hdr.count;
+
+    for (uint batch = 0; batch < count; batch += RENDER_FUSED_BATCH_SIZE) {
+        uint batchCount = min(uint(RENDER_FUSED_BATCH_SIZE), count - batch);
+
+        // Cooperative loading
+        uint tid = local_id.y * params.tileWidth + local_id.x;
+        if (tid < batchCount) {
+            shGaussians[tid] = gaussians[start + batch + tid];
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        if (inBounds) {
+            for (uint i = 0; i < batchCount && trans > 1e-3f; i++) {
+                PackedGaussianF32 g = shGaussians[i];
+
+                float2 mean = g.mean;
+                float2 d = float2(px, py) - mean;
+                d.x = clamp(d.x, -250.0f, 250.0f);
+                d.y = clamp(d.y, -250.0f, 250.0f);
+
+                float4 conic = g.conic;
+                float quad = conic.x * d.x * d.x +
+                             2.0f * conic.y * d.x * d.y +
+                             conic.z * d.y * d.y;
+
+                if (quad > 20.0f) continue;
+
+                float weight = exp(-0.5f * quad);
+                float alpha = min(0.99f, g.opacity * weight);
+                if (alpha < (1.0f / 255.0f)) continue;
+
+                float3 color = float3(g.color);
+                float depth = g.depth;
+
+                accumColor += trans * alpha * color;
+                accumDepth += trans * alpha * depth;
+                accumAlpha += trans * alpha;
+                trans *= (1.0f - alpha);
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    if (inBounds) {
+        float3 bg = params.whiteBackground ? float3(1) : float3(0);
+        float3 finalColor = accumColor + trans * bg;
+        float finalAlpha = 1.0f - trans;
+
+        colorOut.write(half4(half3(finalColor), half(finalAlpha)), uint2(px, py));
+        depthOut.write(float4(accumDepth, 0, 0, 0), uint2(px, py));
+        alphaOut.write(float4(finalAlpha, 0, 0, 0), uint2(px, py));
+    }
+}
+
+/// Fused render kernel for 32x16 tiles - multi-pixel mode (half16)
+/// 8x8 threadgroup, each thread handles 4x2 = 8 pixels
+/// Uses PackedGaussian for cache-efficient single-struct reads
+#define RENDER_FUSED_MULTIPIXEL_BATCH_SIZE 64
+
+kernel void renderTilesFusedMultiPixel_half(
+    const device GaussianHeader*    headers         [[buffer(0)]],
+    const device PackedGaussian*    gaussians       [[buffer(1)]],
+    const device uint*              activeTiles     [[buffer(2)]],
+    const device uint*              activeTileCount [[buffer(3)]],
+    texture2d<half, access::write>  colorOut        [[texture(0)]],
+    texture2d<float, access::write> depthOut        [[texture(1)]],
+    texture2d<float, access::write> alphaOut        [[texture(2)]],
+    constant RenderParams&          params          [[buffer(4)]],
+    uint2                           group_id        [[threadgroup_position_in_grid]],
+    uint2                           local_id        [[thread_position_in_threadgroup]],
+    uint                            tid             [[thread_index_in_threadgroup]]
+) {
+    threadgroup PackedGaussian shGaussians[RENDER_FUSED_MULTIPIXEL_BATCH_SIZE];
+
+    uint tileIdx = group_id.x;
+    if (tileIdx >= *activeTileCount) return;
+
+    uint tile = activeTiles[tileIdx];
+    GaussianHeader hdr = headers[tile];
+
+    uint tileX = tile % params.tilesX;
+    uint tileY = tile / params.tilesX;
+
+    // 32x16 tile, 8x8 threads, 4x2 pixels per thread
+    uint baseX = tileX * 32 + local_id.x * 4;
+    uint baseY = tileY * 16 + local_id.y * 2;
+
+    // Pixel coordinates
+    half px0 = half(baseX), px1 = half(baseX + 1), px2 = half(baseX + 2), px3 = half(baseX + 3);
+    half py0 = half(baseY), py1 = half(baseY + 1);
+
+    // Accumulators for 8 pixels (4x2)
+    half trans00 = 1.0h, trans10 = 1.0h, trans20 = 1.0h, trans30 = 1.0h;
+    half trans01 = 1.0h, trans11 = 1.0h, trans21 = 1.0h, trans31 = 1.0h;
+
+    half3 color00 = half3(0), color10 = half3(0), color20 = half3(0), color30 = half3(0);
+    half3 color01 = half3(0), color11 = half3(0), color21 = half3(0), color31 = half3(0);
+
+    float depth00 = 0, depth10 = 0, depth20 = 0, depth30 = 0;
+    float depth01 = 0, depth11 = 0, depth21 = 0, depth31 = 0;
+
+    uint start = hdr.offset;
+    uint count = hdr.count;
+
+    for (uint batch = 0; batch < count; batch += RENDER_FUSED_MULTIPIXEL_BATCH_SIZE) {
+        uint batchCount = min(uint(RENDER_FUSED_MULTIPIXEL_BATCH_SIZE), count - batch);
+
+        // Cooperative loading with 64 threads
+        if (tid < batchCount) {
+            shGaussians[tid] = gaussians[start + batch + tid];
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        // Process batch
+        for (uint i = 0; i < batchCount; i++) {
+            // Early exit when all pixels are saturated
+            half maxTrans0 = max(max(trans00, trans10), max(trans20, trans30));
+            half maxTrans1 = max(max(trans01, trans11), max(trans21, trans31));
+            if (max(maxTrans0, maxTrans1) < half(1.0h/255.0h)) break;
+
+            PackedGaussian g = shGaussians[i];
+
+            // Direction vectors for all 8 pixels
+            half2 d00 = half2(px0, py0) - g.mean;
+            half2 d10 = half2(px1, py0) - g.mean;
+            half2 d20 = half2(px2, py0) - g.mean;
+            half2 d30 = half2(px3, py0) - g.mean;
+            half2 d01 = half2(px0, py1) - g.mean;
+            half2 d11 = half2(px1, py1) - g.mean;
+            half2 d21 = half2(px2, py1) - g.mean;
+            half2 d31 = half2(px3, py1) - g.mean;
+
+            // Quadratic form for each pixel
+            half p00 = d00.x*d00.x*g.conic.x + d00.y*d00.y*g.conic.z + 2.0h*d00.x*d00.y*g.conic.y;
+            half p10 = d10.x*d10.x*g.conic.x + d10.y*d10.y*g.conic.z + 2.0h*d10.x*d10.y*g.conic.y;
+            half p20 = d20.x*d20.x*g.conic.x + d20.y*d20.y*g.conic.z + 2.0h*d20.x*d20.y*g.conic.y;
+            half p30 = d30.x*d30.x*g.conic.x + d30.y*d30.y*g.conic.z + 2.0h*d30.x*d30.y*g.conic.y;
+            half p01 = d01.x*d01.x*g.conic.x + d01.y*d01.y*g.conic.z + 2.0h*d01.x*d01.y*g.conic.y;
+            half p11 = d11.x*d11.x*g.conic.x + d11.y*d11.y*g.conic.z + 2.0h*d11.x*d11.y*g.conic.y;
+            half p21 = d21.x*d21.x*g.conic.x + d21.y*d21.y*g.conic.z + 2.0h*d21.x*d21.y*g.conic.y;
+            half p31 = d31.x*d31.x*g.conic.x + d31.y*d31.y*g.conic.z + 2.0h*d31.x*d31.y*g.conic.y;
+
+            // Alpha = opacity * exp(-0.5 * power)
+            half opacity = g.opacity;
+            half a00 = min(opacity * exp(-0.5h * p00), half(0.99h));
+            half a10 = min(opacity * exp(-0.5h * p10), half(0.99h));
+            half a20 = min(opacity * exp(-0.5h * p20), half(0.99h));
+            half a30 = min(opacity * exp(-0.5h * p30), half(0.99h));
+            half a01 = min(opacity * exp(-0.5h * p01), half(0.99h));
+            half a11 = min(opacity * exp(-0.5h * p11), half(0.99h));
+            half a21 = min(opacity * exp(-0.5h * p21), half(0.99h));
+            half a31 = min(opacity * exp(-0.5h * p31), half(0.99h));
+
+            // Blend: color += gaussian_color * alpha * transparency
+            half3 gColor = half3(g.color);
+            float gDepth = float(g.depth);
+
+            color00 += gColor * (a00 * trans00); depth00 += gDepth * float(a00 * trans00);
+            color10 += gColor * (a10 * trans10); depth10 += gDepth * float(a10 * trans10);
+            color20 += gColor * (a20 * trans20); depth20 += gDepth * float(a20 * trans20);
+            color30 += gColor * (a30 * trans30); depth30 += gDepth * float(a30 * trans30);
+            color01 += gColor * (a01 * trans01); depth01 += gDepth * float(a01 * trans01);
+            color11 += gColor * (a11 * trans11); depth11 += gDepth * float(a11 * trans11);
+            color21 += gColor * (a21 * trans21); depth21 += gDepth * float(a21 * trans21);
+            color31 += gColor * (a31 * trans31); depth31 += gDepth * float(a31 * trans31);
+
+            // Update transparency
+            trans00 *= (1.0h - a00); trans10 *= (1.0h - a10);
+            trans20 *= (1.0h - a20); trans30 *= (1.0h - a30);
+            trans01 *= (1.0h - a01); trans11 *= (1.0h - a11);
+            trans21 *= (1.0h - a21); trans31 *= (1.0h - a31);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    // Apply background
+    half bg = params.whiteBackground ? half(1.0h) : half(0.0h);
+    color00 += half3(trans00 * bg); color10 += half3(trans10 * bg);
+    color20 += half3(trans20 * bg); color30 += half3(trans30 * bg);
+    color01 += half3(trans01 * bg); color11 += half3(trans11 * bg);
+    color21 += half3(trans21 * bg); color31 += half3(trans31 * bg);
+
+    // Write all 8 pixels
+    if (all(uint2(baseX + 3, baseY + 1) < uint2(params.width, params.height))) {
+        colorOut.write(half4(color00, 1.0h - trans00), uint2(baseX + 0, baseY));
+        colorOut.write(half4(color10, 1.0h - trans10), uint2(baseX + 1, baseY));
+        colorOut.write(half4(color20, 1.0h - trans20), uint2(baseX + 2, baseY));
+        colorOut.write(half4(color30, 1.0h - trans30), uint2(baseX + 3, baseY));
+        colorOut.write(half4(color01, 1.0h - trans01), uint2(baseX + 0, baseY + 1));
+        colorOut.write(half4(color11, 1.0h - trans11), uint2(baseX + 1, baseY + 1));
+        colorOut.write(half4(color21, 1.0h - trans21), uint2(baseX + 2, baseY + 1));
+        colorOut.write(half4(color31, 1.0h - trans31), uint2(baseX + 3, baseY + 1));
+
+        depthOut.write(float4(depth00, 0, 0, 0), uint2(baseX + 0, baseY));
+        depthOut.write(float4(depth10, 0, 0, 0), uint2(baseX + 1, baseY));
+        depthOut.write(float4(depth20, 0, 0, 0), uint2(baseX + 2, baseY));
+        depthOut.write(float4(depth30, 0, 0, 0), uint2(baseX + 3, baseY));
+        depthOut.write(float4(depth01, 0, 0, 0), uint2(baseX + 0, baseY + 1));
+        depthOut.write(float4(depth11, 0, 0, 0), uint2(baseX + 1, baseY + 1));
+        depthOut.write(float4(depth21, 0, 0, 0), uint2(baseX + 2, baseY + 1));
+        depthOut.write(float4(depth31, 0, 0, 0), uint2(baseX + 3, baseY + 1));
+
+        alphaOut.write(float4(1.0f - float(trans00), 0, 0, 0), uint2(baseX + 0, baseY));
+        alphaOut.write(float4(1.0f - float(trans10), 0, 0, 0), uint2(baseX + 1, baseY));
+        alphaOut.write(float4(1.0f - float(trans20), 0, 0, 0), uint2(baseX + 2, baseY));
+        alphaOut.write(float4(1.0f - float(trans30), 0, 0, 0), uint2(baseX + 3, baseY));
+        alphaOut.write(float4(1.0f - float(trans01), 0, 0, 0), uint2(baseX + 0, baseY + 1));
+        alphaOut.write(float4(1.0f - float(trans11), 0, 0, 0), uint2(baseX + 1, baseY + 1));
+        alphaOut.write(float4(1.0f - float(trans21), 0, 0, 0), uint2(baseX + 2, baseY + 1));
+        alphaOut.write(float4(1.0f - float(trans31), 0, 0, 0), uint2(baseX + 3, baseY + 1));
+    } else {
+        // Bounds checking per pixel
+        if (baseX + 0 < params.width && baseY < params.height) {
+            colorOut.write(half4(color00, 1.0h - trans00), uint2(baseX + 0, baseY));
+            depthOut.write(float4(depth00, 0, 0, 0), uint2(baseX + 0, baseY));
+            alphaOut.write(float4(1.0f - float(trans00), 0, 0, 0), uint2(baseX + 0, baseY));
+        }
+        if (baseX + 1 < params.width && baseY < params.height) {
+            colorOut.write(half4(color10, 1.0h - trans10), uint2(baseX + 1, baseY));
+            depthOut.write(float4(depth10, 0, 0, 0), uint2(baseX + 1, baseY));
+            alphaOut.write(float4(1.0f - float(trans10), 0, 0, 0), uint2(baseX + 1, baseY));
+        }
+        if (baseX + 2 < params.width && baseY < params.height) {
+            colorOut.write(half4(color20, 1.0h - trans20), uint2(baseX + 2, baseY));
+            depthOut.write(float4(depth20, 0, 0, 0), uint2(baseX + 2, baseY));
+            alphaOut.write(float4(1.0f - float(trans20), 0, 0, 0), uint2(baseX + 2, baseY));
+        }
+        if (baseX + 3 < params.width && baseY < params.height) {
+            colorOut.write(half4(color30, 1.0h - trans30), uint2(baseX + 3, baseY));
+            depthOut.write(float4(depth30, 0, 0, 0), uint2(baseX + 3, baseY));
+            alphaOut.write(float4(1.0f - float(trans30), 0, 0, 0), uint2(baseX + 3, baseY));
+        }
+        if (baseX + 0 < params.width && baseY + 1 < params.height) {
+            colorOut.write(half4(color01, 1.0h - trans01), uint2(baseX + 0, baseY + 1));
+            depthOut.write(float4(depth01, 0, 0, 0), uint2(baseX + 0, baseY + 1));
+            alphaOut.write(float4(1.0f - float(trans01), 0, 0, 0), uint2(baseX + 0, baseY + 1));
+        }
+        if (baseX + 1 < params.width && baseY + 1 < params.height) {
+            colorOut.write(half4(color11, 1.0h - trans11), uint2(baseX + 1, baseY + 1));
+            depthOut.write(float4(depth11, 0, 0, 0), uint2(baseX + 1, baseY + 1));
+            alphaOut.write(float4(1.0f - float(trans11), 0, 0, 0), uint2(baseX + 1, baseY + 1));
+        }
+        if (baseX + 2 < params.width && baseY + 1 < params.height) {
+            colorOut.write(half4(color21, 1.0h - trans21), uint2(baseX + 2, baseY + 1));
+            depthOut.write(float4(depth21, 0, 0, 0), uint2(baseX + 2, baseY + 1));
+            alphaOut.write(float4(1.0f - float(trans21), 0, 0, 0), uint2(baseX + 2, baseY + 1));
+        }
+        if (baseX + 3 < params.width && baseY + 1 < params.height) {
+            colorOut.write(half4(color31, 1.0h - trans31), uint2(baseX + 3, baseY + 1));
+            depthOut.write(float4(depth31, 0, 0, 0), uint2(baseX + 3, baseY + 1));
+            alphaOut.write(float4(1.0f - float(trans31), 0, 0, 0), uint2(baseX + 3, baseY + 1));
+        }
+    }
+}
+
+/// Fused render kernel for 32x16 tiles - multi-pixel mode (float32)
+kernel void renderTilesFusedMultiPixel_float(
+    const device GaussianHeader*      headers         [[buffer(0)]],
+    const device PackedGaussianF32*   gaussians       [[buffer(1)]],
+    const device uint*                activeTiles     [[buffer(2)]],
+    const device uint*                activeTileCount [[buffer(3)]],
+    texture2d<half, access::write>    colorOut        [[texture(0)]],
+    texture2d<float, access::write>   depthOut        [[texture(1)]],
+    texture2d<float, access::write>   alphaOut        [[texture(2)]],
+    constant RenderParams&            params          [[buffer(4)]],
+    uint2                             group_id        [[threadgroup_position_in_grid]],
+    uint2                             local_id        [[thread_position_in_threadgroup]],
+    uint                              tid             [[thread_index_in_threadgroup]]
+) {
+    threadgroup PackedGaussianF32 shGaussians[RENDER_FUSED_MULTIPIXEL_BATCH_SIZE];
+
+    uint tileIdx = group_id.x;
+    if (tileIdx >= *activeTileCount) return;
+
+    uint tile = activeTiles[tileIdx];
+    GaussianHeader hdr = headers[tile];
+
+    uint tileX = tile % params.tilesX;
+    uint tileY = tile / params.tilesX;
+
+    uint baseX = tileX * 32 + local_id.x * 4;
+    uint baseY = tileY * 16 + local_id.y * 2;
+
+    float px0 = float(baseX), px1 = float(baseX + 1), px2 = float(baseX + 2), px3 = float(baseX + 3);
+    float py0 = float(baseY), py1 = float(baseY + 1);
+
+    float trans00 = 1.0f, trans10 = 1.0f, trans20 = 1.0f, trans30 = 1.0f;
+    float trans01 = 1.0f, trans11 = 1.0f, trans21 = 1.0f, trans31 = 1.0f;
+
+    float3 color00 = float3(0), color10 = float3(0), color20 = float3(0), color30 = float3(0);
+    float3 color01 = float3(0), color11 = float3(0), color21 = float3(0), color31 = float3(0);
+
+    float depth00 = 0, depth10 = 0, depth20 = 0, depth30 = 0;
+    float depth01 = 0, depth11 = 0, depth21 = 0, depth31 = 0;
+
+    uint start = hdr.offset;
+    uint count = hdr.count;
+
+    for (uint batch = 0; batch < count; batch += RENDER_FUSED_MULTIPIXEL_BATCH_SIZE) {
+        uint batchCount = min(uint(RENDER_FUSED_MULTIPIXEL_BATCH_SIZE), count - batch);
+
+        if (tid < batchCount) {
+            shGaussians[tid] = gaussians[start + batch + tid];
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        for (uint i = 0; i < batchCount; i++) {
+            float maxTrans = max(max(max(trans00, trans10), max(trans20, trans30)),
+                                 max(max(trans01, trans11), max(trans21, trans31)));
+            if (maxTrans < 1e-3f) break;
+
+            PackedGaussianF32 g = shGaussians[i];
+
+            float2 d00 = float2(px0, py0) - g.mean;
+            float2 d10 = float2(px1, py0) - g.mean;
+            float2 d20 = float2(px2, py0) - g.mean;
+            float2 d30 = float2(px3, py0) - g.mean;
+            float2 d01 = float2(px0, py1) - g.mean;
+            float2 d11 = float2(px1, py1) - g.mean;
+            float2 d21 = float2(px2, py1) - g.mean;
+            float2 d31 = float2(px3, py1) - g.mean;
+
+            float p00 = d00.x*d00.x*g.conic.x + d00.y*d00.y*g.conic.z + 2.0f*d00.x*d00.y*g.conic.y;
+            float p10 = d10.x*d10.x*g.conic.x + d10.y*d10.y*g.conic.z + 2.0f*d10.x*d10.y*g.conic.y;
+            float p20 = d20.x*d20.x*g.conic.x + d20.y*d20.y*g.conic.z + 2.0f*d20.x*d20.y*g.conic.y;
+            float p30 = d30.x*d30.x*g.conic.x + d30.y*d30.y*g.conic.z + 2.0f*d30.x*d30.y*g.conic.y;
+            float p01 = d01.x*d01.x*g.conic.x + d01.y*d01.y*g.conic.z + 2.0f*d01.x*d01.y*g.conic.y;
+            float p11 = d11.x*d11.x*g.conic.x + d11.y*d11.y*g.conic.z + 2.0f*d11.x*d11.y*g.conic.y;
+            float p21 = d21.x*d21.x*g.conic.x + d21.y*d21.y*g.conic.z + 2.0f*d21.x*d21.y*g.conic.y;
+            float p31 = d31.x*d31.x*g.conic.x + d31.y*d31.y*g.conic.z + 2.0f*d31.x*d31.y*g.conic.y;
+
+            float opacity = g.opacity;
+            float a00 = min(opacity * exp(-0.5f * p00), 0.99f);
+            float a10 = min(opacity * exp(-0.5f * p10), 0.99f);
+            float a20 = min(opacity * exp(-0.5f * p20), 0.99f);
+            float a30 = min(opacity * exp(-0.5f * p30), 0.99f);
+            float a01 = min(opacity * exp(-0.5f * p01), 0.99f);
+            float a11 = min(opacity * exp(-0.5f * p11), 0.99f);
+            float a21 = min(opacity * exp(-0.5f * p21), 0.99f);
+            float a31 = min(opacity * exp(-0.5f * p31), 0.99f);
+
+            float3 gColor = float3(g.color);
+            float gDepth = g.depth;
+
+            color00 += gColor * (a00 * trans00); depth00 += gDepth * (a00 * trans00);
+            color10 += gColor * (a10 * trans10); depth10 += gDepth * (a10 * trans10);
+            color20 += gColor * (a20 * trans20); depth20 += gDepth * (a20 * trans20);
+            color30 += gColor * (a30 * trans30); depth30 += gDepth * (a30 * trans30);
+            color01 += gColor * (a01 * trans01); depth01 += gDepth * (a01 * trans01);
+            color11 += gColor * (a11 * trans11); depth11 += gDepth * (a11 * trans11);
+            color21 += gColor * (a21 * trans21); depth21 += gDepth * (a21 * trans21);
+            color31 += gColor * (a31 * trans31); depth31 += gDepth * (a31 * trans31);
+
+            trans00 *= (1.0f - a00); trans10 *= (1.0f - a10);
+            trans20 *= (1.0f - a20); trans30 *= (1.0f - a30);
+            trans01 *= (1.0f - a01); trans11 *= (1.0f - a11);
+            trans21 *= (1.0f - a21); trans31 *= (1.0f - a31);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    float bg = params.whiteBackground ? 1.0f : 0.0f;
+    color00 += float3(trans00 * bg); color10 += float3(trans10 * bg);
+    color20 += float3(trans20 * bg); color30 += float3(trans30 * bg);
+    color01 += float3(trans01 * bg); color11 += float3(trans11 * bg);
+    color21 += float3(trans21 * bg); color31 += float3(trans31 * bg);
+
+    if (all(uint2(baseX + 3, baseY + 1) < uint2(params.width, params.height))) {
+        colorOut.write(half4(half3(color00), half(1.0f - trans00)), uint2(baseX + 0, baseY));
+        colorOut.write(half4(half3(color10), half(1.0f - trans10)), uint2(baseX + 1, baseY));
+        colorOut.write(half4(half3(color20), half(1.0f - trans20)), uint2(baseX + 2, baseY));
+        colorOut.write(half4(half3(color30), half(1.0f - trans30)), uint2(baseX + 3, baseY));
+        colorOut.write(half4(half3(color01), half(1.0f - trans01)), uint2(baseX + 0, baseY + 1));
+        colorOut.write(half4(half3(color11), half(1.0f - trans11)), uint2(baseX + 1, baseY + 1));
+        colorOut.write(half4(half3(color21), half(1.0f - trans21)), uint2(baseX + 2, baseY + 1));
+        colorOut.write(half4(half3(color31), half(1.0f - trans31)), uint2(baseX + 3, baseY + 1));
+
+        depthOut.write(float4(depth00, 0, 0, 0), uint2(baseX + 0, baseY));
+        depthOut.write(float4(depth10, 0, 0, 0), uint2(baseX + 1, baseY));
+        depthOut.write(float4(depth20, 0, 0, 0), uint2(baseX + 2, baseY));
+        depthOut.write(float4(depth30, 0, 0, 0), uint2(baseX + 3, baseY));
+        depthOut.write(float4(depth01, 0, 0, 0), uint2(baseX + 0, baseY + 1));
+        depthOut.write(float4(depth11, 0, 0, 0), uint2(baseX + 1, baseY + 1));
+        depthOut.write(float4(depth21, 0, 0, 0), uint2(baseX + 2, baseY + 1));
+        depthOut.write(float4(depth31, 0, 0, 0), uint2(baseX + 3, baseY + 1));
+
+        alphaOut.write(float4(1.0f - trans00, 0, 0, 0), uint2(baseX + 0, baseY));
+        alphaOut.write(float4(1.0f - trans10, 0, 0, 0), uint2(baseX + 1, baseY));
+        alphaOut.write(float4(1.0f - trans20, 0, 0, 0), uint2(baseX + 2, baseY));
+        alphaOut.write(float4(1.0f - trans30, 0, 0, 0), uint2(baseX + 3, baseY));
+        alphaOut.write(float4(1.0f - trans01, 0, 0, 0), uint2(baseX + 0, baseY + 1));
+        alphaOut.write(float4(1.0f - trans11, 0, 0, 0), uint2(baseX + 1, baseY + 1));
+        alphaOut.write(float4(1.0f - trans21, 0, 0, 0), uint2(baseX + 2, baseY + 1));
+        alphaOut.write(float4(1.0f - trans31, 0, 0, 0), uint2(baseX + 3, baseY + 1));
+    } else {
+        if (baseX + 0 < params.width && baseY < params.height) {
+            colorOut.write(half4(half3(color00), half(1.0f - trans00)), uint2(baseX + 0, baseY));
+            depthOut.write(float4(depth00, 0, 0, 0), uint2(baseX + 0, baseY));
+            alphaOut.write(float4(1.0f - trans00, 0, 0, 0), uint2(baseX + 0, baseY));
+        }
+        if (baseX + 1 < params.width && baseY < params.height) {
+            colorOut.write(half4(half3(color10), half(1.0f - trans10)), uint2(baseX + 1, baseY));
+            depthOut.write(float4(depth10, 0, 0, 0), uint2(baseX + 1, baseY));
+            alphaOut.write(float4(1.0f - trans10, 0, 0, 0), uint2(baseX + 1, baseY));
+        }
+        if (baseX + 2 < params.width && baseY < params.height) {
+            colorOut.write(half4(half3(color20), half(1.0f - trans20)), uint2(baseX + 2, baseY));
+            depthOut.write(float4(depth20, 0, 0, 0), uint2(baseX + 2, baseY));
+            alphaOut.write(float4(1.0f - trans20, 0, 0, 0), uint2(baseX + 2, baseY));
+        }
+        if (baseX + 3 < params.width && baseY < params.height) {
+            colorOut.write(half4(half3(color30), half(1.0f - trans30)), uint2(baseX + 3, baseY));
+            depthOut.write(float4(depth30, 0, 0, 0), uint2(baseX + 3, baseY));
+            alphaOut.write(float4(1.0f - trans30, 0, 0, 0), uint2(baseX + 3, baseY));
+        }
+        if (baseX + 0 < params.width && baseY + 1 < params.height) {
+            colorOut.write(half4(half3(color01), half(1.0f - trans01)), uint2(baseX + 0, baseY + 1));
+            depthOut.write(float4(depth01, 0, 0, 0), uint2(baseX + 0, baseY + 1));
+            alphaOut.write(float4(1.0f - trans01, 0, 0, 0), uint2(baseX + 0, baseY + 1));
+        }
+        if (baseX + 1 < params.width && baseY + 1 < params.height) {
+            colorOut.write(half4(half3(color11), half(1.0f - trans11)), uint2(baseX + 1, baseY + 1));
+            depthOut.write(float4(depth11, 0, 0, 0), uint2(baseX + 1, baseY + 1));
+            alphaOut.write(float4(1.0f - trans11, 0, 0, 0), uint2(baseX + 1, baseY + 1));
+        }
+        if (baseX + 2 < params.width && baseY + 1 < params.height) {
+            colorOut.write(half4(half3(color21), half(1.0f - trans21)), uint2(baseX + 2, baseY + 1));
+            depthOut.write(float4(depth21, 0, 0, 0), uint2(baseX + 2, baseY + 1));
+            alphaOut.write(float4(1.0f - trans21, 0, 0, 0), uint2(baseX + 2, baseY + 1));
+        }
+        if (baseX + 3 < params.width && baseY + 1 < params.height) {
+            colorOut.write(half4(half3(color31), half(1.0f - trans31)), uint2(baseX + 3, baseY + 1));
+            depthOut.write(float4(depth31, 0, 0, 0), uint2(baseX + 3, baseY + 1));
+            alphaOut.write(float4(1.0f - trans31, 0, 0, 0), uint2(baseX + 3, baseY + 1));
+        }
+    }
 }

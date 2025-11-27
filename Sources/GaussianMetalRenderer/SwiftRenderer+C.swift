@@ -65,9 +65,10 @@ public func gaussian_renderer_render(
         opacities: Renderer.shared.makeBuffer(ptr: opacityPtr, count: count)!,
         depths: Renderer.shared.makeBuffer(ptr: depthsPtr, count: count)!,
         tileCount: count,
-        activeTileIndices: frame.activeTileIndices!,
-        activeTileCount: frame.activeTileCount!,
-        precision: .float32
+        activeTileIndices: frame.activeTileIndices,
+        activeTileCount: frame.activeTileCount,
+        precision: .float32,
+        packedGaussiansFused: nil
     )
     
     guard let commandBuffer = Renderer.shared.queue.makeCommandBuffer() else { 
@@ -362,88 +363,6 @@ public func gaussian_renderer_render_world(
     return result
 }
 
-@_cdecl("gaussian_renderer_project_world_debug")
-public func gaussian_renderer_project_world_debug(
-    gaussianCount: Int32,
-    meansPtr: UnsafePointer<Float>?,
-    scalesPtr: UnsafePointer<Float>?,
-    rotationsPtr: UnsafePointer<Float>?,
-    harmonicsPtr: UnsafePointer<Float>?,
-    opacityPtr: UnsafePointer<Float>?,
-    shComponents: Int32,
-    viewMatrixPtr: UnsafePointer<Float>?,
-    projectionMatrixPtr: UnsafePointer<Float>?,
-    cameraCenterPtr: UnsafePointer<Float>?,
-    pixelFactor: Float,
-    focalX: Float,
-    focalY: Float,
-    nearPlane: Float,
-    farPlane: Float,
-    width: Int32,
-    height: Int32,
-    meansOutPtr: UnsafeMutablePointer<Float>?,
-    conicsOutPtr: UnsafeMutablePointer<Float>?,
-    colorsOutPtr: UnsafeMutablePointer<Float>?,
-    opacitiesOutPtr: UnsafeMutablePointer<Float>?,
-    depthsOutPtr: UnsafeMutablePointer<Float>?,
-    radiiOutPtr: UnsafeMutablePointer<Float>?,
-    maskOutPtr: UnsafeMutablePointer<UInt8>?
-) -> Int32 {
-    guard
-        let meansPtr,
-        let scalesPtr,
-        let rotationsPtr,
-        let harmonicsPtr,
-        let opacityPtr,
-        let viewPtr = viewMatrixPtr,
-        let projPtr = projectionMatrixPtr,
-        let cameraPtr = cameraCenterPtr
-    else {
-        return -1
-    }
-    let count = Int(gaussianCount)
-    guard let worldBuffers = Renderer.shared.prepareWorldBuffers(
-        count: count,
-        meansPtr: meansPtr,
-        scalesPtr: scalesPtr,
-        rotationsPtr: rotationsPtr,
-        harmonicsPtr: harmonicsPtr,
-        opacitiesPtr: opacityPtr,
-        shComponents: Int(shComponents)
-    ) else {
-        return -2
-    }
-    let cameraUniforms = CameraUniformsSwift(
-        viewMatrix: matrixFromPointer(viewPtr),
-        projectionMatrix: matrixFromPointer(projPtr),
-    cameraCenter: SIMD3<Float>(cameraPtr[0], cameraPtr[1], cameraPtr[2]),
-    pixelFactor: pixelFactor,
-    focalX: focalX,
-    focalY: focalY,
-        width: Float(width),
-        height: Float(height),
-        nearPlane: max(max(nearPlane, 0.001), 0.2),
-        farPlane: farPlane,
-        shComponents: UInt32(max(shComponents, 0)),
-        gaussianCount: UInt32(count),
-        padding0: 0,
-        padding1: 0
-    )
-    return Renderer.shared.projectWorldDebug(
-        gaussianCount: count,
-        worldBuffers: worldBuffers,
-        cameraUniforms: cameraUniforms,
-        meansOutPtr: meansOutPtr,
-        conicsOutPtr: conicsOutPtr,
-        colorsOutPtr: colorsOutPtr,
-        opacitiesOutPtr: opacitiesOutPtr,
-        depthsOutPtr: depthsOutPtr,
-        radiiOutPtr: radiiOutPtr,
-        maskOutPtr: maskOutPtr
-    )
-}
-
-
 @_cdecl("gaussian_renderer_dump_tile_assignment")
 public func gaussian_renderer_dump_tile_assignment(
     headerOutPtr: UnsafeMutableRawPointer?,
@@ -459,12 +378,10 @@ public func gaussian_renderer_dump_tile_assignment(
     guard let (frame, slotIndex) = Renderer.shared.acquireFrame(width: 1, height: 1) else { return -5 }
     defer { Renderer.shared.releaseFrame(index: slotIndex) }
 
-    guard let orderedH = frame.orderedHeaders,
-          let globalH = frame.tileAssignmentHeader,
-          let ti = frame.tileIndices,
-          let tids = frame.tileIds else {
-        return -2
-    }
+    let orderedH = frame.orderedHeaders
+    let globalH = frame.tileAssignmentHeader
+    let ti = frame.tileIndices
+    let tids = frame.tileIds
     
     // Header (Per-Tile)
     if let hPtr = headerOutPtr {
@@ -506,11 +423,9 @@ public func gaussian_renderer_dump_tile_bounds(
     guard let (frame, slotIndex) = Renderer.shared.acquireFrame(width: 1, height: 1) else { return -5 }
     defer { Renderer.shared.releaseFrame(index: slotIndex) }
 
-    guard let r = frame.boundsBuffer,
-          let c = frame.coverageBuffer,
-          let o = frame.offsetsBuffer else {
-        return -2
-    }
+    let r = frame.boundsBuffer
+    let c = frame.coverageBuffer
+    let o = frame.offsetsBuffer
     
     guard let cmd = Renderer.shared.queue.makeCommandBuffer(),
           let blit = cmd.makeBlitCommandEncoder(),

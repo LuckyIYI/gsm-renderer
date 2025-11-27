@@ -93,11 +93,7 @@ final class PackEncoder {
         activeTileIndices: MTLBuffer,
         activeTileCount: MTLBuffer
     ) {
-        // Reset active tile count before header/compaction pass.
-        if let blit = commandBuffer.makeBlitCommandEncoder() {
-            blit.fill(buffer: activeTileCount, range: 0 ..< MemoryLayout<UInt32>.stride, value: 0)
-            blit.endEncoding()
-        }
+        // Note: activeTileCount is reset in resetTileBuilderStateKernel before tile assignment
 
         // Headers From Sorted
         if let encoder = commandBuffer.makeComputeCommandEncoder() {

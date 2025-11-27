@@ -290,6 +290,9 @@ public final class Renderer: @unchecked Sendable {
 
     // Fused pipeline encoder (optional - for interleaved data optimization)
     var fusedPipelineEncoder: FusedPipelineEncoder?
+
+    // Reset tile builder state pipeline (replaces blit for lower overhead)
+    private let resetTileBuilderStatePipeline: MTLComputePipelineState
     
     // Frame Resources (Single Buffering for now)
     private var frameResources: [FrameResources] = []
@@ -416,6 +419,12 @@ public final class Renderer: @unchecked Sendable {
             if useFusedPipeline {
                 self.fusedPipelineEncoder = try FusedPipelineEncoder(device: device, library: library)
             }
+
+            // Reset tile builder state pipeline (replaces blit for lower overhead)
+            guard let resetFn = library.makeFunction(name: "resetTileBuilderStateKernel") else {
+                fatalError("resetTileBuilderStateKernel not found in library")
+            }
+            self.resetTileBuilderStatePipeline = try device.makeComputePipelineState(function: resetFn)
 
         } catch {
             fatalError("Failed to load library or initialize encoders: \(error)")
@@ -1840,19 +1849,18 @@ public final class Renderer: @unchecked Sendable {
     }
 
     private func resetTileBuilderState(commandBuffer: MTLCommandBuffer, frame: FrameResources) {
-        // GPU-only reset: use blit encoder to zero the counters
-        // TileHeader layout: [totalAssignments: UInt32, maxAssignments: UInt32, paddedCount: UInt32, overflow: UInt32]
-        // We only need to reset totalAssignments (offset 0) and overflow (offset 12)
-        // maxAssignments and paddedCount are constants set once at init
-        guard let blit = commandBuffer.makeBlitCommandEncoder() else {
-            fatalError("[resetTileBuilderState] Failed to create blit encoder")
+        // GPU-only reset: use compute shader for lower overhead than blit encoder
+        // Resets: totalAssignments, overflow, and activeTileCount in a single dispatch
+        guard let encoder = commandBuffer.makeComputeCommandEncoder() else {
+            fatalError("[resetTileBuilderState] Failed to create compute encoder")
         }
-        blit.label = "ResetTileBuilderState"
-        // Zero totalAssignments (first 4 bytes)
-        blit.fill(buffer: frame.tileAssignmentHeader, range: 0..<4, value: 0)
-        // Zero overflow (bytes 12-16)
-        blit.fill(buffer: frame.tileAssignmentHeader, range: 12..<16, value: 0)
-        blit.endEncoding()
+        encoder.label = "ResetTileBuilderState"
+        encoder.setComputePipelineState(resetTileBuilderStatePipeline)
+        encoder.setBuffer(frame.tileAssignmentHeader, offset: 0, index: 0)
+        encoder.setBuffer(frame.activeTileCount, offset: 0, index: 1)
+        encoder.dispatchThreads(MTLSize(width: 1, height: 1, depth: 1),
+                                threadsPerThreadgroup: MTLSize(width: 1, height: 1, depth: 1))
+        encoder.endEncoding()
     }
 
     internal func acquireFrame(width: Int, height: Int) -> (FrameResources, Int)? {

@@ -231,6 +231,8 @@ final class FusedPipelineEncoder {
         )
 
         // 2. Clear output textures
+        // Note: Can't skip - inactive tiles would have garbage.
+        // TODO: Could optimize by only clearing inactive tiles, or using blit instead of compute
         clearTextures(
             commandBuffer: commandBuffer,
             outputTextures: outputTextures,

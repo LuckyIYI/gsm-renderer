@@ -1179,6 +1179,19 @@ struct TileAssignmentHeader {
     uint overflow;
 };
 
+// Reset tile builder state - replaces blit with single-thread compute for lower overhead
+kernel void resetTileBuilderStateKernel(
+    device TileAssignmentHeader* header [[buffer(0)]],
+    device uint* activeTileCount [[buffer(1)]],
+    uint gid [[thread_position_in_grid]]
+) {
+    if (gid == 0) {
+        header->totalAssignments = 0;
+        header->overflow = 0;
+        *activeTileCount = 0;
+    }
+}
+
 struct SortKeyParams {
     uint maxAssignments;
     uint totalAssignments;
@@ -1396,9 +1409,12 @@ kernel void computeSortKeysKernel(
         if (gid < totalAssignments) {
             int g = tileIndices[gid];
             uint tileId = (uint)tileIds[gid];
-            // Convert to float for consistent bit representation when sorting
+            // Quantize depth to 16-bit half-float for faster radix sort (4 passes instead of 6)
+            // Half-float bits sort correctly for positive values, and 16-bit precision is
+            // more than enough for correct depth ordering within tiles
             float depthFloat = float(depths[g]);
-            uint depthBits = as_type<uint>(depthFloat);
+            half depthHalf = half(depthFloat);
+            uint depthBits = uint(as_type<ushort>(depthHalf));
             sortKeys[gid] = uint2(tileId, depthBits);
             sortedIndices[gid] = g;
         } else {
@@ -3147,7 +3163,9 @@ kernel void fuseSortKeysKernel(
     uint gid [[thread_position_in_grid]]
 ) {
     uint2 key = input_keys[gid];
-    KeyType fused = (KeyType(key.x) << 32) | KeyType(key.y);
+    // Pack tileId in upper bits, 16-bit depth in lower bits
+    // Layout: [depth 0-15, tileId 16-63] for compact radix sort passes
+    KeyType fused = (KeyType(key.x) << 16) | KeyType(key.y & 0xFFFFu);
     output_keys[gid] = fused;
 }
 
@@ -3157,8 +3175,8 @@ kernel void unpackSortKeysKernel(
     uint gid [[thread_position_in_grid]]
 ) {
     KeyType fused = input_keys[gid];
-    uint tile = uint(fused >> 32);
-    uint depthBits = uint(fused & 0xFFFFFFFFull);
+    uint tile = uint(fused >> 16);
+    uint depthBits = uint(fused & 0xFFFFull);
     output_keys[gid] = uint2(tile, depthBits);
 }
 

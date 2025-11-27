@@ -71,7 +71,9 @@ final class RadixSortEncoder {
         }
         
         // Decide how many byte-wide passes we need.
-        let depthBytes = 4
+        // Use 16-bit depth quantization (2 bytes) for faster sorting - works well for gaussian splatting
+        // since relative depth order within a tile matters more than absolute precision
+        let depthBytes = 2  // 16-bit depth = 65536 levels per tile (plenty for correct ordering)
         var tileBytes = 1
         var remainingTiles = max(tileCount - 1, 0)
         while remainingTiles >= 256 {

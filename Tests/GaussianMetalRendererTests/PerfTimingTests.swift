@@ -264,6 +264,113 @@ final class PerfTimingTests: XCTestCase {
         XCTAssertTrue(avgWall < 100, "Render should complete under 100ms")
     }
 
+    /// Test 4M gaussian scale performance at 1920x1080 - V1 vs V2 vs V3 comparison
+    func test4MScale() throws {
+        let width = 1920
+        let height = 1080
+        let renderer = Renderer(
+            precision: .float16,
+            useMultiPixelRendering: true,  // Enable 32x16 tiles for V2/V3 kernel
+            usePreciseIntersection: true,
+            useFusedCoverageScatter: true,
+            useHeapAllocation: false,
+            textureOnly: true,
+            limits: RendererLimits(maxGaussians: 4_500_000, maxWidth: width, maxHeight: height)
+        )
+
+        let testCounts = [1_000_000, 2_000_000, 4_000_000]
+        var resultsV1: [(count: Int, avgMs: Double)] = []
+        var resultsV2: [(count: Int, avgMs: Double)] = []
+        var resultsV3: [(count: Int, avgMs: Double)] = []
+
+        for count in testCounts {
+            let (positions, scales, rotations, opacities, colors) = generateRandomGaussians(
+                count: count,
+                spreadX: Float(width),
+                spreadY: Float(height)
+            )
+
+            guard let packedBuffersHalf = createPackedWorldBuffersHalf(
+                device: renderer.device,
+                positions: positions,
+                scales: scales,
+                rotations: rotations,
+                opacities: opacities,
+                colors: colors
+            ) else {
+                continue
+            }
+
+            let camera = createSimpleCamera(width: Float(width), height: Float(height), gaussianCount: count)
+            let frameParams = FrameParams(gaussianCount: count, whiteBackground: false)
+
+            // Test V1 (original multi-pixel)
+            renderer.fusedPipelineEncoder?.renderVersion = 1
+            for _ in 0..<2 {
+                guard let cb = renderer.queue.makeCommandBuffer() else { continue }
+                _ = renderer.encodeRenderToTextureHalf(commandBuffer: cb, gaussianCount: count, packedWorldBuffersHalf: packedBuffersHalf, cameraUniforms: camera, frameParams: frameParams)
+                cb.commit(); cb.waitUntilCompleted()
+            }
+            var timesV1: [Double] = []
+            for _ in 0..<3 {
+                guard let cb = renderer.queue.makeCommandBuffer() else { continue }
+                _ = renderer.encodeRenderToTextureHalf(commandBuffer: cb, gaussianCount: count, packedWorldBuffersHalf: packedBuffersHalf, cameraUniforms: camera, frameParams: frameParams)
+                cb.commit(); cb.waitUntilCompleted()
+                let gpuTime = cb.gpuEndTime - cb.gpuStartTime
+                if gpuTime > 0 { timesV1.append(gpuTime * 1000) }
+            }
+
+            // Test V2 (shared mem, 4 pixels/thread)
+            renderer.fusedPipelineEncoder?.renderVersion = 2
+            for _ in 0..<2 {
+                guard let cb = renderer.queue.makeCommandBuffer() else { continue }
+                _ = renderer.encodeRenderToTextureHalf(commandBuffer: cb, gaussianCount: count, packedWorldBuffersHalf: packedBuffersHalf, cameraUniforms: camera, frameParams: frameParams)
+                cb.commit(); cb.waitUntilCompleted()
+            }
+            var timesV2: [Double] = []
+            for _ in 0..<3 {
+                guard let cb = renderer.queue.makeCommandBuffer() else { continue }
+                _ = renderer.encodeRenderToTextureHalf(commandBuffer: cb, gaussianCount: count, packedWorldBuffersHalf: packedBuffersHalf, cameraUniforms: camera, frameParams: frameParams)
+                cb.commit(); cb.waitUntilCompleted()
+                let gpuTime = cb.gpuEndTime - cb.gpuStartTime
+                if gpuTime > 0 { timesV2.append(gpuTime * 1000) }
+            }
+
+            // Test V3 (Tellusim-style: no shared mem, 8 pixels/thread)
+            renderer.fusedPipelineEncoder?.renderVersion = 3
+            for _ in 0..<2 {
+                guard let cb = renderer.queue.makeCommandBuffer() else { continue }
+                _ = renderer.encodeRenderToTextureHalf(commandBuffer: cb, gaussianCount: count, packedWorldBuffersHalf: packedBuffersHalf, cameraUniforms: camera, frameParams: frameParams)
+                cb.commit(); cb.waitUntilCompleted()
+            }
+            var timesV3: [Double] = []
+            for _ in 0..<3 {
+                guard let cb = renderer.queue.makeCommandBuffer() else { continue }
+                _ = renderer.encodeRenderToTextureHalf(commandBuffer: cb, gaussianCount: count, packedWorldBuffersHalf: packedBuffersHalf, cameraUniforms: camera, frameParams: frameParams)
+                cb.commit(); cb.waitUntilCompleted()
+                let gpuTime = cb.gpuEndTime - cb.gpuStartTime
+                if gpuTime > 0 { timesV3.append(gpuTime * 1000) }
+            }
+
+            if !timesV1.isEmpty { resultsV1.append((count, timesV1.reduce(0, +) / Double(timesV1.count))) }
+            if !timesV2.isEmpty { resultsV2.append((count, timesV2.reduce(0, +) / Double(timesV2.count))) }
+            if !timesV3.isEmpty { resultsV3.append((count, timesV3.reduce(0, +) / Double(timesV3.count))) }
+        }
+
+        // Print comparison
+        print("\n[PerfTiming] 4M Scale V1 vs V2 vs V3 at 1920x1080:")
+        for i in 0..<min(resultsV1.count, min(resultsV2.count, resultsV3.count)) {
+            let v1 = resultsV1[i]
+            let v2 = resultsV2[i]
+            let v3 = resultsV3[i]
+            let fps = 1000.0 / v3.avgMs
+            print("  \(v1.count/1_000_000)M: V1=\(String(format: "%.1f", v1.avgMs))ms V2=\(String(format: "%.1f", v2.avgMs))ms V3=\(String(format: "%.1f", v3.avgMs))ms (\(String(format: "%.0f", fps)) FPS)")
+        }
+        print("")
+
+        XCTAssertTrue(resultsV3.count > 0, "Should have timing results")
+    }
+
     /// Test precise scale timing at different counts
     func testPreciseScaleTiming() throws {
         let width = 1920

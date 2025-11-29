@@ -37,7 +37,7 @@ public struct RendererLimits: Sendable {
         self.maxHeight = max(1, maxHeight)
         self.tileWidth = max(1, tileWidth)
         self.tileHeight = max(1, tileHeight)
-        self.maxPerTile = max(1, maxPerTile ?? 1024)
+        self.maxPerTile = max(1, maxPerTile ?? 2048)
     }
 
     /// Build RenderParams from FrameParams (runtime settings only)
@@ -418,12 +418,12 @@ public final class Renderer: @unchecked Sendable {
         precision: Precision = .float32,
         useIndirectBitonic: Bool = false,
         sortAlgorithm: SortAlgorithm = .radix,
-        useMultiPixelRendering: Bool = false,
+        useMultiPixelRendering: Bool = true,
         usePreciseIntersection: Bool = true,
         useTileBinningPipeline: Bool = true,
         useFusedCoverageScatter: Bool = true,  // Fused coverage+scatter (eliminates prefix scan)
         useFusedCoverageScatterV2: Bool = true,  // SIMD-optimized V2 (reduced TG memory, higher occupancy)
-        useHeapAllocation: Bool = false,  // Disabled by default - placement heap has issues
+        useHeapAllocation: Bool = false,
         textureOnly: Bool = false,  // Skip buffer output allocation to save ~20MB
         limits: RendererLimits = RendererLimits(maxGaussians: 1_000_000, maxWidth: 2048, maxHeight: 2048)
     ) {

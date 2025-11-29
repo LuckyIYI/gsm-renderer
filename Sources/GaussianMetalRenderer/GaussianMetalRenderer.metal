@@ -4115,3 +4115,332 @@ kernel void renderTilesFusedMultiPixel_float(
         }
     }
 }
+
+// =============================================================================
+// MARK: - Optimized Render Kernel V2 (Lower Register Pressure)
+// =============================================================================
+// Key optimizations:
+// 1. 2x2 pixels per thread (vs 4x2) - halves register usage
+// 2. 128 threads per TG (vs 64) - better occupancy
+// 3. SIMD-level early exit - skip when entire SIMD group is saturated
+// 4. Vectorized conic computation - fewer instructions
+// Target: ~80-100 registers (vs 198), ~6-8% occupancy (vs 2.85%)
+// =============================================================================
+
+// =============================================================================
+// V3: Tellusim-style - NO shared memory, 8 pixels/thread, direct global reads
+// Key insight: Shared memory loading has overhead. Better to load per-thread
+// and process more pixels to amortize the load cost.
+// 32x16 tile, 8x8 threadgroup (64 threads), 4x2 pixels per thread = 512 pixels
+// =============================================================================
+#define RENDER_V3_TG_WIDTH 8
+#define RENDER_V3_TG_HEIGHT 8
+#define RENDER_V3_PIXELS_X 4
+#define RENDER_V3_PIXELS_Y 2
+
+kernel void renderTilesFusedV3_half(
+    const device GaussianHeader*    headers         [[buffer(0)]],
+    const device PackedGaussian*    gaussians       [[buffer(1)]],
+    const device uint*              activeTiles     [[buffer(2)]],
+    const device uint*              activeTileCount [[buffer(3)]],
+    texture2d<half, access::write>  colorOut        [[texture(0)]],
+    texture2d<float, access::write> depthOut        [[texture(1)]],
+    texture2d<float, access::write> alphaOut        [[texture(2)]],
+    constant RenderParams&          params          [[buffer(4)]],
+    uint2                           group_id        [[threadgroup_position_in_grid]],
+    uint2                           local_id        [[thread_position_in_threadgroup]]
+) {
+    // No shared memory - Tellusim insight: direct global reads are better
+    // when each thread processes enough pixels to amortize the load
+
+    uint tileIdx = group_id.x;
+    if (tileIdx >= *activeTileCount) return;
+
+    uint tile = activeTiles[tileIdx];
+    GaussianHeader hdr = headers[tile];
+
+    uint tileX = tile % params.tilesX;
+    uint tileY = tile / params.tilesX;
+
+    // 32x16 tile, 8x8 threads, 4x2 pixels per thread
+    uint baseX = tileX * 32 + local_id.x * RENDER_V3_PIXELS_X;
+    uint baseY = tileY * 16 + local_id.y * RENDER_V3_PIXELS_Y;
+
+    // Pixel positions (8 pixels: 4 wide x 2 tall)
+    half2 pos00 = half2(half(baseX + 0), half(baseY + 0));
+    half2 pos10 = half2(half(baseX + 1), half(baseY + 0));
+    half2 pos20 = half2(half(baseX + 2), half(baseY + 0));
+    half2 pos30 = half2(half(baseX + 3), half(baseY + 0));
+    half2 pos01 = half2(half(baseX + 0), half(baseY + 1));
+    half2 pos11 = half2(half(baseX + 1), half(baseY + 1));
+    half2 pos21 = half2(half(baseX + 2), half(baseY + 1));
+    half2 pos31 = half2(half(baseX + 3), half(baseY + 1));
+
+    // Accumulators for 8 pixels (4x2)
+    half trans00 = 1.0h, trans10 = 1.0h, trans20 = 1.0h, trans30 = 1.0h;
+    half trans01 = 1.0h, trans11 = 1.0h, trans21 = 1.0h, trans31 = 1.0h;
+
+    half3 color00 = 0, color10 = 0, color20 = 0, color30 = 0;
+    half3 color01 = 0, color11 = 0, color21 = 0, color31 = 0;
+
+    half depth00 = 0, depth10 = 0, depth20 = 0, depth30 = 0;
+    half depth01 = 0, depth11 = 0, depth21 = 0, depth31 = 0;
+
+    uint start = hdr.offset;
+    uint count = hdr.count;
+
+    // Direct loop over all gaussians - no batching, no shared memory
+    for (uint i = 0; i < count; i++) {
+        // Early exit when all pixels are saturated
+        half maxTrans0 = max(max(trans00, trans10), max(trans20, trans30));
+        half maxTrans1 = max(max(trans01, trans11), max(trans21, trans31));
+        if (max(maxTrans0, maxTrans1) < half(1.0h/255.0h)) break;
+
+        // Load gaussian directly from global memory
+        PackedGaussian g = gaussians[start + i];
+
+        // Precompute covariance terms
+        half cxx = g.conic.x;
+        half cyy = g.conic.z;
+        half cxy2 = 2.0h * g.conic.y;
+        half opacity = g.opacity;
+        half3 gColor = half3(g.color);
+        half gDepth = g.depth;
+
+        // Direction vectors for 8 pixels
+        half2 d00 = pos00 - g.mean;
+        half2 d10 = pos10 - g.mean;
+        half2 d20 = pos20 - g.mean;
+        half2 d30 = pos30 - g.mean;
+        half2 d01 = pos01 - g.mean;
+        half2 d11 = pos11 - g.mean;
+        half2 d21 = pos21 - g.mean;
+        half2 d31 = pos31 - g.mean;
+
+        // Quadratic form: power = cxx*dx*dx + cyy*dy*dy + cxy2*dx*dy
+        half p00 = d00.x*d00.x*cxx + d00.y*d00.y*cyy + d00.x*d00.y*cxy2;
+        half p10 = d10.x*d10.x*cxx + d10.y*d10.y*cyy + d10.x*d10.y*cxy2;
+        half p20 = d20.x*d20.x*cxx + d20.y*d20.y*cyy + d20.x*d20.y*cxy2;
+        half p30 = d30.x*d30.x*cxx + d30.y*d30.y*cyy + d30.x*d30.y*cxy2;
+        half p01 = d01.x*d01.x*cxx + d01.y*d01.y*cyy + d01.x*d01.y*cxy2;
+        half p11 = d11.x*d11.x*cxx + d11.y*d11.y*cyy + d11.x*d11.y*cxy2;
+        half p21 = d21.x*d21.x*cxx + d21.y*d21.y*cyy + d21.x*d21.y*cxy2;
+        half p31 = d31.x*d31.x*cxx + d31.y*d31.y*cyy + d31.x*d31.y*cxy2;
+
+        // Alpha = opacity * exp(-0.5 * power)
+        half a00 = min(opacity * exp(-0.5h * p00), 0.99h);
+        half a10 = min(opacity * exp(-0.5h * p10), 0.99h);
+        half a20 = min(opacity * exp(-0.5h * p20), 0.99h);
+        half a30 = min(opacity * exp(-0.5h * p30), 0.99h);
+        half a01 = min(opacity * exp(-0.5h * p01), 0.99h);
+        half a11 = min(opacity * exp(-0.5h * p11), 0.99h);
+        half a21 = min(opacity * exp(-0.5h * p21), 0.99h);
+        half a31 = min(opacity * exp(-0.5h * p31), 0.99h);
+
+        // Blend color and depth
+        color00 += gColor * (a00 * trans00); depth00 += gDepth * (a00 * trans00);
+        color10 += gColor * (a10 * trans10); depth10 += gDepth * (a10 * trans10);
+        color20 += gColor * (a20 * trans20); depth20 += gDepth * (a20 * trans20);
+        color30 += gColor * (a30 * trans30); depth30 += gDepth * (a30 * trans30);
+        color01 += gColor * (a01 * trans01); depth01 += gDepth * (a01 * trans01);
+        color11 += gColor * (a11 * trans11); depth11 += gDepth * (a11 * trans11);
+        color21 += gColor * (a21 * trans21); depth21 += gDepth * (a21 * trans21);
+        color31 += gColor * (a31 * trans31); depth31 += gDepth * (a31 * trans31);
+
+        // Update transparency
+        trans00 *= (1.0h - a00); trans10 *= (1.0h - a10);
+        trans20 *= (1.0h - a20); trans30 *= (1.0h - a30);
+        trans01 *= (1.0h - a01); trans11 *= (1.0h - a11);
+        trans21 *= (1.0h - a21); trans31 *= (1.0h - a31);
+    }
+
+    // Apply background
+    half bg = params.whiteBackground ? 1.0h : 0.0h;
+    color00 += trans00 * bg; color10 += trans10 * bg;
+    color20 += trans20 * bg; color30 += trans30 * bg;
+    color01 += trans01 * bg; color11 += trans11 * bg;
+    color21 += trans21 * bg; color31 += trans31 * bg;
+
+    // Write 8 pixels (bounds checking)
+    uint w = params.width, h = params.height;
+    if (baseX + 0 < w && baseY + 0 < h) {
+        colorOut.write(half4(color00, 1.0h - trans00), uint2(baseX + 0, baseY + 0));
+        depthOut.write(float4(float(depth00), 0, 0, 0), uint2(baseX + 0, baseY + 0));
+        alphaOut.write(float4(1.0f - float(trans00), 0, 0, 0), uint2(baseX + 0, baseY + 0));
+    }
+    if (baseX + 1 < w && baseY + 0 < h) {
+        colorOut.write(half4(color10, 1.0h - trans10), uint2(baseX + 1, baseY + 0));
+        depthOut.write(float4(float(depth10), 0, 0, 0), uint2(baseX + 1, baseY + 0));
+        alphaOut.write(float4(1.0f - float(trans10), 0, 0, 0), uint2(baseX + 1, baseY + 0));
+    }
+    if (baseX + 2 < w && baseY + 0 < h) {
+        colorOut.write(half4(color20, 1.0h - trans20), uint2(baseX + 2, baseY + 0));
+        depthOut.write(float4(float(depth20), 0, 0, 0), uint2(baseX + 2, baseY + 0));
+        alphaOut.write(float4(1.0f - float(trans20), 0, 0, 0), uint2(baseX + 2, baseY + 0));
+    }
+    if (baseX + 3 < w && baseY + 0 < h) {
+        colorOut.write(half4(color30, 1.0h - trans30), uint2(baseX + 3, baseY + 0));
+        depthOut.write(float4(float(depth30), 0, 0, 0), uint2(baseX + 3, baseY + 0));
+        alphaOut.write(float4(1.0f - float(trans30), 0, 0, 0), uint2(baseX + 3, baseY + 0));
+    }
+    if (baseX + 0 < w && baseY + 1 < h) {
+        colorOut.write(half4(color01, 1.0h - trans01), uint2(baseX + 0, baseY + 1));
+        depthOut.write(float4(float(depth01), 0, 0, 0), uint2(baseX + 0, baseY + 1));
+        alphaOut.write(float4(1.0f - float(trans01), 0, 0, 0), uint2(baseX + 0, baseY + 1));
+    }
+    if (baseX + 1 < w && baseY + 1 < h) {
+        colorOut.write(half4(color11, 1.0h - trans11), uint2(baseX + 1, baseY + 1));
+        depthOut.write(float4(float(depth11), 0, 0, 0), uint2(baseX + 1, baseY + 1));
+        alphaOut.write(float4(1.0f - float(trans11), 0, 0, 0), uint2(baseX + 1, baseY + 1));
+    }
+    if (baseX + 2 < w && baseY + 1 < h) {
+        colorOut.write(half4(color21, 1.0h - trans21), uint2(baseX + 2, baseY + 1));
+        depthOut.write(float4(float(depth21), 0, 0, 0), uint2(baseX + 2, baseY + 1));
+        alphaOut.write(float4(1.0f - float(trans21), 0, 0, 0), uint2(baseX + 2, baseY + 1));
+    }
+    if (baseX + 3 < w && baseY + 1 < h) {
+        colorOut.write(half4(color31, 1.0h - trans31), uint2(baseX + 3, baseY + 1));
+        depthOut.write(float4(float(depth31), 0, 0, 0), uint2(baseX + 3, baseY + 1));
+        alphaOut.write(float4(1.0f - float(trans31), 0, 0, 0), uint2(baseX + 3, baseY + 1));
+    }
+}
+
+// =============================================================================
+// V2: Cooperative loading with shared memory (kept for comparison)
+// =============================================================================
+#define RENDER_V2_BATCH_SIZE 64
+#define RENDER_V2_TG_WIDTH 16
+#define RENDER_V2_TG_HEIGHT 8
+#define RENDER_V2_PIXELS_X 2
+#define RENDER_V2_PIXELS_Y 2
+
+kernel void renderTilesFusedV2_half(
+    const device GaussianHeader*    headers         [[buffer(0)]],
+    const device PackedGaussian*    gaussians       [[buffer(1)]],
+    const device uint*              activeTiles     [[buffer(2)]],
+    const device uint*              activeTileCount [[buffer(3)]],
+    texture2d<half, access::write>  colorOut        [[texture(0)]],
+    texture2d<float, access::write> depthOut        [[texture(1)]],
+    texture2d<float, access::write> alphaOut        [[texture(2)]],
+    constant RenderParams&          params          [[buffer(4)]],
+    uint2                           group_id        [[threadgroup_position_in_grid]],
+    uint2                           local_id        [[thread_position_in_threadgroup]],
+    uint                            tid             [[thread_index_in_threadgroup]]
+) {
+    // Shared memory for cooperative loading - 128 threads load 64 gaussians
+    threadgroup PackedGaussian shGaussians[RENDER_V2_BATCH_SIZE];
+
+    uint tileIdx = group_id.x;
+    if (tileIdx >= *activeTileCount) return;
+
+    uint tile = activeTiles[tileIdx];
+    GaussianHeader hdr = headers[tile];
+
+    uint tileX = tile % params.tilesX;
+    uint tileY = tile / params.tilesX;
+
+    // 32x16 tile, 16x8 threads, 2x2 pixels per thread
+    uint baseX = tileX * 32 + local_id.x * RENDER_V2_PIXELS_X;
+    uint baseY = tileY * 16 + local_id.y * RENDER_V2_PIXELS_Y;
+
+    // Pixel coordinates (2x2 = 4 pixels per thread)
+    half px0 = half(baseX), px1 = half(baseX + 1);
+    half py0 = half(baseY), py1 = half(baseY + 1);
+
+    // Accumulators for 4 pixels (2x2) - reduced from 8
+    half trans00 = 1.0h, trans10 = 1.0h;
+    half trans01 = 1.0h, trans11 = 1.0h;
+
+    half3 color00 = half3(0), color10 = half3(0);
+    half3 color01 = half3(0), color11 = half3(0);
+
+    half depth00 = 0, depth10 = 0;
+    half depth01 = 0, depth11 = 0;
+
+    uint start = hdr.offset;
+    uint count = hdr.count;
+
+    for (uint batch = 0; batch < count; batch += RENDER_V2_BATCH_SIZE) {
+        uint batchCount = min(uint(RENDER_V2_BATCH_SIZE), count - batch);
+
+        // Cooperative loading: 128 threads load up to 64 gaussians
+        // First 64 threads load, rest wait
+        if (tid < batchCount) {
+            shGaussians[tid] = gaussians[start + batch + tid];
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        // Process batch
+        for (uint i = 0; i < batchCount; i++) {
+            // SIMD-level early exit check
+            half maxTrans = max(max(trans00, trans10), max(trans01, trans11));
+            if (simd_all(maxTrans < half(1.0h/255.0h))) break;
+
+            PackedGaussian g = shGaussians[i];
+
+            // Direction vectors for 4 pixels
+            half2 d00 = half2(px0, py0) - g.mean;
+            half2 d10 = half2(px1, py0) - g.mean;
+            half2 d01 = half2(px0, py1) - g.mean;
+            half2 d11 = half2(px1, py1) - g.mean;
+
+            // Quadratic form - vectorized where possible
+            half cxx = g.conic.x, cyy = g.conic.z, cxy2 = 2.0h * g.conic.y;
+            half p00 = d00.x*d00.x*cxx + d00.y*d00.y*cyy + d00.x*d00.y*cxy2;
+            half p10 = d10.x*d10.x*cxx + d10.y*d10.y*cyy + d10.x*d10.y*cxy2;
+            half p01 = d01.x*d01.x*cxx + d01.y*d01.y*cyy + d01.x*d01.y*cxy2;
+            half p11 = d11.x*d11.x*cxx + d11.y*d11.y*cyy + d11.x*d11.y*cxy2;
+
+            // Alpha computation with fast exp
+            half opacity = g.opacity;
+            half a00 = min(opacity * exp(-0.5h * p00), half(0.99h));
+            half a10 = min(opacity * exp(-0.5h * p10), half(0.99h));
+            half a01 = min(opacity * exp(-0.5h * p01), half(0.99h));
+            half a11 = min(opacity * exp(-0.5h * p11), half(0.99h));
+
+            // Skip if all alphas are near zero
+            if (max(max(a00, a10), max(a01, a11)) < half(1.0h/255.0h)) continue;
+
+            // Blend
+            half3 gColor = half3(g.color);
+            half gDepth = g.depth;
+
+            color00 += gColor * (a00 * trans00); depth00 += gDepth * (a00 * trans00);
+            color10 += gColor * (a10 * trans10); depth10 += gDepth * (a10 * trans10);
+            color01 += gColor * (a01 * trans01); depth01 += gDepth * (a01 * trans01);
+            color11 += gColor * (a11 * trans11); depth11 += gDepth * (a11 * trans11);
+
+            // Update transparency
+            trans00 *= (1.0h - a00); trans10 *= (1.0h - a10);
+            trans01 *= (1.0h - a01); trans11 *= (1.0h - a11);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    // Apply background
+    half bg = params.whiteBackground ? half(1.0h) : half(0.0h);
+    color00 += half3(trans00 * bg); color10 += half3(trans10 * bg);
+    color01 += half3(trans01 * bg); color11 += half3(trans11 * bg);
+
+    // Write 4 pixels with bounds checking
+    if (baseX < params.width && baseY < params.height) {
+        colorOut.write(half4(color00, 1.0h - trans00), uint2(baseX, baseY));
+        depthOut.write(float4(float(depth00), 0, 0, 0), uint2(baseX, baseY));
+        alphaOut.write(float4(1.0f - float(trans00), 0, 0, 0), uint2(baseX, baseY));
+    }
+    if (baseX + 1 < params.width && baseY < params.height) {
+        colorOut.write(half4(color10, 1.0h - trans10), uint2(baseX + 1, baseY));
+        depthOut.write(float4(float(depth10), 0, 0, 0), uint2(baseX + 1, baseY));
+        alphaOut.write(float4(1.0f - float(trans10), 0, 0, 0), uint2(baseX + 1, baseY));
+    }
+    if (baseX < params.width && baseY + 1 < params.height) {
+        colorOut.write(half4(color01, 1.0h - trans01), uint2(baseX, baseY + 1));
+        depthOut.write(float4(float(depth01), 0, 0, 0), uint2(baseX, baseY + 1));
+        alphaOut.write(float4(1.0f - float(trans01), 0, 0, 0), uint2(baseX, baseY + 1));
+    }
+    if (baseX + 1 < params.width && baseY + 1 < params.height) {
+        colorOut.write(half4(color11, 1.0h - trans11), uint2(baseX + 1, baseY + 1));
+        depthOut.write(float4(float(depth11), 0, 0, 0), uint2(baseX + 1, baseY + 1));
+        alphaOut.write(float4(1.0f - float(trans11), 0, 0, 0), uint2(baseX + 1, baseY + 1));
+    }
+}

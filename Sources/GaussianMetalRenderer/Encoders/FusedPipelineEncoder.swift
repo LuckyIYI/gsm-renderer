@@ -12,6 +12,8 @@ final class FusedPipelineEncoder {
     private let renderFusedFloatPipeline: MTLComputePipelineState
     private let renderFusedMultiPixelHalfPipeline: MTLComputePipelineState
     private let renderFusedMultiPixelFloatPipeline: MTLComputePipelineState
+    private let renderFusedV2HalfPipeline: MTLComputePipelineState?  // V2: lower register pressure
+    private let renderFusedV3HalfPipeline: MTLComputePipelineState?  // V3: Tellusim-style, no shared mem
     private let prepareDispatchPipeline: MTLComputePipelineState
     private let clearTexturesPipeline: MTLComputePipelineState
 
@@ -19,7 +21,12 @@ final class FusedPipelineEncoder {
     let interleaveThreadgroupSize: Int
     let packThreadgroupSize: Int
     let renderThreadgroupSize: MTLSize
-    let renderMultiPixelThreadgroupSize: MTLSize  // 8x8 for 32x16 tiles
+    let renderMultiPixelThreadgroupSize: MTLSize  // 8x8 for 32x16 tiles (4x2 pixels/thread)
+    let renderV2ThreadgroupSize: MTLSize  // 16x8 for 32x16 tiles (2x2 pixels/thread)
+    let renderV3ThreadgroupSize: MTLSize  // 8x8 for 32x16 tiles (4x2 pixels/thread) - Tellusim style
+
+    /// Render kernel version: 1=original, 2=shared mem, 3=Tellusim (no shared mem, 8 pixels/thread)
+    public var renderVersion: Int = 2  // Default to V2 (shared mem, lower register pressure)
 
     init(device: MTLDevice, library: MTLLibrary) throws {
         // Interleave kernels
@@ -54,6 +61,12 @@ final class FusedPipelineEncoder {
                           userInfo: [NSLocalizedDescriptionKey: "Render fused multi-pixel kernel functions missing"])
         }
 
+        // Render fused V2 kernel (lower register pressure, higher occupancy)
+        let renderFusedV2HalfFn = library.makeFunction(name: "renderTilesFusedV2_half")
+
+        // Render fused V3 kernel (Tellusim-style: no shared memory, 8 pixels/thread)
+        let renderFusedV3HalfFn = library.makeFunction(name: "renderTilesFusedV3_half")
+
         // Prepare dispatch and clear textures kernels
         guard let prepFn = library.makeFunction(name: "prepareRenderDispatchKernel"),
               let clearTexFn = library.makeFunction(name: "clearRenderTexturesKernel")
@@ -74,6 +87,20 @@ final class FusedPipelineEncoder {
         self.prepareDispatchPipeline = try device.makeComputePipelineState(function: prepFn)
         self.clearTexturesPipeline = try device.makeComputePipelineState(function: clearTexFn)
 
+        // V2 render kernel (optional - may not exist in older metallibs)
+        if let v2Fn = renderFusedV2HalfFn {
+            self.renderFusedV2HalfPipeline = try device.makeComputePipelineState(function: v2Fn)
+        } else {
+            self.renderFusedV2HalfPipeline = nil
+        }
+
+        // V3 render kernel (Tellusim-style)
+        if let v3Fn = renderFusedV3HalfFn {
+            self.renderFusedV3HalfPipeline = try device.makeComputePipelineState(function: v3Fn)
+        } else {
+            self.renderFusedV3HalfPipeline = nil
+        }
+
         // Compute threadgroup sizes
         self.interleaveThreadgroupSize = max(1, min(interleaveHalfPipeline.maxTotalThreadsPerThreadgroup, 256))
         self.packThreadgroupSize = max(1, min(packFusedHalfPipeline.maxTotalThreadsPerThreadgroup, 256))
@@ -81,6 +108,10 @@ final class FusedPipelineEncoder {
         self.renderThreadgroupSize = MTLSize(width: 16, height: 16, depth: 1)
         // Multi-pixel render uses 8x8 threadgroup for 32x16 tiles (4x2 pixels per thread)
         self.renderMultiPixelThreadgroupSize = MTLSize(width: 8, height: 8, depth: 1)
+        // V2 render uses 16x8 threadgroup for 32x16 tiles (2x2 pixels per thread)
+        self.renderV2ThreadgroupSize = MTLSize(width: 16, height: 8, depth: 1)
+        // V3 render uses 8x8 threadgroup for 32x16 tiles (4x2 pixels per thread) - Tellusim style
+        self.renderV3ThreadgroupSize = MTLSize(width: 8, height: 8, depth: 1)
     }
 
     // MARK: - Interleave
@@ -175,14 +206,34 @@ final class FusedPipelineEncoder {
         // Detect multi-pixel mode: 32x16 tiles
         let isMultiPixel = params.tileWidth == 32 && params.tileHeight == 16
 
+        // Select kernel and threadgroup size based on renderVersion
+        let threadgroupSize: MTLSize
+
         if isMultiPixel {
-            encoder.label = "RenderFusedMultiPixel"
-            let pipeline = precision == .float16 ? renderFusedMultiPixelHalfPipeline : renderFusedMultiPixelFloatPipeline
-            encoder.setComputePipelineState(pipeline)
+            // Try V3 first (Tellusim-style: no shared mem, 8 pixels/thread)
+            if renderVersion >= 3, precision == .float16, let v3Pipeline = renderFusedV3HalfPipeline {
+                encoder.label = "RenderFusedV3"
+                encoder.setComputePipelineState(v3Pipeline)
+                threadgroupSize = renderV3ThreadgroupSize  // 8x8 = 64 threads
+            }
+            // Then try V2 (shared mem, 4 pixels/thread)
+            else if renderVersion >= 2, precision == .float16, let v2Pipeline = renderFusedV2HalfPipeline {
+                encoder.label = "RenderFusedV2"
+                encoder.setComputePipelineState(v2Pipeline)
+                threadgroupSize = renderV2ThreadgroupSize  // 16x8 = 128 threads
+            }
+            // Fallback to original multi-pixel
+            else {
+                encoder.label = "RenderFusedMultiPixel"
+                let pipeline = precision == .float16 ? renderFusedMultiPixelHalfPipeline : renderFusedMultiPixelFloatPipeline
+                encoder.setComputePipelineState(pipeline)
+                threadgroupSize = renderMultiPixelThreadgroupSize  // 8x8 = 64 threads
+            }
         } else {
             encoder.label = "RenderFused"
             let pipeline = precision == .float16 ? renderFusedHalfPipeline : renderFusedFloatPipeline
             encoder.setComputePipelineState(pipeline)
+            threadgroupSize = renderThreadgroupSize  // 16x16 = 256 threads
         }
 
         encoder.setBuffer(headers, offset: 0, index: 0)
@@ -198,8 +249,6 @@ final class FusedPipelineEncoder {
         encoder.setBytes(&renderParams, length: MemoryLayout<RenderParams>.stride, index: 4)
 
         // Dispatch one threadgroup per active tile
-        // 16x16 threads for standard tiles, 8x8 threads for 32x16 tiles
-        let threadgroupSize = isMultiPixel ? renderMultiPixelThreadgroupSize : renderThreadgroupSize
         encoder.dispatchThreadgroups(
             indirectBuffer: dispatchArgs,
             indirectBufferOffset: dispatchOffset,

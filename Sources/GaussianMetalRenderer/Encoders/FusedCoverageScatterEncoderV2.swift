@@ -1,30 +1,33 @@
 import Metal
 
-    /// Encoder for fused coverage + scatter kernel
-    /// Eliminates prefix scan by using atomic allocation
-    /// Cooperative: one threadgroup per gaussian
-final class FusedCoverageScatterEncoder {
+/// Optimized encoder for fused coverage + scatter kernel V2
+/// Key optimizations over V1:
+/// - Reduced threadgroup memory: 128 tiles (512B) vs 2048 (8KB) = ~8x occupancy
+/// - SIMD ballot/prefix for tile counting - no threadgroup atomics in hot loop
+/// - Warp-cooperative global allocation - one atomic per SIMD group
+/// - True half precision math for half variant
+final class FusedCoverageScatterEncoderV2 {
     private let fusedFloatPipeline: MTLComputePipelineState
     private let fusedHalfPipeline: MTLComputePipelineState?
 
-    // Threadgroup size mirrors FUSED_TG_SIZE in Metal
+    // Threadgroup size matches FUSED_V2_TG_SIZE in Metal
     let threadgroupSize: Int = 64
 
     init(device: MTLDevice, library: MTLLibrary) throws {
-        guard let fusedFloatFn = library.makeFunction(name: "fusedCoverageScatterKernel_float") else {
-            fatalError("fusedCoverageScatterKernel_float not found in library")
+        guard let fusedFloatFn = library.makeFunction(name: "fusedCoverageScatterKernelV2_float") else {
+            fatalError("fusedCoverageScatterKernelV2_float not found in library")
         }
         self.fusedFloatPipeline = try device.makeComputePipelineState(function: fusedFloatFn)
 
-        if let fusedHalfFn = library.makeFunction(name: "fusedCoverageScatterKernel_half") {
+        if let fusedHalfFn = library.makeFunction(name: "fusedCoverageScatterKernelV2_half") {
             self.fusedHalfPipeline = try? device.makeComputePipelineState(function: fusedHalfFn)
         } else {
             self.fusedHalfPipeline = nil
         }
     }
 
-    /// Encode fused coverage + scatter in single pass
-    /// Replaces: Coverage (5 passes) + Scatter (2 passes) = 7 passes → 1 pass
+    /// Encode fused coverage + scatter V2 in single pass
+    /// Uses SIMD optimizations for better occupancy and throughput
     func encode(
         commandBuffer: MTLCommandBuffer,
         gaussianCount: Int,
@@ -43,7 +46,7 @@ final class FusedCoverageScatterEncoder {
         precision: Precision = .float32
     ) {
         guard let encoder = commandBuffer.makeComputeCommandEncoder() else { return }
-        encoder.label = "FusedCoverageScatter"
+        encoder.label = "FusedCoverageScatterV2"
 
         let pipeline: MTLComputePipelineState
         if precision == .float16, let halfPipe = fusedHalfPipeline {
@@ -58,6 +61,7 @@ final class FusedCoverageScatterEncoder {
         encoder.setBuffer(coverageBuffer, offset: 0, index: 1)
         encoder.setBuffer(opacitiesBuffer, offset: 0, index: 2)
 
+        // Reuse existing params struct - same layout
         var params = FusedCoverageScatterParamsSwift(
             gaussianCount: UInt32(gaussianCount),
             tileWidth: UInt32(tileWidth),
@@ -79,5 +83,13 @@ final class FusedCoverageScatterEncoder {
         encoder.dispatchThreadgroups(tgCount, threadsPerThreadgroup: threadsPerTG)
 
         encoder.endEncoding()
+    }
+
+    /// Get pipeline state for external use (e.g., occupancy queries)
+    func getPipeline(precision: Precision) -> MTLComputePipelineState {
+        if precision == .float16, let halfPipe = fusedHalfPipeline {
+            return halfPipe
+        }
+        return fusedFloatPipeline
     }
 }

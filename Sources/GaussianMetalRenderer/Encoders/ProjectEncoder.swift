@@ -1,142 +1,117 @@
 import Metal
 
+/// Packed world gaussian buffers (float32) - single interleaved buffer for optimal memory access
+public struct PackedWorldBuffers {
+    public let packedGaussians: MTLBuffer  // PackedWorldGaussian array (48 bytes each)
+    public let harmonics: MTLBuffer         // Separate buffer for variable-size SH data
+
+    public init(packedGaussians: MTLBuffer, harmonics: MTLBuffer) {
+        self.packedGaussians = packedGaussians
+        self.harmonics = harmonics
+    }
+}
+
+/// Packed world gaussian buffers (float16) - half the memory of PackedWorldBuffers
+public struct PackedWorldBuffersHalf {
+    public let packedGaussians: MTLBuffer  // PackedWorldGaussianHalf array (24 bytes each)
+    public let harmonics: MTLBuffer         // Separate buffer for variable-size SH data (still float for accuracy)
+
+    public init(packedGaussians: MTLBuffer, harmonics: MTLBuffer) {
+        self.packedGaussians = packedGaussians
+        self.harmonics = harmonics
+    }
+}
+
 final class ProjectEncoder {
-    private let pipelineFloat: MTLComputePipelineState
-    private let pipelineHalf: MTLComputePipelineState?
-    private let pipelineHalfInput: MTLComputePipelineState?
+    private let pipelineFloatHalf: MTLComputePipelineState   // float input -> half output
+    private let pipelineFloatFloat: MTLComputePipelineState  // float input -> float output
+    private let pipelineHalfHalf: MTLComputePipelineState    // half input -> half output
 
     init(device: MTLDevice, library: MTLLibrary) throws {
-        guard let functionFloat = library.makeFunction(name: "projectGaussians_float") else {
-            fatalError("projectGaussians_float not found")
+        guard let fnFloatHalf = library.makeFunction(name: "projectGaussiansPacked_float_half") else {
+            fatalError("projectGaussiansPacked_float_half not found")
+        }
+        guard let fnFloatFloat = library.makeFunction(name: "projectGaussiansPacked_float_float") else {
+            fatalError("projectGaussiansPacked_float_float not found")
+        }
+        guard let fnHalfHalf = library.makeFunction(name: "projectGaussiansPacked_half_half") else {
+            fatalError("projectGaussiansPacked_half_half not found")
         }
 
-        self.pipelineFloat = try device.makeComputePipelineState(function: functionFloat)
-
-        if let functionHalf = library.makeFunction(name: "projectGaussians_half") {
-            self.pipelineHalf = try device.makeComputePipelineState(function: functionHalf)
-        } else {
-            self.pipelineHalf = nil
-        }
-
-        if let functionHalfInput = library.makeFunction(name: "projectGaussians_half_input") {
-            self.pipelineHalfInput = try device.makeComputePipelineState(function: functionHalfInput)
-        } else {
-            self.pipelineHalfInput = nil
-        }
+        self.pipelineFloatHalf = try device.makeComputePipelineState(function: fnFloatHalf)
+        self.pipelineFloatFloat = try device.makeComputePipelineState(function: fnFloatFloat)
+        self.pipelineHalfHalf = try device.makeComputePipelineState(function: fnHalfHalf)
     }
 
+    /// Encode projection from packed world buffers (optimized memory access)
     func encode(
         commandBuffer: MTLCommandBuffer,
         gaussianCount: Int,
-        worldBuffers: WorldGaussianBuffers,
-        cameraUniforms: CameraUniformsSwift,
-        projectionBuffers: ProjectionReadbackBuffers
-    ) {
-        // Debug always uses Float for readback ease
-        guard let encoder = commandBuffer.makeComputeCommandEncoder() else { return }
-        encoder.label = "ProjectGaussiansDebug"
-        
-        encoder.setComputePipelineState(self.pipelineFloat)
-        encoder.setBuffer(worldBuffers.positions, offset: 0, index: 0)
-        encoder.setBuffer(worldBuffers.scales, offset: 0, index: 1)
-        encoder.setBuffer(worldBuffers.rotations, offset: 0, index: 2)
-        encoder.setBuffer(worldBuffers.opacities, offset: 0, index: 3)
-        encoder.setBuffer(worldBuffers.harmonics, offset: 0, index: 4)
-        
-        encoder.setBuffer(projectionBuffers.meansOut, offset: 0, index: 5)
-        encoder.setBuffer(projectionBuffers.conicsOut, offset: 0, index: 6)
-        encoder.setBuffer(projectionBuffers.colorsOut, offset: 0, index: 7)
-        encoder.setBuffer(projectionBuffers.opacitiesOut, offset: 0, index: 8)
-        encoder.setBuffer(projectionBuffers.depthsOut, offset: 0, index: 9)
-        encoder.setBuffer(projectionBuffers.radiiOut, offset: 0, index: 10)
-        encoder.setBuffer(projectionBuffers.maskOut, offset: 0, index: 11)
-        
-        var cam = cameraUniforms
-        encoder.setBytes(&cam, length: MemoryLayout<CameraUniformsSwift>.stride, index: 12)
-        
-        let threads = MTLSize(width: gaussianCount, height: 1, depth: 1)
-        let tg = MTLSize(width: self.pipelineFloat.threadExecutionWidth, height: 1, depth: 1)
-        encoder.dispatchThreads(threads, threadsPerThreadgroup: tg)
-        encoder.endEncoding()
-    }
-
-    func encodeForRender(
-        commandBuffer: MTLCommandBuffer,
-        gaussianCount: Int,
-        worldBuffers: WorldGaussianBuffers,
+        packedWorldBuffers: PackedWorldBuffers,
         cameraUniforms: CameraUniformsSwift,
         gaussianBuffers: GaussianInputBuffers,
         precision: Precision
     ) {
         guard let encoder = commandBuffer.makeComputeCommandEncoder() else { return }
-        encoder.label = "ProjectGaussians"
+        encoder.label = "ProjectGaussiansPacked"
 
-        if precision == .float16, let pipe = self.pipelineHalf {
-            encoder.setComputePipelineState(pipe)
-        } else {
-            encoder.setComputePipelineState(self.pipelineFloat)
-        }
+        let pipeline = precision == .float16 ? pipelineFloatHalf : pipelineFloatFloat
 
-        encoder.setBuffer(worldBuffers.positions, offset: 0, index: 0)
-        encoder.setBuffer(worldBuffers.scales, offset: 0, index: 1)
-        encoder.setBuffer(worldBuffers.rotations, offset: 0, index: 2)
-        encoder.setBuffer(worldBuffers.opacities, offset: 0, index: 3)
-        encoder.setBuffer(worldBuffers.harmonics, offset: 0, index: 4)
+        encoder.setComputePipelineState(pipeline)
 
-        encoder.setBuffer(gaussianBuffers.means, offset: 0, index: 5)
-        encoder.setBuffer(gaussianBuffers.conics, offset: 0, index: 6)
-        encoder.setBuffer(gaussianBuffers.colors, offset: 0, index: 7)
-        encoder.setBuffer(gaussianBuffers.opacities, offset: 0, index: 8)
-        encoder.setBuffer(gaussianBuffers.depths, offset: 0, index: 9)
-        encoder.setBuffer(gaussianBuffers.radii, offset: 0, index: 10)
-        encoder.setBuffer(gaussianBuffers.mask, offset: 0, index: 11)
+        // Input buffers (packed format - single coalesced read per gaussian)
+        encoder.setBuffer(packedWorldBuffers.packedGaussians, offset: 0, index: 0)
+        encoder.setBuffer(packedWorldBuffers.harmonics, offset: 0, index: 1)
+
+        // Output buffers
+        encoder.setBuffer(gaussianBuffers.means, offset: 0, index: 2)
+        encoder.setBuffer(gaussianBuffers.conics, offset: 0, index: 3)
+        encoder.setBuffer(gaussianBuffers.colors, offset: 0, index: 4)
+        encoder.setBuffer(gaussianBuffers.opacities, offset: 0, index: 5)
+        encoder.setBuffer(gaussianBuffers.depths, offset: 0, index: 6)
+        encoder.setBuffer(gaussianBuffers.radii, offset: 0, index: 7)
+        encoder.setBuffer(gaussianBuffers.mask, offset: 0, index: 8)
 
         var cam = cameraUniforms
-        encoder.setBytes(&cam, length: MemoryLayout<CameraUniformsSwift>.stride, index: 12)
+        encoder.setBytes(&cam, length: MemoryLayout<CameraUniformsSwift>.stride, index: 9)
 
         let threads = MTLSize(width: gaussianCount, height: 1, depth: 1)
-        let tg = MTLSize(width: self.pipelineFloat.threadExecutionWidth, height: 1, depth: 1)
+        let tg = MTLSize(width: pipeline.threadExecutionWidth, height: 1, depth: 1)
         encoder.dispatchThreads(threads, threadsPerThreadgroup: tg)
         encoder.endEncoding()
     }
 
-    /// Encode projection from half-precision world buffers to half-precision gaussian buffers.
-    func encodeForRenderHalf(
+    /// Encode projection from half-precision packed world buffers (full half pipeline)
+    func encode(
         commandBuffer: MTLCommandBuffer,
         gaussianCount: Int,
-        worldBuffers: WorldGaussianBuffersHalf,
+        packedWorldBuffersHalf: PackedWorldBuffersHalf,
         cameraUniforms: CameraUniformsSwift,
-        gaussianBuffers: GaussianInputBuffers  // Uses same buffer struct, but with half layout
+        gaussianBuffers: GaussianInputBuffers
     ) {
         guard let encoder = commandBuffer.makeComputeCommandEncoder() else { return }
-        encoder.label = "ProjectGaussiansHalfInput"
+        encoder.label = "ProjectGaussiansPacked_HalfHalf"
 
-        if let pipe = self.pipelineHalfInput {
-            encoder.setComputePipelineState(pipe)
-        } else {
-            // Fallback: This should not happen if Metal file is compiled correctly
-            fatalError("projectGaussians_half_input pipeline not available")
-        }
+        encoder.setComputePipelineState(pipelineHalfHalf)
 
-        encoder.setBuffer(worldBuffers.positions, offset: 0, index: 0)
-        encoder.setBuffer(worldBuffers.scales, offset: 0, index: 1)
-        encoder.setBuffer(worldBuffers.rotations, offset: 0, index: 2)
-        encoder.setBuffer(worldBuffers.opacities, offset: 0, index: 3)
-        encoder.setBuffer(worldBuffers.harmonics, offset: 0, index: 4)
+        // Input buffers (half-precision packed format)
+        encoder.setBuffer(packedWorldBuffersHalf.packedGaussians, offset: 0, index: 0)
+        encoder.setBuffer(packedWorldBuffersHalf.harmonics, offset: 0, index: 1)
 
-        encoder.setBuffer(gaussianBuffers.means, offset: 0, index: 5)
-        encoder.setBuffer(gaussianBuffers.conics, offset: 0, index: 6)
-        encoder.setBuffer(gaussianBuffers.colors, offset: 0, index: 7)
-        encoder.setBuffer(gaussianBuffers.opacities, offset: 0, index: 8)
-        encoder.setBuffer(gaussianBuffers.depths, offset: 0, index: 9)
-        encoder.setBuffer(gaussianBuffers.radii, offset: 0, index: 10)
-        encoder.setBuffer(gaussianBuffers.mask, offset: 0, index: 11)
+        // Output buffers (half precision)
+        encoder.setBuffer(gaussianBuffers.means, offset: 0, index: 2)
+        encoder.setBuffer(gaussianBuffers.conics, offset: 0, index: 3)
+        encoder.setBuffer(gaussianBuffers.colors, offset: 0, index: 4)
+        encoder.setBuffer(gaussianBuffers.opacities, offset: 0, index: 5)
+        encoder.setBuffer(gaussianBuffers.depths, offset: 0, index: 6)
+        encoder.setBuffer(gaussianBuffers.radii, offset: 0, index: 7)
+        encoder.setBuffer(gaussianBuffers.mask, offset: 0, index: 8)
 
         var cam = cameraUniforms
-        encoder.setBytes(&cam, length: MemoryLayout<CameraUniformsSwift>.stride, index: 12)
+        encoder.setBytes(&cam, length: MemoryLayout<CameraUniformsSwift>.stride, index: 9)
 
         let threads = MTLSize(width: gaussianCount, height: 1, depth: 1)
-        let tg = MTLSize(width: self.pipelineHalfInput!.threadExecutionWidth, height: 1, depth: 1)
+        let tg = MTLSize(width: pipelineHalfHalf.threadExecutionWidth, height: 1, depth: 1)
         encoder.dispatchThreads(threads, threadsPerThreadgroup: tg)
         encoder.endEncoding()
     }

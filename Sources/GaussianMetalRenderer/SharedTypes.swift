@@ -144,6 +144,32 @@ public struct FusedCoverageScatterParamsSwift {
     }
 }
 
+/// Tile-binning parameters: counts per tile then scatters using per-tile offsets
+public struct TileBinningParamsSwift {
+    public var gaussianCount: UInt32
+    public var tilesX: UInt32
+    public var tilesY: UInt32
+    public var tileWidth: UInt32
+    public var tileHeight: UInt32
+    public var maxAssignments: UInt32
+
+    public init(
+        gaussianCount: UInt32,
+        tilesX: UInt32,
+        tilesY: UInt32,
+        tileWidth: UInt32,
+        tileHeight: UInt32,
+        maxAssignments: UInt32
+    ) {
+        self.gaussianCount = gaussianCount
+        self.tilesX = tilesX
+        self.tilesY = tilesY
+        self.tileWidth = tileWidth
+        self.tileHeight = tileHeight
+        self.maxAssignments = maxAssignments
+    }
+}
+
 public struct PackParamsSwift {
     public var totalAssignments: UInt32
     public var padding: UInt32 = 0
@@ -345,76 +371,10 @@ public struct RenderSubmission {
     public let params: RenderParams
 }
 
-public struct WorldGaussianBuffers {
-    public let positions: MTLBuffer
-    public let scales: MTLBuffer
-    public let rotations: MTLBuffer
-    public let harmonics: MTLBuffer
-    public let opacities: MTLBuffer
-    public let shComponents: Int
-    public init(
-        positions: MTLBuffer,
-        scales: MTLBuffer,
-        rotations: MTLBuffer,
-        harmonics: MTLBuffer,
-        opacities: MTLBuffer,
-        shComponents: Int
-    ) {
-        self.positions = positions
-        self.scales = scales
-        self.rotations = rotations
-        self.harmonics = harmonics
-        self.opacities = opacities
-        self.shComponents = shComponents
-    }
-}
-
-/// Half-precision world gaussian buffers for native float16 input data.
-/// Layout: positions (half3), scales (half3), rotations (half4), harmonics (half), opacities (half)
-public struct WorldGaussianBuffersHalf {
-    public let positions: MTLBuffer    // half3 packed as 3 x UInt16
-    public let scales: MTLBuffer       // half3 packed as 3 x UInt16
-    public let rotations: MTLBuffer    // half4 packed as 4 x UInt16
-    public let harmonics: MTLBuffer    // half (SH coefficients)
-    public let opacities: MTLBuffer    // half
-    public let shComponents: Int
-
-    public init(
-        positions: MTLBuffer,
-        scales: MTLBuffer,
-        rotations: MTLBuffer,
-        harmonics: MTLBuffer,
-        opacities: MTLBuffer,
-        shComponents: Int
-    ) {
-        self.positions = positions
-        self.scales = scales
-        self.rotations = rotations
-        self.harmonics = harmonics
-        self.opacities = opacities
-        self.shComponents = shComponents
-    }
-}
-
-/// Unified wrapper for world gaussian buffers supporting both precisions.
-public enum WorldGaussianBuffersUnified {
-    case float32(WorldGaussianBuffers)
-    case float16(WorldGaussianBuffersHalf)
-
-    public var precision: Precision {
-        switch self {
-        case .float32: return .float32
-        case .float16: return .float16
-        }
-    }
-
-    public var shComponents: Int {
-        switch self {
-        case .float32(let b): return b.shComponents
-        case .float16(let b): return b.shComponents
-        }
-    }
-}
+/* REMOVED: WorldGaussianBuffers, WorldGaussianBuffersHalf, WorldGaussianBuffersUnified
+   Use PackedWorldBuffers (defined in ProjectEncoder.swift) instead.
+   PackedWorldBuffers contains a single interleaved buffer for optimal memory access.
+*/
 
 public struct ProjectionReadbackBuffers {
     public let meansOut: MTLBuffer

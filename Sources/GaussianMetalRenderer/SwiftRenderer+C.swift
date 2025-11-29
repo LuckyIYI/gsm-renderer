@@ -2,8 +2,11 @@ import Foundation
 import simd
 import Metal
 
-// MARK: - C Bridge Functions
+// MARK: - C Bridge Functions (DISABLED - under refactoring)
+// The C API is temporarily disabled while RenderParams is being simplified.
+// The Swift API is the recommended interface.
 
+/*
 @_cdecl("gaussian_renderer_set_capture_path")
 public func setNextFrameCapturePath(_ path: String) {
     Renderer.shared.triggerCapture(path: path)
@@ -880,3 +883,4 @@ public func gaussian_renderer_debug_dump_raw(
 
     return 0
 }
+*/

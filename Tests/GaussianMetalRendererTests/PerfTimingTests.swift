@@ -1,242 +1,353 @@
 import XCTest
+import Metal
+import simd
 @testable import GaussianMetalRenderer
 
+/// Performance timing tests for the rendering pipeline.
 final class PerfTimingTests: XCTestCase {
-    func testRendererStartupLatency() {
-        let start = CFAbsoluteTimeGetCurrent()
-        let renderer = Renderer(
-            useHeapAllocation: true,
-            limits: RendererLimits(maxGaussians: 1024, maxWidth: 64, maxHeight: 64, tileWidth: 16, tileHeight: 16, maxPerTile: 64)
-        )
-        let initTime = CFAbsoluteTimeGetCurrent() - start
 
-        // Run a tiny render to capture first-frame overhead.
-        let width: Int32 = 32
-        let height: Int32 = 32
-        let tile: Int32 = 16
-        let means: [Float] = [8, 8]
-        let conics: [Float] = [1, 0, 1, 0]
-        let colors: [Float] = [1, 0, 0]
-        let opacities: [Float] = [1]
-        let depths: [Float] = [1]
-        let radii: [Float] = [4]
-        var colorOut = [Float](repeating: 0, count: Int(width * height) * 3)
-        var depthOut = [Float](repeating: 0, count: Int(width * height))
-        var alphaOut = [Float](repeating: 0, count: Int(width * height))
+    // MARK: - Helpers
 
-        let params = RenderParams(
-            width: UInt32(width),
-            height: UInt32(height),
-            tileWidth: UInt32(tile),
-            tileHeight: UInt32(tile),
-            tilesX: 2,
-            tilesY: 2,
-            maxPerTile: 16,
-            whiteBackground: 0,
-            activeTileCount: 0,
-            gaussianCount: 1
-        )
-
-        let renderStart = CFAbsoluteTimeGetCurrent()
-        let result = means.withUnsafeBufferPointer { meansBuf in
-            conics.withUnsafeBufferPointer { conicsBuf in
-                colors.withUnsafeBufferPointer { colorsBuf in
-                    opacities.withUnsafeBufferPointer { opacitiesBuf in
-                        depths.withUnsafeBufferPointer { depthsBuf in
-                            radii.withUnsafeBufferPointer { radiiBuf in
-                                colorOut.withUnsafeMutableBufferPointer { colorOutBuf in
-                                    depthOut.withUnsafeMutableBufferPointer { depthOutBuf in
-                                        alphaOut.withUnsafeMutableBufferPointer { alphaOutBuf in
-                                            renderer.renderRaw(
-                                                gaussianCount: 1,
-                                                meansPtr: meansBuf.baseAddress!,
-                                                conicsPtr: conicsBuf.baseAddress!,
-                                                colorsPtr: colorsBuf.baseAddress!,
-                                                opacityPtr: opacitiesBuf.baseAddress!,
-                                                depthsPtr: depthsBuf.baseAddress!,
-                                                radiiPtr: radiiBuf.baseAddress!,
-                                                colorOutPtr: colorOutBuf.baseAddress!,
-                                                depthOutPtr: depthOutBuf.baseAddress!,
-                                                alphaOutPtr: alphaOutBuf.baseAddress!,
-                                                params: params
-                                            )
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        }
-        let renderTime = CFAbsoluteTimeGetCurrent() - renderStart
-
-        XCTAssertEqual(result, 0)
-        // Keep thresholds loose to avoid flaky bots; adjust downward as we optimize.
-        XCTAssertLessThan(initTime, 1.0, "Renderer init too slow: \(initTime)s")
-        XCTAssertLessThan(renderTime, 0.2, "First render too slow: \(renderTime)s")
-        print("[StartupTiming] init=\(initTime)s firstRender=\(renderTime)s")
-    }
-    /// Simple wall-clock measurement helper.
-    private func timeMillis(_ block: () -> Void) -> Double {
-        let start = CFAbsoluteTimeGetCurrent()
-        block()
-        let end = CFAbsoluteTimeGetCurrent()
-        return (end - start) * 1000.0
-    }
-
-    func testRenderRawTimings() {
-        let configs: [(label: String, width: Int32, height: Int32, tile: Int32, count: Int, perTile: Int)] = [
-            ("100k", 256, 256, 16, 100_000, 512),
-            ("1M", 256, 256, 16, 1_000_000, 512),
-            ("5M", 256, 256, 16, 5_000_000, 512),
-        ]
-
-        let maxCount = configs.map { $0.count }.max() ?? 1
-        let maxWidth = configs.map { Int($0.width) }.max() ?? 256
-        let maxHeight = configs.map { Int($0.height) }.max() ?? 256
-        let tile = configs.map { Int($0.tile) }.max() ?? 16
-        let maxPerTile = configs.map { $0.perTile }.max() ?? maxCount
-
-        let renderer = Renderer(
-            useIndirectBitonic: false,
-            limits: RendererLimits(
-                maxGaussians: maxCount,
-                maxWidth: maxWidth,
-                maxHeight: maxHeight,
-                tileWidth: tile,
-                tileHeight: tile,
-                maxPerTile: maxPerTile
-            )
-        )
-
-        var results: [(String, Double)] = []
-
-        for cfg in configs {
-            // Build deterministic grid of gaussians.
-            var means: [Float] = []
-            var conics: [Float] = []
-            var colors: [Float] = []
-            var opacities: [Float] = []
-            var depths: [Float] = []
-            var radii: [Float] = []
-
-            let tilesX = cfg.width / cfg.tile
-            let tilesY = cfg.height / cfg.tile
-            let perTileTarget = max(cfg.perTile, Int(ceil(Double(cfg.count) / Double(max(Int(tilesX * tilesY), 1)))))
-            var placed = 0
-            for ty in 0..<tilesY {
-                for tx in 0..<tilesX {
-                    let cx = Float(tx) * Float(cfg.tile) + Float(cfg.tile) / 2.0
-                    let cy = Float(ty) * Float(cfg.tile) + Float(cfg.tile) / 2.0
-                    for i in 0..<perTileTarget {
-                        let jitter = Float(i) * 0.01
-                        means.append(cx + jitter)
-                        means.append(cy + jitter)
-                        conics.append(contentsOf: [1.0, 0.0, 1.0, 0.0])
-                        colors.append(contentsOf: [1.0, 1.0, 1.0])
-                        opacities.append(1.0)
-                        depths.append(Float(i % 8) * 0.1)
-                        radii.append(Float(cfg.tile) * 0.25)
-                        placed += 1
-                        if placed >= cfg.count { break }
-                    }
-                    if placed >= cfg.count { break }
-                }
-                if placed >= cfg.count { break }
-            }
-
-            let count = means.count / 2
-            var colorOut = [Float](repeating: 0, count: Int(cfg.width * cfg.height) * 3)
-            var depthOut = [Float](repeating: 0, count: Int(cfg.width * cfg.height))
-            var alphaOut = [Float](repeating: 0, count: Int(cfg.width * cfg.height))
-
-            let params = RenderParams(
-                width: UInt32(cfg.width),
-                height: UInt32(cfg.height),
-                tileWidth: UInt32(cfg.tile),
-                tileHeight: UInt32(cfg.tile),
-                tilesX: UInt32(max(Int(cfg.width / cfg.tile), 1)),
-                tilesY: UInt32(max(Int(cfg.height / cfg.tile), 1)),
-                maxPerTile: UInt32(perTileTarget),
-                whiteBackground: 0,
-                activeTileCount: 0,
-                gaussianCount: UInt32(count)
-            )
-
-            // Warmup once to avoid JIT noise.
-            _ = means.withUnsafeBufferPointer { meansBuf in
-                conics.withUnsafeBufferPointer { conicsBuf in
-                    colors.withUnsafeBufferPointer { colorsBuf in
-                        opacities.withUnsafeBufferPointer { opacitiesBuf in
-                            depths.withUnsafeBufferPointer { depthsBuf in
-                                radii.withUnsafeBufferPointer { radiiBuf in
-                                    colorOut.withUnsafeMutableBufferPointer { colorOutBuf in
-                                        depthOut.withUnsafeMutableBufferPointer { depthOutBuf in
-                                            alphaOut.withUnsafeMutableBufferPointer { alphaOutBuf in
-                                                renderer.renderRaw(
-                                                    gaussianCount: count,
-                                                    meansPtr: meansBuf.baseAddress!,
-                                                    conicsPtr: conicsBuf.baseAddress!,
-                                                    colorsPtr: colorsBuf.baseAddress!,
-                                                    opacityPtr: opacitiesBuf.baseAddress!,
-                                                    depthsPtr: depthsBuf.baseAddress!,
-                                                    radiiPtr: radiiBuf.baseAddress!,
-                                                    colorOutPtr: colorOutBuf.baseAddress!,
-                                                    depthOutPtr: depthOutBuf.baseAddress!,
-                                                    alphaOutPtr: alphaOutBuf.baseAddress!,
-                                                    params: params
-                                                )
-                                            }
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-
-            let elapsed = timeMillis {
-                _ = means.withUnsafeBufferPointer { meansBuf in
-                    conics.withUnsafeBufferPointer { conicsBuf in
-                        colors.withUnsafeBufferPointer { colorsBuf in
-                            opacities.withUnsafeBufferPointer { opacitiesBuf in
-                                depths.withUnsafeBufferPointer { depthsBuf in
-                                    radii.withUnsafeBufferPointer { radiiBuf in
-                                        colorOut.withUnsafeMutableBufferPointer { colorOutBuf in
-                                            depthOut.withUnsafeMutableBufferPointer { depthOutBuf in
-                                                alphaOut.withUnsafeMutableBufferPointer { alphaOutBuf in
-                                                    renderer.renderRaw(
-                                                        gaussianCount: count,
-                                                        meansPtr: meansBuf.baseAddress!,
-                                                        conicsPtr: conicsBuf.baseAddress!,
-                                                        colorsPtr: colorsBuf.baseAddress!,
-                                                        opacityPtr: opacitiesBuf.baseAddress!,
-                                                        depthsPtr: depthsBuf.baseAddress!,
-                                                        radiiPtr: radiiBuf.baseAddress!,
-                                                        colorOutPtr: colorOutBuf.baseAddress!,
-                                                        depthOutPtr: depthOutBuf.baseAddress!,
-                                                        alphaOutPtr: alphaOutBuf.baseAddress!,
-                                                        params: params
-                                                    )
-                                                }
-                                            }
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-
-            results.append((cfg.label, elapsed))
+    func createPackedWorldBuffers(
+        device: MTLDevice,
+        positions: [SIMD3<Float>],
+        scales: [SIMD3<Float>],
+        rotations: [SIMD4<Float>],
+        opacities: [Float],
+        colors: [SIMD3<Float>]
+    ) -> PackedWorldBuffers? {
+        let count = positions.count
+        guard count == scales.count, count == rotations.count,
+              count == opacities.count, count == colors.count else {
+            return nil
         }
 
-        // Log concise timing table.
-        let table = results.map { label, ms in "\(label): \(String(format: "%.3f", ms)) ms" }
-        print("[PerfTiming] renderRaw wall-times -> \(table.joined(separator: " | "))")
-        XCTAssertFalse(results.isEmpty)
+        var packed: [PackedWorldGaussian] = []
+        for i in 0..<count {
+            packed.append(PackedWorldGaussian(
+                position: positions[i],
+                scale: scales[i],
+                rotation: rotations[i],
+                opacity: opacities[i]
+            ))
+        }
+
+        var harmonics: [Float] = []
+        for color in colors {
+            harmonics.append(color.x)
+            harmonics.append(color.y)
+            harmonics.append(color.z)
+        }
+
+        guard let packedBuf = device.makeBuffer(
+            bytes: &packed,
+            length: count * MemoryLayout<PackedWorldGaussian>.stride,
+            options: .storageModeShared
+        ) else { return nil }
+
+        guard let harmonicsBuf = device.makeBuffer(
+            bytes: &harmonics,
+            length: count * 3 * MemoryLayout<Float>.stride,
+            options: .storageModeShared
+        ) else { return nil }
+
+        return PackedWorldBuffers(packedGaussians: packedBuf, harmonics: harmonicsBuf)
+    }
+
+    func createPackedWorldBuffersHalf(
+        device: MTLDevice,
+        positions: [SIMD3<Float>],
+        scales: [SIMD3<Float>],
+        rotations: [SIMD4<Float>],
+        opacities: [Float],
+        colors: [SIMD3<Float>]
+    ) -> PackedWorldBuffersHalf? {
+        let count = positions.count
+        guard count == scales.count, count == rotations.count,
+              count == opacities.count, count == colors.count else {
+            return nil
+        }
+
+        var packed: [PackedWorldGaussianHalf] = []
+        for i in 0..<count {
+            packed.append(PackedWorldGaussianHalf(
+                position: positions[i],
+                scale: scales[i],
+                rotation: rotations[i],
+                opacity: opacities[i]
+            ))
+        }
+
+        var harmonics: [Float] = []
+        for color in colors {
+            harmonics.append(color.x)
+            harmonics.append(color.y)
+            harmonics.append(color.z)
+        }
+
+        guard let packedBuf = device.makeBuffer(
+            bytes: &packed,
+            length: count * MemoryLayout<PackedWorldGaussianHalf>.stride,
+            options: .storageModeShared
+        ) else { return nil }
+
+        guard let harmonicsBuf = device.makeBuffer(
+            bytes: &harmonics,
+            length: count * 3 * MemoryLayout<Float>.stride,
+            options: .storageModeShared
+        ) else { return nil }
+
+        return PackedWorldBuffersHalf(packedGaussians: packedBuf, harmonics: harmonicsBuf)
+    }
+
+    func createSimpleCamera(width: Float, height: Float, gaussianCount: Int) -> CameraUniformsSwift {
+        var projMatrix = matrix_identity_float4x4
+        projMatrix.columns.0 = SIMD4(2.0 / width, 0, 0, 0)
+        projMatrix.columns.1 = SIMD4(0, 2.0 / height, 0, 0)
+        projMatrix.columns.2 = SIMD4(0, 0, -0.02, 0)
+        projMatrix.columns.3 = SIMD4(0, 0, -1.002, 1)
+
+        return CameraUniformsSwift(
+            viewMatrix: matrix_identity_float4x4,
+            projectionMatrix: projMatrix,
+            cameraCenter: SIMD3<Float>(0, 0, 0),
+            pixelFactor: 1.0,
+            focalX: width / 2.0,
+            focalY: height / 2.0,
+            width: width,
+            height: height,
+            nearPlane: 0.1,
+            farPlane: 100.0,
+            shComponents: 0,
+            gaussianCount: UInt32(gaussianCount),
+            padding0: 0,
+            padding1: 0
+        )
+    }
+
+    func generateRandomGaussians(count: Int, spreadX: Float = 800, spreadY: Float = 600) -> (
+        positions: [SIMD3<Float>],
+        scales: [SIMD3<Float>],
+        rotations: [SIMD4<Float>],
+        opacities: [Float],
+        colors: [SIMD3<Float>]
+    ) {
+        var positions: [SIMD3<Float>] = []
+        var scales: [SIMD3<Float>] = []
+        var rotations: [SIMD4<Float>] = []
+        var opacities: [Float] = []
+        var colors: [SIMD3<Float>] = []
+
+        for i in 0..<count {
+            let gridSize = Int(sqrt(Double(count))) + 1
+            let x = Float(i % gridSize) / Float(gridSize) * spreadX - spreadX/2
+            let y = Float(i / gridSize) / Float(gridSize) * spreadY - spreadY/2
+            let z = Float.random(in: 1...50)
+            positions.append(SIMD3(x, y, z))
+
+            let s = Float.random(in: 0.1...0.5)
+            scales.append(SIMD3(s, s, s))
+
+            rotations.append(SIMD4(0, 0, 0, 1))
+            opacities.append(Float.random(in: 0.5...1.0))
+            colors.append(SIMD3(
+                Float.random(in: -0.3...0.3),
+                Float.random(in: -0.3...0.3),
+                Float.random(in: -0.3...0.3)
+            ))
+        }
+
+        return (positions, scales, rotations, opacities, colors)
+    }
+
+    // MARK: - Tests
+
+    /// Test renderer startup time
+    func testStartupTiming() throws {
+        let startTime = CFAbsoluteTimeGetCurrent()
+
+        let renderer = Renderer(
+            precision: .float32,
+            usePreciseIntersection: true,
+            useFusedCoverageScatter: true,
+            useHeapAllocation: false,
+            limits: RendererLimits(maxGaussians: 1_000_000, maxWidth: 1920, maxHeight: 1080)
+        )
+
+        let endTime = CFAbsoluteTimeGetCurrent()
+        let startupMs = (endTime - startTime) * 1000
+
+        print("[PerfTiming] Renderer startup: \(String(format: "%.1f", startupMs))ms")
+
+        // Verify renderer is functional
+        XCTAssertNotNil(renderer.device)
+        XCTAssertTrue(startupMs < 5000, "Startup should be under 5 seconds")
+    }
+
+    /// Test wall-clock render time
+    func testRenderWallTime() throws {
+        let width = 1024
+        let height = 768
+        let renderer = Renderer(
+            precision: .float16,
+            usePreciseIntersection: true,
+            useFusedCoverageScatter: true,
+            useHeapAllocation: false,
+            textureOnly: true,
+            limits: RendererLimits(maxGaussians: 200_000, maxWidth: width, maxHeight: height)
+        )
+
+        let count = 100_000
+        let (positions, scales, rotations, opacities, colors) = generateRandomGaussians(count: count)
+
+        guard let packedBuffersHalf = createPackedWorldBuffersHalf(
+            device: renderer.device,
+            positions: positions,
+            scales: scales,
+            rotations: rotations,
+            opacities: opacities,
+            colors: colors
+        ) else {
+            XCTFail("Failed to create packed buffers half")
+            return
+        }
+
+        let camera = createSimpleCamera(width: Float(width), height: Float(height), gaussianCount: count)
+        let frameParams = FrameParams(gaussianCount: count, whiteBackground: false)
+
+        // Warm up
+        for _ in 0..<3 {
+            guard let commandBuffer = renderer.queue.makeCommandBuffer() else { continue }
+            _ = renderer.encodeRenderToTextureHalf(
+                commandBuffer: commandBuffer,
+                gaussianCount: count,
+                packedWorldBuffersHalf: packedBuffersHalf,
+                cameraUniforms: camera,
+                frameParams: frameParams
+            )
+            commandBuffer.commit()
+            commandBuffer.waitUntilCompleted()
+        }
+
+        // Measure wall time
+        var wallTimes: [Double] = []
+        var gpuTimes: [Double] = []
+
+        for _ in 0..<10 {
+            guard let commandBuffer = renderer.queue.makeCommandBuffer() else { continue }
+
+            let wallStart = CFAbsoluteTimeGetCurrent()
+            _ = renderer.encodeRenderToTextureHalf(
+                commandBuffer: commandBuffer,
+                gaussianCount: count,
+                packedWorldBuffersHalf: packedBuffersHalf,
+                cameraUniforms: camera,
+                frameParams: frameParams
+            )
+            commandBuffer.commit()
+            commandBuffer.waitUntilCompleted()
+            let wallEnd = CFAbsoluteTimeGetCurrent()
+
+            wallTimes.append((wallEnd - wallStart) * 1000)
+
+            let gpuTime = commandBuffer.gpuEndTime - commandBuffer.gpuStartTime
+            if gpuTime > 0 {
+                gpuTimes.append(gpuTime * 1000)
+            }
+        }
+
+        let avgWall = wallTimes.reduce(0, +) / Double(wallTimes.count)
+        let avgGPU = gpuTimes.isEmpty ? 0 : gpuTimes.reduce(0, +) / Double(gpuTimes.count)
+
+        print("[PerfTiming] \(count) gaussians @ \(width)x\(height): wall=\(String(format: "%.2f", avgWall))ms gpu=\(String(format: "%.2f", avgGPU))ms")
+
+        XCTAssertTrue(avgWall < 100, "Render should complete under 100ms")
+    }
+
+    /// Test precise scale timing at different counts
+    func testPreciseScaleTiming() throws {
+        let width = 1920
+        let height = 1080
+        let renderer = Renderer(
+            precision: .float16,
+            usePreciseIntersection: true,
+            useFusedCoverageScatter: true,
+            useHeapAllocation: false,
+            textureOnly: true,
+            limits: RendererLimits(maxGaussians: 1_000_000, maxWidth: width, maxHeight: height)
+        )
+
+        let testCounts = [10_000, 50_000, 100_000, 500_000]
+        var results: [(count: Int, avgMs: Double, minMs: Double, maxMs: Double)] = []
+
+        for count in testCounts {
+            let (positions, scales, rotations, opacities, colors) = generateRandomGaussians(
+                count: count,
+                spreadX: Float(width),
+                spreadY: Float(height)
+            )
+
+            guard let packedBuffersHalf = createPackedWorldBuffersHalf(
+                device: renderer.device,
+                positions: positions,
+                scales: scales,
+                rotations: rotations,
+                opacities: opacities,
+                colors: colors
+            ) else {
+                continue
+            }
+
+            let camera = createSimpleCamera(width: Float(width), height: Float(height), gaussianCount: count)
+            let frameParams = FrameParams(gaussianCount: count, whiteBackground: false)
+
+            // Warm up
+            for _ in 0..<2 {
+                guard let commandBuffer = renderer.queue.makeCommandBuffer() else { continue }
+                _ = renderer.encodeRenderToTextureHalf(
+                    commandBuffer: commandBuffer,
+                    gaussianCount: count,
+                    packedWorldBuffersHalf: packedBuffersHalf,
+                    cameraUniforms: camera,
+                    frameParams: frameParams
+                )
+                commandBuffer.commit()
+                commandBuffer.waitUntilCompleted()
+            }
+
+            // Measure
+            var times: [Double] = []
+            for _ in 0..<5 {
+                guard let commandBuffer = renderer.queue.makeCommandBuffer() else { continue }
+                _ = renderer.encodeRenderToTextureHalf(
+                    commandBuffer: commandBuffer,
+                    gaussianCount: count,
+                    packedWorldBuffersHalf: packedBuffersHalf,
+                    cameraUniforms: camera,
+                    frameParams: frameParams
+                )
+                commandBuffer.commit()
+                commandBuffer.waitUntilCompleted()
+
+                let gpuTime = commandBuffer.gpuEndTime - commandBuffer.gpuStartTime
+                if gpuTime > 0 {
+                    times.append(gpuTime * 1000)
+                }
+            }
+
+            if !times.isEmpty {
+                let avg = times.reduce(0, +) / Double(times.count)
+                results.append((count, avg, times.min()!, times.max()!))
+            }
+        }
+
+        // Print summary
+        var summary = "[PerfTiming] Scale timing: "
+        for r in results {
+            summary += "\(r.count/1000)k: avg=\(String(format: "%.2f", r.avgMs))ms | "
+        }
+        print(summary)
+
+        XCTAssertTrue(results.count > 0, "Should have timing results")
     }
 }

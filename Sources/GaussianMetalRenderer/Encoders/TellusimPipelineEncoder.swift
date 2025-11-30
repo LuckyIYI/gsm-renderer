@@ -36,7 +36,7 @@ public final class TellusimPipelineEncoder {
               let finalizeFn = library.makeFunction(name: "tellusim_finalize_scan"),
               let finalizeAndZeroFn = library.makeFunction(name: "tellusim_finalize_scan_and_zero"),
               let prepareDispatchFn = library.makeFunction(name: "tellusim_prepare_scatter_dispatch"),
-              let scatterFn = library.makeFunction(name: "tellusim_scatter"),
+              let scatterFn = library.makeFunction(name: "tellusim_scatter_simd"),
               let sortFn = library.makeFunction(name: "tellusim_per_tile_sort"),
               let renderFn = library.makeFunction(name: "tellusim_render") else {
             fatalError("Missing required kernel functions in TellusimShaders")
@@ -53,8 +53,8 @@ public final class TellusimPipelineEncoder {
         self.perTileSortPipeline = try device.makeComputePipelineState(function: sortFn)
         self.renderPipeline = try device.makeComputePipelineState(function: renderFn)
 
-        // Half precision project kernel (optional)
-        if let projectHalfFn = library.makeFunction(name: "tellusim_project_compact_count_half") {
+        // Half precision project kernel (half world + half harmonics for bandwidth)
+        if let projectHalfFn = library.makeFunction(name: "tellusim_project_compact_count_half_halfsh") {
             self.projectCompactCountHalfPipeline = try? device.makeComputePipelineState(function: projectHalfFn)
         } else {
             self.projectCompactCountHalfPipeline = nil
@@ -209,21 +209,24 @@ public final class TellusimPipelineEncoder {
 
         // === 5a. PREPARE INDIRECT DISPATCH for scatter (GPU-driven) ===
         // Create dispatch args buffer inline (12 bytes for MTLDispatchThreadgroupsIndirectArguments)
+        // SIMD scatter: 4 gaussians per threadgroup (4 SIMD groups × 32 threads = 128 threads)
         let dispatchArgsBuffer = commandBuffer.device.makeBuffer(length: 12, options: .storageModeShared)!
         if let encoder = commandBuffer.makeComputeCommandEncoder() {
             encoder.label = "Tellusim_PrepareScatterDispatch"
             encoder.setComputePipelineState(prepareScatterDispatchPipeline)
             encoder.setBuffer(compactedHeader, offset: 0, index: 0)
             encoder.setBuffer(dispatchArgsBuffer, offset: 0, index: 1)
-            var tgWidth = UInt32(scatterPipeline.threadExecutionWidth)
+            var tgWidth = UInt32(4)  // 4 gaussians per threadgroup (4 SIMD groups)
             encoder.setBytes(&tgWidth, length: MemoryLayout<UInt32>.stride, index: 2)
             encoder.dispatchThreads(MTLSize(width: 1, height: 1, depth: 1), threadsPerThreadgroup: MTLSize(width: 1, height: 1, depth: 1))
             encoder.endEncoding()
         }
 
-        // === 5b. SCATTER (GPU-driven indirect dispatch) ===
+        // === 5b. SCATTER (SIMD-cooperative, GPU-driven indirect dispatch) ===
+        // Each SIMD group (32 threads) handles 1 gaussian cooperatively
+        // 4 SIMD groups per threadgroup = 4 gaussians per threadgroup = 128 threads
         if let encoder = commandBuffer.makeComputeCommandEncoder() {
-            encoder.label = "Tellusim_Scatter"
+            encoder.label = "Tellusim_Scatter_SIMD"
             encoder.setComputePipelineState(scatterPipeline)
             encoder.setBuffer(compactedGaussians, offset: 0, index: 0)
             encoder.setBuffer(compactedHeader, offset: 0, index: 1)
@@ -238,7 +241,8 @@ public final class TellusimPipelineEncoder {
             encoder.setBytes(&tileW, length: MemoryLayout<Int32>.stride, index: 8)
             encoder.setBytes(&tileH, length: MemoryLayout<Int32>.stride, index: 9)
 
-            let tg = MTLSize(width: scatterPipeline.threadExecutionWidth, height: 1, depth: 1)
+            // 128 threads per threadgroup (4 SIMD groups = 4 gaussians)
+            let tg = MTLSize(width: 128, height: 1, depth: 1)
             encoder.dispatchThreadgroups(indirectBuffer: dispatchArgsBuffer, indirectBufferOffset: 0, threadsPerThreadgroup: tg)
             encoder.endEncoding()
         }

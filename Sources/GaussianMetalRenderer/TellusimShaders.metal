@@ -764,11 +764,15 @@ kernel void tellusim_scatter_balanced(
 }
 
 // =============================================================================
-// KERNEL 4 (legacy): ATOMIC SCATTER
+// KERNEL 4: SIMD-COOPERATIVE SCATTER (FlashGS-style)
 // =============================================================================
-// Kept for compatibility, but balanced scatter is preferred
+// All 32 threads in SIMD group work on ONE gaussian cooperatively
+// - Broadcasts gaussian data via simd_shuffle
+// - Threads divide up tile range
+// - Warp-level atomic batching (only lane 0 does atomic)
+// - Each thread computes its write position via popcount
 
-kernel void tellusim_scatter(
+kernel void tellusim_scatter_simd(
     const device TellusimCompactedGaussian* compacted [[buffer(0)]],
     const device TellusimCompactedHeader* header [[buffer(1)]],
     device atomic_uint* tileCounters [[buffer(2)]],
@@ -779,47 +783,96 @@ kernel void tellusim_scatter(
     constant uint& maxAssignments [[buffer(7)]],
     constant int& tileWidth [[buffer(8)]],
     constant int& tileHeight [[buffer(9)]],
-    uint gid [[thread_position_in_grid]]
+    uint gid [[thread_position_in_grid]],
+    uint simd_lane [[thread_index_in_simdgroup]],
+    uint simd_group_id [[simdgroup_index_in_threadgroup]],
+    uint tg_id [[threadgroup_position_in_grid]]
 ) {
+    // Each SIMD group (32 threads) processes gaussians cooperatively
+    // Thread group: multiple SIMD groups, each processing different gaussians
     uint visibleCount = atomic_load_explicit(&header->visibleCount, memory_order_relaxed);
-    if (gid >= visibleCount) return;
 
-    TellusimCompactedGaussian g = compacted[gid];
+    // Calculate which gaussian this SIMD group is responsible for
+    uint simd_groups_per_tg = 4;  // 128 threads / 32 = 4 SIMD groups per threadgroup
+    uint global_simd_id = tg_id * simd_groups_per_tg + simd_group_id;
+    uint gaussianIdx = global_simd_id;
 
-    // Depth key (24-bit)
-    float depth = g.covariance_depth.w;
-    uint depthKey = (as_type<uint>(depth) ^ 0x80000000u) >> 8u;
+    if (gaussianIdx >= visibleCount) return;
 
-    // FlashGS-style intersection data
-    float3 conic = g.covariance_depth.xyz;
-    float2 center = g.position_color.xy;
-    half4 colorOp = tellusim_unpackHalf4(g.position_color.zw);
-    float opacity = float(colorOp.w);
-    float power = tellusim_computePower(opacity);
+    // Lane 0 loads gaussian data
+    TellusimCompactedGaussian g;
+    float3 conic;
+    float2 center;
+    float power;
+    uint depthKey;
+    int minTX, minTY, maxTX, maxTY;
 
-    int2 minTile = g.min_tile;
-    int2 maxTile = g.max_tile;
+    if (simd_lane == 0) {
+        g = compacted[gaussianIdx];
+        conic = g.covariance_depth.xyz;
+        center = g.position_color.xy;
+        half4 colorOp = tellusim_unpackHalf4(g.position_color.zw);
+        power = tellusim_computePower(float(colorOp.w));
+        depthKey = (as_type<uint>(g.covariance_depth.w) ^ 0x80000000u) >> 8u;
+        minTX = g.min_tile.x;
+        minTY = g.min_tile.y;
+        maxTX = g.max_tile.x;
+        maxTY = g.max_tile.y;
+    }
 
-    // FlashGS-style scatter with precise intersection
-    for (int ty = minTile.y; ty < maxTile.y; ++ty) {
-        for (int tx = minTile.x; tx < maxTile.x; ++tx) {
-            // Pixel bounds for this tile
-            int2 pix_min = int2(tx * tileWidth, ty * tileHeight);
-            int2 pix_max = int2(pix_min.x + tileWidth - 1, pix_min.y + tileHeight - 1);
+    // Broadcast to all lanes in SIMD group
+    conic.x = simd_shuffle(conic.x, 0);
+    conic.y = simd_shuffle(conic.y, 0);
+    conic.z = simd_shuffle(conic.z, 0);
+    center.x = simd_shuffle(center.x, 0);
+    center.y = simd_shuffle(center.y, 0);
+    power = simd_shuffle(power, 0);
+    depthKey = simd_shuffle(depthKey, 0);
+    minTX = simd_shuffle(minTX, 0);
+    minTY = simd_shuffle(minTY, 0);
+    maxTX = simd_shuffle(maxTX, 0);
+    maxTY = simd_shuffle(maxTY, 0);
 
-            // FlashGS intersection test: center in tile OR ellipse intersects tile
-            bool valid = tellusim_blockContainsCenter(pix_min, pix_max, center) ||
-                         tellusim_blockIntersectEllipse(pix_min, pix_max, center, conic, power);
+    // Tile range
+    int tileRangeX = maxTX - minTX;
+    int tileRangeY = maxTY - minTY;
+    int totalTiles = tileRangeX * tileRangeY;
 
-            if (!valid) continue;
+    // Each lane handles a subset of tiles
+    for (int tileIdx = int(simd_lane); tileIdx < totalTiles; tileIdx += 32) {
+        int localY = tileIdx / tileRangeX;
+        int localX = tileIdx % tileRangeX;
+        int tx = minTX + localX;
+        int ty = minTY + localY;
 
+        // Pixel bounds for intersection test
+        int2 pix_min = int2(tx * tileWidth, ty * tileHeight);
+        int2 pix_max = int2(pix_min.x + tileWidth - 1, pix_min.y + tileHeight - 1);
+
+        // FlashGS intersection test
+        bool valid = tellusim_blockContainsCenter(pix_min, pix_max, center) ||
+                     tellusim_blockIntersectEllipse(pix_min, pix_max, center, conic, power);
+
+        // SIMD ballot for warp-level coordination
+        simd_vote ballot = simd_ballot(valid);
+        uint simdMask = uint(simd_vote::vote_t(ballot) & 0xFFFFFFFFull);
+        uint simdCount = popcount(simdMask);
+
+        if (simdCount == 0) continue;
+
+        // Compute prefix within SIMD group for write position
+        uint lowerMask = (1u << simd_lane) - 1u;
+        uint simdPrefix = popcount(simdMask & lowerMask);
+
+        // Each valid lane writes to its tile
+        if (valid) {
             uint tileId = uint(ty) * tilesX + uint(tx);
             uint localIdx = atomic_fetch_add_explicit(&tileCounters[tileId], 1u, memory_order_relaxed);
             uint writePos = offsets[tileId] + localIdx;
 
             if (writePos < maxAssignments) {
                 sortKeys[writePos] = depthKey;
-                sortIndices[writePos] = gid;
+                sortIndices[writePos] = gaussianIdx;
             }
         }
     }

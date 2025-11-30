@@ -23,7 +23,9 @@ let package = Package(
             path: "Sources",
             resources: [
                 .process("GaussianMetalRenderer/GaussianMetalRenderer.metallib"),
-                .process("GaussianMetalRenderer/GaussianMetalRenderer.metal")
+                .process("GaussianMetalRenderer/GaussianMetalRenderer.metal"),
+                .process("GaussianMetalRenderer/TellusimShaders.metallib"),
+                .process("GaussianMetalRenderer/TellusimShaders.metal")
             ]
         ),
         .testTarget(

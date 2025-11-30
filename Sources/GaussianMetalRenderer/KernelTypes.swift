@@ -197,3 +197,70 @@ public struct RenderParams {
         self.gaussianCount = gaussianCount
     }
 }
+
+// =============================================================================
+// TELLUSIM-STYLE PIPELINE TYPES
+// =============================================================================
+
+/// Compacted gaussian for Tellusim-style pipeline (matches Metal struct)
+/// 48 bytes total
+public struct CompactedGaussianSwift {
+    public var covariance_depth: SIMD4<Float>  // conic.xyz + depth
+    public var position_color: SIMD4<Float>    // pos.xy + packed half4(color, opacity)
+    public var min_tile: SIMD2<Int32>
+    public var max_tile: SIMD2<Int32>
+
+    public init() {
+        self.covariance_depth = .zero
+        self.position_color = .zero
+        self.min_tile = .zero
+        self.max_tile = .zero
+    }
+}
+
+/// Parameters for fused project+compact+count kernel
+public struct ProjectCompactParamsSwift {
+    public var gaussianCount: UInt32
+    public var tilesX: UInt32
+    public var tilesY: UInt32
+    public var tileWidth: UInt32
+    public var tileHeight: UInt32
+    public var surfaceWidth: UInt32
+    public var surfaceHeight: UInt32
+    public var maxCompacted: UInt32
+
+    public init(
+        gaussianCount: UInt32,
+        tilesX: UInt32,
+        tilesY: UInt32,
+        tileWidth: UInt32,
+        tileHeight: UInt32,
+        surfaceWidth: UInt32,
+        surfaceHeight: UInt32,
+        maxCompacted: UInt32
+    ) {
+        self.gaussianCount = gaussianCount
+        self.tilesX = tilesX
+        self.tilesY = tilesY
+        self.tileWidth = tileWidth
+        self.tileHeight = tileHeight
+        self.surfaceWidth = surfaceWidth
+        self.surfaceHeight = surfaceHeight
+        self.maxCompacted = maxCompacted
+    }
+}
+
+/// Header for compacted gaussians (matches Metal struct, but atomic is read as UInt32)
+public struct CompactedHeaderSwift {
+    public var visibleCount: UInt32
+    public var maxCompacted: UInt32
+    public var overflow: UInt32
+    public var _pad: UInt32
+
+    public init(visibleCount: UInt32 = 0, maxCompacted: UInt32 = 0, overflow: UInt32 = 0) {
+        self.visibleCount = visibleCount
+        self.maxCompacted = maxCompacted
+        self.overflow = overflow
+        self._pad = 0
+    }
+}

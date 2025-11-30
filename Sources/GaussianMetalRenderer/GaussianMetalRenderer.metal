@@ -518,10 +518,25 @@ kernel void projectGaussiansPacked(
         return;
     }
 
+
     float ndcX = clip.x / clip.w;
     float ndcY = clip.y / clip.w;
     float px = ((ndcX + 1.0f) * camera.width - 1.0f) * 0.5f;
     float py = ((ndcY + 1.0f) * camera.height - 1.0f) * 0.5f;
+
+//    
+//    
+//    // Tile bounds
+//    int tileW = int(params.tileWidth);
+//    int tileH = int(params.tileHeight);
+//    int2 minTile = int2(
+//        max(0, int(floor((px - radius) / float(tileW)))),
+//        max(0, int(floor((py - radius) / float(tileH))))
+//    );
+//    int2 maxTile = int2(
+//        min(int(params.tilesX), int(ceil((px + radius) / float(tileW)))),
+//        min(int(params.tilesY), int(ceil((py + radius) / float(tileH))))
+//    );
 
     // Opacity already loaded from packed struct
     float opacity = float(g.opacity);
@@ -547,6 +562,14 @@ kernel void projectGaussiansPacked(
     computeConicAndRadius(cov2d, conic, radius);
 
     if (radius < 0.5f) {
+        outMask[gid] = 0;
+        outRadii[gid] = 0.0f;
+        return;
+    }
+
+    // Off-screen culling: skip gaussians completely outside the viewport
+    if (px + radius < 0.0f || px - radius > camera.width ||
+        py + radius < 0.0f || py - radius > camera.height) {
         outMask[gid] = 0;
         outRadii[gid] = 0.0f;
         return;

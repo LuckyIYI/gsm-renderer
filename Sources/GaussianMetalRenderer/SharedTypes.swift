@@ -335,8 +335,9 @@ public struct OrderedGaussianBuffers {
     public let activeTileCount: MTLBuffer
     public let precision: Precision
 
-    // Fused pipeline buffers (optional - for cache-efficient rendering)
-    public let packedGaussiansFused: MTLBuffer?
+    // Index-based render (like LocalSort): render reads via sortedIndices
+    public let interleavedGaussians: MTLBuffer?
+    public let sortedIndices: MTLBuffer?
 }
 
 public struct SortBufferSet {
@@ -362,7 +363,6 @@ public struct RenderOutputBuffers {
 public struct RenderOutputTextures {
     public let color: MTLTexture
     public let depth: MTLTexture
-    public let alpha: MTLTexture
 }
 
 public struct RenderSubmission {

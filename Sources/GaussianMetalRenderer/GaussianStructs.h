@@ -71,25 +71,6 @@ struct GaussianRenderDataF32 {
     uint           _pad;      // 4 bytes (alignment to 48)
 };
 
-/// Packed gaussian for render stage - matches GaussianRenderData layout
-struct PackedGaussian {
-    half2         mean;       // 4 bytes
-    half4         conic;      // 8 bytes
-    packed_half3  color;      // 6 bytes
-    half          opacity;    // 2 bytes
-    half          depth;      // 2 bytes
-    ushort        _pad;       // 2 bytes
-};
-
-struct PackedGaussianF32 {
-    float2         mean;      // 8 bytes
-    float4         conic;     // 16 bytes
-    packed_float3  color;     // 12 bytes
-    float          opacity;   // 4 bytes
-    float          depth;     // 4 bytes
-    uint           _pad;      // 4 bytes
-};
-
 // =============================================================================
 // PACKED WORLD GAUSSIAN - Interleaved input for projection kernel
 // Eliminates 5 scattered buffer reads -> 1 coalesced read

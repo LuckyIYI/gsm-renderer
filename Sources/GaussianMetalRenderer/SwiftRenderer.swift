@@ -112,7 +112,6 @@ final class FrameResources {
 
     // Fused Pipeline Buffers (interleaved data for cache efficiency)
     let interleavedGaussians: MTLBuffer?
-    let packedGaussiansFused: MTLBuffer?
 
     // Dispatch Args (Per-frame to avoid race on indirect dispatch)
     let dispatchArgs: MTLBuffer
@@ -192,7 +191,6 @@ final class FrameResources {
         self.radixKeysScratch = optionalBuffer("RadixScratch")
         self.radixPayloadScratch = optionalBuffer("RadixPayload")
         self.interleavedGaussians = optionalBuffer("InterleavedGaussians")
-        self.packedGaussiansFused = optionalBuffer("PackedGaussiansFused")
 
         // Output buffers (skipped in textureOnly mode to save ~20MB)
         let pixelBytes = layout.pixelCapacity
@@ -217,14 +215,13 @@ final class FrameResources {
         guard let colorTex = device.makeTexture(descriptor: texDesc) else { fatalError("Failed to allocate color texture") }
         colorTex.label = "OutputColorTex"
 
-        let depthDesc = MTLTextureDescriptor.texture2DDescriptor(pixelFormat: .r32Float, width: layout.limits.maxWidth, height: layout.limits.maxHeight, mipmapped: false)
+        // Depth texture uses half precision like LocalSort
+        let depthDesc = MTLTextureDescriptor.texture2DDescriptor(pixelFormat: .r16Float, width: layout.limits.maxWidth, height: layout.limits.maxHeight, mipmapped: false)
         depthDesc.usage = [.shaderWrite, .shaderRead]
         depthDesc.storageMode = .private
-        guard let depthTex = device.makeTexture(descriptor: depthDesc),
-              let alphaTex = device.makeTexture(descriptor: depthDesc) else { fatalError("Failed to allocate depth/alpha textures") }
+        guard let depthTex = device.makeTexture(descriptor: depthDesc) else { fatalError("Failed to allocate depth texture") }
         depthTex.label = "OutputDepthTex"
-        alphaTex.label = "OutputAlphaTex"
-        self.outputTextures = RenderOutputTextures(color: colorTex, depth: depthTex, alpha: alphaTex)
+        self.outputTextures = RenderOutputTextures(color: colorTex, depth: depthTex)
     }
 }
 
@@ -513,7 +510,7 @@ public final class GlobalSortRenderer: GaussianRenderer, @unchecked Sendable {
         }
 
         guard let result = output else { return nil }
-        return TextureRenderResult(color: result.color, depth: result.depth, alpha: result.alpha)
+        return TextureRenderResult(color: result.color, depth: result.depth, alpha: nil)
     }
 
     /// Render to CPU-readable buffers (protocol method)
@@ -669,7 +666,6 @@ public final class GlobalSortRenderer: GaussianRenderer, @unchecked Sendable {
 
         // Fused pipeline buffers (always enabled)
         add("InterleavedGaussians", gaussianCapacity * strideForInterleaved())
-        add("PackedGaussiansFused", maxAssignmentCapacity * strideForInterleaved())
 
         return FrameResourceLayout(
             limits: limits,
@@ -835,19 +831,23 @@ public final class GlobalSortRenderer: GaussianRenderer, @unchecked Sendable {
         // Submit render to textures
         let textures = frame.outputTextures
         let dispatchArgs = frame.dispatchArgs
+        let dispatchOffset = DispatchSlot.renderTiles.rawValue * MemoryLayout<DispatchIndirectArgsSwift>.stride
 
-        // Fused render: single-struct reads for cache efficiency
-        guard ordered.packedGaussiansFused != nil else {
-            fatalError("[encodeRenderToTextures] Fused pipeline unavailable")
+        // Unified index-based render (like LocalSort)
+        guard let interleavedGaussians = ordered.interleavedGaussians,
+              let sortedIndices = ordered.sortedIndices else {
+            fatalError("[encodeRenderToTextures] No interleavedGaussians or sortedIndices available")
         }
-        self.fusedPipelineEncoder.encodeCompleteFusedRender(
+        self.fusedPipelineEncoder.encodeCompleteRender(
             commandBuffer: commandBuffer,
             orderedBuffers: ordered,
-            outputTextures: textures,
+            interleavedGaussians: interleavedGaussians,
+            sortedIndices: sortedIndices,
+            colorTexture: textures.color,
+            depthTexture: textures.depth,
             params: params,
             dispatchArgs: dispatchArgs,
-            dispatchOffset: DispatchSlot.renderTiles.rawValue * MemoryLayout<DispatchIndirectArgsSwift>.stride,
-            precision: self.effectivePrecision
+            dispatchOffset: dispatchOffset
         )
 
         commandBuffer.addCompletedHandler { [weak self] _ in
@@ -929,19 +929,23 @@ public final class GlobalSortRenderer: GaussianRenderer, @unchecked Sendable {
 
         let textures = frame.outputTextures
         let dispatchArgs = frame.dispatchArgs
+        let dispatchOffset = DispatchSlot.renderTiles.rawValue * MemoryLayout<DispatchIndirectArgsSwift>.stride
 
-        // Fused render: single-struct reads for cache efficiency
-        guard ordered.packedGaussiansFused != nil else {
-            fatalError("[encodeRenderToTextureHalf] Fused pipeline unavailable")
+        // Unified index-based render (like LocalSort)
+        guard let interleavedGaussians = ordered.interleavedGaussians,
+              let sortedIndices = ordered.sortedIndices else {
+            fatalError("[encodeRenderToTextureHalf] No interleavedGaussians or sortedIndices available")
         }
-        self.fusedPipelineEncoder.encodeCompleteFusedRender(
+        self.fusedPipelineEncoder.encodeCompleteRender(
             commandBuffer: commandBuffer,
             orderedBuffers: ordered,
-            outputTextures: textures,
+            interleavedGaussians: interleavedGaussians,
+            sortedIndices: sortedIndices,
+            colorTexture: textures.color,
+            depthTexture: textures.depth,
             params: params,
             dispatchArgs: dispatchArgs,
-            dispatchOffset: DispatchSlot.renderTiles.rawValue * MemoryLayout<DispatchIndirectArgsSwift>.stride,
-            precision: .float16
+            dispatchOffset: dispatchOffset
         )
 
         commandBuffer.addCompletedHandler { [weak self] _ in
@@ -961,8 +965,7 @@ public final class GlobalSortRenderer: GaussianRenderer, @unchecked Sendable {
         cameraUniforms: CameraUniformsSwift,
         frameParams: FrameParams,
         targetColor: MTLTexture,
-        targetDepth: MTLTexture?,
-        targetAlpha: MTLTexture?
+        targetDepth: MTLTexture?
     ) -> Bool {
         let params = limits.buildParams(from: frameParams)
         guard self.validateLimits(gaussianCount: gaussianCount) else {
@@ -1013,26 +1016,28 @@ public final class GlobalSortRenderer: GaussianRenderer, @unchecked Sendable {
         }
 
         let dispatchArgs = frame.dispatchArgs
+        let dispatchOffset = DispatchSlot.renderTiles.rawValue * MemoryLayout<DispatchIndirectArgsSwift>.stride
 
         // Use user's target textures
-        let outputTextures = RenderOutputTextures(
-            color: targetColor,
-            depth: targetDepth ?? frame.outputTextures.depth,
-            alpha: targetAlpha ?? frame.outputTextures.alpha
-        )
+        let colorTex = targetColor
+        let depthTex = targetDepth ?? frame.outputTextures.depth
 
-        // Fused render: single-struct reads for cache efficiency
-        guard ordered.packedGaussiansFused != nil else {
-            fatalError("[encodeRenderToTargetTexture] Fused pipeline unavailable")
+        // Unified index-based render (like LocalSort)
+        guard let interleavedGaussians = ordered.interleavedGaussians,
+              let sortedIndices = ordered.sortedIndices else {
+            self.releaseFrame(index: slotIndex)
+            return false
         }
-        self.fusedPipelineEncoder.encodeCompleteFusedRender(
+        self.fusedPipelineEncoder.encodeCompleteRender(
             commandBuffer: commandBuffer,
             orderedBuffers: ordered,
-            outputTextures: outputTextures,
+            interleavedGaussians: interleavedGaussians,
+            sortedIndices: sortedIndices,
+            colorTexture: colorTex,
+            depthTexture: depthTex,
             params: params,
             dispatchArgs: dispatchArgs,
-            dispatchOffset: DispatchSlot.renderTiles.rawValue * MemoryLayout<DispatchIndirectArgsSwift>.stride,
-            precision: .float16
+            dispatchOffset: dispatchOffset
         )
 
         commandBuffer.addCompletedHandler { [weak self] _ in
@@ -1228,15 +1233,14 @@ public final class GlobalSortRenderer: GaussianRenderer, @unchecked Sendable {
         )
         frame.activeTileCount.contents().storeBytes(of: UInt32(0), as: UInt32.self)
 
-        // Check if we can use texture-only fused path (skip redundant standard pack payload)
-        let canUseFusedOnly = textureOnlyFused &&
-                              frame.interleavedGaussians != nil &&
-                              frame.packedGaussiansFused != nil
+        var indexBasedInterleavedBuffer: MTLBuffer? = nil
+        var indexBasedSortedIndicesBuffer: MTLBuffer? = nil
 
-        var fusedBuffer: MTLBuffer? = nil
+        // Index-based render path (like LocalSort): skip Pack step, render reads via sortedIndices
+        let useIndexBasedRender = textureOnlyFused && frame.interleavedGaussians != nil
 
-        if canUseFusedOnly {
-            // Texture-only fused path: skip standard pack payload, only build headers + fused data
+        if useIndexBasedRender {
+            // Index-based path: skip Pack step, render reads via sortedIndices
             self.packEncoder.encodeHeadersAndActiveTiles(
                 commandBuffer: commandBuffer,
                 sortedKeys: sortKeysBuffer,
@@ -1248,9 +1252,8 @@ public final class GlobalSortRenderer: GaussianRenderer, @unchecked Sendable {
 
             let fusedEncoder = self.fusedPipelineEncoder
             let interleavedBuffer = frame.interleavedGaussians!
-            let packedFusedBuffer = frame.packedGaussiansFused!
 
-            // 1. Interleave gaussian data into single struct per gaussian
+            // Only Interleave - NO Pack step (render will use sortedIndices)
             fusedEncoder.encodeInterleave(
                 commandBuffer: commandBuffer,
                 gaussianBuffers: gaussianBuffers,
@@ -1259,22 +1262,10 @@ public final class GlobalSortRenderer: GaussianRenderer, @unchecked Sendable {
                 precision: precision
             )
 
-            // 2. Pack using interleaved data (single struct read for texture render)
-            fusedEncoder.encodePackFused(
-                commandBuffer: commandBuffer,
-                sortedIndices: sortedIndicesBuffer,
-                interleavedGaussians: interleavedBuffer,
-                packedOutput: packedFusedBuffer,
-                header: assignment.header,
-                dispatchArgs: dispatchArgs,
-                dispatchOffset: DispatchSlot.pack.rawValue * MemoryLayout<DispatchIndirectArgsSwift>.stride,
-                precision: precision
-            )
-
-            fusedBuffer = packedFusedBuffer
+            indexBasedInterleavedBuffer = interleavedBuffer
+            indexBasedSortedIndicesBuffer = sortedIndicesBuffer
         } else {
             // Standard path: full pack with separated buffers (needed for buffer render)
-            // Don't run fused pack here - it's not used for buffer render
             self.packEncoder.encode(
                 commandBuffer: commandBuffer,
                 sortedIndices: sortedIndicesBuffer,
@@ -1288,7 +1279,6 @@ public final class GlobalSortRenderer: GaussianRenderer, @unchecked Sendable {
                 activeTileCount: frame.activeTileCount,
                 precision: precision
             )
-            // fusedBuffer stays nil - buffer render uses separated buffers
         }
 
         return OrderedGaussianBuffers(
@@ -1302,7 +1292,8 @@ public final class GlobalSortRenderer: GaussianRenderer, @unchecked Sendable {
             activeTileIndices: frame.activeTileIndices,
             activeTileCount: frame.activeTileCount,
             precision: precision,
-            packedGaussiansFused: fusedBuffer
+            interleavedGaussians: indexBasedInterleavedBuffer,
+            sortedIndices: indexBasedSortedIndicesBuffer
         )
     }
         

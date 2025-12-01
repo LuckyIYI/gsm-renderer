@@ -71,7 +71,8 @@ public func gaussian_renderer_render(
         activeTileIndices: frame.activeTileIndices,
         activeTileCount: frame.activeTileCount,
         precision: .float32,
-        packedGaussiansFused: nil
+        interleavedGaussians: nil,
+        sortedIndices: nil
     )
     
     guard let commandBuffer = Renderer.shared.queue.makeCommandBuffer() else { 

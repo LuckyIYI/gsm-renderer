@@ -46,18 +46,18 @@ public final class TemporalPipelineEncoder {
         self.library = lib
 
         // Load all kernel functions
-        guard let clearFn = lib.makeFunction(name: "temporal_clear"),
-              let initFn = lib.makeFunction(name: "temporal_init_sorted"),
-              let scatterDepthFn = lib.makeFunction(name: "temporal_scatter_candidates_depth"),
-              let scatterHonestFn = lib.makeFunction(name: "temporal_scatter_candidates_honest"),
-              let recomputeScoresFn = lib.makeFunction(name: "temporal_recompute_sorted_scores"),
-              let recomputeDepthsFn = lib.makeFunction(name: "temporal_recompute_sorted_depths"),
-              let resortFn = lib.makeFunction(name: "temporal_resort_after_recompute"),
-              let insertionFn = lib.makeFunction(name: "temporal_insertion_sort"),
-              let spatialFn = lib.makeFunction(name: "temporal_spatial_reuse"),
-              let renderFn = lib.makeFunction(name: "temporal_render"),
-              let stochasticFn = lib.makeFunction(name: "temporal_render_stochastic"),
-              let randomSampleFn = lib.makeFunction(name: "temporal_random_sample_tiles") else {
+        guard let clearFn = lib.makeFunction(name: "temporalClear"),
+              let initFn = lib.makeFunction(name: "temporalInitSorted"),
+              let scatterDepthFn = lib.makeFunction(name: "temporalScatterCandidatesDepth"),
+              let scatterHonestFn = lib.makeFunction(name: "temporalScatterCandidatesHonest"),
+              let recomputeScoresFn = lib.makeFunction(name: "temporalRecomputeSortedScores"),
+              let recomputeDepthsFn = lib.makeFunction(name: "temporalRecomputeSortedDepths"),
+              let resortFn = lib.makeFunction(name: "temporalResortAfterRecompute"),
+              let insertionFn = lib.makeFunction(name: "temporalInsertionSort"),
+              let spatialFn = lib.makeFunction(name: "temporalSpatialReuse"),
+              let renderFn = lib.makeFunction(name: "temporalRender"),
+              let stochasticFn = lib.makeFunction(name: "temporalRenderStochastic"),
+              let randomSampleFn = lib.makeFunction(name: "temporalRandomSampleTiles") else {
             fatalError("Missing required kernel functions in TemporalShaders")
         }
 

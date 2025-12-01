@@ -64,13 +64,13 @@ struct LocalSortRenderParams {
 // =============================================================================
 
 // Pack half4 to float2
-inline float2 localSort_packHalf4(half4 v) {
+inline float2 localSortPackHalf4(half4 v) {
     uint2 u = uint2(as_type<uint>(half2(v.xy)), as_type<uint>(half2(v.zw)));
     return float2(as_type<float>(u.x), as_type<float>(u.y));
 }
 
 // Unpack float2 to half4
-inline half4 localSort_unpackHalf4(float2 v) {
+inline half4 localSortUnpackHalf4(float2 v) {
     uint2 u = uint2(as_type<uint>(v.x), as_type<uint>(v.y));
     return half4(as_type<half2>(u.x), as_type<half2>(u.y));
 }
@@ -83,7 +83,7 @@ inline half4 localSort_unpackHalf4(float2 v) {
 // Threshold w = 2 * power in the quadratic form: conic.x*dx^2 + 2*conic.y*dx*dy + conic.z*dy^2 <= w
 
 // Segment-ellipse intersection (FlashGS exact)
-inline bool localSort_segmentIntersectEllipse(float a, float b, float c, float d, float l, float r) {
+inline bool localSortSegmentIntersectEllipse(float a, float b, float c, float d, float l, float r) {
     float delta = b * b - 4.0f * a * c;
     float t1 = (l - d) * (2.0f * a) + b;
     float t2 = (r - d) * (2.0f * a) + b;
@@ -92,7 +92,7 @@ inline bool localSort_segmentIntersectEllipse(float a, float b, float c, float d
 
 // Block-ellipse intersection (FlashGS exact)
 // Tests closest vertical and horizontal edges
-inline bool localSort_blockIntersectEllipse(int2 pix_min, int2 pix_max, float2 center, float3 conic, float power) {
+inline bool localSortBlockIntersectEllipse(int2 pix_min, int2 pix_max, float2 center, float3 conic, float power) {
     float w = 2.0f * power;
     float dx, dy;
     float a, b, c;
@@ -107,7 +107,7 @@ inline bool localSort_blockIntersectEllipse(int2 pix_min, int2 pix_max, float2 c
     b = -2.0f * conic.y * dx;
     c = conic.x * dx * dx - w;
 
-    if (localSort_segmentIntersectEllipse(a, b, c, center.y, float(pix_min.y), float(pix_max.y))) {
+    if (localSortSegmentIntersectEllipse(a, b, c, center.y, float(pix_min.y), float(pix_max.y))) {
         return true;
     }
 
@@ -121,7 +121,7 @@ inline bool localSort_blockIntersectEllipse(int2 pix_min, int2 pix_max, float2 c
     b = -2.0f * conic.y * dy;
     c = conic.z * dy * dy - w;
 
-    if (localSort_segmentIntersectEllipse(a, b, c, center.x, float(pix_min.x), float(pix_max.x))) {
+    if (localSortSegmentIntersectEllipse(a, b, c, center.x, float(pix_min.x), float(pix_max.x))) {
         return true;
     }
 
@@ -129,7 +129,7 @@ inline bool localSort_blockIntersectEllipse(int2 pix_min, int2 pix_max, float2 c
 }
 
 // Block contains center (FlashGS exact)
-inline bool localSort_blockContainsCenter(int2 pix_min, int2 pix_max, float2 center) {
+inline bool localSortBlockContainsCenter(int2 pix_min, int2 pix_max, float2 center) {
     return center.x >= float(pix_min.x) && center.x <= float(pix_max.x) &&
            center.y >= float(pix_min.y) && center.y <= float(pix_max.y);
 }
@@ -137,7 +137,7 @@ inline bool localSort_blockContainsCenter(int2 pix_min, int2 pix_max, float2 cen
 // Compute power from opacity (FlashGS exact)
 // power = ln2 * 8 + ln2 * log2(opacity) = ln(256 * opacity)
 constant float LN2 = 0.693147180559945f;
-inline float localSort_computePower(float opacity) {
+inline float localSortComputePower(float opacity) {
     return LN2 * 8.0f + LN2 * log2(max(opacity, 1e-6f));
 }
 
@@ -159,7 +159,7 @@ kernel void tileBinningZeroCountsKernel(
 // KERNEL 1: CLEAR (full reset including header)
 // =============================================================================
 
-kernel void localSort_clear(
+kernel void localSortClear(
     device atomic_uint* tileCounts [[buffer(0)]],
     device LocalSortCompactedHeader* header [[buffer(1)]],
     constant uint& tileCount [[buffer(2)]],
@@ -182,7 +182,7 @@ kernel void localSort_clear(
 // Templated on world gaussian type and harmonics type for maximum flexibility
 
 template <typename PackedWorldT, typename HarmonicsT>
-kernel void localSort_project_compact_count(
+kernel void localSortProjectCompactCount(
     const device PackedWorldT* worldGaussians [[buffer(0)]],
     const device HarmonicsT* harmonics [[buffer(1)]],
     device LocalSortCompactedGaussian* compacted [[buffer(2)]],
@@ -294,7 +294,7 @@ kernel void localSort_project_compact_count(
 
     compacted[idx].covariance_depth = float4(conic, depth);
     // Use the computed color from harmonics (debug line removed)
-    compacted[idx].position_color = float4(px, py, localSort_packHalf4(half4(half3(color), half(opacity))));
+    compacted[idx].position_color = float4(px, py, localSortPackHalf4(half4(half3(color), half(opacity))));
     compacted[idx].min_tile = minTile;
     compacted[idx].max_tile = maxTile;
 }
@@ -303,32 +303,32 @@ kernel void localSort_project_compact_count(
 // Uses shared structures from GaussianStructs.h: PackedWorldGaussian, PackedWorldGaussianHalf, CameraUniforms
 
 // Float world, float harmonics (original)
-template [[host_name("localSort_project_compact_count_float")]]
-kernel void localSort_project_compact_count<PackedWorldGaussian, float>(
+template [[host_name("localSortProjectCompactCountFloat")]]
+kernel void localSortProjectCompactCount<PackedWorldGaussian, float>(
     const device PackedWorldGaussian*, const device float*,
     device LocalSortCompactedGaussian*, device LocalSortCompactedHeader*,
     device atomic_uint*, constant CameraUniforms&,
     constant LocalSortProjectParams&, uint);
 
 // Half world, float harmonics
-template [[host_name("localSort_project_compact_count_half")]]
-kernel void localSort_project_compact_count<PackedWorldGaussianHalf, float>(
+template [[host_name("localSortProjectCompactCountHalf")]]
+kernel void localSortProjectCompactCount<PackedWorldGaussianHalf, float>(
     const device PackedWorldGaussianHalf*, const device float*,
     device LocalSortCompactedGaussian*, device LocalSortCompactedHeader*,
     device atomic_uint*, constant CameraUniforms&,
     constant LocalSortProjectParams&, uint);
 
 // Float world, half harmonics (memory bandwidth optimization)
-template [[host_name("localSort_project_compact_count_float_halfsh")]]
-kernel void localSort_project_compact_count<PackedWorldGaussian, half>(
+template [[host_name("localSortProjectCompactCountFloatHalfSh")]]
+kernel void localSortProjectCompactCount<PackedWorldGaussian, half>(
     const device PackedWorldGaussian*, const device half*,
     device LocalSortCompactedGaussian*, device LocalSortCompactedHeader*,
     device atomic_uint*, constant CameraUniforms&,
     constant LocalSortProjectParams&, uint);
 
 // Half world, half harmonics (full half precision pipeline)
-template [[host_name("localSort_project_compact_count_half_halfsh")]]
-kernel void localSort_project_compact_count<PackedWorldGaussianHalf, half>(
+template [[host_name("localSortProjectCompactCountHalfHalfSh")]]
+kernel void localSortProjectCompactCount<PackedWorldGaussianHalf, half>(
     const device PackedWorldGaussianHalf*, const device half*,
     device LocalSortCompactedGaussian*, device LocalSortCompactedHeader*,
     device atomic_uint*, constant CameraUniforms&,
@@ -341,7 +341,7 @@ kernel void localSort_project_compact_count<PackedWorldGaussianHalf, half>(
 #define LOCAL_SORT_PREFIX_BLOCK_SIZE 256
 #define LOCAL_SORT_PREFIX_GRAIN_SIZE 4
 
-kernel void localSort_prefix_scan(
+kernel void localSortPrefixScan(
     const device uint* input [[buffer(0)]],
     device uint* output [[buffer(1)]],
     constant uint& count [[buffer(2)]],
@@ -395,7 +395,7 @@ kernel void localSort_prefix_scan(
     }
 }
 
-kernel void localSort_scan_partial_sums(
+kernel void localSortScanPartialSums(
     device uint* partialSums [[buffer(0)]],
     constant uint& numPartials [[buffer(1)]],
     ushort localId [[thread_position_in_threadgroup]]
@@ -419,7 +419,7 @@ kernel void localSort_scan_partial_sums(
     }
 }
 
-kernel void localSort_finalize_scan(
+kernel void localSortFinalizeScan(
     device uint* output [[buffer(0)]],
     constant uint& count [[buffer(1)]],
     const device uint* partialSums [[buffer(2)]],
@@ -441,7 +441,7 @@ kernel void localSort_finalize_scan(
 }
 
 // Fused finalize scan + zero counters (one dispatch instead of two)
-kernel void localSort_finalize_scan_and_zero(
+kernel void localSortFinalizeScanAndZero(
     device uint* output [[buffer(0)]],
     device atomic_uint* counters [[buffer(1)]],
     constant uint& count [[buffer(2)]],
@@ -472,7 +472,7 @@ kernel void localSort_finalize_scan_and_zero(
 // Writes MTLDispatchThreadgroupsIndirectArguments based on visibleCount
 // Uses Metal's built-in MTLDispatchThreadgroupsIndirectArguments struct
 
-kernel void localSort_prepare_scatter_dispatch(
+kernel void localSortPrepareScatterDispatch(
     const device LocalSortCompactedHeader* header [[buffer(0)]],
     device MTLDispatchThreadgroupsIndirectArguments* dispatchArgs [[buffer(1)]],
     constant uint& threadgroupWidth [[buffer(2)]]
@@ -488,7 +488,7 @@ kernel void localSort_prepare_scatter_dispatch(
 // KERNEL 4a: COMPUTE PER-GAUSSIAN TILE COUNTS (for balanced scatter)
 // =============================================================================
 
-kernel void localSort_compute_gaussian_tile_counts(
+kernel void localSortComputeGaussianTileCounts(
     const device LocalSortCompactedGaussian* compacted [[buffer(0)]],
     const device LocalSortCompactedHeader* header [[buffer(1)]],
     device uint* gaussianTileCounts [[buffer(2)]],  // Output: tiles per gaussian
@@ -518,7 +518,7 @@ kernel void localSort_compute_gaussian_tile_counts(
 // - Warp-level atomic batching (only lane 0 does atomic)
 // - Each thread computes its write position via popcount
 
-kernel void localSort_scatter_simd(
+kernel void localSortScatterSimd(
     const device LocalSortCompactedGaussian* compacted [[buffer(0)]],
     const device LocalSortCompactedHeader* header [[buffer(1)]],
     device atomic_uint* tileCounters [[buffer(2)]],
@@ -557,8 +557,8 @@ kernel void localSort_scatter_simd(
         g = compacted[gaussianIdx];
         conic = g.covariance_depth.xyz;
         center = g.position_color.xy;
-        half4 colorOp = localSort_unpackHalf4(g.position_color.zw);
-        power = localSort_computePower(float(colorOp.w));
+        half4 colorOp = localSortUnpackHalf4(g.position_color.zw);
+        power = localSortComputePower(float(colorOp.w));
         // 32-bit stable key: (depth16 << 16) | compactedIdx for deterministic tie-breaking
         uint depth16 = ((as_type<uint>(g.covariance_depth.w) ^ 0x80000000u) >> 16u) & 0xFFFFu;
         depthKey = (depth16 << 16) | (gaussianIdx & 0xFFFFu);
@@ -598,8 +598,8 @@ kernel void localSort_scatter_simd(
         int2 pix_max = int2(pix_min.x + tileWidth - 1, pix_min.y + tileHeight - 1);
 
         // FlashGS intersection test 
-        bool valid = localSort_blockContainsCenter(pix_min, pix_max, center) ||
-                     localSort_blockIntersectEllipse(pix_min, pix_max, center, conic, power);
+        bool valid = localSortBlockContainsCenter(pix_min, pix_max, center) ||
+                     localSortBlockIntersectEllipse(pix_min, pix_max, center, conic, power);
 
         // SIMD early-out: skip iteration if no lanes are valid
         simd_vote ballot = simd_ballot(valid);
@@ -628,7 +628,7 @@ kernel void localSort_scatter_simd(
 
 #define SORT_MAX_SIZE 4096
 
-kernel void localSort_per_tile_sort(
+kernel void localSortPerTileSort(
     device uint* keys [[buffer(0)]],
     device uint* values [[buffer(1)]],
     const device uint* offsets [[buffer(2)]],
@@ -713,7 +713,7 @@ kernel void localSort_per_tile_sort(
 #define LOCAL_SORT_PIXELS_X 4
 #define LOCAL_SORT_PIXELS_Y 2
 
-kernel void localSort_render(
+kernel void localSortRender(
     const device LocalSortCompactedGaussian* compacted [[buffer(0)]],
     const device uint* offsets [[buffer(1)]],
     const device uint* counts [[buffer(2)]],
@@ -759,7 +759,7 @@ kernel void localSort_render(
 
         half2 gPos = half2(g.position_color.xy);
         half3 cov = half3(g.covariance_depth.xyz);
-        half4 colorOp = localSort_unpackHalf4(g.position_color.zw);
+        half4 colorOp = localSortUnpackHalf4(g.position_color.zw);
 
         // Match original pipeline's formula exactly
         half cxx = cov.x, cyy = cov.z, cxy2 = 2.0h * cov.y;

@@ -5,12 +5,12 @@ final class TileBoundsEncoder {
     private let pipelineHalf: MTLComputePipelineState?
 
     init(device: MTLDevice, library: MTLLibrary) throws {
-        guard let function = library.makeFunction(name: "tileBoundsKernel_float") else {
-            fatalError("tileBoundsKernel_float not found")
+        guard let function = library.makeFunction(name: "tileBoundsKernelFloat") else {
+            fatalError("tileBoundsKernelFloat not found")
         }
         self.pipeline = try device.makeComputePipelineState(function: function)
 
-        if let functionHalf = library.makeFunction(name: "tileBoundsKernel_half") {
+        if let functionHalf = library.makeFunction(name: "tileBoundsKernelHalf") {
             self.pipelineHalf = try? device.makeComputePipelineState(function: functionHalf)
         } else {
             self.pipelineHalf = nil

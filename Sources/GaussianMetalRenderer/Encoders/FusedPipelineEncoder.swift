@@ -16,15 +16,15 @@ final class FusedPipelineEncoder {
 
     init(device: MTLDevice, library: MTLLibrary) throws {
         // Interleave kernels
-        guard let interleaveHalfFn = library.makeFunction(name: "interleaveGaussianDataKernel_half"),
-              let interleaveFloatFn = library.makeFunction(name: "interleaveGaussianDataKernel_float")
+        guard let interleaveHalfFn = library.makeFunction(name: "interleaveGaussianDataKernelHalf"),
+              let interleaveFloatFn = library.makeFunction(name: "interleaveGaussianDataKernelFloat")
         else {
             throw NSError(domain: "FusedPipelineEncoder", code: 1,
                           userInfo: [NSLocalizedDescriptionKey: "Interleave kernel functions missing"])
         }
 
         // Unified render kernel (like LocalSort)
-        guard let renderFn = library.makeFunction(name: "globalSort_render") else {
+        guard let renderFn = library.makeFunction(name: "globalSortRender") else {
             throw NSError(domain: "FusedPipelineEncoder", code: 3,
                           userInfo: [NSLocalizedDescriptionKey: "Render kernel function missing"])
         }
@@ -103,7 +103,7 @@ final class FusedPipelineEncoder {
     ) {
         guard let encoder = commandBuffer.makeComputeCommandEncoder() else { return }
 
-        encoder.label = "GlobalSort_Render"
+        encoder.label = "GlobalSortRender"
         encoder.setComputePipelineState(renderPipeline)
 
         encoder.setBuffer(headers, offset: 0, index: 0)

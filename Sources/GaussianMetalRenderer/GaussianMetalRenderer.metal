@@ -312,8 +312,8 @@ kernel void renderTiles(
     }
 }
 
-#define instantiate_renderTiles(name, T, Vec2, Vec4, Packed3) \
-    template [[host_name("renderTiles_" #name)]] \
+#define instantiate_renderTiles(name, hostName, T, Vec2, Vec4, Packed3) \
+    template [[host_name(hostName)]] \
     kernel void renderTiles<T, Vec2, Vec4, Packed3>( \
         const device GaussianHeader* headers [[buffer(0)]], \
         const device Vec2* means [[buffer(1)]], \
@@ -332,8 +332,8 @@ kernel void renderTiles(
         uint threadIdx [[thread_index_in_threadgroup]] \
     );
 
-instantiate_renderTiles(float, float, float2, float4, packed_float3)
-instantiate_renderTiles(half, half, half2, half4, packed_half3)
+instantiate_renderTiles(float, "renderTilesFloat", float, float2, float4, packed_float3)
+instantiate_renderTiles(half, "renderTilesHalf", half, half2, half4, packed_half3)
 
 #undef instantiate_renderTiles
 
@@ -430,8 +430,8 @@ kernel void tileBoundsKernel(
     bounds[idx] = int4(minX, maxX, minY, maxY);
 }
 
-#define instantiate_tileBoundsKernel(name, MeansT) \
-    template [[host_name("tileBoundsKernel_" #name)]] \
+#define instantiate_tileBoundsKernel(name, hostName, MeansT) \
+    template [[host_name(hostName)]] \
     kernel void tileBoundsKernel<MeansT>( \
         const device MeansT* means [[buffer(0)]], \
         const device float* radii [[buffer(1)]], \
@@ -440,8 +440,8 @@ kernel void tileBoundsKernel(
         constant TileBoundsParams& params [[buffer(4)]], \
         uint idx [[thread_position_in_grid]]);
 
-instantiate_tileBoundsKernel(float, float2)
-instantiate_tileBoundsKernel(half, half2)
+instantiate_tileBoundsKernel(float, "tileBoundsKernelFloat", float2)
+instantiate_tileBoundsKernel(half, "tileBoundsKernelHalf", half2)
 
 #undef instantiate_tileBoundsKernel
 
@@ -478,8 +478,8 @@ kernel void computeSortKeysKernel(
     }
 }
 
-#define instantiate_computeSortKeysKernel(name, DepthT) \
-    template [[host_name("computeSortKeysKernel_" #name)]] \
+#define instantiate_computeSortKeysKernel(name, hostName, DepthT) \
+    template [[host_name(hostName)]] \
     kernel void computeSortKeysKernel<DepthT>( \
         const device int* tileIds [[buffer(0)]], \
         const device int* tileIndices [[buffer(1)]], \
@@ -489,8 +489,8 @@ kernel void computeSortKeysKernel(
         const device TileAssignmentHeader& header [[buffer(5)]], \
         uint gid [[thread_position_in_grid]]);
 
-instantiate_computeSortKeysKernel(float, float)
-instantiate_computeSortKeysKernel(half, half)
+instantiate_computeSortKeysKernel(float, "computeSortKeysKernelFloat", float)
+instantiate_computeSortKeysKernel(half, "computeSortKeysKernelHalf", half)
 
 #undef instantiate_computeSortKeysKernel
 
@@ -532,8 +532,8 @@ kernel void packTileDataKernel(
     outDepths[gid] = OutT(float(depths[src]));
 }
 
-#define instantiate_packTileDataKernel(name, InT, InVec2, InVec4, InPacked3, OutT, OutVec2, OutVec4, OutPacked3) \
-    template [[host_name("packTileDataKernel_" #name)]] \
+#define instantiate_packTileDataKernel(name, hostName, InT, InVec2, InVec4, InPacked3, OutT, OutVec2, OutVec4, OutPacked3) \
+    template [[host_name(hostName)]] \
     kernel void packTileDataKernel<InT, InVec2, InVec4, InPacked3, OutT, OutVec2, OutVec4, OutPacked3>( \
         const device int* sortedIndices [[buffer(0)]], \
         const device InVec2* means [[buffer(1)]], \
@@ -553,9 +553,9 @@ kernel void packTileDataKernel(
     );
 
 // float input -> float output
-instantiate_packTileDataKernel(float, float, float2, float4, packed_float3, float, float2, float4, packed_float3)
+instantiate_packTileDataKernel(float, "packTileDataKernelFloat", float, float2, float4, packed_float3, float, float2, float4, packed_float3)
 // half input -> half output
-instantiate_packTileDataKernel(half, half, half2, half4, packed_half3, half, half2, half4, packed_half3)
+instantiate_packTileDataKernel(half, "packTileDataKernelHalf", half, half2, half4, packed_half3, half, half2, half4, packed_half3)
 
 #undef instantiate_packTileDataKernel
 
@@ -1658,7 +1658,7 @@ kernel void unpackSortKeysKernel(
 // =============================================================================
 
 /// Interleave separate gaussian buffers into single struct (half16)
-kernel void interleaveGaussianDataKernel_half(
+kernel void interleaveGaussianDataKernelHalf(
     const device half2*         means       [[buffer(0)]],
     const device half4*         conics      [[buffer(1)]],
     const device packed_half3*  colors      [[buffer(2)]],
@@ -1682,7 +1682,7 @@ kernel void interleaveGaussianDataKernel_half(
 }
 
 /// Interleave separate gaussian buffers into single struct (float32)
-kernel void interleaveGaussianDataKernel_float(
+kernel void interleaveGaussianDataKernelFloat(
     const device float2*         means       [[buffer(0)]],
     const device float4*         conics      [[buffer(1)]],
     const device packed_float3*  colors      [[buffer(2)]],
@@ -1721,7 +1721,7 @@ kernel void interleaveGaussianDataKernel_float(
 // - Uses index-based access via sortedIndices (no Pack step needed)
 // - Half precision only (matching LocalSort)
 
-kernel void globalSort_render(
+kernel void globalSortRender(
     const device GaussianHeader*     headers         [[buffer(0)]],
     const device GaussianRenderData* gaussians       [[buffer(1)]],  // interleavedGaussians
     const device int*                sortedIndices   [[buffer(2)]],  // indices into gaussians

@@ -60,16 +60,16 @@ public final class LocalSortPipelineEncoder {
         var defaultDegree: UInt32 = 3
         defaultConstants.setConstantValue(&defaultDegree, type: .uint, index: 0)
 
-        guard let clearFn = library.makeFunction(name: "localSort_clear"),
-              let projectFn = try? library.makeFunction(name: "localSort_project_compact_count_float", constantValues: defaultConstants),
-              let prefixFn = library.makeFunction(name: "localSort_prefix_scan"),
-              let partialFn = library.makeFunction(name: "localSort_scan_partial_sums"),
-              let finalizeFn = library.makeFunction(name: "localSort_finalize_scan"),
-              let finalizeAndZeroFn = library.makeFunction(name: "localSort_finalize_scan_and_zero"),
-              let prepareDispatchFn = library.makeFunction(name: "localSort_prepare_scatter_dispatch"),
-              let scatterFn = library.makeFunction(name: "localSort_scatter_simd"),
-              let sortFn = library.makeFunction(name: "localSort_per_tile_sort"),
-              let renderFn = library.makeFunction(name: "localSort_render") else {
+        guard let clearFn = library.makeFunction(name: "localSortClear"),
+              let projectFn = try? library.makeFunction(name: "localSortProjectCompactCountFloat", constantValues: defaultConstants),
+              let prefixFn = library.makeFunction(name: "localSortPrefixScan"),
+              let partialFn = library.makeFunction(name: "localSortScanPartialSums"),
+              let finalizeFn = library.makeFunction(name: "localSortFinalizeScan"),
+              let finalizeAndZeroFn = library.makeFunction(name: "localSortFinalizeScanAndZero"),
+              let prepareDispatchFn = library.makeFunction(name: "localSortPrepareScatterDispatch"),
+              let scatterFn = library.makeFunction(name: "localSortScatterSimd"),
+              let sortFn = library.makeFunction(name: "localSortPerTileSort"),
+              let renderFn = library.makeFunction(name: "localSortRender") else {
             fatalError("Missing required kernel functions in LocalSortShaders")
         }
 
@@ -85,7 +85,7 @@ public final class LocalSortPipelineEncoder {
         self.renderPipeline = try device.makeComputePipelineState(function: renderFn)
 
         // Half precision project kernel (half world + half harmonics for bandwidth)
-        if let projectHalfFn = try? library.makeFunction(name: "localSort_project_compact_count_half_halfsh", constantValues: defaultConstants) {
+        if let projectHalfFn = try? library.makeFunction(name: "localSortProjectCompactCountHalfHalfSh", constantValues: defaultConstants) {
             self.projectCompactCountHalfPipeline = try? device.makeComputePipelineState(function: projectHalfFn)
         } else {
             self.projectCompactCountHalfPipeline = nil
@@ -99,19 +99,19 @@ public final class LocalSortPipelineEncoder {
             constantValues.setConstantValue(&shDegree, type: .uint, index: 0) // SH_DEGREE at index 0
 
             // Float world + float harmonics variant
-            if let fn = try? library.makeFunction(name: "localSort_project_compact_count_float", constantValues: constantValues) {
+            if let fn = try? library.makeFunction(name: "localSortProjectCompactCountFloat", constantValues: constantValues) {
                 self.projectPipelinesBySHDegree[degree] = try? device.makeComputePipelineState(function: fn)
             }
 
             // Half world + half harmonics variant
-            if let fn = try? library.makeFunction(name: "localSort_project_compact_count_half_halfsh", constantValues: constantValues) {
+            if let fn = try? library.makeFunction(name: "localSortProjectCompactCountHalfHalfSh", constantValues: constantValues) {
                 self.projectHalfPipelinesBySHDegree[degree] = try? device.makeComputePipelineState(function: fn)
             }
         }
 
         // Texture-cached render pipelines (optional, for TLB optimization)
-        if let packFn = library.makeFunction(name: "localSort_pack_render_texture"),
-           let renderTexFn = library.makeFunction(name: "localSort_render_textured") {
+        if let packFn = library.makeFunction(name: "localSortPackRenderTexture"),
+           let renderTexFn = library.makeFunction(name: "localSortRenderTextured") {
             self.packRenderTexturePipeline = try? device.makeComputePipelineState(function: packFn)
             self.renderTexturedPipeline = try? device.makeComputePipelineState(function: renderTexFn)
         } else {

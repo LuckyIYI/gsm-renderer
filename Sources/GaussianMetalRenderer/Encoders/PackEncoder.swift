@@ -10,15 +10,15 @@ final class PackEncoder {
 
     init(device: MTLDevice, library: MTLLibrary) throws {
         guard
-            let packFn = library.makeFunction(name: "packTileDataKernel_float"),
+            let packFn = library.makeFunction(name: "packTileDataKernelFloat"),
             let headerFn = library.makeFunction(name: "buildHeadersFromSortedKernel"),
             let compactFn = library.makeFunction(name: "compactActiveTilesKernel")
         else {
             fatalError("Pack functions missing")
         }
-        
+
         self.packPipeline = try device.makeComputePipelineState(function: packFn)
-        if let packHalfFn = library.makeFunction(name: "packTileDataKernel_half") {
+        if let packHalfFn = library.makeFunction(name: "packTileDataKernelHalf") {
             self.packPipelineHalf = try? device.makeComputePipelineState(function: packHalfFn)
         } else {
             self.packPipelineHalf = nil

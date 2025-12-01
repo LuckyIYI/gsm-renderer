@@ -6,12 +6,12 @@ final class SortKeyGenEncoder {
     let threadgroupSize: Int
 
     init(device: MTLDevice, library: MTLLibrary) throws {
-        guard let function = library.makeFunction(name: "computeSortKeysKernel_float") else {
-            fatalError("computeSortKeysKernel_float not found")
+        guard let function = library.makeFunction(name: "computeSortKeysKernelFloat") else {
+            fatalError("computeSortKeysKernelFloat not found")
         }
         self.pipeline = try device.makeComputePipelineState(function: function)
 
-        if let functionHalf = library.makeFunction(name: "computeSortKeysKernel_half") {
+        if let functionHalf = library.makeFunction(name: "computeSortKeysKernelHalf") {
             self.pipelineHalf = try? device.makeComputePipelineState(function: functionHalf)
         } else {
             self.pipelineHalf = nil

@@ -286,7 +286,7 @@ inline uint temporal_compute_score_key(TemporalCompactedGaussian g) {
 // KERNEL: CLEAR TEMPORAL BUFFERS
 // =============================================================================
 
-kernel void temporal_clear(
+kernel void temporalClear(
     device uint* candidateCounts [[buffer(0)]],
     device uint* worldToCompacted [[buffer(1)]],
     device uint* candidateIndices [[buffer(2)]],
@@ -308,7 +308,7 @@ kernel void temporal_clear(
 // KERNEL: INITIALIZE SORTED BUFFERS
 // =============================================================================
 
-kernel void temporal_init_sorted(
+kernel void temporalInitSorted(
     device uint* sortedKeys [[buffer(0)]],
     device uint* sortedIndices [[buffer(1)]],
     device uint* sortedCounts [[buffer(2)]],
@@ -330,7 +330,7 @@ kernel void temporal_init_sorted(
 // KERNEL: SCATTER CANDIDATES (STOCHASTIC HASH-BASED)
 // =============================================================================
 
-kernel void temporal_scatter_candidates_depth(
+kernel void temporalScatterCandidatesDepth(
     const device TemporalCompactedGaussian* compacted [[buffer(0)]],
     const device TemporalCompactedHeader* header [[buffer(1)]],
     const device uint* compactedToWorld [[buffer(2)]],
@@ -394,7 +394,7 @@ kernel void temporal_scatter_candidates_depth(
 // KERNEL: SCATTER CANDIDATES (HONEST - ATOMIC COUNTERS)
 // =============================================================================
 
-kernel void temporal_scatter_candidates_honest(
+kernel void temporalScatterCandidatesHonest(
     const device TemporalCompactedGaussian* compacted [[buffer(0)]],
     const device TemporalCompactedHeader* header [[buffer(1)]],
     const device uint* compactedToWorld [[buffer(2)]],
@@ -451,7 +451,7 @@ kernel void temporal_scatter_candidates_honest(
 // KERNEL: RECOMPUTE SORTED SCORES
 // =============================================================================
 
-kernel void temporal_recompute_sorted_scores(
+kernel void temporalRecomputeSortedScores(
     device uint* sortedKeys [[buffer(0)]],
     device uint* sortedIndices [[buffer(1)]],
     device uint* sortedCounts [[buffer(2)]],
@@ -511,7 +511,7 @@ kernel void temporal_recompute_sorted_scores(
 // KERNEL: RECOMPUTE SORTED DEPTHS (PARALLEL)
 // =============================================================================
 
-kernel void temporal_recompute_sorted_depths(
+kernel void temporalRecomputeSortedDepths(
     device uint* sortedKeys [[buffer(0)]],
     const device uint* sortedIndices [[buffer(1)]],
     const device uint* sortedCounts [[buffer(2)]],
@@ -563,7 +563,7 @@ kernel void temporal_recompute_sorted_depths(
 // KERNEL: RESORT AFTER RECOMPUTE
 // =============================================================================
 
-kernel void temporal_resort_after_recompute(
+kernel void temporalResortAfterRecompute(
     device uint* sortedKeys [[buffer(0)]],
     device uint* sortedIndices [[buffer(1)]],
     device uint* sortedCounts [[buffer(2)]],
@@ -634,7 +634,7 @@ kernel void temporal_resort_after_recompute(
 // KERNEL: TEMPORAL INSERTION SORT
 // =============================================================================
 
-kernel void temporal_insertion_sort(
+kernel void temporalInsertionSort(
     device uint* sortedKeys [[buffer(0)]],
     device uint* sortedIndices [[buffer(1)]],
     device uint* sortedCounts [[buffer(2)]],
@@ -753,7 +753,7 @@ kernel void temporal_insertion_sort(
 // KERNEL: SPATIAL REUSE
 // =============================================================================
 
-kernel void temporal_spatial_reuse(
+kernel void temporalSpatialReuse(
     device uint* sortedKeys [[buffer(0)]],
     device uint* sortedIndices [[buffer(1)]],
     device uint* sortedCounts [[buffer(2)]],
@@ -842,7 +842,7 @@ kernel void temporal_spatial_reuse(
 // KERNEL: TEMPORAL RENDER
 // =============================================================================
 
-kernel void temporal_render(
+kernel void temporalRender(
     const device TemporalCompactedGaussian* compacted [[buffer(0)]],
     const device uint* sortedCounts [[buffer(1)]],
     const device uint* sortedWorldIndices [[buffer(2)]],
@@ -952,7 +952,7 @@ kernel void temporal_render(
 // KERNEL: STOCHASTIC RENDER
 // =============================================================================
 
-kernel void temporal_render_stochastic(
+kernel void temporalRenderStochastic(
     const device TemporalCompactedGaussian* compacted [[buffer(0)]],
     const device uint* sortedCounts [[buffer(1)]],
     const device uint* sortedWorldIndices [[buffer(2)]],
@@ -1053,7 +1053,7 @@ kernel void temporal_render_stochastic(
 // KERNEL: RANDOM SAMPLE TILES
 // =============================================================================
 
-kernel void temporal_random_sample_tiles(
+kernel void temporalRandomSampleTiles(
     const device TemporalCompactedGaussian* compacted [[buffer(0)]],
     const device uint* compactedHeader [[buffer(1)]],
     const device uint* compactedToWorld [[buffer(2)]],

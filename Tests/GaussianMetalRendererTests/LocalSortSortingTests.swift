@@ -25,7 +25,7 @@ final class LocalSortSortingTests: XCTestCase {
         // Load Local library
         let library = try loadLocalLibrary(device: device)
 
-        guard let sortFn = library.makeFunction(name: "localSort_per_tile_sort") else {
+        guard let sortFn = library.makeFunction(name: "localSortPerTileSort") else {
             XCTFail("Missing sort function")
             return
         }
@@ -133,7 +133,7 @@ final class LocalSortSortingTests: XCTestCase {
 
         let library = try loadLocalLibrary(device: device)
 
-        guard let sortFn = library.makeFunction(name: "localSort_per_tile_sort") else {
+        guard let sortFn = library.makeFunction(name: "localSortPerTileSort") else {
             XCTFail("Missing sort function")
             return
         }
@@ -209,7 +209,7 @@ final class LocalSortSortingTests: XCTestCase {
 
         let library = try loadLocalLibrary(device: device)
 
-        guard let sortFn = library.makeFunction(name: "localSort_per_tile_sort") else {
+        guard let sortFn = library.makeFunction(name: "localSortPerTileSort") else {
             XCTFail("Missing sort function")
             return
         }

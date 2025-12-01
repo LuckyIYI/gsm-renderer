@@ -133,20 +133,36 @@ struct ScatterParams {
     uint tileHeight;
 };
 
+/// Unified parameters for projection/tiling/binning
+/// Used by both LocalSort (project+compact+count) and GlobalSort (tile binning)
 struct TileBinningParams {
     uint gaussianCount;
     uint tilesX;
     uint tilesY;
     uint tileWidth;
     uint tileHeight;
-    uint maxAssignments;
+    uint surfaceWidth;      // = width for screen-space bounds
+    uint surfaceHeight;     // = height for screen-space bounds
+    uint maxCapacity;       // maxCompacted / maxAssignments - same concept
 };
 
+/// Unified header for tile assignment tracking
+/// Contains both atomic and non-atomic views of the same data
+/// Memory layout: [visibleCount/totalAssignments][maxCapacity][paddedCount][overflow]
 struct TileAssignmentHeader {
-    uint totalAssignments;
-    uint maxAssignments;
-    uint paddedCount;
-    uint overflow;
+    uint totalAssignments;  // Non-atomic read of visible count (after kernel completes)
+    uint maxCapacity;       // Max assignments/compacted capacity
+    uint paddedCount;       // Padded count for radix sort (power of 2)
+    uint overflow;          // Overflow flag
+};
+
+/// Atomic version of header for GPU atomics (same memory layout as TileAssignmentHeader)
+/// Use this in kernels that need atomic_fetch_add on visibleCount
+struct TileAssignmentHeaderAtomic {
+    atomic_uint visibleCount;   // Atomic counter for visible gaussians
+    uint maxCapacity;           // Max capacity (read-only in kernel)
+    uint paddedCount;           // Padded count (set after sort)
+    uint overflow;              // Overflow flag
 };
 
 struct SortKeyParams {

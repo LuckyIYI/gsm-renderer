@@ -7,23 +7,18 @@
 using namespace metal;
 
 // =============================================================================
-// PACKED PROJECTION KERNEL - Single coalesced read per gaussian
-// Uses PackedWorldGaussian for dramatically better memory access patterns
+// PROJECTION KERNEL - Outputs to packed GaussianRenderData struct
+// Single coalesced read per gaussian, single write to packed output
 // =============================================================================
 
-template <typename PackedWorldT, typename HarmonicT,
-          typename OutVec2, typename OutVec4, typename OutT, typename OutPacked3>
-kernel void projectGaussiansPacked(
+template <typename PackedWorldT, typename HarmonicT, typename RenderDataT>
+kernel void projectGaussians(
     const device PackedWorldT* worldGaussians [[buffer(0)]],
     const device HarmonicT* harmonics [[buffer(1)]],
-    device OutVec2* outMeans [[buffer(2)]],
-    device OutVec4* outConics [[buffer(3)]],
-    device OutPacked3* outColors [[buffer(4)]],
-    device OutT* outOpacities [[buffer(5)]],
-    device OutT* outDepths [[buffer(6)]],
-    device float* outRadii [[buffer(7)]],
-    device uchar* outMask [[buffer(8)]],
-    constant CameraUniforms& camera [[buffer(9)]],
+    device RenderDataT* outRenderData [[buffer(2)]],      // AoS packed output
+    device float* outRadii [[buffer(3)]],                 // Still separate for tileBounds
+    device uchar* outMask [[buffer(4)]],                  // Still separate for culling
+    constant CameraUniforms& camera [[buffer(5)]],
     uint gid [[thread_position_in_grid]]
 ) {
     if (gid >= camera.gaussianCount) { return; }
@@ -49,27 +44,11 @@ kernel void projectGaussiansPacked(
         return;
     }
 
-
     float ndcX = clip.x / clip.w;
     float ndcY = clip.y / clip.w;
     float px = ((ndcX + 1.0f) * camera.width - 1.0f) * 0.5f;
     float py = ((ndcY + 1.0f) * camera.height - 1.0f) * 0.5f;
 
-//    
-//    
-//    // Tile bounds
-//    int tileW = int(params.tileWidth);
-//    int tileH = int(params.tileHeight);
-//    int2 minTile = int2(
-//        max(0, int(floor((px - radius) / float(tileW)))),
-//        max(0, int(floor((py - radius) / float(tileH))))
-//    );
-//    int2 maxTile = int2(
-//        min(int(params.tilesX), int(ceil((px + radius) / float(tileW)))),
-//        min(int(params.tilesY), int(ceil((py + radius) / float(tileH))))
-//    );
-
-    // Opacity already loaded from packed struct
     float opacity = float(g.opacity);
     if (opacity < 1e-4f) {
         outMask[gid] = 0;
@@ -77,7 +56,6 @@ kernel void projectGaussiansPacked(
         return;
     }
 
-    // Scale and rotation already loaded from packed struct
     float3 scale = float3(g.scale);
     float4 quat = float4(g.rotation);
     float3x3 cov3d = buildCovariance3D(scale, quat);
@@ -98,7 +76,7 @@ kernel void projectGaussiansPacked(
         return;
     }
 
-    // Off-screen culling: skip gaussians completely outside the viewport
+    // Off-screen culling
     if (px + radius < 0.0f || px - radius > camera.width ||
         py + radius < 0.0f || py - radius > camera.height) {
         outMask[gid] = 0;
@@ -106,46 +84,37 @@ kernel void projectGaussiansPacked(
         return;
     }
 
-    // Compute SH color using shared function (supports half harmonics template)
+    // Compute SH color
     float3 color = computeSHColor(harmonics, gid, position, camera.cameraCenter, camera.shComponents);
     color = max(color + float3(0.5f), float3(0.0f));
 
-    // Write outputs
-    outMeans[gid] = OutVec2(px, py);
-    outConics[gid] = OutVec4(conic);
-    outOpacities[gid] = OutT(opacity);
-    outDepths[gid] = OutT(depth);
+    // Write AoS output - single struct write
+    RenderDataT renderData;
+    renderData.mean = decltype(renderData.mean)(px, py);
+    renderData.conic = decltype(renderData.conic)(conic);
+    renderData.color = decltype(renderData.color)(color);
+    renderData.opacity = decltype(renderData.opacity)(opacity);
+    renderData.depth = decltype(renderData.depth)(depth);
+    outRenderData[gid] = renderData;
+
     outRadii[gid] = radius;
-    outColors[gid] = OutPacked3(color);
     outMask[gid] = 1;
 }
 
-// Instantiation macro for packed projectGaussians
-#define instantiate_projectGaussiansPacked(name, PackedWorldT, HarmonicT, OutVec2, OutVec4, OutT, OutPacked3) \
-    template [[host_name("projectGaussiansPacked_" #name)]] \
-    kernel void projectGaussiansPacked<PackedWorldT, HarmonicT, OutVec2, OutVec4, OutT, OutPacked3>( \
-        const device PackedWorldT* worldGaussians [[buffer(0)]], \
-        const device HarmonicT* harmonics [[buffer(1)]], \
-        device OutVec2* outMeans [[buffer(2)]], \
-        device OutVec4* outConics [[buffer(3)]], \
-        device OutPacked3* outColors [[buffer(4)]], \
-        device OutT* outOpacities [[buffer(5)]], \
-        device OutT* outDepths [[buffer(6)]], \
-        device float* outRadii [[buffer(7)]], \
-        device uchar* outMask [[buffer(8)]], \
-        constant CameraUniforms& camera [[buffer(9)]], \
-        uint gid [[thread_position_in_grid]]);
+// Projection kernel instantiation (outputs to packed GaussianRenderData)
+// Float world input
+template [[host_name("projectGaussiansKernel")]]
+kernel void projectGaussians<PackedWorldGaussian, float, GaussianRenderData>(
+    const device PackedWorldGaussian*, const device float*,
+    device GaussianRenderData*, device float*, device uchar*,
+    constant CameraUniforms&, uint);
 
-// Float packed world -> Half output (main path for half pipeline)
-instantiate_projectGaussiansPacked(float_half, PackedWorldGaussian, float, half2, half4, half, packed_half3)
-
-// Float packed world -> Float output
-instantiate_projectGaussiansPacked(float_float, PackedWorldGaussian, float, float2, float4, float, packed_float3)
-
-// Half packed world -> Half output (full half pipeline with half harmonics)
-instantiate_projectGaussiansPacked(half_half, PackedWorldGaussianHalf, half, half2, half4, half, packed_half3)
-
-#undef instantiate_projectGaussiansPacked
+// Half world input (for bandwidth optimization)
+template [[host_name("projectGaussiansKernelHalf")]]
+kernel void projectGaussians<PackedWorldGaussianHalf, half, GaussianRenderData>(
+    const device PackedWorldGaussianHalf*, const device half*,
+    device GaussianRenderData*, device float*, device uchar*,
+    constant CameraUniforms&, uint);
 
 // Fast exp approximation for Gaussian weight calculation
 // Uses Schraudolph's method - accurate enough for alpha blending
@@ -384,9 +353,10 @@ kernel void resetTileBuilderStateKernel(
     }
 }
 
-template <typename MeansT>
+// Tile bounds kernel - reads mean from packed GaussianRenderData
+template <typename RenderDataT>
 kernel void tileBoundsKernel(
-    const device MeansT* means [[buffer(0)]],
+    const device RenderDataT* renderData [[buffer(0)]],
     const device float* radii [[buffer(1)]],
     const device uchar* mask [[buffer(2)]],
     device int4* bounds [[buffer(3)]],
@@ -401,7 +371,7 @@ kernel void tileBoundsKernel(
         return;
     }
 
-    float2 mean = float2(means[idx]);
+    float2 mean = float2(renderData[idx].mean);
     float radius = radii[idx];
 
     float xmin = mean.x - radius;
@@ -430,28 +400,19 @@ kernel void tileBoundsKernel(
     bounds[idx] = int4(minX, maxX, minY, maxY);
 }
 
-#define instantiate_tileBoundsKernel(name, hostName, MeansT) \
-    template [[host_name(hostName)]] \
-    kernel void tileBoundsKernel<MeansT>( \
-        const device MeansT* means [[buffer(0)]], \
-        const device float* radii [[buffer(1)]], \
-        const device uchar* mask [[buffer(2)]], \
-        device int4* bounds [[buffer(3)]], \
-        constant TileBoundsParams& params [[buffer(4)]], \
-        uint idx [[thread_position_in_grid]]);
-
-instantiate_tileBoundsKernel(float, "tileBoundsKernelFloat", float2)
-instantiate_tileBoundsKernel(half, "tileBoundsKernelHalf", half2)
-
-#undef instantiate_tileBoundsKernel
+template [[host_name("tileBoundsKernel")]]
+kernel void tileBoundsKernel<GaussianRenderData>(
+    const device GaussianRenderData*, const device float*, const device uchar*,
+    device int4*, constant TileBoundsParams&, uint);
 
 // Ellipse intersection functions are now in GaussianHelpers.h
 
-template <typename DepthT>
+// Sort key generation - reads depth from packed GaussianRenderData
+template <typename RenderDataT>
 kernel void computeSortKeysKernel(
     const device int* tileIds [[buffer(0)]],
     const device int* tileIndices [[buffer(1)]],
-    const device DepthT* depths [[buffer(2)]],
+    const device RenderDataT* renderData [[buffer(2)]],
     device uint2* sortKeys [[buffer(3)]],
     device int* sortedIndices [[buffer(4)]],
     const device TileAssignmentHeader& header [[buffer(5)]],
@@ -463,10 +424,7 @@ kernel void computeSortKeysKernel(
         if (gid < totalAssignments) {
             int g = tileIndices[gid];
             uint tileId = (uint)tileIds[gid];
-            // Quantize depth to 16-bit half-float for faster radix sort (4 passes instead of 6)
-            // Half-float bits sort correctly for positive values, and 16-bit precision is
-            // more than enough for correct depth ordering within tiles
-            float depthFloat = float(depths[g]);
+            float depthFloat = float(renderData[g].depth);
             half depthHalf = half(depthFloat);
             uint depthBits = uint(as_type<ushort>(depthHalf));
             sortKeys[gid] = uint2(tileId, depthBits);
@@ -478,21 +436,10 @@ kernel void computeSortKeysKernel(
     }
 }
 
-#define instantiate_computeSortKeysKernel(name, hostName, DepthT) \
-    template [[host_name(hostName)]] \
-    kernel void computeSortKeysKernel<DepthT>( \
-        const device int* tileIds [[buffer(0)]], \
-        const device int* tileIndices [[buffer(1)]], \
-        const device DepthT* depths [[buffer(2)]], \
-        device uint2* sortKeys [[buffer(3)]], \
-        device int* sortedIndices [[buffer(4)]], \
-        const device TileAssignmentHeader& header [[buffer(5)]], \
-        uint gid [[thread_position_in_grid]]);
-
-instantiate_computeSortKeysKernel(float, "computeSortKeysKernelFloat", float)
-instantiate_computeSortKeysKernel(half, "computeSortKeysKernelHalf", half)
-
-#undef instantiate_computeSortKeysKernel
+template [[host_name("computeSortKeysKernel")]]
+kernel void computeSortKeysKernel<GaussianRenderData>(
+    const device int*, const device int*, const device GaussianRenderData*,
+    device uint2*, device int*, const device TileAssignmentHeader&, uint);
 
 struct PackParams {
     uint totalAssignments;
@@ -871,17 +818,16 @@ struct FusedCoverageScatterParamsV2 {
     uint maxAssignments;
 };
 
-template <typename MeansT, typename ConicT, typename OpacityT>
+// Fused coverage + scatter - reads from packed GaussianRenderData
+template <typename RenderDataT>
 kernel void fusedCoverageScatterKernelV2(
     const device int4* bounds [[buffer(0)]],
     device uint* coverageCounts [[buffer(1)]],
-    const device OpacityT* opacities [[buffer(2)]],
+    const device RenderDataT* renderData [[buffer(2)]],
     constant FusedCoverageScatterParamsV2& params [[buffer(3)]],
-    const device MeansT* means [[buffer(4)]],
-    const device ConicT* conics [[buffer(5)]],
-    device int* tileIndices [[buffer(6)]],
-    device int* tileIds [[buffer(7)]],
-    device TileAssignmentHeader* header [[buffer(8)]],
+    device int* tileIndices [[buffer(4)]],
+    device int* tileIds [[buffer(5)]],
+    device TileAssignmentHeader* header [[buffer(6)]],
     uint tgIdx [[thread_index_in_threadgroup]],
     uint simdLaneId [[thread_index_in_simdgroup]],
     uint simdGroupId [[simdgroup_index_in_threadgroup]],
@@ -890,12 +836,12 @@ kernel void fusedCoverageScatterKernelV2(
     const uint gaussianIdx = groupIdx;
     if (gaussianIdx >= params.gaussianCount) return;
 
-    // Reduced threadgroup memory - 512 bytes instead of 8KB
     threadgroup int sharedTileIds[FUSED_V2_MAX_TILES];
     threadgroup uint sharedCount;
     threadgroup uint sharedGlobalOffset;
 
-    // Load gaussian data once
+    // Load gaussian data from packed struct
+    const RenderDataT g = renderData[gaussianIdx];
     const int4 rect = bounds[gaussianIdx];
     const int minTX = rect.x;
     const int maxTX = rect.y;
@@ -912,7 +858,7 @@ kernel void fusedCoverageScatterKernelV2(
     }
 
     const uint aabbCount = uint(aabbWidth * aabbHeight);
-    const float alpha = float(opacities[gaussianIdx]);
+    const float alpha = float(g.opacity);
 
     if (alpha < 1e-4f) {
         if (tgIdx == 0u) {
@@ -921,7 +867,6 @@ kernel void fusedCoverageScatterKernelV2(
         return;
     }
 
-    // Initialize shared count
     if (tgIdx == 0u) {
         sharedCount = 0u;
     }
@@ -932,9 +877,8 @@ kernel void fusedCoverageScatterKernelV2(
     const uint tilesX = params.tilesX;
     const bool needsPrecise = (aabbCount > FUSED_V2_PRECISE_THRESHOLD);
 
-    const float2 center = float2(means[gaussianIdx]);
-    const ConicT conicData = conics[gaussianIdx];
-    const float3 conic = float3(float(conicData.x), float(conicData.y), float(conicData.z));
+    const float2 center = float2(g.mean);
+    const float3 conic = float3(float(g.conic.x), float(g.conic.y), float(g.conic.z));
     const float qMax = computeQMax(alpha, GAUSSIAN_TAU);
 
     // Pre-compute expanded qMax for tile-center test
@@ -1042,27 +986,11 @@ kernel void fusedCoverageScatterKernelV2(
     }
 }
 
-#define instantiate_fusedCoverageScatterKernelV2(name, MeansT, ConicT, OpacityT) \
-    template [[host_name("fusedCoverageScatterKernelV2_" #name)]] \
-    kernel void fusedCoverageScatterKernelV2<MeansT, ConicT, OpacityT>( \
-        const device int4* bounds [[buffer(0)]], \
-        device uint* coverageCounts [[buffer(1)]], \
-        const device OpacityT* opacities [[buffer(2)]], \
-        constant FusedCoverageScatterParamsV2& params [[buffer(3)]], \
-        const device MeansT* means [[buffer(4)]], \
-        const device ConicT* conics [[buffer(5)]], \
-        device int* tileIndices [[buffer(6)]], \
-        device int* tileIds [[buffer(7)]], \
-        device TileAssignmentHeader* header [[buffer(8)]], \
-        uint tgIdx [[thread_index_in_threadgroup]], \
-        uint simdLaneId [[thread_index_in_simdgroup]], \
-        uint simdGroupId [[simdgroup_index_in_threadgroup]], \
-        uint groupIdx [[threadgroup_position_in_grid]]);
-
-instantiate_fusedCoverageScatterKernelV2(float, float2, float4, float)
-instantiate_fusedCoverageScatterKernelV2(half, half2, half4, half)
-
-#undef instantiate_fusedCoverageScatterKernelV2
+template [[host_name("fusedCoverageScatterKernelV2")]]
+kernel void fusedCoverageScatterKernelV2<GaussianRenderData>(
+    const device int4*, device uint*, const device GaussianRenderData*,
+    constant FusedCoverageScatterParamsV2&, device int*, device int*,
+    device TileAssignmentHeader*, uint, uint, uint, uint);
 
 kernel void prepareAssignmentDispatchKernel(
     device TileAssignmentHeader* header [[buffer(0)]],
@@ -1651,58 +1579,6 @@ kernel void unpackSortKeysKernel(
     uint tile = uint(fused >> 16);
     uint depthBits = uint(fused & 0xFFFFull);
     output_keys[gid] = uint2(tile, depthBits);
-}
-
-// =============================================================================
-// FUSED PIPELINE KERNELS - Interleaved data for cache efficiency
-// =============================================================================
-
-/// Interleave separate gaussian buffers into single struct (half16)
-kernel void interleaveGaussianDataKernelHalf(
-    const device half2*         means       [[buffer(0)]],
-    const device half4*         conics      [[buffer(1)]],
-    const device packed_half3*  colors      [[buffer(2)]],
-    const device half*          opacities   [[buffer(3)]],
-    const device half*          depths      [[buffer(4)]],
-    device GaussianRenderData*  output      [[buffer(5)]],
-    constant uint&              count       [[buffer(6)]],
-    uint                        gid         [[thread_position_in_grid]]
-) {
-    if (gid >= count) return;
-
-    GaussianRenderData g;
-    g.mean     = means[gid];
-    g.conic    = conics[gid];
-    g.color    = colors[gid];
-    g.opacity  = opacities[gid];
-    g.depth    = depths[gid];
-    g._pad     = 0;
-
-    output[gid] = g;
-}
-
-/// Interleave separate gaussian buffers into single struct (float32)
-kernel void interleaveGaussianDataKernelFloat(
-    const device float2*         means       [[buffer(0)]],
-    const device float4*         conics      [[buffer(1)]],
-    const device packed_float3*  colors      [[buffer(2)]],
-    const device float*          opacities   [[buffer(3)]],
-    const device float*          depths      [[buffer(4)]],
-    device GaussianRenderDataF32* output     [[buffer(5)]],
-    constant uint&               count       [[buffer(6)]],
-    uint                         gid         [[thread_position_in_grid]]
-) {
-    if (gid >= count) return;
-
-    GaussianRenderDataF32 g;
-    g.mean     = means[gid];
-    g.conic    = conics[gid];
-    g.color    = colors[gid];
-    g.opacity  = opacities[gid];
-    g.depth    = depths[gid];
-    g._pad     = 0;
-
-    output[gid] = g;
 }
 
 // =============================================================================

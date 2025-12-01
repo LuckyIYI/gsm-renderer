@@ -54,52 +54,6 @@ final class PerfTimingTests: XCTestCase {
         return PackedWorldBuffers(packedGaussians: packedBuf, harmonics: harmonicsBuf)
     }
 
-    func createPackedWorldBuffersHalf(
-        device: MTLDevice,
-        positions: [SIMD3<Float>],
-        scales: [SIMD3<Float>],
-        rotations: [SIMD4<Float>],
-        opacities: [Float],
-        colors: [SIMD3<Float>]
-    ) -> PackedWorldBuffersHalf? {
-        let count = positions.count
-        guard count == scales.count, count == rotations.count,
-              count == opacities.count, count == colors.count else {
-            return nil
-        }
-
-        var packed: [PackedWorldGaussianHalf] = []
-        for i in 0..<count {
-            packed.append(PackedWorldGaussianHalf(
-                position: positions[i],
-                scale: scales[i],
-                rotation: rotations[i],
-                opacity: opacities[i]
-            ))
-        }
-
-        var harmonics: [Float] = []
-        for color in colors {
-            harmonics.append(color.x)
-            harmonics.append(color.y)
-            harmonics.append(color.z)
-        }
-
-        guard let packedBuf = device.makeBuffer(
-            bytes: &packed,
-            length: count * MemoryLayout<PackedWorldGaussianHalf>.stride,
-            options: .storageModeShared
-        ) else { return nil }
-
-        guard let harmonicsBuf = device.makeBuffer(
-            bytes: &harmonics,
-            length: count * 3 * MemoryLayout<Float>.stride,
-            options: .storageModeShared
-        ) else { return nil }
-
-        return PackedWorldBuffersHalf(packedGaussians: packedBuf, harmonics: harmonicsBuf)
-    }
-
     func createSimpleCamera(width: Float, height: Float, gaussianCount: Int) -> CameraUniformsSwift {
         var projMatrix = matrix_identity_float4x4
         projMatrix.columns.0 = SIMD4(2.0 / width, 0, 0, 0)
@@ -196,7 +150,7 @@ final class PerfTimingTests: XCTestCase {
         let count = 100_000
         let (positions, scales, rotations, opacities, colors) = generateRandomGaussians(count: count)
 
-        guard let packedBuffersHalf = createPackedWorldBuffersHalf(
+        guard let packedBuffersHalf = createPackedWorldBuffers(
             device: renderer.device,
             positions: positions,
             scales: scales,
@@ -214,10 +168,10 @@ final class PerfTimingTests: XCTestCase {
         // Warm up
         for _ in 0..<3 {
             guard let commandBuffer = renderer.queue.makeCommandBuffer() else { continue }
-            _ = renderer.encodeRenderToTextureHalf(
+            _ = renderer.encodeRenderToTextures(
                 commandBuffer: commandBuffer,
                 gaussianCount: count,
-                packedWorldBuffersHalf: packedBuffersHalf,
+                packedWorldBuffers: packedBuffersHalf,
                 cameraUniforms: camera,
                 frameParams: frameParams
             )
@@ -233,10 +187,10 @@ final class PerfTimingTests: XCTestCase {
             guard let commandBuffer = renderer.queue.makeCommandBuffer() else { continue }
 
             let wallStart = CFAbsoluteTimeGetCurrent()
-            _ = renderer.encodeRenderToTextureHalf(
+            _ = renderer.encodeRenderToTextures(
                 commandBuffer: commandBuffer,
                 gaussianCount: count,
-                packedWorldBuffersHalf: packedBuffersHalf,
+                packedWorldBuffers: packedBuffersHalf,
                 cameraUniforms: camera,
                 frameParams: frameParams
             )
@@ -281,7 +235,7 @@ final class PerfTimingTests: XCTestCase {
                 spreadY: Float(height)
             )
 
-            guard let packedBuffersHalf = createPackedWorldBuffersHalf(
+            guard let packedBuffersHalf = createPackedWorldBuffers(
                 device: renderer.device,
                 positions: positions,
                 scales: scales,
@@ -298,7 +252,7 @@ final class PerfTimingTests: XCTestCase {
             // Warmup
             for _ in 0..<2 {
                 guard let cb = renderer.queue.makeCommandBuffer() else { continue }
-                _ = renderer.encodeRenderToTextureHalf(commandBuffer: cb, gaussianCount: count, packedWorldBuffersHalf: packedBuffersHalf, cameraUniforms: camera, frameParams: frameParams)
+                _ = renderer.encodeRenderToTextures(commandBuffer: cb, gaussianCount: count, packedWorldBuffers: packedBuffersHalf, cameraUniforms: camera, frameParams: frameParams)
                 cb.commit(); cb.waitUntilCompleted()
             }
 
@@ -306,7 +260,7 @@ final class PerfTimingTests: XCTestCase {
             var times: [Double] = []
             for _ in 0..<3 {
                 guard let cb = renderer.queue.makeCommandBuffer() else { continue }
-                _ = renderer.encodeRenderToTextureHalf(commandBuffer: cb, gaussianCount: count, packedWorldBuffersHalf: packedBuffersHalf, cameraUniforms: camera, frameParams: frameParams)
+                _ = renderer.encodeRenderToTextures(commandBuffer: cb, gaussianCount: count, packedWorldBuffers: packedBuffersHalf, cameraUniforms: camera, frameParams: frameParams)
                 cb.commit(); cb.waitUntilCompleted()
                 let gpuTime = cb.gpuEndTime - cb.gpuStartTime
                 if gpuTime > 0 { times.append(gpuTime * 1000) }
@@ -347,7 +301,7 @@ final class PerfTimingTests: XCTestCase {
                 spreadY: Float(height)
             )
 
-            guard let packedBuffersHalf = createPackedWorldBuffersHalf(
+            guard let packedBuffersHalf = createPackedWorldBuffers(
                 device: renderer.device,
                 positions: positions,
                 scales: scales,
@@ -364,10 +318,10 @@ final class PerfTimingTests: XCTestCase {
             // Warm up
             for _ in 0..<2 {
                 guard let commandBuffer = renderer.queue.makeCommandBuffer() else { continue }
-                _ = renderer.encodeRenderToTextureHalf(
+                _ = renderer.encodeRenderToTextures(
                     commandBuffer: commandBuffer,
                     gaussianCount: count,
-                    packedWorldBuffersHalf: packedBuffersHalf,
+                    packedWorldBuffers: packedBuffersHalf,
                     cameraUniforms: camera,
                     frameParams: frameParams
                 )
@@ -379,10 +333,10 @@ final class PerfTimingTests: XCTestCase {
             var times: [Double] = []
             for _ in 0..<5 {
                 guard let commandBuffer = renderer.queue.makeCommandBuffer() else { continue }
-                _ = renderer.encodeRenderToTextureHalf(
+                _ = renderer.encodeRenderToTextures(
                     commandBuffer: commandBuffer,
                     gaussianCount: count,
-                    packedWorldBuffersHalf: packedBuffersHalf,
+                    packedWorldBuffers: packedBuffersHalf,
                     cameraUniforms: camera,
                     frameParams: frameParams
                 )

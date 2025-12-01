@@ -55,52 +55,6 @@ final class FusedPipelineTests: XCTestCase {
         return PackedWorldBuffers(packedGaussians: packedBuf, harmonics: harmonicsBuf)
     }
 
-    func createPackedWorldBuffersHalf(
-        device: MTLDevice,
-        positions: [SIMD3<Float>],
-        scales: [SIMD3<Float>],
-        rotations: [SIMD4<Float>],
-        opacities: [Float],
-        colors: [SIMD3<Float>]
-    ) -> PackedWorldBuffersHalf? {
-        let count = positions.count
-        guard count == scales.count, count == rotations.count,
-              count == opacities.count, count == colors.count else {
-            return nil
-        }
-
-        var packed: [PackedWorldGaussianHalf] = []
-        for i in 0..<count {
-            packed.append(PackedWorldGaussianHalf(
-                position: positions[i],
-                scale: scales[i],
-                rotation: rotations[i],
-                opacity: opacities[i]
-            ))
-        }
-
-        var harmonics: [Float] = []
-        for color in colors {
-            harmonics.append(color.x)
-            harmonics.append(color.y)
-            harmonics.append(color.z)
-        }
-
-        guard let packedBuf = device.makeBuffer(
-            bytes: &packed,
-            length: count * MemoryLayout<PackedWorldGaussianHalf>.stride,
-            options: .storageModeShared
-        ) else { return nil }
-
-        guard let harmonicsBuf = device.makeBuffer(
-            bytes: &harmonics,
-            length: count * 3 * MemoryLayout<Float>.stride,
-            options: .storageModeShared
-        ) else { return nil }
-
-        return PackedWorldBuffersHalf(packedGaussians: packedBuf, harmonics: harmonicsBuf)
-    }
-
     func createSimpleCamera(width: Float, height: Float, gaussianCount: Int) -> CameraUniformsSwift {
         var projMatrix = matrix_identity_float4x4
         projMatrix.columns.0 = SIMD4(2.0 / width, 0, 0, 0)
@@ -177,7 +131,7 @@ final class FusedPipelineTests: XCTestCase {
         let count = 100
         let (positions, scales, rotations, opacities, colors) = generateRandomGaussians(count: count)
 
-        guard let packedBuffersHalf = createPackedWorldBuffersHalf(
+        guard let packedBuffersHalf = createPackedWorldBuffers(
             device: renderer.device,
             positions: positions,
             scales: scales,
@@ -197,10 +151,10 @@ final class FusedPipelineTests: XCTestCase {
         }
 
         let frameParams = FrameParams(gaussianCount: count, whiteBackground: false)
-        let textures = renderer.encodeRenderToTextureHalf(
+        let textures = renderer.encodeRenderToTextures(
             commandBuffer: commandBuffer,
             gaussianCount: count,
-            packedWorldBuffersHalf: packedBuffersHalf,
+            packedWorldBuffers: packedBuffersHalf,
             cameraUniforms: camera,
             frameParams: frameParams
         )
@@ -319,7 +273,7 @@ final class FusedPipelineTests: XCTestCase {
         let count = 500_000
         let (positions, scales, rotations, opacities, colors) = generateRandomGaussians(count: count)
 
-        guard let packedBuffersHalf = createPackedWorldBuffersHalf(
+        guard let packedBuffersHalf = createPackedWorldBuffers(
             device: renderer.device,
             positions: positions,
             scales: scales,
@@ -339,10 +293,10 @@ final class FusedPipelineTests: XCTestCase {
         }
 
         let frameParams = FrameParams(gaussianCount: count, whiteBackground: true)
-        let textures = renderer.encodeRenderToTextureHalf(
+        let textures = renderer.encodeRenderToTextures(
             commandBuffer: commandBuffer,
             gaussianCount: count,
-            packedWorldBuffersHalf: packedBuffersHalf,
+            packedWorldBuffers: packedBuffersHalf,
             cameraUniforms: camera,
             frameParams: frameParams
         )
@@ -413,7 +367,7 @@ final class FusedPipelineTests: XCTestCase {
         let count = 50_000
         let (positions, scales, rotations, opacities, colors) = generateRandomGaussians(count: count)
 
-        guard let packedBuffersHalf = createPackedWorldBuffersHalf(
+        guard let packedBuffersHalf = createPackedWorldBuffers(
             device: renderer.device,
             positions: positions,
             scales: scales,
@@ -433,10 +387,10 @@ final class FusedPipelineTests: XCTestCase {
         }
 
         let frameParams = FrameParams(gaussianCount: count, whiteBackground: true)
-        let textures = renderer.encodeRenderToTextureHalf(
+        let textures = renderer.encodeRenderToTextures(
             commandBuffer: commandBuffer,
             gaussianCount: count,
-            packedWorldBuffersHalf: packedBuffersHalf,
+            packedWorldBuffers: packedBuffersHalf,
             cameraUniforms: camera,
             frameParams: frameParams
         )

@@ -351,8 +351,10 @@ public final class LocalSortPipelineEncoder {
             tileHeight: UInt32(tileHeight),
             tilesX: UInt32(tilesX),
             tilesY: UInt32(tilesY),
+            maxPerTile: 0,  // Not used in LocalSort render
             whiteBackground: whiteBackground ? 1 : 0,
-            _pad: 0
+            activeTileCount: 0,  // Not used in LocalSort render
+            gaussianCount: 0  // Not used in LocalSort render
         )
 
         if let encoder = commandBuffer.makeComputeCommandEncoder() {
@@ -437,8 +439,10 @@ public final class LocalSortPipelineEncoder {
             tileHeight: UInt32(tileHeight),
             tilesX: UInt32(tilesX),
             tilesY: UInt32(tilesY),
+            maxPerTile: 0,  // Not used in LocalSort render
             whiteBackground: whiteBackground ? 1 : 0,
-            _pad: 0
+            activeTileCount: 0,  // Not used in LocalSort render
+            gaussianCount: 0  // Not used in LocalSort render
         )
 
         if let encoder = commandBuffer.makeComputeCommandEncoder() {
@@ -586,7 +590,7 @@ public final class LocalSortPipelineEncoder {
     }
 }
 
-// Render params struct for local sort pipeline
+/// Render params struct for local sort pipeline (matches Metal RenderParams - 40 bytes)
 public struct LocalSortRenderParamsSwift {
     public var width: UInt32
     public var height: UInt32
@@ -594,6 +598,8 @@ public struct LocalSortRenderParamsSwift {
     public var tileHeight: UInt32
     public var tilesX: UInt32
     public var tilesY: UInt32
+    public var maxPerTile: UInt32
     public var whiteBackground: UInt32
-    public var _pad: UInt32
+    public var activeTileCount: UInt32
+    public var gaussianCount: UInt32
 }

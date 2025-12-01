@@ -20,44 +20,16 @@ using namespace metal;
 
 /// Compacted gaussian (after projection + culling) - 48 bytes
 /// Matches LocalSort's layout for optimal render performance
-struct LocalSortCompactedGaussian {
+struct CompactedGaussian {
     float4 covariance_depth;    // conic.xyz + depth (16 bytes)
     float4 position_color;      // pos.xy + packed_half4(color,opacity) (16 bytes)
     int2 min_tile;              // 8 bytes
     int2 max_tile;              // 8 bytes
 };
 
-/// Parameters for fused project+compact+count kernel
-struct LocalSortProjectParams {
-    uint gaussianCount;
-    uint tilesX;
-    uint tilesY;
-    uint tileWidth;
-    uint tileHeight;
-    uint surfaceWidth;
-    uint surfaceHeight;
-    uint maxCompacted;
-};
-
-/// Header for compacted gaussians (uses atomic_uint for GPU atomics)
-struct LocalSortCompactedHeader {
-    atomic_uint visibleCount;
-    uint maxCompacted;
-    uint overflow;
-    uint _pad;
-};
-
-/// Render parameters (simplified version of RenderParams for LocalSort)
-struct LocalSortRenderParams {
-    uint width;
-    uint height;
-    uint tileWidth;
-    uint tileHeight;
-    uint tilesX;
-    uint tilesY;
-    uint whiteBackground;
-    uint _pad;
-};
+// TileBinningParams from GaussianStructs.h used for project params
+// TileAssignmentHeaderAtomic from GaussianStructs.h used for compacted header
+// RenderParams from GaussianStructs.h used for render params
 
 // =============================================================================
 // HELPER FUNCTIONS (LocalSort-specific - shared math helpers in GaussianHelpers.h)
@@ -161,9 +133,9 @@ kernel void tileBinningZeroCountsKernel(
 
 kernel void localSortClear(
     device atomic_uint* tileCounts [[buffer(0)]],
-    device LocalSortCompactedHeader* header [[buffer(1)]],
+    device TileAssignmentHeaderAtomic* header [[buffer(1)]],
     constant uint& tileCount [[buffer(2)]],
-    constant uint& maxCompacted [[buffer(3)]],
+    constant uint& maxCapacity [[buffer(3)]],
     uint gid [[thread_position_in_grid]]
 ) {
     if (gid < tileCount) {
@@ -171,7 +143,7 @@ kernel void localSortClear(
     }
     if (gid == 0u) {
         atomic_store_explicit(&header->visibleCount, 0u, memory_order_relaxed);
-        header->maxCompacted = maxCompacted;
+        header->maxCapacity = maxCapacity;
         header->overflow = 0u;
     }
 }
@@ -185,11 +157,11 @@ template <typename PackedWorldT, typename HarmonicsT>
 kernel void localSortProjectCompactCount(
     const device PackedWorldT* worldGaussians [[buffer(0)]],
     const device HarmonicsT* harmonics [[buffer(1)]],
-    device LocalSortCompactedGaussian* compacted [[buffer(2)]],
-    device LocalSortCompactedHeader* header [[buffer(3)]],
+    device CompactedGaussian* compacted [[buffer(2)]],
+    device TileAssignmentHeaderAtomic* header [[buffer(3)]],
     device atomic_uint* tileCounts [[buffer(4)]],
     constant CameraUniforms& camera [[buffer(5)]],
-    constant LocalSortProjectParams& params [[buffer(6)]],
+    constant TileBinningParams& params [[buffer(6)]],
     uint gid [[thread_position_in_grid]]
 ) {
     if (gid >= params.gaussianCount) return;
@@ -287,7 +259,7 @@ kernel void localSortProjectCompactCount(
 
     // Compact: write visible gaussian
     uint idx = atomic_fetch_add_explicit(&header->visibleCount, 1u, memory_order_relaxed);
-    if (idx >= params.maxCompacted) {
+    if (idx >= params.maxCapacity) {
         header->overflow = 1u;
         return;
     }
@@ -306,33 +278,33 @@ kernel void localSortProjectCompactCount(
 template [[host_name("localSortProjectCompactCountFloat")]]
 kernel void localSortProjectCompactCount<PackedWorldGaussian, float>(
     const device PackedWorldGaussian*, const device float*,
-    device LocalSortCompactedGaussian*, device LocalSortCompactedHeader*,
+    device CompactedGaussian*, device TileAssignmentHeaderAtomic*,
     device atomic_uint*, constant CameraUniforms&,
-    constant LocalSortProjectParams&, uint);
+    constant TileBinningParams&, uint);
 
 // Half world, float harmonics
 template [[host_name("localSortProjectCompactCountHalf")]]
 kernel void localSortProjectCompactCount<PackedWorldGaussianHalf, float>(
     const device PackedWorldGaussianHalf*, const device float*,
-    device LocalSortCompactedGaussian*, device LocalSortCompactedHeader*,
+    device CompactedGaussian*, device TileAssignmentHeaderAtomic*,
     device atomic_uint*, constant CameraUniforms&,
-    constant LocalSortProjectParams&, uint);
+    constant TileBinningParams&, uint);
 
 // Float world, half harmonics (memory bandwidth optimization)
 template [[host_name("localSortProjectCompactCountFloatHalfSh")]]
 kernel void localSortProjectCompactCount<PackedWorldGaussian, half>(
     const device PackedWorldGaussian*, const device half*,
-    device LocalSortCompactedGaussian*, device LocalSortCompactedHeader*,
+    device CompactedGaussian*, device TileAssignmentHeaderAtomic*,
     device atomic_uint*, constant CameraUniforms&,
-    constant LocalSortProjectParams&, uint);
+    constant TileBinningParams&, uint);
 
 // Half world, half harmonics (full half precision pipeline)
 template [[host_name("localSortProjectCompactCountHalfHalfSh")]]
 kernel void localSortProjectCompactCount<PackedWorldGaussianHalf, half>(
     const device PackedWorldGaussianHalf*, const device half*,
-    device LocalSortCompactedGaussian*, device LocalSortCompactedHeader*,
+    device CompactedGaussian*, device TileAssignmentHeaderAtomic*,
     device atomic_uint*, constant CameraUniforms&,
-    constant LocalSortProjectParams&, uint);
+    constant TileBinningParams&, uint);
 
 // =============================================================================
 // KERNEL 3: PREFIX SCAN (reuse from main file or inline simple version)
@@ -473,7 +445,7 @@ kernel void localSortFinalizeScanAndZero(
 // Uses Metal's built-in MTLDispatchThreadgroupsIndirectArguments struct
 
 kernel void localSortPrepareScatterDispatch(
-    const device LocalSortCompactedHeader* header [[buffer(0)]],
+    const device TileAssignmentHeaderAtomic* header [[buffer(0)]],
     device MTLDispatchThreadgroupsIndirectArguments* dispatchArgs [[buffer(1)]],
     constant uint& threadgroupWidth [[buffer(2)]]
 ) {
@@ -489,8 +461,8 @@ kernel void localSortPrepareScatterDispatch(
 // =============================================================================
 
 kernel void localSortComputeGaussianTileCounts(
-    const device LocalSortCompactedGaussian* compacted [[buffer(0)]],
-    const device LocalSortCompactedHeader* header [[buffer(1)]],
+    const device CompactedGaussian* compacted [[buffer(0)]],
+    const device TileAssignmentHeaderAtomic* header [[buffer(1)]],
     device uint* gaussianTileCounts [[buffer(2)]],  // Output: tiles per gaussian
     uint gid [[thread_position_in_grid]]
 ) {
@@ -500,7 +472,7 @@ kernel void localSortComputeGaussianTileCounts(
         return;
     }
 
-    LocalSortCompactedGaussian g = compacted[gid];
+    CompactedGaussian g = compacted[gid];
     int2 minTile = g.min_tile;
     int2 maxTile = g.max_tile;
 
@@ -519,14 +491,14 @@ kernel void localSortComputeGaussianTileCounts(
 // - Each thread computes its write position via popcount
 
 kernel void localSortScatterSimd(
-    const device LocalSortCompactedGaussian* compacted [[buffer(0)]],
-    const device LocalSortCompactedHeader* header [[buffer(1)]],
+    const device CompactedGaussian* compacted [[buffer(0)]],
+    const device TileAssignmentHeaderAtomic* header [[buffer(1)]],
     device atomic_uint* tileCounters [[buffer(2)]],
     const device uint* offsets [[buffer(3)]],
     device uint* sortKeys [[buffer(4)]],
     device uint* sortIndices [[buffer(5)]],
     constant uint& tilesX [[buffer(6)]],
-    constant uint& maxAssignments [[buffer(7)]],
+    constant uint& maxCapacity [[buffer(7)]],
     constant int& tileWidth [[buffer(8)]],
     constant int& tileHeight [[buffer(9)]],
     uint gid [[thread_position_in_grid]],
@@ -546,7 +518,7 @@ kernel void localSortScatterSimd(
     if (gaussianIdx >= visibleCount) return;
 
     // Lane 0 loads gaussian data
-    LocalSortCompactedGaussian g;
+    CompactedGaussian g;
     float3 conic;
     float2 center;
     float power;
@@ -611,7 +583,7 @@ kernel void localSortScatterSimd(
             uint localIdx = atomic_fetch_add_explicit(&tileCounters[tileId], 1u, memory_order_relaxed);
             uint writePos = offsets[tileId] + localIdx;
 
-            if (writePos < maxAssignments) {
+            if (writePos < maxCapacity) {
                 sortKeys[writePos] = depthKey;
                 sortIndices[writePos] = gaussianIdx;
             }
@@ -714,13 +686,13 @@ kernel void localSortPerTileSort(
 #define LOCAL_SORT_PIXELS_Y 2
 
 kernel void localSortRender(
-    const device LocalSortCompactedGaussian* compacted [[buffer(0)]],
+    const device CompactedGaussian* compacted [[buffer(0)]],
     const device uint* offsets [[buffer(1)]],
     const device uint* counts [[buffer(2)]],
     const device uint* sortedIndices [[buffer(3)]],
     texture2d<half, access::write> colorOut [[texture(0)]],
     texture2d<half, access::write> depthOut [[texture(1)]],
-    constant LocalSortRenderParams& params [[buffer(4)]],
+    constant RenderParams& params [[buffer(4)]],
     uint2 groupId [[threadgroup_position_in_grid]],
     uint2 localId [[thread_position_in_threadgroup]],
     uint localIdx [[thread_index_in_threadgroup]],
@@ -755,7 +727,7 @@ kernel void localSortRender(
     // Process all gaussians
     for (uint i = 0; i < gaussCount; ++i) {
         uint gIdx = sortedIndices[offset + i];
-        LocalSortCompactedGaussian g = compacted[gIdx];
+        CompactedGaussian g = compacted[gIdx];
 
         half2 gPos = half2(g.position_color.xy);
         half3 cov = half3(g.covariance_depth.xyz);

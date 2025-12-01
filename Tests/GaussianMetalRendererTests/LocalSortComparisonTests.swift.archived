@@ -87,23 +87,15 @@ final class LocalSortComparisonTests: XCTestCase {
         // ============================================
         // Run ORIGINAL pipeline projection
         // ============================================
-        let origMeansBuffer = device.makeBuffer(length: gaussianCount * MemoryLayout<SIMD2<Float>>.stride, options: .storageModeShared)!
-        let origConicBuffer = device.makeBuffer(length: gaussianCount * MemoryLayout<SIMD4<Float>>.stride, options: .storageModeShared)!
-        // packed_float3 is 12 bytes (3 floats contiguous), not 16
-        let origColorBuffer = device.makeBuffer(length: gaussianCount * 12, options: .storageModeShared)!
-        let origOpacityBuffer = device.makeBuffer(length: gaussianCount * MemoryLayout<Float>.stride, options: .storageModeShared)!
-        let origDepthBuffer = device.makeBuffer(length: gaussianCount * MemoryLayout<Float>.stride, options: .storageModeShared)!
+        // Output buffers - packed GaussianRenderData (24 bytes each)
+        let origRenderDataBuffer = device.makeBuffer(length: gaussianCount * 24, options: .storageModeShared)!
         let origRadiiBuffer = device.makeBuffer(length: gaussianCount * MemoryLayout<Float>.stride, options: .storageModeShared)!
         let origMaskBuffer = device.makeBuffer(length: gaussianCount * MemoryLayout<UInt8>.stride, options: .storageModeShared)!
 
-        let gaussianBuffers = GaussianInputBuffers(
-            means: origMeansBuffer,
+        let projectionOutput = ProjectionOutput(
+            renderData: origRenderDataBuffer,
             radii: origRadiiBuffer,
-            mask: origMaskBuffer,
-            depths: origDepthBuffer,
-            conics: origConicBuffer,
-            colors: origColorBuffer,
-            opacities: origOpacityBuffer
+            mask: origMaskBuffer
         )
 
         let projectEncoder = try ProjectEncoder(device: device, library: library)
@@ -115,8 +107,8 @@ final class LocalSortComparisonTests: XCTestCase {
                 gaussianCount: gaussianCount,
                 packedWorldBuffers: packedWorld,
                 cameraUniforms: cameraUniforms,
-                gaussianBuffers: gaussianBuffers,
-                precision: Precision.float32
+                output: projectionOutput,
+                useHalfWorld: false
             )
             cb.commit()
             cb.waitUntilCompleted()

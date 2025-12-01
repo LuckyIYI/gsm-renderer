@@ -4,17 +4,26 @@ import Metal
 
 // MARK: - Common Types
 
+/// Unified header for tile assignment tracking (matches TileAssignmentHeader in Metal)
+/// Used by both LocalSort and GlobalSort pipelines
+/// Memory layout: [totalAssignments/visibleCount][maxCapacity][paddedCount][overflow]
 public struct TileAssignmentHeaderSwift {
-    public var totalAssignments: UInt32
-    public var maxAssignments: UInt32
+    public var totalAssignments: UInt32  // Also accessed as visibleCount (atomic) in LocalSort
+    public var maxCapacity: UInt32       // maxAssignments / maxCompacted - unified name
     public var paddedCount: UInt32
     public var overflow: UInt32
 
-    public init(totalAssignments: UInt32 = 0, maxAssignments: UInt32 = 0, paddedCount: UInt32 = 0, overflow: UInt32 = 0) {
+    public init(totalAssignments: UInt32 = 0, maxCapacity: UInt32 = 0, paddedCount: UInt32 = 0, overflow: UInt32 = 0) {
         self.totalAssignments = totalAssignments
-        self.maxAssignments = maxAssignments
+        self.maxCapacity = maxCapacity
         self.paddedCount = paddedCount
         self.overflow = overflow
+    }
+
+    /// Convenience accessor for LocalSort's visibleCount (same as totalAssignments)
+    public var visibleCount: UInt32 {
+        get { totalAssignments }
+        set { totalAssignments = newValue }
     }
 }
 
@@ -144,31 +153,8 @@ public struct FusedCoverageScatterParamsSwift {
     }
 }
 
-/// Tile-binning parameters: counts per tile then scatters using per-tile offsets
-public struct TileBinningParamsSwift {
-    public var gaussianCount: UInt32
-    public var tilesX: UInt32
-    public var tilesY: UInt32
-    public var tileWidth: UInt32
-    public var tileHeight: UInt32
-    public var maxAssignments: UInt32
-
-    public init(
-        gaussianCount: UInt32,
-        tilesX: UInt32,
-        tilesY: UInt32,
-        tileWidth: UInt32,
-        tileHeight: UInt32,
-        maxAssignments: UInt32
-    ) {
-        self.gaussianCount = gaussianCount
-        self.tilesX = tilesX
-        self.tilesY = tilesY
-        self.tileWidth = tileWidth
-        self.tileHeight = tileHeight
-        self.maxAssignments = maxAssignments
-    }
-}
+// TileBinningParamsSwift removed - use ProjectCompactParamsSwift from KernelTypes.swift instead
+// (it matches TileBinningParams in Metal with all 8 fields including surfaceWidth/Height)
 
 public struct PackParamsSwift {
     public var totalAssignments: UInt32
@@ -336,7 +322,8 @@ public struct OrderedGaussianBuffers {
     public let precision: Precision
 
     // Index-based render (like LocalSort): render reads via sortedIndices
-    public let interleavedGaussians: MTLBuffer?
+    // renderData: AoS packed GaussianRenderData from projectGaussiansAoS
+    public let renderData: MTLBuffer?
     public let sortedIndices: MTLBuffer?
 }
 

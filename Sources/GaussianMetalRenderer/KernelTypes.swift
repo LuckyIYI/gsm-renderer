@@ -198,6 +198,40 @@ public struct RenderParams {
     }
 }
 
+/// Swift struct matching Metal GaussianRenderData (24 bytes)
+/// Layout: half2 mean (4) + half4 conic (8) + packed_half3 color (6) + half opacity (2) + half depth (2) + ushort pad (2)
+/// Note: In Metal, half vectors only need 2-byte alignment (not size-based), so half4 packs directly after half2
+public struct GaussianRenderDataSwift {
+    // half2 mean - 4 bytes @ 0
+    public var meanX: Float16
+    public var meanY: Float16
+    // half4 conic - 8 bytes @ 4
+    public var conicA: Float16
+    public var conicB: Float16
+    public var conicC: Float16
+    public var conicD: Float16
+    // packed_half3 color - 6 bytes @ 12
+    public var colorR: Float16
+    public var colorG: Float16
+    public var colorB: Float16
+    // half opacity - 2 bytes @ 18
+    public var opacity: Float16
+    // half depth - 2 bytes @ 20
+    public var depth: Float16
+    // ushort _pad - 2 bytes @ 22
+    public var _pad: UInt16
+
+    public var mean: SIMD2<Float> {
+        get { SIMD2(Float(meanX), Float(meanY)) }
+    }
+    public var conic: SIMD4<Float> {
+        get { SIMD4(Float(conicA), Float(conicB), Float(conicC), Float(conicD)) }
+    }
+    public var color: SIMD3<Float> {
+        get { SIMD3(Float(colorR), Float(colorG), Float(colorB)) }
+    }
+}
+
 // =============================================================================
 // LOCAL-STYLE PIPELINE TYPES
 // =============================================================================
@@ -250,17 +284,18 @@ public struct ProjectCompactParamsSwift {
     }
 }
 
-/// Header for compacted gaussians (matches Metal struct, but atomic is read as UInt32)
+/// Header for compacted gaussians (matches TileAssignmentHeaderAtomic in Metal)
+/// Layout must match: [visibleCount][maxCapacity][paddedCount][overflow]
 public struct CompactedHeaderSwift {
-    public var visibleCount: UInt32
-    public var maxCompacted: UInt32
-    public var overflow: UInt32
-    public var _pad: UInt32
+    public var visibleCount: UInt32    // Atomic counter (read as UInt32 on CPU)
+    public var maxCapacity: UInt32     // Max compacted capacity
+    public var paddedCount: UInt32     // Padded count for radix sort
+    public var overflow: UInt32        // Overflow flag
 
-    public init(visibleCount: UInt32 = 0, maxCompacted: UInt32 = 0, overflow: UInt32 = 0) {
+    public init(visibleCount: UInt32 = 0, maxCapacity: UInt32 = 0, paddedCount: UInt32 = 0, overflow: UInt32 = 0) {
         self.visibleCount = visibleCount
-        self.maxCompacted = maxCompacted
+        self.maxCapacity = maxCapacity
+        self.paddedCount = paddedCount
         self.overflow = overflow
-        self._pad = 0
     }
 }

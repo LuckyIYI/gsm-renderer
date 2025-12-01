@@ -162,7 +162,7 @@ final class FrameResources {
         // Initialize TileHeader constants ONCE at setup (not during render)
         // TileHeader is .storageModeShared so this CPU write at init is allowed
         let headerPtr = self.tileAssignmentHeader.contents().bindMemory(to: TileAssignmentHeaderSwift.self, capacity: 1)
-        headerPtr.pointee.maxAssignments = UInt32(layout.maxAssignmentCapacity)
+        headerPtr.pointee.maxCapacity = UInt32(layout.maxAssignmentCapacity)
         headerPtr.pointee.paddedCount = UInt32(layout.paddedCapacity)
         headerPtr.pointee.totalAssignments = 0
         headerPtr.pointee.overflow = 0
@@ -481,36 +481,20 @@ public final class GlobalSortRenderer: GaussianRenderer, @unchecked Sendable {
             whiteBackground: whiteBackground
         )
 
-        let output: RenderOutputTextures?
+        let packedWorld = PackedWorldBuffers(
+            packedGaussians: input.gaussians,
+            harmonics: input.harmonics
+        )
 
-        if effectivePrecision == .float16 {
-            let packedWorld = PackedWorldBuffersHalf(
-                packedGaussians: input.gaussians,
-                harmonics: input.harmonics
-            )
-            output = encodeRenderToTextureHalf(
-                commandBuffer: commandBuffer,
-                gaussianCount: input.gaussianCount,
-                packedWorldBuffersHalf: packedWorld,
-                cameraUniforms: cameraUniforms,
-                frameParams: frameParams
-            )
-        } else {
-            let packedWorld = PackedWorldBuffers(
-                packedGaussians: input.gaussians,
-                harmonics: input.harmonics
-            )
-            output = encodeRenderToTextures(
-                commandBuffer: commandBuffer,
-                gaussianCount: input.gaussianCount,
-                packedWorldBuffers: packedWorld,
-                cameraUniforms: cameraUniforms,
-                frameParams: frameParams
-            )
-        }
+        guard let output = encodeRenderToTextures(
+            commandBuffer: commandBuffer,
+            gaussianCount: input.gaussianCount,
+            packedWorldBuffers: packedWorld,
+            cameraUniforms: cameraUniforms,
+            frameParams: frameParams
+        ) else { return nil }
 
-        guard let result = output else { return nil }
-        return TextureRenderResult(color: result.color, depth: result.depth, alpha: nil)
+        return TextureRenderResult(color: output.color, depth: output.depth, alpha: nil)
     }
 
     /// Render to CPU-readable buffers (protocol method)
@@ -705,10 +689,10 @@ public final class GlobalSortRenderer: GaussianRenderer, @unchecked Sendable {
             descriptor.outputURL = URL(fileURLWithPath: capturePath)
             let manager = MTLCaptureManager.shared()
             try? manager.startCapture(with: descriptor)
-            self.nextFrameCapturePath = nil // Consume the capture path
+            self.nextFrameCapturePath = nil
         }
 
-        guard let gaussianBuffers = self.prepareGaussianBuffers(count: gaussianCount) else {
+        guard let projectionOutput = self.prepareProjectionOutput(frame: frame) else {
             self.releaseFrame(index: slotIndex)
             if MTLCaptureManager.shared().isCapturing { MTLCaptureManager.shared().stopCapture() }
             return nil
@@ -719,14 +703,19 @@ public final class GlobalSortRenderer: GaussianRenderer, @unchecked Sendable {
             gaussianCount: gaussianCount,
             packedWorldBuffers: packedWorldBuffers,
             cameraUniforms: cameraUniforms,
-            gaussianBuffers: gaussianBuffers,
-            precision: self.effectivePrecision
+            output: projectionOutput,
+            useHalfWorld: effectivePrecision == .float16
         )
 
-        guard let assignment = self.buildTileAssignmentsGPU(commandBuffer: commandBuffer, gaussianCount: gaussianCount, gaussianBuffers: gaussianBuffers, params: params, frame: frame) else {
+        guard let assignment = self.buildTileAssignments(
+            commandBuffer: commandBuffer,
+            gaussianCount: gaussianCount,
+            projectionOutput: projectionOutput,
+            params: params,
+            frame: frame
+        ) else {
             self.releaseFrame(index: slotIndex)
             if MTLCaptureManager.shared().isCapturing { MTLCaptureManager.shared().stopCapture() }
-
             return nil
         }
 
@@ -734,14 +723,12 @@ public final class GlobalSortRenderer: GaussianRenderer, @unchecked Sendable {
             commandBuffer: commandBuffer,
             gaussianCount: gaussianCount,
             assignment: assignment,
-            gaussianBuffers: gaussianBuffers,
+            projectionOutput: projectionOutput,
             params: params,
-            frame: frame,
-            precision: self.effectivePrecision
+            frame: frame
         ) else {
             self.releaseFrame(index: slotIndex)
             if MTLCaptureManager.shared().isCapturing { MTLCaptureManager.shared().stopCapture() }
-
             return nil
         }
 
@@ -753,7 +740,7 @@ public final class GlobalSortRenderer: GaussianRenderer, @unchecked Sendable {
             slotIndex: slotIndex,
             precision: self.effectivePrecision
         )
-        
+
         guard submission else {
             self.releaseFrame(index: slotIndex)
             if MTLCaptureManager.shared().isCapturing { MTLCaptureManager.shared().stopCapture() }
@@ -764,11 +751,11 @@ public final class GlobalSortRenderer: GaussianRenderer, @unchecked Sendable {
             self?.releaseFrame(index: slotIndex)
             if MTLCaptureManager.shared().isCapturing { MTLCaptureManager.shared().stopCapture() }
         }
-        
+
         return frame.outputBuffers
     }
     
-    // New API for Texture-based rendering
+    /// Render to textures using packed GaussianRenderData pipeline
     public func encodeRenderToTextures(
         commandBuffer: MTLCommandBuffer,
         gaussianCount: Int,
@@ -777,9 +764,8 @@ public final class GlobalSortRenderer: GaussianRenderer, @unchecked Sendable {
         frameParams: FrameParams
     ) -> RenderOutputTextures? {
         let params = limits.buildParams(from: frameParams)
-        // validateLimits now crashes with descriptive message on failure
         guard self.validateLimits(gaussianCount: gaussianCount) else {
-            fatalError("[encodeRenderToTextures] validateLimits failed - should have crashed with details")
+            fatalError("[encodeRenderToTextures] validateLimits failed")
         }
 
         guard let (frame, slotIndex) = self.acquireFrame(width: limits.maxWidth, height: limits.maxHeight) else {
@@ -796,36 +782,42 @@ public final class GlobalSortRenderer: GaussianRenderer, @unchecked Sendable {
             self.nextFrameCapturePath = nil
         }
 
-        guard let gaussianBuffers = self.prepareGaussianBuffers(count: gaussianCount) else {
-            fatalError("[encodeRenderToTextures] prepareGaussianBuffers failed for count \(gaussianCount)")
+        // Prepare projection output (packed renderData + radii + mask)
+        guard let projectionOutput = self.prepareProjectionOutput(frame: frame) else {
+            fatalError("[encodeRenderToTextures] prepareProjectionOutput failed")
         }
 
+        // Project world gaussians to packed GaussianRenderData
         self.projectEncoder.encode(
             commandBuffer: commandBuffer,
             gaussianCount: gaussianCount,
             packedWorldBuffers: packedWorldBuffers,
             cameraUniforms: cameraUniforms,
-            gaussianBuffers: gaussianBuffers,
-            precision: self.effectivePrecision
+            output: projectionOutput,
+            useHalfWorld: effectivePrecision == .float16
         )
 
-        // buildTileAssignmentsGPU now crashes with descriptive message on failure
-        guard let assignment = self.buildTileAssignmentsGPU(commandBuffer: commandBuffer, gaussianCount: gaussianCount, gaussianBuffers: gaussianBuffers, params: params, frame: frame) else {
-            fatalError("[encodeRenderToTextures] buildTileAssignmentsGPU failed - should have crashed with details")
+        // Build tile assignments from packed render data
+        guard let assignment = self.buildTileAssignments(
+            commandBuffer: commandBuffer,
+            gaussianCount: gaussianCount,
+            projectionOutput: projectionOutput,
+            params: params,
+            frame: frame
+        ) else {
+            fatalError("[encodeRenderToTextures] buildTileAssignments failed")
         }
 
-        // buildOrderedGaussians now crashes with descriptive message on failure
+        // Build sorted indices for rendering
         guard let ordered = self.buildOrderedGaussians(
             commandBuffer: commandBuffer,
             gaussianCount: gaussianCount,
             assignment: assignment,
-            gaussianBuffers: gaussianBuffers,
+            projectionOutput: projectionOutput,
             params: params,
-            frame: frame,
-            precision: self.effectivePrecision,
-            textureOnlyFused: true  // Skip redundant pack for texture render
+            frame: frame
         ) else {
-            fatalError("[encodeRenderToTextures] buildOrderedGaussians failed - should have crashed with details")
+            fatalError("[encodeRenderToTextures] buildOrderedGaussians failed")
         }
 
         // Submit render to textures
@@ -833,113 +825,14 @@ public final class GlobalSortRenderer: GaussianRenderer, @unchecked Sendable {
         let dispatchArgs = frame.dispatchArgs
         let dispatchOffset = DispatchSlot.renderTiles.rawValue * MemoryLayout<DispatchIndirectArgsSwift>.stride
 
-        // Unified index-based render (like LocalSort)
-        guard let interleavedGaussians = ordered.interleavedGaussians,
+        guard let renderData = ordered.renderData,
               let sortedIndices = ordered.sortedIndices else {
-            fatalError("[encodeRenderToTextures] No interleavedGaussians or sortedIndices available")
+            fatalError("[encodeRenderToTextures] No renderData or sortedIndices available")
         }
         self.fusedPipelineEncoder.encodeCompleteRender(
             commandBuffer: commandBuffer,
             orderedBuffers: ordered,
-            interleavedGaussians: interleavedGaussians,
-            sortedIndices: sortedIndices,
-            colorTexture: textures.color,
-            depthTexture: textures.depth,
-            params: params,
-            dispatchArgs: dispatchArgs,
-            dispatchOffset: dispatchOffset
-        )
-
-        commandBuffer.addCompletedHandler { [weak self] _ in
-            self?.releaseFrame(index: slotIndex)
-            if MTLCaptureManager.shared().isCapturing { MTLCaptureManager.shared().stopCapture() }
-        }
-
-        return textures
-    }
-
-    /// API for full half-precision pipeline (half input -> half output).
-    /// Uses PackedWorldBuffersHalf for optimal memory bandwidth.
-    public func encodeRenderToTextureHalf(
-        commandBuffer: MTLCommandBuffer,
-        gaussianCount: Int,
-        packedWorldBuffersHalf: PackedWorldBuffersHalf,
-        cameraUniforms: CameraUniformsSwift,
-        frameParams: FrameParams
-    ) -> RenderOutputTextures? {
-        let params = limits.buildParams(from: frameParams)
-        // validateLimits now crashes with descriptive message on failure
-        guard self.validateLimits(gaussianCount: gaussianCount) else {
-            fatalError("[encodeRenderToTextureHalf] validateLimits failed - should have crashed with details")
-        }
-
-        guard let (frame, slotIndex) = self.acquireFrame(width: limits.maxWidth, height: limits.maxHeight) else {
-            fatalError("[encodeRenderToTextureHalf] acquireFrame failed for \(limits.maxWidth)x\(limits.maxHeight)")
-        }
-
-        if let capturePath = self.nextFrameCapturePath {
-            let descriptor = MTLCaptureDescriptor()
-            descriptor.captureObject = self.device
-            descriptor.destination = .gpuTraceDocument
-            descriptor.outputURL = URL(fileURLWithPath: capturePath)
-            let manager = MTLCaptureManager.shared()
-            try? manager.startCapture(with: descriptor)
-            self.nextFrameCapturePath = nil
-        }
-
-        // Prepare gaussian buffers with half-precision layout
-        guard let gaussianBuffers = self.prepareGaussianBuffersHalf(count: gaussianCount) else {
-            fatalError("[encodeRenderToTextureHalf] prepareGaussianBuffersHalf failed for count \(gaussianCount)")
-        }
-
-        // Project from half-precision packed world data to half gaussian data (half_half pipeline)
-        self.projectEncoder.encode(
-            commandBuffer: commandBuffer,
-            gaussianCount: gaussianCount,
-            packedWorldBuffersHalf: packedWorldBuffersHalf,
-            cameraUniforms: cameraUniforms,
-            gaussianBuffers: gaussianBuffers
-        )
-
-        // buildTileAssignmentsGPU now crashes with descriptive message on failure
-        guard let assignment = self.buildTileAssignmentsGPU(
-            commandBuffer: commandBuffer,
-            gaussianCount: gaussianCount,
-            gaussianBuffers: gaussianBuffers,
-            params: params,
-            frame: frame,
-            precision: .float16  // Half precision for this path
-        ) else {
-            fatalError("[encodeRenderToTextureHalf] buildTileAssignmentsGPU failed - should have crashed with details")
-        }
-
-        // buildOrderedGaussians now crashes with descriptive message on failure
-        guard let ordered = self.buildOrderedGaussians(
-            commandBuffer: commandBuffer,
-            gaussianCount: gaussianCount,
-            assignment: assignment,
-            gaussianBuffers: gaussianBuffers,
-            params: params,
-            frame: frame,
-            precision: .float16,  // Always half for this path
-            textureOnlyFused: true  // Skip redundant pack for texture render
-        ) else {
-            fatalError("[encodeRenderToTextureHalf] buildOrderedGaussians failed - should have crashed with details")
-        }
-
-        let textures = frame.outputTextures
-        let dispatchArgs = frame.dispatchArgs
-        let dispatchOffset = DispatchSlot.renderTiles.rawValue * MemoryLayout<DispatchIndirectArgsSwift>.stride
-
-        // Unified index-based render (like LocalSort)
-        guard let interleavedGaussians = ordered.interleavedGaussians,
-              let sortedIndices = ordered.sortedIndices else {
-            fatalError("[encodeRenderToTextureHalf] No interleavedGaussians or sortedIndices available")
-        }
-        self.fusedPipelineEncoder.encodeCompleteRender(
-            commandBuffer: commandBuffer,
-            orderedBuffers: ordered,
-            interleavedGaussians: interleavedGaussians,
+            renderData: renderData,
             sortedIndices: sortedIndices,
             colorTexture: textures.color,
             depthTexture: textures.depth,
@@ -975,7 +868,7 @@ public final class GlobalSortRenderer: GaussianRenderer, @unchecked Sendable {
             return false
         }
 
-        guard let gaussianBuffers = self.prepareGaussianBuffersHalf(count: gaussianCount) else {
+        guard let projectionOutput = self.prepareProjectionOutput(frame: frame) else {
             self.releaseFrame(index: slotIndex)
             return false
         }
@@ -985,17 +878,16 @@ public final class GlobalSortRenderer: GaussianRenderer, @unchecked Sendable {
             gaussianCount: gaussianCount,
             packedWorldBuffers: packedWorldBuffers,
             cameraUniforms: cameraUniforms,
-            gaussianBuffers: gaussianBuffers,
-            precision: .float16
+            output: projectionOutput,
+            useHalfWorld: effectivePrecision == .float16
         )
 
-        guard let assignment = self.buildTileAssignmentsGPU(
+        guard let assignment = self.buildTileAssignments(
             commandBuffer: commandBuffer,
             gaussianCount: gaussianCount,
-            gaussianBuffers: gaussianBuffers,
+            projectionOutput: projectionOutput,
             params: params,
-            frame: frame,
-            precision: .float16  // Half precision for this path
+            frame: frame
         ) else {
             self.releaseFrame(index: slotIndex)
             return false
@@ -1005,11 +897,9 @@ public final class GlobalSortRenderer: GaussianRenderer, @unchecked Sendable {
             commandBuffer: commandBuffer,
             gaussianCount: gaussianCount,
             assignment: assignment,
-            gaussianBuffers: gaussianBuffers,
+            projectionOutput: projectionOutput,
             params: params,
-            frame: frame,
-            precision: .float16,
-            textureOnlyFused: true  // Skip redundant pack for texture render
+            frame: frame
         ) else {
             self.releaseFrame(index: slotIndex)
             return false
@@ -1022,8 +912,7 @@ public final class GlobalSortRenderer: GaussianRenderer, @unchecked Sendable {
         let colorTex = targetColor
         let depthTex = targetDepth ?? frame.outputTextures.depth
 
-        // Unified index-based render (like LocalSort)
-        guard let interleavedGaussians = ordered.interleavedGaussians,
+        guard let renderData = ordered.renderData,
               let sortedIndices = ordered.sortedIndices else {
             self.releaseFrame(index: slotIndex)
             return false
@@ -1031,7 +920,7 @@ public final class GlobalSortRenderer: GaussianRenderer, @unchecked Sendable {
         self.fusedPipelineEncoder.encodeCompleteRender(
             commandBuffer: commandBuffer,
             orderedBuffers: ordered,
-            interleavedGaussians: interleavedGaussians,
+            renderData: renderData,
             sortedIndices: sortedIndices,
             colorTexture: colorTex,
             depthTexture: depthTex,
@@ -1066,44 +955,43 @@ public final class GlobalSortRenderer: GaussianRenderer, @unchecked Sendable {
         return true
     }
     
-    internal func buildTileAssignmentsGPU(
+    /// Build tile assignments from packed GaussianRenderData
+    internal func buildTileAssignments(
         commandBuffer: MTLCommandBuffer,
         gaussianCount: Int,
-        gaussianBuffers: GaussianInputBuffers,
+        projectionOutput: ProjectionOutput,
         params: RenderParams,
-        frame: FrameResources,
-        precision: Precision = .float32
+        frame: FrameResources
     ) -> TileAssignmentBuffers? {
-        // CRASH on failures - silent returns cause black screens!
         precondition(gaussianCount <= limits.maxGaussians,
-            "[buildTileAssignmentsGPU] gaussianCount (\(gaussianCount)) > limits.maxGaussians (\(limits.maxGaussians))")
+            "[buildTileAssignments] gaussianCount (\(gaussianCount)) > limits.maxGaussians (\(limits.maxGaussians))")
 
         let tileCount = Int(params.tilesX * params.tilesY)
         precondition(tileCount <= limits.maxTileCount,
-            "[buildTileAssignmentsGPU] tileCount (\(tileCount)) > limits.maxTileCount (\(limits.maxTileCount))")
+            "[buildTileAssignments] tileCount (\(tileCount)) > limits.maxTileCount (\(limits.maxTileCount))")
 
-        // Validate capacity using same formula as computeLayout:
-        // maxAssignmentCapacity = min(tileCapacity, gaussianTileCapacity)
         let perTileLimit = (params.maxPerTile == 0) ? UInt32(limits.maxPerTile) : min(params.maxPerTile, UInt32(limits.maxPerTile))
         let tileCapacity = tileCount * Int(perTileLimit)
-        let gaussianTileCapacity = gaussianCount * 8  // each gaussian spans ~8 tiles max
+        let gaussianTileCapacity = gaussianCount * 8
         let requiredCapacity = min(tileCapacity, gaussianTileCapacity)
 
         precondition(requiredCapacity <= frame.tileAssignmentMaxAssignments,
-            "[buildTileAssignmentsGPU] requiredCapacity (\(requiredCapacity)) > frame.tileAssignmentMaxAssignments (\(frame.tileAssignmentMaxAssignments)) - increase limits.maxPerTile or maxGaussians")
+            "[buildTileAssignments] requiredCapacity (\(requiredCapacity)) > frame.tileAssignmentMaxAssignments (\(frame.tileAssignmentMaxAssignments))")
 
         resetTileBuilderState(commandBuffer: commandBuffer, frame: frame)
 
+        // TileBounds - reads mean from packed GaussianRenderData
         self.tileBoundsEncoder.encode(
             commandBuffer: commandBuffer,
-            gaussianBuffers: gaussianBuffers,
+            renderData: projectionOutput.renderData,
+            radii: projectionOutput.radii,
+            mask: projectionOutput.mask,
             boundsBuffer: frame.boundsBuffer,
             params: params,
-            gaussianCount: gaussianCount,
-            precision: precision
+            gaussianCount: gaussianCount
         )
 
-        // SIMD-optimized fused coverage+scatter V2
+        // Fused coverage+scatter - reads mean/conic/opacity from packed GaussianRenderData
         self.fusedCoverageScatterEncoderV2.encode(
             commandBuffer: commandBuffer,
             gaussianCount: gaussianCount,
@@ -1113,15 +1001,12 @@ public final class GlobalSortRenderer: GaussianRenderer, @unchecked Sendable {
             maxAssignments: frame.tileAssignmentMaxAssignments,
             boundsBuffer: frame.boundsBuffer,
             coverageBuffer: frame.coverageBuffer,
-            opacitiesBuffer: gaussianBuffers.opacities,
-            meansBuffer: gaussianBuffers.means,
-            conicsBuffer: gaussianBuffers.conics,
+            renderData: projectionOutput.renderData,
             tileIndicesBuffer: frame.tileIndices,
             tileIdsBuffer: frame.tileIds,
-            tileAssignmentHeader: frame.tileAssignmentHeader,
-            precision: precision
+            tileAssignmentHeader: frame.tileAssignmentHeader
         )
-        
+
         return TileAssignmentBuffers(
             tileCount: tileCount,
             maxAssignments: frame.tileAssignmentMaxAssignments,
@@ -1130,19 +1015,18 @@ public final class GlobalSortRenderer: GaussianRenderer, @unchecked Sendable {
             header: frame.tileAssignmentHeader
         )
     }
-    
-    
+
+
+    /// Build ordered gaussian buffers - generates sort keys, sorts, and prepares for rendering
+    /// Uses index-based render (no pack step - render reads via sortedIndices into packed renderData)
     internal func buildOrderedGaussians(
         commandBuffer: MTLCommandBuffer,
         gaussianCount: Int,
         assignment: TileAssignmentBuffers,
-        gaussianBuffers: GaussianInputBuffers,
+        projectionOutput: ProjectionOutput,
         params: RenderParams,
-        frame: FrameResources,
-        precision: Precision,
-        textureOnlyFused: Bool = false  // When true, skip standard pack payload for fused texture render
+        frame: FrameResources
     ) -> OrderedGaussianBuffers? {
-        // CRASH on failures - silent returns cause black screens!
         precondition(gaussianCount <= limits.maxGaussians,
             "[buildOrderedGaussians] gaussianCount (\(gaussianCount)) > limits.maxGaussians (\(limits.maxGaussians))")
         precondition(assignment.maxAssignments <= frame.tileAssignmentMaxAssignments,
@@ -1150,9 +1034,6 @@ public final class GlobalSortRenderer: GaussianRenderer, @unchecked Sendable {
 
         let sortKeysBuffer = frame.sortKeys
         let sortedIndicesBuffer = frame.sortedIndices
-
-        let paddedCount = frame.tileAssignmentPaddedCapacity
-
         let dispatchArgs = frame.dispatchArgs
 
         self.dispatchEncoder.encode(
@@ -1161,22 +1042,23 @@ public final class GlobalSortRenderer: GaussianRenderer, @unchecked Sendable {
             dispatchArgs: dispatchArgs,
             maxAssignments: frame.tileAssignmentMaxAssignments
         )
-        
+
+        // Sort key generation - reads depth from packed GaussianRenderData
         self.sortKeyGenEncoder.encode(
             commandBuffer: commandBuffer,
             tileIds: assignment.tileIds,
             tileIndices: assignment.tileIndices,
-            depths: gaussianBuffers.depths,
+            renderData: projectionOutput.renderData,
             sortKeys: sortKeysBuffer,
             sortedIndices: sortedIndicesBuffer,
             header: assignment.header,
             dispatchArgs: dispatchArgs,
-            dispatchOffset: DispatchSlot.sortKeys.rawValue * MemoryLayout<DispatchIndirectArgsSwift>.stride,
-            precision: precision
+            dispatchOffset: DispatchSlot.sortKeys.rawValue * MemoryLayout<DispatchIndirectArgsSwift>.stride
         )
 
+        // Sort
         if self.sortAlgorithm == .radix {
-             let radixBuffers = RadixBufferSet(
+            let radixBuffers = RadixBufferSet(
                 histogram: frame.radixHistogram!,
                 blockSums: frame.radixBlockSums!,
                 scannedHistogram: frame.radixScannedHistogram!,
@@ -1184,7 +1066,7 @@ public final class GlobalSortRenderer: GaussianRenderer, @unchecked Sendable {
                 scratchKeys: frame.radixKeysScratch!,
                 scratchPayload: frame.radixPayloadScratch!
             )
-            
+
             let offsets = (
                 fuse: DispatchSlot.fuseKeys.rawValue * MemoryLayout<DispatchIndirectArgsSwift>.stride,
                 unpack: DispatchSlot.unpackKeys.rawValue * MemoryLayout<DispatchIndirectArgsSwift>.stride,
@@ -1194,7 +1076,7 @@ public final class GlobalSortRenderer: GaussianRenderer, @unchecked Sendable {
                 apply: DispatchSlot.radixApply.rawValue * MemoryLayout<DispatchIndirectArgsSwift>.stride,
                 scatter: DispatchSlot.radixScatter.rawValue * MemoryLayout<DispatchIndirectArgsSwift>.stride
             )
-            
+
             self.radixSortEncoder.encode(
                 commandBuffer: commandBuffer,
                 keyBuffer: sortKeysBuffer,
@@ -1206,12 +1088,13 @@ public final class GlobalSortRenderer: GaussianRenderer, @unchecked Sendable {
                 tileCount: assignment.tileCount
             )
         } else {
-             let offsets = (
+            let paddedCount = frame.tileAssignmentPaddedCapacity
+            let offsets = (
                 first: DispatchSlot.bitonicFirst.rawValue * MemoryLayout<DispatchIndirectArgsSwift>.stride,
                 general: DispatchSlot.bitonicGeneral.rawValue * MemoryLayout<DispatchIndirectArgsSwift>.stride,
                 final: DispatchSlot.bitonicFinal.rawValue * MemoryLayout<DispatchIndirectArgsSwift>.stride
             )
-            
+
             self.bitonicSortEncoder.encode(
                 commandBuffer: commandBuffer,
                 sortKeys: sortKeysBuffer,
@@ -1222,7 +1105,8 @@ public final class GlobalSortRenderer: GaussianRenderer, @unchecked Sendable {
                 paddedCapacity: paddedCount
             )
         }
-        
+
+        // Build headers and active tile list (index-based render - no pack step)
         let orderedBuffers = OrderedBufferSet(
             headers: frame.orderedHeaders,
             means: frame.packedMeans,
@@ -1233,53 +1117,14 @@ public final class GlobalSortRenderer: GaussianRenderer, @unchecked Sendable {
         )
         frame.activeTileCount.contents().storeBytes(of: UInt32(0), as: UInt32.self)
 
-        var indexBasedInterleavedBuffer: MTLBuffer? = nil
-        var indexBasedSortedIndicesBuffer: MTLBuffer? = nil
-
-        // Index-based render path (like LocalSort): skip Pack step, render reads via sortedIndices
-        let useIndexBasedRender = textureOnlyFused && frame.interleavedGaussians != nil
-
-        if useIndexBasedRender {
-            // Index-based path: skip Pack step, render reads via sortedIndices
-            self.packEncoder.encodeHeadersAndActiveTiles(
-                commandBuffer: commandBuffer,
-                sortedKeys: sortKeysBuffer,
-                assignment: assignment,
-                orderedHeaders: orderedBuffers.headers,
-                activeTileIndices: frame.activeTileIndices,
-                activeTileCount: frame.activeTileCount
-            )
-
-            let fusedEncoder = self.fusedPipelineEncoder
-            let interleavedBuffer = frame.interleavedGaussians!
-
-            // Only Interleave - NO Pack step (render will use sortedIndices)
-            fusedEncoder.encodeInterleave(
-                commandBuffer: commandBuffer,
-                gaussianBuffers: gaussianBuffers,
-                interleavedOutput: interleavedBuffer,
-                gaussianCount: gaussianCount,
-                precision: precision
-            )
-
-            indexBasedInterleavedBuffer = interleavedBuffer
-            indexBasedSortedIndicesBuffer = sortedIndicesBuffer
-        } else {
-            // Standard path: full pack with separated buffers (needed for buffer render)
-            self.packEncoder.encode(
-                commandBuffer: commandBuffer,
-                sortedIndices: sortedIndicesBuffer,
-                sortedKeys: sortKeysBuffer,
-                gaussianBuffers: gaussianBuffers,
-                orderedBuffers: orderedBuffers,
-                assignment: assignment,
-                dispatchArgs: dispatchArgs,
-                dispatchOffset: DispatchSlot.pack.rawValue * MemoryLayout<DispatchIndirectArgsSwift>.stride,
-                activeTileIndices: frame.activeTileIndices,
-                activeTileCount: frame.activeTileCount,
-                precision: precision
-            )
-        }
+        self.packEncoder.encodeHeadersAndActiveTiles(
+            commandBuffer: commandBuffer,
+            sortedKeys: sortKeysBuffer,
+            assignment: assignment,
+            orderedHeaders: orderedBuffers.headers,
+            activeTileIndices: frame.activeTileIndices,
+            activeTileCount: frame.activeTileCount
+        )
 
         return OrderedGaussianBuffers(
             headers: orderedBuffers.headers,
@@ -1291,13 +1136,12 @@ public final class GlobalSortRenderer: GaussianRenderer, @unchecked Sendable {
             tileCount: assignment.tileCount,
             activeTileIndices: frame.activeTileIndices,
             activeTileCount: frame.activeTileCount,
-            precision: precision,
-            interleavedGaussians: indexBasedInterleavedBuffer,
-            sortedIndices: indexBasedSortedIndicesBuffer
+            precision: self.effectivePrecision,
+            renderData: projectionOutput.renderData,
+            sortedIndices: sortedIndicesBuffer
         )
     }
-        
-    
+
     private func submitRender(
         commandBuffer: MTLCommandBuffer,
         ordered: OrderedGaussianBuffers,
@@ -1403,49 +1247,19 @@ public final class GlobalSortRenderer: GaussianRenderer, @unchecked Sendable {
 
     /* REMOVED: prepareWorldBuffers - was for C API with non-packed buffers */
     
-    internal func prepareGaussianBuffers(count: Int) -> GaussianInputBuffers? {
-        guard count <= limits.maxGaussians else { return nil }
+    /// Prepare ProjectionOutput for projection kernel output
+    /// Uses frame's interleavedGaussians for packed render data, shared caches for radii/mask
+    internal func prepareProjectionOutput(frame: FrameResources) -> ProjectionOutput? {
         guard
-            let means = self.gaussianMeansCache,
+            let renderData = frame.interleavedGaussians,
             let radii = self.gaussianRadiiCache,
-            let mask = self.gaussianMaskCache,
-            let depths = self.gaussianDepthsCache,
-            let conics = self.gaussianConicsCache,
-            let colors = self.gaussianColorsCache,
-            let opacities = self.gaussianOpacitiesCache
+            let mask = self.gaussianMaskCache
         else { return nil }
 
-        return GaussianInputBuffers(
-            means: means,
+        return ProjectionOutput(
+            renderData: renderData,
             radii: radii,
-            mask: mask,
-            depths: depths,
-            conics: conics,
-            colors: colors,
-            opacities: opacities
-        )
-    }
-
-    internal func prepareGaussianBuffersHalf(count: Int) -> GaussianInputBuffers? {
-        guard count <= limits.maxGaussians else { return nil }
-        guard
-            let means = self.gaussianMeansHalfCache,
-            let radii = self.gaussianRadiiCache,
-            let mask = self.gaussianMaskCache,
-            let depths = self.gaussianDepthsHalfCache,
-            let conics = self.gaussianConicsHalfCache,
-            let colors = self.gaussianColorsHalfCache,
-            let opacities = self.gaussianOpacitiesHalfCache
-        else { return nil }
-
-        return GaussianInputBuffers(
-            means: means,
-            radii: radii,
-            mask: mask,
-            depths: depths,
-            conics: conics,
-            colors: colors,
-            opacities: opacities
+            mask: mask
         )
     }
 

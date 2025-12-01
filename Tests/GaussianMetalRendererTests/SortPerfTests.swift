@@ -97,7 +97,7 @@ final class SortPerfTests: XCTestCase {
                 let headerPtr = headerBuffer.contents().bindMemory(to: TileAssignmentHeaderSwift.self, capacity: 1)
                 headerPtr.pointee.totalAssignments = UInt32(count)
                 headerPtr.pointee.paddedCount = UInt32(paddedCount)
-                headerPtr.pointee.maxAssignments = UInt32(paddedCount)
+                headerPtr.pointee.maxCapacity = UInt32(paddedCount)
             }
 
 

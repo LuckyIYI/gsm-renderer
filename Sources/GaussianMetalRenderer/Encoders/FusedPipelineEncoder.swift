@@ -1,28 +1,18 @@
 import Metal
 
-/// Encoder for fused pipeline operations using interleaved data structures
+/// Encoder for fused pipeline operations using AoS (Array of Structures) data
 /// Unified with LocalSort approach: index-based render, no alpha texture, half precision
+/// NOTE: Interleave step is OBSOLETE - projection now outputs AoS directly via projectGaussiansAoS
 final class FusedPipelineEncoder {
     // Pipeline states
-    private let interleaveHalfPipeline: MTLComputePipelineState
-    private let interleaveFloatPipeline: MTLComputePipelineState
     private let renderPipeline: MTLComputePipelineState  // Unified render (like LocalSort)
     private let prepareDispatchPipeline: MTLComputePipelineState
     private let clearTexturesPipeline: MTLComputePipelineState
 
     // Threadgroup sizes
-    let interleaveThreadgroupSize: Int
-    let renderThreadgroupSize: MTLSize  // 8x8 for 32x16 tiles (4x2 pixels/thread)
+    let renderThreadgroupSize: MTLSize  // 8x8 for 32x16 tiles (4x2 pixels per thread)
 
     init(device: MTLDevice, library: MTLLibrary) throws {
-        // Interleave kernels
-        guard let interleaveHalfFn = library.makeFunction(name: "interleaveGaussianDataKernelHalf"),
-              let interleaveFloatFn = library.makeFunction(name: "interleaveGaussianDataKernelFloat")
-        else {
-            throw NSError(domain: "FusedPipelineEncoder", code: 1,
-                          userInfo: [NSLocalizedDescriptionKey: "Interleave kernel functions missing"])
-        }
-
         // Unified render kernel (like LocalSort)
         guard let renderFn = library.makeFunction(name: "globalSortRender") else {
             throw NSError(domain: "FusedPipelineEncoder", code: 3,
@@ -38,49 +28,12 @@ final class FusedPipelineEncoder {
         }
 
         // Create pipeline states
-        self.interleaveHalfPipeline = try device.makeComputePipelineState(function: interleaveHalfFn)
-        self.interleaveFloatPipeline = try device.makeComputePipelineState(function: interleaveFloatFn)
         self.renderPipeline = try device.makeComputePipelineState(function: renderFn)
         self.prepareDispatchPipeline = try device.makeComputePipelineState(function: prepFn)
         self.clearTexturesPipeline = try device.makeComputePipelineState(function: clearTexFn)
 
-        // Compute threadgroup sizes
-        self.interleaveThreadgroupSize = max(1, min(interleaveHalfPipeline.maxTotalThreadsPerThreadgroup, 256))
         // Render uses 8x8 threadgroup for 32x16 tiles (4x2 pixels per thread)
         self.renderThreadgroupSize = MTLSize(width: 8, height: 8, depth: 1)
-    }
-
-    // MARK: - Interleave
-
-    /// Interleave separate gaussian buffers into single GaussianRenderData struct
-    func encodeInterleave(
-        commandBuffer: MTLCommandBuffer,
-        gaussianBuffers: GaussianInputBuffers,
-        interleavedOutput: MTLBuffer,
-        gaussianCount: Int,
-        precision: Precision
-    ) {
-        guard let encoder = commandBuffer.makeComputeCommandEncoder() else { return }
-        encoder.label = "InterleaveGaussians"
-
-        let pipeline = precision == .float16 ? interleaveHalfPipeline : interleaveFloatPipeline
-        encoder.setComputePipelineState(pipeline)
-
-        encoder.setBuffer(gaussianBuffers.means, offset: 0, index: 0)
-        encoder.setBuffer(gaussianBuffers.conics, offset: 0, index: 1)
-        encoder.setBuffer(gaussianBuffers.colors, offset: 0, index: 2)
-        encoder.setBuffer(gaussianBuffers.opacities, offset: 0, index: 3)
-        encoder.setBuffer(gaussianBuffers.depths, offset: 0, index: 4)
-        encoder.setBuffer(interleavedOutput, offset: 0, index: 5)
-
-        var count = UInt32(gaussianCount)
-        encoder.setBytes(&count, length: 4, index: 6)
-
-        let threads = MTLSize(width: gaussianCount, height: 1, depth: 1)
-        let tg = MTLSize(width: interleaveThreadgroupSize, height: 1, depth: 1)
-        encoder.dispatchThreads(threads, threadsPerThreadgroup: tg)
-
-        encoder.endEncoding()
     }
 
     // MARK: - Render (unified, like LocalSort)
@@ -88,10 +41,11 @@ final class FusedPipelineEncoder {
     /// Render using index-based access (like LocalSort)
     /// No Pack step needed - reads via sortedIndices directly
     /// Only outputs color + depth (alpha in color.a channel)
+    /// renderData: AoS packed GaussianRenderData from projectGaussiansAoS
     func encodeRender(
         commandBuffer: MTLCommandBuffer,
         headers: MTLBuffer,
-        interleavedGaussians: MTLBuffer,
+        renderData: MTLBuffer,  // GaussianRenderData from AoS projection
         sortedIndices: MTLBuffer,
         activeTileIndices: MTLBuffer,
         activeTileCount: MTLBuffer,
@@ -107,7 +61,7 @@ final class FusedPipelineEncoder {
         encoder.setComputePipelineState(renderPipeline)
 
         encoder.setBuffer(headers, offset: 0, index: 0)
-        encoder.setBuffer(interleavedGaussians, offset: 0, index: 1)
+        encoder.setBuffer(renderData, offset: 0, index: 1)
         encoder.setBuffer(sortedIndices, offset: 0, index: 2)
         encoder.setBuffer(activeTileIndices, offset: 0, index: 3)
         encoder.setBuffer(activeTileCount, offset: 0, index: 4)
@@ -131,10 +85,11 @@ final class FusedPipelineEncoder {
     // MARK: - Complete Render (prep + clear + render)
 
     /// Complete render: prepares dispatch, clears textures, and renders
+    /// renderData: AoS packed GaussianRenderData from projectGaussiansAoS
     func encodeCompleteRender(
         commandBuffer: MTLCommandBuffer,
         orderedBuffers: OrderedGaussianBuffers,
-        interleavedGaussians: MTLBuffer,
+        renderData: MTLBuffer,  // GaussianRenderData from AoS projection
         sortedIndices: MTLBuffer,
         colorTexture: MTLTexture,
         depthTexture: MTLTexture,
@@ -161,7 +116,7 @@ final class FusedPipelineEncoder {
         encodeRender(
             commandBuffer: commandBuffer,
             headers: orderedBuffers.headers,
-            interleavedGaussians: interleavedGaussians,
+            renderData: renderData,
             sortedIndices: sortedIndices,
             activeTileIndices: orderedBuffers.activeTileIndices,
             activeTileCount: orderedBuffers.activeTileCount,

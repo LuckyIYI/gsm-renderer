@@ -4,7 +4,7 @@ import simd
 @testable import GaussianMetalRenderer
 
 /// Compare Tellusim pipeline output to original pipeline output
-final class TellusimComparisonTests: XCTestCase {
+final class LocalSortComparisonTests: XCTestCase {
     private let imageWidth = 1920
     private let imageHeight = 1080
     private let tileWidth = 32
@@ -125,7 +125,7 @@ final class TellusimComparisonTests: XCTestCase {
         // ============================================
         // Run TELLUSIM pipeline projection
         // ============================================
-        let tellusimEncoder = try TellusimPipelineEncoder(device: device, library: library)
+        let tellusimEncoder = try LocalSortPipelineEncoder(device: device, library: library)
 
         let tilesX = (imageWidth + tileWidth - 1) / tileWidth
         let tilesY = (imageHeight + tileHeight - 1) / tileHeight
@@ -182,7 +182,7 @@ final class TellusimComparisonTests: XCTestCase {
         let origMask = origMaskBuffer.contents().bindMemory(to: UInt8.self, capacity: gaussianCount)
         let origDepth = origDepthBuffer.contents().bindMemory(to: Float.self, capacity: gaussianCount)
 
-        let tellusimVisibleCount = TellusimPipelineEncoder.readVisibleCount(from: tellusimHeader)
+        let tellusimVisibleCount = LocalSortPipelineEncoder.readVisibleCount(from: tellusimHeader)
         let tellusimCompactedPtr = tellusimCompacted.contents().bindMemory(to: CompactedGaussianSwift.self, capacity: Int(tellusimVisibleCount))
 
         print("\n╔═══════════════════════════════════════════════════════════╗")
@@ -263,7 +263,7 @@ final class TellusimComparisonTests: XCTestCase {
         // Create original renderer (uses fused pipeline by default)
         let origRenderer = GlobalSortRenderer(
             precision: Precision.float32,
-            useHeapAllocation: false,
+            
             limits: RendererLimits(maxGaussians: 1024, maxWidth: width, maxHeight: height, tileWidth: 16, tileHeight: 16)
         )
         let device = origRenderer.device
@@ -521,7 +521,7 @@ final class TellusimComparisonTests: XCTestCase {
         // Create original renderer
         let origRenderer = GlobalSortRenderer(
             precision: Precision.float32,
-            useHeapAllocation: false,
+            
             limits: RendererLimits(maxGaussians: 1024, maxWidth: width, maxHeight: height, tileWidth: 16, tileHeight: 16)
         )
         let device = origRenderer.device

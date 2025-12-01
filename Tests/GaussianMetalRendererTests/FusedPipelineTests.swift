@@ -170,7 +170,7 @@ final class FusedPipelineTests: XCTestCase {
         let height = 256
         let renderer = GlobalSortRenderer(
             precision: Precision.float16,
-            useHeapAllocation: false,
+            
             limits: RendererLimits(maxGaussians: 10_000, maxWidth: width, maxHeight: height)
         )
 
@@ -217,7 +217,7 @@ final class FusedPipelineTests: XCTestCase {
         let height = 512
         let renderer = GlobalSortRenderer(
             precision: Precision.float32,
-            useHeapAllocation: false,
+            
             limits: RendererLimits(maxGaussians: 50_000, maxWidth: width, maxHeight: height)
         )
 
@@ -264,7 +264,7 @@ final class FusedPipelineTests: XCTestCase {
         let height = 768
         let renderer = GlobalSortRenderer(
             precision: Precision.float32,
-            useHeapAllocation: false,
+            
             limits: RendererLimits(maxGaussians: 200_000, maxWidth: width, maxHeight: height)
         )
 
@@ -311,7 +311,7 @@ final class FusedPipelineTests: XCTestCase {
         let height = 1080
         let renderer = GlobalSortRenderer(
             precision: Precision.float16,
-            useHeapAllocation: false,
+            
             textureOnly: true,
             limits: RendererLimits(maxGaussians: 600_000, maxWidth: width, maxHeight: height)
         )
@@ -359,7 +359,7 @@ final class FusedPipelineTests: XCTestCase {
         let height = 256
         let renderer = GlobalSortRenderer(
             precision: Precision.float32,
-            useHeapAllocation: false,
+            
             limits: RendererLimits(maxGaussians: 10_000, maxWidth: width, maxHeight: height, tileWidth: 32, tileHeight: 16)
         )
 
@@ -406,7 +406,7 @@ final class FusedPipelineTests: XCTestCase {
         let height = 768
         let renderer = GlobalSortRenderer(
             precision: Precision.float16,
-            useHeapAllocation: false,
+            
             limits: RendererLimits(maxGaussians: 100_000, maxWidth: width, maxHeight: height, tileWidth: 32, tileHeight: 16)
         )
 
@@ -453,7 +453,7 @@ final class FusedPipelineTests: XCTestCase {
         let height = 512
         let renderer = GlobalSortRenderer(
             precision: Precision.float32,
-            useHeapAllocation: false,
+            
             limits: RendererLimits(maxGaussians: 50_000, maxWidth: width, maxHeight: height)
         )
 

@@ -170,7 +170,7 @@ final class RadixIntegrationTests: XCTestCase {
         let renderer = GlobalSortRenderer(
             precision: Precision.float32,
             sortAlgorithm: .radix,
-            useHeapAllocation: false,
+            
             limits: RendererLimits(maxGaussians: 50_000, maxWidth: width, maxHeight: height)
         )
 
@@ -218,7 +218,7 @@ final class RadixIntegrationTests: XCTestCase {
         let renderer = GlobalSortRenderer(
             precision: Precision.float16,
             sortAlgorithm: .radix,
-            useHeapAllocation: false,
+            
             textureOnly: true,
             limits: RendererLimits(maxGaussians: 200_000, maxWidth: width, maxHeight: height)
         )
@@ -272,14 +272,14 @@ final class RadixIntegrationTests: XCTestCase {
         let radixRenderer = GlobalSortRenderer(
             precision: Precision.float32,
             sortAlgorithm: .radix,
-            useHeapAllocation: false,
+            
             limits: RendererLimits(maxGaussians: 10_000, maxWidth: width, maxHeight: height)
         )
 
         let bitonicRenderer = GlobalSortRenderer(
             precision: Precision.float32,
             sortAlgorithm: .bitonic,
-            useHeapAllocation: false,
+            
             limits: RendererLimits(maxGaussians: 10_000, maxWidth: width, maxHeight: height)
         )
 

@@ -11,7 +11,7 @@ final class RenderTests: XCTestCase {
         super.setUp()
         renderer = GlobalSortRenderer(
             precision: Precision.float32,
-            useHeapAllocation: false,
+            
             limits: RendererLimits(maxGaussians: 100_000, maxWidth: 1024, maxHeight: 1024, tileWidth: 16, tileHeight: 16)
         )
     }
@@ -149,7 +149,7 @@ final class RenderTests: XCTestCase {
         let height = 32
         let renderer = GlobalSortRenderer(
             precision: Precision.float32,
-            useHeapAllocation: false,
+            
             limits: RendererLimits(maxGaussians: 1024, maxWidth: width, maxHeight: height, tileWidth: 16, tileHeight: 16)
         )
 
@@ -201,7 +201,7 @@ final class RenderTests: XCTestCase {
         let height = 64
         let renderer = GlobalSortRenderer(
             precision: Precision.float32,
-            useHeapAllocation: false,
+            
             limits: RendererLimits(maxGaussians: 1024, maxWidth: width, maxHeight: height, tileWidth: 16, tileHeight: 16)
         )
 
@@ -271,7 +271,7 @@ final class RenderTests: XCTestCase {
         let height = 64
         let renderer = GlobalSortRenderer(
             precision: Precision.float32,
-            useHeapAllocation: false,
+            
             limits: RendererLimits(maxGaussians: 1024, maxWidth: width, maxHeight: height, tileWidth: 16, tileHeight: 16)
         )
 
@@ -324,7 +324,7 @@ final class RenderTests: XCTestCase {
         let height = 64
         let renderer = GlobalSortRenderer(
             precision: Precision.float32,
-            useHeapAllocation: false,
+            
             limits: RendererLimits(maxGaussians: 1024, maxWidth: width, maxHeight: height, tileWidth: 16, tileHeight: 16)
         )
 
@@ -395,7 +395,7 @@ final class RenderTests: XCTestCase {
         let height = 32
         let renderer = GlobalSortRenderer(
             precision: Precision.float16,
-            useHeapAllocation: false,
+            
             limits: RendererLimits(maxGaussians: 1024, maxWidth: width, maxHeight: height, tileWidth: 16, tileHeight: 16)
         )
 
@@ -465,7 +465,7 @@ final class RenderTests: XCTestCase {
         let height = 64
         let renderer = GlobalSortRenderer(
             precision: Precision.float32,
-            useHeapAllocation: false,
+            
             limits: RendererLimits(maxGaussians: 10_000, maxWidth: width, maxHeight: height, tileWidth: 16, tileHeight: 16)
         )
 
@@ -535,7 +535,7 @@ final class RenderTests: XCTestCase {
         let height = 32
         let renderer = GlobalSortRenderer(
             precision: Precision.float16,
-            useHeapAllocation: false,
+            
             limits: RendererLimits(maxGaussians: 1024, maxWidth: width, maxHeight: height, tileWidth: 16, tileHeight: 16)
         )
 
@@ -590,7 +590,7 @@ final class RenderTests: XCTestCase {
         let height = 512
         let renderer = GlobalSortRenderer(
             precision: Precision.float16,
-            useHeapAllocation: false,
+            
             limits: RendererLimits(maxGaussians: 20_000, maxWidth: width, maxHeight: height, tileWidth: 16, tileHeight: 16)
         )
 

@@ -21,19 +21,19 @@ xcrun -sdk $SDK metallib \
 
 echo "Done: $LIB"
 
-# Tellusim shaders
-SRC2="Sources/GaussianMetalRenderer/TellusimShaders.metal"
-AIR2="Sources/GaussianMetalRenderer/TellusimShaders.air"
-LIB2="Sources/GaussianMetalRenderer/TellusimShaders.metallib"
+# LocalSort shaders (per-tile bitonic sort)
+SRC2="Sources/GaussianMetalRenderer/LocalSortShaders.metal"
+AIR2="Sources/GaussianMetalRenderer/LocalSortShaders.air"
+LIB2="Sources/GaussianMetalRenderer/LocalSortShaders.metallib"
 
 echo ""
-echo "Compiling Tellusim Shaders..."
+echo "Compiling LocalSort Shaders..."
 xcrun -sdk $SDK metal \
   -frecord-sources -gline-tables-only \
   -c "$SRC2" \
   -o "$AIR2"
 
-echo "Linking Tellusim Metal Library..."
+echo "Linking LocalSort Metal Library..."
 xcrun -sdk $SDK metallib \
   "$AIR2" \
   -o "$LIB2"

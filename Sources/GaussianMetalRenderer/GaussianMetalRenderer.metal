@@ -2273,7 +2273,7 @@ kernel void renderTilesFusedMultiPixel_float(
 // =============================================================================
 
 // =============================================================================
-// V3: Tellusim-style - NO shared memory, 8 pixels/thread, direct global reads
+// V3: local sort style - NO shared memory, 8 pixels/thread, direct global reads
 // Key insight: Shared memory loading has overhead. Better to load per-thread
 // and process more pixels to amortize the load cost.
 // 32x16 tile, 8x8 threadgroup (64 threads), 4x2 pixels per thread = 512 pixels
@@ -2295,7 +2295,7 @@ kernel void renderTilesFusedV3_half(
     uint2                           group_id        [[threadgroup_position_in_grid]],
     uint2                           local_id        [[thread_position_in_threadgroup]]
 ) {
-    // No shared memory - Tellusim insight: direct global reads are better
+    // No shared memory - local sort insight: direct global reads are better
     // when each thread processes enough pixels to amortize the load
 
     uint tileIdx = group_id.x;

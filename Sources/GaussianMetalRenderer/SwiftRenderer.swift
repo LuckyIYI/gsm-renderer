@@ -64,70 +64,18 @@ public struct RendererLimits: Sendable {
 
 // MARK: - Frame Resources
 
-/// Placement heap allocator with optional residency management
-final class HeapAllocator {
-    private let device: MTLDevice
-    var residencySetProvider: (() -> (any MTLResidencySet)?)?
-    private(set) var heap: MTLHeap?
-    private(set) var heapSize: Int = 0
-    private var currentOffset: Int = 0
-
-    init(device: MTLDevice, residencySetProvider: (() -> (any MTLResidencySet)?)? = nil) {
-        self.device = device
-        self.residencySetProvider = residencySetProvider
-    }
-
-    func createHeap(size: Int, label: String) -> Bool {
-        guard size > 0 else { return false }
-        let descriptor = MTLHeapDescriptor()
-        descriptor.type = .placement
-        descriptor.storageMode = .private
-        descriptor.hazardTrackingMode = .tracked
-        descriptor.size = size
-
-        guard let newHeap = device.makeHeap(descriptor: descriptor) else { return false }
-        newHeap.label = label
-        heap = newHeap
-        heapSize = size
-        currentOffset = 0
-
-        if let resSet = residencySetProvider?() {
-            resSet.addAllocation(newHeap)
-            resSet.commit()
-        }
-        return true
-    }
-
-    func allocateBuffer(length: Int, options: MTLResourceOptions, label: String?) -> MTLBuffer? {
-        guard let heap else { return nil }
-        let sa = device.heapBufferSizeAndAlign(length: length, options: options)
-        let align = max(Int(sa.align), 1)
-        currentOffset = (currentOffset + align - 1) & ~(align - 1)
-        guard currentOffset + Int(sa.size) <= heapSize else { return nil }
-        guard let buffer = heap.makeBuffer(length: length, options: options, offset: currentOffset) else { return nil }
-        buffer.label = label
-        currentOffset += Int(sa.size)
-        return buffer
-    }
-}
-
 struct FrameResourceLayout {
     let limits: RendererLimits
     /// Maximum tile assignments capacity (tileCount * maxPerTile, clamped by gaussianCapacity)
     let maxAssignmentCapacity: Int
     /// Padded capacity for sort alignment (power-of-2 for bitonic, 1024-aligned for radix)
     let paddedCapacity: Int
-    let heapAllocations: [(label: String, length: Int, options: MTLResourceOptions)]
-    let sharedAllocations: [(label: String, length: Int, options: MTLResourceOptions)]
-    let heapSize: Int
+    let bufferAllocations: [(label: String, length: Int, options: MTLResourceOptions)]
     let pixelCapacity: Int
     let precisionStride: Int
 }
 
 final class FrameResources {
-    // Placement heap allocator for efficient buffer allocation
-    let heapAllocator: HeapAllocator
-
     // Tile Builder Buffers
     let boundsBuffer: MTLBuffer
     let coverageBuffer: MTLBuffer
@@ -176,9 +124,8 @@ final class FrameResources {
 
     let device: MTLDevice
 
-    init(device: MTLDevice, layout: FrameResourceLayout, residencySetProvider: (() -> (any MTLResidencySet)?)?, useHeap: Bool, textureOnly: Bool = false) {
+    init(device: MTLDevice, layout: FrameResourceLayout, textureOnly: Bool = false) {
         self.device = device
-        self.heapAllocator = HeapAllocator(device: device, residencySetProvider: residencySetProvider)
         self.tileAssignmentMaxAssignments = layout.maxAssignmentCapacity
         self.tileAssignmentPaddedCapacity = layout.paddedCapacity
 
@@ -188,40 +135,21 @@ final class FrameResources {
         dispatchArgs.label = "FrameDispatchArgs"
         self.dispatchArgs = dispatchArgs
 
-        func makeDeviceBuffer(_ req: (label: String, length: Int, options: MTLResourceOptions)) -> MTLBuffer {
+        // Buffer allocation helper
+        var bufferMap: [String: MTLBuffer] = [:]
+        for req in layout.bufferAllocations {
             guard let buf = device.makeBuffer(length: req.length, options: req.options) else {
                 fatalError("Failed to allocate buffer \(req.label)")
             }
             buf.label = req.label
-            return buf
-        }
-
-        var heapBuffers: [String: MTLBuffer] = [:]
-        let heapActive = useHeap
-        if heapActive {
-            guard heapAllocator.createHeap(size: layout.heapSize, label: "FrameResourcesHeap") else {
-                fatalError("Failed to create placement heap of size \(layout.heapSize)")
-            }
-            for req in layout.heapAllocations {
-                guard let buf = heapAllocator.allocateBuffer(length: req.length, options: req.options, label: req.label) else {
-                    fatalError("Failed to allocate \(req.label) from heap")
-                }
-                heapBuffers[req.label] = buf
-            }
+            bufferMap[req.label] = buf
         }
 
         func buffer(_ label: String) -> MTLBuffer {
-            if let buf = heapBuffers[label] { return buf }
-            if let match = layout.sharedAllocations.first(where: { $0.label == label }) {
-                return makeDeviceBuffer(match)
+            guard let buf = bufferMap[label] else {
+                fatalError("Unknown buffer label \(label)")
             }
-            if let match = layout.heapAllocations.first(where: { $0.label == label }) {
-                if heapActive {
-                    fatalError("Heap allocation for \(label) missing; heap failed or overflowed")
-                }
-                return makeDeviceBuffer(match)
-            }
-            fatalError("Unknown buffer label \(label)")
+            return buf
         }
 
         // Assign buffers
@@ -255,7 +183,7 @@ final class FrameResources {
 
         // Conditionally allocate radix/fused buffers based on config
         func optionalBuffer(_ label: String) -> MTLBuffer? {
-            layout.heapAllocations.contains(where: { $0.label == label }) ? buffer(label) : nil
+            bufferMap[label]
         }
         self.radixHistogram = optionalBuffer("RadixHist")
         self.radixBlockSums = optionalBuffer("RadixBlockSums")
@@ -369,11 +297,6 @@ public final class GlobalSortRenderer: GaussianRenderer, @unchecked Sendable {
     /// Last GPU execution time in seconds (from command buffer GPUStartTime/GPUEndTime)
     public private(set) var lastGPUTime: Double?
 
-    /// Residency set for efficient GPU memory management (macOS 15+ / iOS 18+)
-    private var residencySet: (any MTLResidencySet)?
-
-    /// Use heap allocation for frame buffers (reduces TLB misses)
-    public let useHeapAllocation: Bool
     private let limits: RendererLimits
     let frameLayout: FrameResourceLayout  // internal for tests
 
@@ -384,7 +307,6 @@ public final class GlobalSortRenderer: GaussianRenderer, @unchecked Sendable {
     public init(
         precision: Precision = .float32,
         sortAlgorithm: SortAlgorithm = .radix,
-        useHeapAllocation: Bool = false,
         textureOnly: Bool = false,  // Skip buffer output allocation to save ~20MB
         limits: RendererLimits = RendererLimits(maxGaussians: 1_000_000, maxWidth: 2048, maxHeight: 2048)
     ) {
@@ -444,19 +366,7 @@ public final class GlobalSortRenderer: GaussianRenderer, @unchecked Sendable {
         }
         self.precision = precision
         self.sortAlgorithm = sortAlgorithm
-        self.useHeapAllocation = useHeapAllocation
         self.limits = limits
-
-        do {
-            let descriptor = MTLResidencySetDescriptor()
-            descriptor.label = "GaussianRendererResidencySet"
-            descriptor.initialCapacity = 64
-            let resSet = try device.makeResidencySet(descriptor: descriptor)
-            self.residencySet = resSet
-            queue.addResidencySet(resSet)
-        } catch {
-            self.residencySet = nil
-        }
 
         // Compute layout once using max precision for safety
         self.frameLayout = GlobalSortRenderer.computeLayout(
@@ -473,8 +383,6 @@ public final class GlobalSortRenderer: GaussianRenderer, @unchecked Sendable {
             let frame = FrameResources(
                 device: device,
                 layout: self.frameLayout,
-                residencySetProvider: { [weak self] in self?.residencySet },
-                useHeap: useHeapAllocation,
                 textureOnly: textureOnly
             )
             self.frameResources.append(frame)
@@ -540,7 +448,6 @@ public final class GlobalSortRenderer: GaussianRenderer, @unchecked Sendable {
         self.init(
             precision: precision,
             sortAlgorithm: .radix,
-            useHeapAllocation: config.useHeapAllocation,
             textureOnly: false,
             limits: limits
         )
@@ -712,10 +619,14 @@ public final class GlobalSortRenderer: GaussianRenderer, @unchecked Sendable {
         let elementsPerGroup = prefixBlockSize * prefixGrainSize
         let groups = (gaussianCapacity + elementsPerGroup - 1) / elementsPerGroup
 
-        var heapAllocations: [(label: String, length: Int, options: MTLResourceOptions)] = []
+        var bufferAllocations: [(label: String, length: Int, options: MTLResourceOptions)] = []
         func add(_ label: String, _ length: Int, _ opts: MTLResourceOptions = .storageModePrivate) {
-            heapAllocations.append((label, max(1, length), opts))
+            bufferAllocations.append((label, max(1, length), opts))
         }
+
+        // Shared allocations (CPU-visible)
+        add("TileHeader", MemoryLayout<TileAssignmentHeaderSwift>.stride, .storageModeShared)
+        add("ActiveTileCount", MemoryLayout<UInt32>.stride, .storageModeShared)
 
         // Per-gaussian buffers (sized to gaussianCapacity)
         add("Bounds", gaussianCapacity * MemoryLayout<SIMD4<Int32>>.stride)
@@ -760,29 +671,11 @@ public final class GlobalSortRenderer: GaussianRenderer, @unchecked Sendable {
         add("InterleavedGaussians", gaussianCapacity * strideForInterleaved())
         add("PackedGaussiansFused", maxAssignmentCapacity * strideForInterleaved())
 
-        func heapSize(for allocations: [(label: String, length: Int, options: MTLResourceOptions)]) -> Int {
-            var offset = 0
-            for req in allocations {
-                let sa = device.heapBufferSizeAndAlign(length: req.length, options: req.options)
-                let align = max(Int(sa.align), 1)
-                offset = (offset + align - 1) & ~(align - 1)
-                offset += Int(sa.size)
-            }
-            return (offset + 65535) & ~65535
-        }
-
-        let sharedAllocations: [(label: String, length: Int, options: MTLResourceOptions)] = [
-            ("TileHeader", MemoryLayout<TileAssignmentHeaderSwift>.stride, .storageModeShared),
-            ("ActiveTileCount", MemoryLayout<UInt32>.stride, .storageModeShared)
-        ]
-
         return FrameResourceLayout(
             limits: limits,
             maxAssignmentCapacity: maxAssignmentCapacity,
             paddedCapacity: paddedCapacity,
-            heapAllocations: heapAllocations,
-            sharedAllocations: sharedAllocations,
-            heapSize: heapSize(for: heapAllocations),
+            bufferAllocations: bufferAllocations,
             pixelCapacity: limits.maxWidth * limits.maxHeight,
             precisionStride: strideForPrecision
         )
@@ -1608,9 +1501,6 @@ public final class GlobalSortRenderer: GaussianRenderer, @unchecked Sendable {
     }
 
     // MARK: - Debug/Test helpers
-    internal func debugHeapSizeBytes() -> Int? {
-        return frameResources.first?.heapAllocator.heap?.size
-    }
 
     func makeBuffer<T>(ptr: UnsafePointer<T>, count: Int) -> MTLBuffer? {
         self.device.makeBuffer(bytes: ptr, length: count * MemoryLayout<T>.stride, options: .storageModeShared)

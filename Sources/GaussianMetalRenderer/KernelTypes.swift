@@ -202,7 +202,7 @@ public struct RenderParams {
 // TELLUSIM-STYLE PIPELINE TYPES
 // =============================================================================
 
-/// Compacted gaussian for Tellusim-style pipeline (matches Metal struct)
+/// Compacted gaussian for local sort pipeline (matches Metal struct)
 /// 48 bytes total
 public struct CompactedGaussianSwift {
     public var covariance_depth: SIMD4<Float>  // conic.xyz + depth

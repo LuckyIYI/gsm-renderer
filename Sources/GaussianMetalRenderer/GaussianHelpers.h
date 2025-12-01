@@ -1,5 +1,5 @@
 // GaussianHelpers.h - Shared helper functions for Gaussian splatting
-// Used by both global radix sort (GaussianMetalRenderer) and local sort (Tellusim) pipelines
+// Used by both global radix sort (GaussianMetalRenderer) and local sort (LocalSort) pipelines
 
 #ifndef GAUSSIAN_HELPERS_H
 #define GAUSSIAN_HELPERS_H

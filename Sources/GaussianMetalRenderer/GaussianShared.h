@@ -1,5 +1,5 @@
 // GaussianShared.h - Shared constants for Gaussian rendering
-// Included by both GaussianMetalRenderer.metal and TellusimShaders.metal
+// Included by both GaussianMetalRenderer.metal and LocalSortShaders.metal
 
 #ifndef GAUSSIAN_SHARED_H
 #define GAUSSIAN_SHARED_H

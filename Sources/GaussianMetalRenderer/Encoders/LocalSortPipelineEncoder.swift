@@ -1,14 +1,14 @@
 import Metal
 
-/// Tellusim-style pipeline encoder
-/// Uses dedicated TellusimShaders.metallib for clean, optimized implementation
+/// Local sort pipeline encoder
+/// Uses dedicated LocalSortShaders.metallib for clean, optimized implementation
 /// Pipeline: Clear → Project+Compact+Count → PrefixScan → Scatter → PerTileSort → Render
-public final class TellusimPipelineEncoder {
+public final class LocalSortPipelineEncoder {
     // Device and library for creating function constant variants
     private let device: MTLDevice
-    private let tellusimLibrary: MTLLibrary
+    private let localSortLibrary: MTLLibrary
 
-    // Pipeline states from TellusimShaders.metallib
+    // Pipeline states from LocalSortShaders.metallib
     private let clearPipeline: MTLComputePipelineState
     private let projectCompactCountPipeline: MTLComputePipelineState
     private let projectCompactCountHalfPipeline: MTLComputePipelineState?
@@ -47,12 +47,12 @@ public final class TellusimPipelineEncoder {
     public init(device: MTLDevice) throws {
         self.device = device
 
-        // Load Tellusim shader library
-        guard let libraryURL = Bundle.module.url(forResource: "TellusimShaders", withExtension: "metallib"),
+        // Load Local sort shader library
+        guard let libraryURL = Bundle.module.url(forResource: "LocalSortShaders", withExtension: "metallib"),
               let library = try? device.makeLibrary(URL: libraryURL) else {
-            fatalError("Failed to load TellusimShaders.metallib")
+            fatalError("Failed to load LocalSortShaders.metallib")
         }
-        self.tellusimLibrary = library
+        self.localSortLibrary = library
 
         // Load all kernel functions
         // Default function constant values (degree 3 = 16 SH coeffs, for functions that use SH)
@@ -60,17 +60,17 @@ public final class TellusimPipelineEncoder {
         var defaultDegree: UInt32 = 3
         defaultConstants.setConstantValue(&defaultDegree, type: .uint, index: 0)
 
-        guard let clearFn = library.makeFunction(name: "tellusim_clear"),
-              let projectFn = try? library.makeFunction(name: "tellusim_project_compact_count_float", constantValues: defaultConstants),
-              let prefixFn = library.makeFunction(name: "tellusim_prefix_scan"),
-              let partialFn = library.makeFunction(name: "tellusim_scan_partial_sums"),
-              let finalizeFn = library.makeFunction(name: "tellusim_finalize_scan"),
-              let finalizeAndZeroFn = library.makeFunction(name: "tellusim_finalize_scan_and_zero"),
-              let prepareDispatchFn = library.makeFunction(name: "tellusim_prepare_scatter_dispatch"),
-              let scatterFn = library.makeFunction(name: "tellusim_scatter_simd"),
-              let sortFn = library.makeFunction(name: "tellusim_per_tile_sort"),
-              let renderFn = library.makeFunction(name: "tellusim_render") else {
-            fatalError("Missing required kernel functions in TellusimShaders")
+        guard let clearFn = library.makeFunction(name: "localSort_clear"),
+              let projectFn = try? library.makeFunction(name: "localSort_project_compact_count_float", constantValues: defaultConstants),
+              let prefixFn = library.makeFunction(name: "localSort_prefix_scan"),
+              let partialFn = library.makeFunction(name: "localSort_scan_partial_sums"),
+              let finalizeFn = library.makeFunction(name: "localSort_finalize_scan"),
+              let finalizeAndZeroFn = library.makeFunction(name: "localSort_finalize_scan_and_zero"),
+              let prepareDispatchFn = library.makeFunction(name: "localSort_prepare_scatter_dispatch"),
+              let scatterFn = library.makeFunction(name: "localSort_scatter_simd"),
+              let sortFn = library.makeFunction(name: "localSort_per_tile_sort"),
+              let renderFn = library.makeFunction(name: "localSort_render") else {
+            fatalError("Missing required kernel functions in LocalSortShaders")
         }
 
         self.clearPipeline = try device.makeComputePipelineState(function: clearFn)
@@ -85,7 +85,7 @@ public final class TellusimPipelineEncoder {
         self.renderPipeline = try device.makeComputePipelineState(function: renderFn)
 
         // Half precision project kernel (half world + half harmonics for bandwidth)
-        if let projectHalfFn = try? library.makeFunction(name: "tellusim_project_compact_count_half_halfsh", constantValues: defaultConstants) {
+        if let projectHalfFn = try? library.makeFunction(name: "localSort_project_compact_count_half_halfsh", constantValues: defaultConstants) {
             self.projectCompactCountHalfPipeline = try? device.makeComputePipelineState(function: projectHalfFn)
         } else {
             self.projectCompactCountHalfPipeline = nil
@@ -99,19 +99,19 @@ public final class TellusimPipelineEncoder {
             constantValues.setConstantValue(&shDegree, type: .uint, index: 0) // SH_DEGREE at index 0
 
             // Float world + float harmonics variant
-            if let fn = try? library.makeFunction(name: "tellusim_project_compact_count_float", constantValues: constantValues) {
+            if let fn = try? library.makeFunction(name: "localSort_project_compact_count_float", constantValues: constantValues) {
                 self.projectPipelinesBySHDegree[degree] = try? device.makeComputePipelineState(function: fn)
             }
 
             // Half world + half harmonics variant
-            if let fn = try? library.makeFunction(name: "tellusim_project_compact_count_half_halfsh", constantValues: constantValues) {
+            if let fn = try? library.makeFunction(name: "localSort_project_compact_count_half_halfsh", constantValues: constantValues) {
                 self.projectHalfPipelinesBySHDegree[degree] = try? device.makeComputePipelineState(function: fn)
             }
         }
 
         // Texture-cached render pipelines (optional, for TLB optimization)
-        if let packFn = library.makeFunction(name: "tellusim_pack_render_texture"),
-           let renderTexFn = library.makeFunction(name: "tellusim_render_textured") {
+        if let packFn = library.makeFunction(name: "localSort_pack_render_texture"),
+           let renderTexFn = library.makeFunction(name: "localSort_render_textured") {
             self.packRenderTexturePipeline = try? device.makeComputePipelineState(function: packFn)
             self.renderTexturedPipeline = try? device.makeComputePipelineState(function: renderTexFn)
         } else {
@@ -119,9 +119,9 @@ public final class TellusimPipelineEncoder {
             self.renderTexturedPipeline = nil
         }
 
-        // Zero kernel - from Tellusim library
+        // Zero kernel - from local sort library
         guard let zeroFn = library.makeFunction(name: "tileBinningZeroCountsKernel") else {
-            fatalError("Missing tileBinningZeroCountsKernel in TellusimShaders")
+            fatalError("Missing tileBinningZeroCountsKernel in LocalSortShaders")
         }
         self.zeroPipeline = try device.makeComputePipelineState(function: zeroFn)
     }
@@ -131,7 +131,7 @@ public final class TellusimPipelineEncoder {
         try self.init(device: device)
     }
 
-    /// Encode the full Tellusim-style pipeline (steps 1-5: Clear → Project → Scan → Scatter → Sort)
+    /// Encode the full Local sort pipeline (steps 1-5: Clear → Project → Scan → Scatter → Sort)
     public func encode(
         commandBuffer: MTLCommandBuffer,
         // Input
@@ -186,7 +186,7 @@ public final class TellusimPipelineEncoder {
 
         // === 1. CLEAR ===
         if let encoder = commandBuffer.makeComputeCommandEncoder() {
-            encoder.label = "Tellusim_Clear"
+            encoder.label = "LocalSort_Clear"
             encoder.setComputePipelineState(clearPipeline)
             encoder.setBuffer(tileCounts, offset: 0, index: 0)
             encoder.setBuffer(compactedHeader, offset: 0, index: 1)
@@ -201,7 +201,7 @@ public final class TellusimPipelineEncoder {
 
         // === 2. PROJECT + COMPACT + COUNT ===
         if let encoder = commandBuffer.makeComputeCommandEncoder() {
-            encoder.label = "Tellusim_ProjectCompactCount"
+            encoder.label = "LocalSort_ProjectCompactCount"
 
             // Select pipeline with SH function constant for optimized unrolled loops
             let shDegree = Self.shDegree(from: camera.shComponents)
@@ -229,7 +229,7 @@ public final class TellusimPipelineEncoder {
 
         // === 3. PREFIX SCAN ===
         if let encoder = commandBuffer.makeComputeCommandEncoder() {
-            encoder.label = "Tellusim_PrefixScan"
+            encoder.label = "LocalSort_PrefixScan"
             encoder.setComputePipelineState(prefixScanPipeline)
             encoder.setBuffer(tileCounts, offset: 0, index: 0)
             encoder.setBuffer(tileOffsets, offset: 0, index: 1)
@@ -242,7 +242,7 @@ public final class TellusimPipelineEncoder {
         }
 
         if let encoder = commandBuffer.makeComputeCommandEncoder() {
-            encoder.label = "Tellusim_ScanPartialSums"
+            encoder.label = "LocalSort_ScanPartialSums"
             encoder.setComputePipelineState(scanPartialSumsPipeline)
             var numPartial = UInt32(actualGroups)
             encoder.setBuffer(partialSums, offset: 0, index: 0)
@@ -254,7 +254,7 @@ public final class TellusimPipelineEncoder {
 
         // === 3b + 4. FUSED FINALIZE SCAN + ZERO COUNTERS ===
         if let encoder = commandBuffer.makeComputeCommandEncoder() {
-            encoder.label = "Tellusim_FinalizeScanAndZero"
+            encoder.label = "LocalSort_FinalizeScanAndZero"
             encoder.setComputePipelineState(finalizeScanAndZeroPipeline)
             encoder.setBuffer(tileOffsets, offset: 0, index: 0)
             encoder.setBuffer(tileCounts, offset: 0, index: 1)
@@ -271,7 +271,7 @@ public final class TellusimPipelineEncoder {
         // SIMD scatter: 4 gaussians per threadgroup (4 SIMD groups × 32 threads = 128 threads)
         let dispatchArgsBuffer = commandBuffer.device.makeBuffer(length: 12, options: .storageModeShared)!
         if let encoder = commandBuffer.makeComputeCommandEncoder() {
-            encoder.label = "Tellusim_PrepareScatterDispatch"
+            encoder.label = "LocalSort_PrepareScatterDispatch"
             encoder.setComputePipelineState(prepareScatterDispatchPipeline)
             encoder.setBuffer(compactedHeader, offset: 0, index: 0)
             encoder.setBuffer(dispatchArgsBuffer, offset: 0, index: 1)
@@ -285,7 +285,7 @@ public final class TellusimPipelineEncoder {
         // Each SIMD group (32 threads) handles 1 gaussian cooperatively
         // 4 SIMD groups per threadgroup = 4 gaussians per threadgroup = 128 threads
         if let encoder = commandBuffer.makeComputeCommandEncoder() {
-            encoder.label = "Tellusim_Scatter_SIMD"
+            encoder.label = "LocalSort_Scatter_SIMD"
             encoder.setComputePipelineState(scatterPipeline)
             encoder.setBuffer(compactedGaussians, offset: 0, index: 0)
             encoder.setBuffer(compactedHeader, offset: 0, index: 1)
@@ -309,7 +309,7 @@ public final class TellusimPipelineEncoder {
         // === 6. PER-TILE SORT ===
         if !skipSort, let tempK = tempSortKeys, let tempV = tempSortIndices {
             if let encoder = commandBuffer.makeComputeCommandEncoder() {
-                encoder.label = "Tellusim_PerTileSort"
+                encoder.label = "LocalSort_PerTileSort"
                 encoder.setComputePipelineState(perTileSortPipeline)
                 encoder.setBuffer(sortKeys, offset: 0, index: 0)
                 encoder.setBuffer(sortIndices, offset: 0, index: 1)
@@ -344,7 +344,7 @@ public final class TellusimPipelineEncoder {
         tileHeight: Int,
         whiteBackground: Bool = false
     ) {
-        var params = TellusimRenderParamsSwift(
+        var params = LocalSortRenderParamsSwift(
             width: UInt32(width),
             height: UInt32(height),
             tileWidth: UInt32(tileWidth),
@@ -356,7 +356,7 @@ public final class TellusimPipelineEncoder {
         )
 
         if let encoder = commandBuffer.makeComputeCommandEncoder() {
-            encoder.label = "Tellusim_Render"
+            encoder.label = "LocalSort_Render"
             encoder.setComputePipelineState(renderPipeline)
             encoder.setBuffer(compactedGaussians, offset: 0, index: 0)
             encoder.setBuffer(tileOffsets, offset: 0, index: 1)
@@ -364,7 +364,7 @@ public final class TellusimPipelineEncoder {
             encoder.setBuffer(sortedIndices, offset: 0, index: 3)
             encoder.setTexture(colorTexture, index: 0)
             encoder.setTexture(depthTexture, index: 1)
-            encoder.setBytes(&params, length: MemoryLayout<TellusimRenderParamsSwift>.stride, index: 4)
+            encoder.setBytes(&params, length: MemoryLayout<LocalSortRenderParamsSwift>.stride, index: 4)
 
             // 8x8 threadgroup, one per tile
             let tgs = MTLSize(width: tilesX, height: tilesY, depth: 1)
@@ -393,7 +393,7 @@ public final class TellusimPipelineEncoder {
         guard let packPipeline = packRenderTexturePipeline else { return }
 
         if let encoder = commandBuffer.makeComputeCommandEncoder() {
-            encoder.label = "Tellusim_PackRenderTexture"
+            encoder.label = "LocalSort_PackRenderTexture"
             encoder.setComputePipelineState(packPipeline)
             encoder.setBuffer(compactedGaussians, offset: 0, index: 0)
             encoder.setBuffer(compactedHeader, offset: 0, index: 1)
@@ -430,7 +430,7 @@ public final class TellusimPipelineEncoder {
             return
         }
 
-        var params = TellusimRenderParamsSwift(
+        var params = LocalSortRenderParamsSwift(
             width: UInt32(width),
             height: UInt32(height),
             tileWidth: UInt32(tileWidth),
@@ -442,7 +442,7 @@ public final class TellusimPipelineEncoder {
         )
 
         if let encoder = commandBuffer.makeComputeCommandEncoder() {
-            encoder.label = "Tellusim_RenderTextured"
+            encoder.label = "LocalSort_RenderTextured"
             encoder.setComputePipelineState(renderTexPipeline)
             encoder.setTexture(gaussianTexture, index: 0)
             encoder.setBuffer(tileOffsets, offset: 0, index: 0)
@@ -450,7 +450,7 @@ public final class TellusimPipelineEncoder {
             encoder.setBuffer(sortedIndices, offset: 0, index: 2)
             encoder.setTexture(colorTexture, index: 1)
             encoder.setTexture(depthTexture, index: 2)
-            encoder.setBytes(&params, length: MemoryLayout<TellusimRenderParamsSwift>.stride, index: 3)
+            encoder.setBytes(&params, length: MemoryLayout<LocalSortRenderParamsSwift>.stride, index: 3)
 
             // 8x8 threadgroup, one per tile
             let tgs = MTLSize(width: tilesX, height: tilesY, depth: 1)
@@ -469,10 +469,10 @@ public final class TellusimPipelineEncoder {
     /// Debug: Print first few compacted gaussians (call after command buffer completes)
     public static func debugPrintCompacted(from compacted: MTLBuffer, header: MTLBuffer, count: Int = 5) {
         let visibleCount = readVisibleCount(from: header)
-        print("[Tellusim Debug] Visible count: \(visibleCount)")
+        print("[LocalSort Debug] Visible count: \(visibleCount)")
 
         guard visibleCount > 0, compacted.storageMode == .shared else {
-            print("[Tellusim Debug] Cannot read compacted buffer (private storage or empty)")
+            print("[LocalSort Debug] Cannot read compacted buffer (private storage or empty)")
             return
         }
 
@@ -497,7 +497,7 @@ public final class TellusimPipelineEncoder {
     ) {
         // Zero out the header (visibleCount = 0, overflow = 0)
         if let blitEncoder = commandBuffer.makeBlitCommandEncoder() {
-            blitEncoder.label = "Tellusim_ClearHeader"
+            blitEncoder.label = "LocalSort_ClearHeader"
             blitEncoder.fill(buffer: header, range: 0..<MemoryLayout<CompactedHeaderSwift>.stride, value: 0)
             blitEncoder.endEncoding()
         }
@@ -543,7 +543,7 @@ public final class TellusimPipelineEncoder {
 
         // === 1. CLEAR ===
         if let encoder = commandBuffer.makeComputeCommandEncoder() {
-            encoder.label = "Tellusim_Clear"
+            encoder.label = "LocalSort_Clear"
             encoder.setComputePipelineState(clearPipeline)
             encoder.setBuffer(tileCounts, offset: 0, index: 0)
             encoder.setBuffer(compactedHeader, offset: 0, index: 1)
@@ -558,7 +558,7 @@ public final class TellusimPipelineEncoder {
 
         // === 2. PROJECT + COMPACT + COUNT ===
         if let encoder = commandBuffer.makeComputeCommandEncoder() {
-            encoder.label = "Tellusim_ProjectCompactCount"
+            encoder.label = "LocalSort_ProjectCompactCount"
 
             // Select pipeline with SH function constant for optimized unrolled loops
             let shDegree = Self.shDegree(from: camera.shComponents)
@@ -586,8 +586,8 @@ public final class TellusimPipelineEncoder {
     }
 }
 
-// Render params struct for Tellusim pipeline
-public struct TellusimRenderParamsSwift {
+// Render params struct for local sort pipeline
+public struct LocalSortRenderParamsSwift {
     public var width: UInt32
     public var height: UInt32
     public var tileWidth: UInt32

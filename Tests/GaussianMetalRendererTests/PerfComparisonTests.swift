@@ -24,7 +24,7 @@ final class PerfComparisonTests: XCTestCase {
         // Create OLD renderer with appropriate limits
         let oldRenderer = GlobalSortRenderer(
             precision: Precision.float32,
-            useHeapAllocation: false,
+            
             limits: RendererLimits(
                 maxGaussians: gaussianCount,
                 maxWidth: imageWidth,

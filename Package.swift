@@ -24,8 +24,8 @@ let package = Package(
             resources: [
                 .process("GaussianMetalRenderer/GaussianMetalRenderer.metallib"),
                 .process("GaussianMetalRenderer/GaussianMetalRenderer.metal"),
-                .process("GaussianMetalRenderer/TellusimShaders.metallib"),
-                .process("GaussianMetalRenderer/TellusimShaders.metal"),
+                .process("GaussianMetalRenderer/LocalSortShaders.metallib"),
+                .process("GaussianMetalRenderer/LocalSortShaders.metal"),
                 .process("GaussianMetalRenderer/TemporalShaders.metallib"),
                 .process("GaussianMetalRenderer/TemporalShaders.metal")
             ]

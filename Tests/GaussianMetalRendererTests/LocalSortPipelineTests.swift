@@ -4,7 +4,7 @@ import simd
 @testable import GaussianMetalRenderer
 
 /// Tests for the Tellusim-style pipeline (fused project + compact + count + scatter)
-final class TellusimPipelineTests: XCTestCase {
+final class LocalSortPipelineTests: XCTestCase {
     private let tileWidth = 32
     private let tileHeight = 16
     private let imageWidth = 1920
@@ -17,7 +17,7 @@ final class TellusimPipelineTests: XCTestCase {
         let library = renderer.library
         let queue = renderer.queue
 
-        let encoder = try TellusimPipelineEncoder(device: device, library: library)
+        let encoder = try LocalSortPipelineEncoder(device: device, library: library)
 
         let tilesX = (imageWidth + tileWidth - 1) / tileWidth
         let tilesY = (imageHeight + tileHeight - 1) / tileHeight
@@ -108,8 +108,8 @@ final class TellusimPipelineTests: XCTestCase {
         cb.waitUntilCompleted()
 
         // Read results
-        let visibleCount = TellusimPipelineEncoder.readVisibleCount(from: headerBuffer)
-        let overflow = TellusimPipelineEncoder.readOverflow(from: headerBuffer)
+        let visibleCount = LocalSortPipelineEncoder.readVisibleCount(from: headerBuffer)
+        let overflow = LocalSortPipelineEncoder.readOverflow(from: headerBuffer)
 
         print("Visible count: \(visibleCount) / \(gaussianCount)")
         print("Overflow: \(overflow)")
@@ -145,7 +145,7 @@ final class TellusimPipelineTests: XCTestCase {
         let library = renderer.library
         let queue = renderer.queue
 
-        let encoder = try TellusimPipelineEncoder(device: device, library: library)
+        let encoder = try LocalSortPipelineEncoder(device: device, library: library)
 
         let tilesX = (imageWidth + tileWidth - 1) / tileWidth
         let tilesY = (imageHeight + tileHeight - 1) / tileHeight
@@ -288,7 +288,7 @@ final class TellusimPipelineTests: XCTestCase {
         cb.waitUntilCompleted()
 
         // Verify results
-        let visibleCount = TellusimPipelineEncoder.readVisibleCount(from: headerBuffer)
+        let visibleCount = LocalSortPipelineEncoder.readVisibleCount(from: headerBuffer)
         print("Full pipeline - Visible: \(visibleCount) / \(gaussianCount)")
 
         XCTAssertGreaterThan(visibleCount, 0, "Should have visible gaussians")
@@ -332,7 +332,7 @@ final class TellusimPipelineTests: XCTestCase {
         let library = renderer.library
         let queue = renderer.queue
 
-        let encoder = try TellusimPipelineEncoder(device: device, library: library)
+        let encoder = try LocalSortPipelineEncoder(device: device, library: library)
 
         let tilesX = (imageWidth + tileWidth - 1) / tileWidth
         let tilesY = (imageHeight + tileHeight - 1) / tileHeight
@@ -526,7 +526,7 @@ final class TellusimPipelineTests: XCTestCase {
 
             guard !times.isEmpty else { continue }
 
-            let visibleCount = TellusimPipelineEncoder.readVisibleCount(from: headerBuffer)
+            let visibleCount = LocalSortPipelineEncoder.readVisibleCount(from: headerBuffer)
             let avg = times.reduce(0, +) / Double(times.count)
             let fps = 1000.0 / avg
 
@@ -554,7 +554,7 @@ final class TellusimPipelineTests: XCTestCase {
         let library = renderer.library
         let queue = renderer.queue
 
-        let encoder = try TellusimPipelineEncoder(device: device, library: library)
+        let encoder = try LocalSortPipelineEncoder(device: device, library: library)
 
         let tilesX = (imageWidth + tileWidth - 1) / tileWidth
         let tilesY = (imageHeight + tileHeight - 1) / tileHeight
@@ -782,7 +782,7 @@ final class TellusimPipelineTests: XCTestCase {
         }
         let avgPerTile = Double(totalAssignments) / Double(nonEmptyTiles)
 
-        let visibleCount = TellusimPipelineEncoder.readVisibleCount(from: headerBuffer)
+        let visibleCount = LocalSortPipelineEncoder.readVisibleCount(from: headerBuffer)
 
         print("\n╔═══════════════════════════════════════════════╗")
         print("║  PIPELINE STAGE BREAKDOWN (500k gaussians)    ║")
@@ -809,7 +809,7 @@ final class TellusimPipelineTests: XCTestCase {
         let library = renderer.library
         let queue = renderer.queue
 
-        let encoder = try TellusimPipelineEncoder(device: device, library: library)
+        let encoder = try LocalSortPipelineEncoder(device: device, library: library)
 
         let tilesX = (imageWidth + tileWidth - 1) / tileWidth
         let tilesY = (imageHeight + tileHeight - 1) / tileHeight
@@ -1036,7 +1036,7 @@ final class TellusimPipelineTests: XCTestCase {
         }
         let avgPerTile = Double(totalAssignments) / Double(max(1, nonEmptyTiles))
 
-        let visibleCount = TellusimPipelineEncoder.readVisibleCount(from: headerBuffer)
+        let visibleCount = LocalSortPipelineEncoder.readVisibleCount(from: headerBuffer)
 
         print("\n╔═══════════════════════════════════════════════════════════╗")
         print("║  PIPELINE STAGE BREAKDOWN (2M gaussians)                   ║")
@@ -1064,7 +1064,7 @@ final class TellusimPipelineTests: XCTestCase {
         let library = renderer.library
         let queue = renderer.queue
 
-        let encoder = try TellusimPipelineEncoder(device: device, library: library)
+        let encoder = try LocalSortPipelineEncoder(device: device, library: library)
 
         let tilesX = (imageWidth + tileWidth - 1) / tileWidth
         let tilesY = (imageHeight + tileHeight - 1) / tileHeight
@@ -1270,8 +1270,8 @@ final class TellusimPipelineTests: XCTestCase {
             if gpuTime > 0 { times.append(gpuTime * 1000) }
         }
 
-        let visibleCount = TellusimPipelineEncoder.readVisibleCount(from: headerBuffer)
-        let overflow = TellusimPipelineEncoder.readOverflow(from: headerBuffer)
+        let visibleCount = LocalSortPipelineEncoder.readVisibleCount(from: headerBuffer)
+        let overflow = LocalSortPipelineEncoder.readOverflow(from: headerBuffer)
 
         guard !times.isEmpty else {
             XCTFail("No timing results")
@@ -1308,7 +1308,7 @@ final class TellusimPipelineTests: XCTestCase {
         let library = renderer.library
         let queue = renderer.queue
 
-        let encoder = try TellusimPipelineEncoder(device: device, library: library)
+        let encoder = try LocalSortPipelineEncoder(device: device, library: library)
 
         let tilesX = (imageWidth + tileWidth - 1) / tileWidth
         let tilesY = (imageHeight + tileHeight - 1) / tileHeight
@@ -1433,7 +1433,7 @@ final class TellusimPipelineTests: XCTestCase {
 
             guard !times.isEmpty else { continue }
 
-            let visibleCount = TellusimPipelineEncoder.readVisibleCount(from: headerBuffer)
+            let visibleCount = LocalSortPipelineEncoder.readVisibleCount(from: headerBuffer)
             let avg = times.reduce(0, +) / Double(times.count)
 
             summaries.append("\(gaussianCount/1000)k: \(String(format: "%.2f", avg))ms (visible: \(visibleCount))")

@@ -13,7 +13,7 @@ final class FusedPipelineEncoder {
     private let renderFusedMultiPixelHalfPipeline: MTLComputePipelineState
     private let renderFusedMultiPixelFloatPipeline: MTLComputePipelineState
     private let renderFusedV2HalfPipeline: MTLComputePipelineState?  // V2: lower register pressure
-    private let renderFusedV3HalfPipeline: MTLComputePipelineState?  // V3: Tellusim-style, no shared mem
+    private let renderFusedV3HalfPipeline: MTLComputePipelineState?  // V3: local sort style, no shared mem
     private let prepareDispatchPipeline: MTLComputePipelineState
     private let clearTexturesPipeline: MTLComputePipelineState
 
@@ -23,7 +23,7 @@ final class FusedPipelineEncoder {
     let renderThreadgroupSize: MTLSize
     let renderMultiPixelThreadgroupSize: MTLSize  // 8x8 for 32x16 tiles (4x2 pixels/thread)
     let renderV2ThreadgroupSize: MTLSize  // 16x8 for 32x16 tiles (2x2 pixels/thread)
-    let renderV3ThreadgroupSize: MTLSize  // 8x8 for 32x16 tiles (4x2 pixels/thread) - Tellusim style
+    let renderV3ThreadgroupSize: MTLSize  // 8x8 for 32x16 tiles (4x2 pixels/thread) - local sort style
 
     /// Render kernel version: 1=original, 2=shared mem, 3=Tellusim (no shared mem, 8 pixels/thread)
     public var renderVersion: Int = 2  // Default to V2 (shared mem, lower register pressure)
@@ -64,7 +64,7 @@ final class FusedPipelineEncoder {
         // Render fused V2 kernel (lower register pressure, higher occupancy)
         let renderFusedV2HalfFn = library.makeFunction(name: "renderTilesFusedV2_half")
 
-        // Render fused V3 kernel (Tellusim-style: no shared memory, 8 pixels/thread)
+        // Render fused V3 kernel (local sort style: no shared memory, 8 pixels/thread)
         let renderFusedV3HalfFn = library.makeFunction(name: "renderTilesFusedV3_half")
 
         // Prepare dispatch and clear textures kernels
@@ -94,7 +94,7 @@ final class FusedPipelineEncoder {
             self.renderFusedV2HalfPipeline = nil
         }
 
-        // V3 render kernel (Tellusim-style)
+        // V3 render kernel (local sort style)
         if let v3Fn = renderFusedV3HalfFn {
             self.renderFusedV3HalfPipeline = try device.makeComputePipelineState(function: v3Fn)
         } else {
@@ -110,7 +110,7 @@ final class FusedPipelineEncoder {
         self.renderMultiPixelThreadgroupSize = MTLSize(width: 8, height: 8, depth: 1)
         // V2 render uses 16x8 threadgroup for 32x16 tiles (2x2 pixels per thread)
         self.renderV2ThreadgroupSize = MTLSize(width: 16, height: 8, depth: 1)
-        // V3 render uses 8x8 threadgroup for 32x16 tiles (4x2 pixels per thread) - Tellusim style
+        // V3 render uses 8x8 threadgroup for 32x16 tiles (4x2 pixels per thread) - local sort style
         self.renderV3ThreadgroupSize = MTLSize(width: 8, height: 8, depth: 1)
     }
 
@@ -210,7 +210,7 @@ final class FusedPipelineEncoder {
         let threadgroupSize: MTLSize
 
         if isMultiPixel {
-            // Try V3 first (Tellusim-style: no shared mem, 8 pixels/thread)
+            // Try V3 first (local sort style: no shared mem, 8 pixels/thread)
             if renderVersion >= 3, precision == .float16, let v3Pipeline = renderFusedV3HalfPipeline {
                 encoder.label = "RenderFusedV3"
                 encoder.setComputePipelineState(v3Pipeline)

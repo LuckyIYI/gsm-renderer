@@ -168,7 +168,7 @@ final class PerfTimingTests: XCTestCase {
 
         let renderer = GlobalSortRenderer(
             precision: Precision.float32,
-            useHeapAllocation: false,
+            
             limits: RendererLimits(maxGaussians: 1_000_000, maxWidth: 1920, maxHeight: 1080)
         )
 
@@ -188,7 +188,7 @@ final class PerfTimingTests: XCTestCase {
         let height = 768
         let renderer = GlobalSortRenderer(
             precision: Precision.float16,
-            useHeapAllocation: false,
+            
             textureOnly: true,
             limits: RendererLimits(maxGaussians: 200_000, maxWidth: width, maxHeight: height)
         )
@@ -266,7 +266,7 @@ final class PerfTimingTests: XCTestCase {
         let height = 1080
         let renderer = GlobalSortRenderer(
             precision: Precision.float16,
-            useHeapAllocation: false,
+            
             textureOnly: true,
             limits: RendererLimits(maxGaussians: 4_500_000, maxWidth: width, maxHeight: height)
         )
@@ -370,7 +370,7 @@ final class PerfTimingTests: XCTestCase {
         let height = 1080
         let renderer = GlobalSortRenderer(
             precision: Precision.float16,
-            useHeapAllocation: false,
+            
             textureOnly: true,
             limits: RendererLimits(maxGaussians: 1_000_000, maxWidth: width, maxHeight: height)
         )

@@ -6,7 +6,7 @@ import Metal
 public final class LocalSortRenderer: GaussianRenderer, @unchecked Sendable {
     public let device: MTLDevice
     private let queue: MTLCommandQueue
-    private let encoder: TellusimPipelineEncoder
+    private let encoder: LocalSortPipelineEncoder
 
     // Tile configuration
     private let tileWidth = 32
@@ -44,24 +44,24 @@ public final class LocalSortRenderer: GaussianRenderer, @unchecked Sendable {
         self.device = device
         self.config = RendererConfig()
         guard let queue = device.makeCommandQueue() else {
-            throw TellusimError.failedToCreateQueue
+            throw LocalSortError.failedToCreateQueue
         }
         self.queue = queue
-        self.encoder = try TellusimPipelineEncoder(device: device)
+        self.encoder = try LocalSortPipelineEncoder(device: device)
     }
 
     /// Initialize with configuration
     public init(config: RendererConfig = RendererConfig()) throws {
         self.config = config
         guard let device = MTLCreateSystemDefaultDevice() else {
-            throw TellusimError.failedToCreateQueue
+            throw LocalSortError.failedToCreateQueue
         }
         self.device = device
         guard let queue = device.makeCommandQueue() else {
-            throw TellusimError.failedToCreateQueue
+            throw LocalSortError.failedToCreateQueue
         }
         self.queue = queue
-        self.encoder = try TellusimPipelineEncoder(device: device)
+        self.encoder = try LocalSortPipelineEncoder(device: device)
     }
 
     // MARK: - GaussianRenderer Protocol Methods
@@ -213,7 +213,7 @@ public final class LocalSortRenderer: GaussianRenderer, @unchecked Sendable {
         )
 
         if debugPrint {
-            print("[TellusimBackend] Rendering \(gaussianCount) gaussians at \(width)x\(height)")
+            print("[LocalSortRenderer] Rendering \(gaussianCount) gaussians at \(width)x\(height)")
             print("  flipY: \(flipY)")
             print("  focalX: \(focalX), focalY: \(focalY)")
         }
@@ -300,12 +300,12 @@ public final class LocalSortRenderer: GaussianRenderer, @unchecked Sendable {
     /// Get visible count after render completes (call after waitUntilCompleted)
     public func getVisibleCount() -> UInt32 {
         guard let header = headerBuffer else { return 0 }
-        return TellusimPipelineEncoder.readVisibleCount(from: header)
+        return LocalSortPipelineEncoder.readVisibleCount(from: header)
     }
 
     /// Debug helper: print first few harmonics values and compacted colors
     public func debugPrintData(harmonics: MTLBuffer, harmonicsCount: Int) {
-        print("\n[TellusimBackend DEBUG]")
+        print("\n[LocalSortRenderer DEBUG]")
 
         // Print first 3 harmonics (9 floats = 3 RGB values)
         let harmonicsPtr = harmonics.contents().bindMemory(to: Float.self, capacity: min(9, harmonicsCount))
@@ -319,7 +319,7 @@ public final class LocalSortRenderer: GaussianRenderer, @unchecked Sendable {
 
         // Print compacted colors if available
         if let compacted = compactedBuffer, let header = headerBuffer {
-            let visibleCount = TellusimPipelineEncoder.readVisibleCount(from: header)
+            let visibleCount = LocalSortPipelineEncoder.readVisibleCount(from: header)
             print("  Visible count: \(visibleCount)")
 
             if visibleCount > 0 && compacted.storageMode == .shared {
@@ -347,7 +347,7 @@ public final class LocalSortRenderer: GaussianRenderer, @unchecked Sendable {
     /// Check if overflow occurred
     public func hadOverflow() -> Bool {
         guard let header = headerBuffer else { return false }
-        return TellusimPipelineEncoder.readOverflow(from: header)
+        return LocalSortPipelineEncoder.readOverflow(from: header)
     }
 
     // MARK: - Private
@@ -435,7 +435,7 @@ public final class LocalSortRenderer: GaussianRenderer, @unchecked Sendable {
         // Gaussian render texture for texture-cached rendering
         // Each gaussian uses 2 texels (covariance_depth + position_color)
         // Layout: width = RENDER_TEX_WIDTH (4096), height = ceil(gaussianCount * 2 / 4096)
-        let renderTexWidth = TellusimPipelineEncoder.renderTexWidth
+        let renderTexWidth = LocalSortPipelineEncoder.renderTexWidth
         let texelCount = maxCompacted * 2
         let renderTexHeight = (texelCount + renderTexWidth - 1) / renderTexWidth
         let gaussianTexDesc = MTLTextureDescriptor.texture2DDescriptor(
@@ -449,13 +449,13 @@ public final class LocalSortRenderer: GaussianRenderer, @unchecked Sendable {
         gaussianRenderTexture = device.makeTexture(descriptor: gaussianTexDesc)
 
         if debugPrint {
-            print("[TellusimBackend] Allocated buffers for \(gaussianCount) gaussians, \(width)x\(height)")
+            print("[LocalSortRenderer] Allocated buffers for \(gaussianCount) gaussians, \(width)x\(height)")
             print("  Gaussian render texture: \(renderTexWidth)x\(renderTexHeight)")
         }
     }
 }
 
-public enum TellusimError: Error {
+public enum LocalSortError: Error {
     case failedToCreateQueue
     case failedToCreateEncoder
 }

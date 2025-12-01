@@ -96,20 +96,17 @@ public struct RendererConfig: Sendable {
     public let maxWidth: Int
     public let maxHeight: Int
     public let precision: RenderPrecision
-    public let useHeapAllocation: Bool
 
     public init(
         maxGaussians: Int = 2_000_000,
         maxWidth: Int = 1920,
         maxHeight: Int = 1080,
-        precision: RenderPrecision = .float16,
-        useHeapAllocation: Bool = true
+        precision: RenderPrecision = .float16
     ) {
         self.maxGaussians = maxGaussians
         self.maxWidth = maxWidth
         self.maxHeight = maxHeight
         self.precision = precision
-        self.useHeapAllocation = useHeapAllocation
     }
 }
 

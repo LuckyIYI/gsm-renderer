@@ -1,5 +1,5 @@
-// Copyright (C) 2024 - Tellusim-style Gaussian Splatting Pipeline
-// Clean, optimized implementation inspired by Tellusim's approach
+// LocalSortShaders.metal - Per-tile local sort Gaussian splatting pipeline
+// Uses bitonic sort within each tile for efficient rendering
 
 #include <metal_stdlib>
 #include <metal_atomic>
@@ -16,7 +16,7 @@ using namespace metal;
 // =============================================================================
 
 /// Camera uniforms (matches Swift CameraUniformsSwift)
-struct TellusimCameraUniforms {
+struct LocalSortCameraUniforms {
     float4x4 viewMatrix;
     float4x4 projectionMatrix;
     float3 cameraCenter;
@@ -34,7 +34,7 @@ struct TellusimCameraUniforms {
 };
 
 /// Packed world gaussian input (float32) - 48 bytes
-struct TellusimPackedWorld {
+struct LocalSortPackedWorld {
     packed_float3 position;   // 12 bytes
     float         opacity;    // 4 bytes
     packed_float3 scale;      // 12 bytes
@@ -43,7 +43,7 @@ struct TellusimPackedWorld {
 };
 
 /// Packed world gaussian input (half16) - 24 bytes
-struct TellusimPackedWorldHalf {
+struct LocalSortPackedWorldHalf {
     packed_half3  position;   // 6 bytes
     half          opacity;    // 2 bytes
     packed_half3  scale;      // 6 bytes
@@ -52,8 +52,8 @@ struct TellusimPackedWorldHalf {
 };
 
 /// Compacted gaussian (after projection + culling) - 48 bytes
-/// Matches Tellusim's layout for optimal render performance
-struct TellusimCompactedGaussian {
+/// Matches LocalSort's layout for optimal render performance
+struct LocalSortCompactedGaussian {
     float4 covariance_depth;    // conic.xyz + depth (16 bytes)
     float4 position_color;      // pos.xy + packed_half4(color,opacity) (16 bytes)
     int2 min_tile;              // 8 bytes
@@ -61,7 +61,7 @@ struct TellusimCompactedGaussian {
 };
 
 /// Parameters for fused project+compact+count kernel
-struct TellusimProjectParams {
+struct LocalSortProjectParams {
     uint gaussianCount;
     uint tilesX;
     uint tilesY;
@@ -73,7 +73,7 @@ struct TellusimProjectParams {
 };
 
 /// Header for compacted gaussians
-struct TellusimCompactedHeader {
+struct LocalSortCompactedHeader {
     atomic_uint visibleCount;
     uint maxCompacted;
     uint overflow;
@@ -81,7 +81,7 @@ struct TellusimCompactedHeader {
 };
 
 /// Render parameters
-struct TellusimRenderParams {
+struct LocalSortRenderParams {
     uint width;
     uint height;
     uint tileWidth;
@@ -93,17 +93,17 @@ struct TellusimRenderParams {
 };
 
 // =============================================================================
-// HELPER FUNCTIONS (Tellusim-specific - shared math helpers in GaussianHelpers.h)
+// HELPER FUNCTIONS (LocalSort-specific - shared math helpers in GaussianHelpers.h)
 // =============================================================================
 
 // Pack half4 to float2
-inline float2 tellusim_packHalf4(half4 v) {
+inline float2 localSort_packHalf4(half4 v) {
     uint2 u = uint2(as_type<uint>(half2(v.xy)), as_type<uint>(half2(v.zw)));
     return float2(as_type<float>(u.x), as_type<float>(u.y));
 }
 
 // Unpack float2 to half4
-inline half4 tellusim_unpackHalf4(float2 v) {
+inline half4 localSort_unpackHalf4(float2 v) {
     uint2 u = uint2(as_type<uint>(v.x), as_type<uint>(v.y));
     return half4(as_type<half2>(u.x), as_type<half2>(u.y));
 }
@@ -116,7 +116,7 @@ inline half4 tellusim_unpackHalf4(float2 v) {
 // Threshold w = 2 * power in the quadratic form: conic.x*dx^2 + 2*conic.y*dx*dy + conic.z*dy^2 <= w
 
 // Segment-ellipse intersection (FlashGS exact)
-inline bool tellusim_segmentIntersectEllipse(float a, float b, float c, float d, float l, float r) {
+inline bool localSort_segmentIntersectEllipse(float a, float b, float c, float d, float l, float r) {
     float delta = b * b - 4.0f * a * c;
     float t1 = (l - d) * (2.0f * a) + b;
     float t2 = (r - d) * (2.0f * a) + b;
@@ -125,7 +125,7 @@ inline bool tellusim_segmentIntersectEllipse(float a, float b, float c, float d,
 
 // Block-ellipse intersection (FlashGS exact)
 // Tests closest vertical and horizontal edges
-inline bool tellusim_blockIntersectEllipse(int2 pix_min, int2 pix_max, float2 center, float3 conic, float power) {
+inline bool localSort_blockIntersectEllipse(int2 pix_min, int2 pix_max, float2 center, float3 conic, float power) {
     float w = 2.0f * power;
     float dx, dy;
     float a, b, c;
@@ -140,7 +140,7 @@ inline bool tellusim_blockIntersectEllipse(int2 pix_min, int2 pix_max, float2 ce
     b = -2.0f * conic.y * dx;
     c = conic.x * dx * dx - w;
 
-    if (tellusim_segmentIntersectEllipse(a, b, c, center.y, float(pix_min.y), float(pix_max.y))) {
+    if (localSort_segmentIntersectEllipse(a, b, c, center.y, float(pix_min.y), float(pix_max.y))) {
         return true;
     }
 
@@ -154,7 +154,7 @@ inline bool tellusim_blockIntersectEllipse(int2 pix_min, int2 pix_max, float2 ce
     b = -2.0f * conic.y * dy;
     c = conic.z * dy * dy - w;
 
-    if (tellusim_segmentIntersectEllipse(a, b, c, center.x, float(pix_min.x), float(pix_max.x))) {
+    if (localSort_segmentIntersectEllipse(a, b, c, center.x, float(pix_min.x), float(pix_max.x))) {
         return true;
     }
 
@@ -162,7 +162,7 @@ inline bool tellusim_blockIntersectEllipse(int2 pix_min, int2 pix_max, float2 ce
 }
 
 // Block contains center (FlashGS exact)
-inline bool tellusim_blockContainsCenter(int2 pix_min, int2 pix_max, float2 center) {
+inline bool localSort_blockContainsCenter(int2 pix_min, int2 pix_max, float2 center) {
     return center.x >= float(pix_min.x) && center.x <= float(pix_max.x) &&
            center.y >= float(pix_min.y) && center.y <= float(pix_max.y);
 }
@@ -170,7 +170,7 @@ inline bool tellusim_blockContainsCenter(int2 pix_min, int2 pix_max, float2 cent
 // Compute power from opacity (FlashGS exact)
 // power = ln2 * 8 + ln2 * log2(opacity) = ln(256 * opacity)
 constant float LN2 = 0.693147180559945f;
-inline float tellusim_computePower(float opacity) {
+inline float localSort_computePower(float opacity) {
     return LN2 * 8.0f + LN2 * log2(max(opacity, 1e-6f));
 }
 
@@ -192,9 +192,9 @@ kernel void tileBinningZeroCountsKernel(
 // KERNEL 1: CLEAR (full reset including header)
 // =============================================================================
 
-kernel void tellusim_clear(
+kernel void localSort_clear(
     device atomic_uint* tileCounts [[buffer(0)]],
-    device TellusimCompactedHeader* header [[buffer(1)]],
+    device LocalSortCompactedHeader* header [[buffer(1)]],
     constant uint& tileCount [[buffer(2)]],
     constant uint& maxCompacted [[buffer(3)]],
     uint gid [[thread_position_in_grid]]
@@ -215,14 +215,14 @@ kernel void tellusim_clear(
 // Templated on world gaussian type and harmonics type for maximum flexibility
 
 template <typename PackedWorldT, typename HarmonicsT>
-kernel void tellusim_project_compact_count(
+kernel void localSort_project_compact_count(
     const device PackedWorldT* worldGaussians [[buffer(0)]],
     const device HarmonicsT* harmonics [[buffer(1)]],
-    device TellusimCompactedGaussian* compacted [[buffer(2)]],
-    device TellusimCompactedHeader* header [[buffer(3)]],
+    device LocalSortCompactedGaussian* compacted [[buffer(2)]],
+    device LocalSortCompactedHeader* header [[buffer(3)]],
     device atomic_uint* tileCounts [[buffer(4)]],
-    constant TellusimCameraUniforms& camera [[buffer(5)]],
-    constant TellusimProjectParams& params [[buffer(6)]],
+    constant LocalSortCameraUniforms& camera [[buffer(5)]],
+    constant LocalSortProjectParams& params [[buffer(6)]],
     uint gid [[thread_position_in_grid]]
 ) {
     if (gid >= params.gaussianCount) return;
@@ -327,43 +327,43 @@ kernel void tellusim_project_compact_count(
 
     compacted[idx].covariance_depth = float4(conic, depth);
     // Use the computed color from harmonics (debug line removed)
-    compacted[idx].position_color = float4(px, py, tellusim_packHalf4(half4(half3(color), half(opacity))));
+    compacted[idx].position_color = float4(px, py, localSort_packHalf4(half4(half3(color), half(opacity))));
     compacted[idx].min_tile = minTile;
     compacted[idx].max_tile = maxTile;
 }
 
 // Instantiate all combinations: World(float/half) x Harmonics(float/half)
 // Float world, float harmonics (original)
-template [[host_name("tellusim_project_compact_count_float")]]
-kernel void tellusim_project_compact_count<TellusimPackedWorld, float>(
-    const device TellusimPackedWorld*, const device float*,
-    device TellusimCompactedGaussian*, device TellusimCompactedHeader*,
-    device atomic_uint*, constant TellusimCameraUniforms&,
-    constant TellusimProjectParams&, uint);
+template [[host_name("localSort_project_compact_count_float")]]
+kernel void localSort_project_compact_count<LocalSortPackedWorld, float>(
+    const device LocalSortPackedWorld*, const device float*,
+    device LocalSortCompactedGaussian*, device LocalSortCompactedHeader*,
+    device atomic_uint*, constant LocalSortCameraUniforms&,
+    constant LocalSortProjectParams&, uint);
 
 // Half world, float harmonics
-template [[host_name("tellusim_project_compact_count_half")]]
-kernel void tellusim_project_compact_count<TellusimPackedWorldHalf, float>(
-    const device TellusimPackedWorldHalf*, const device float*,
-    device TellusimCompactedGaussian*, device TellusimCompactedHeader*,
-    device atomic_uint*, constant TellusimCameraUniforms&,
-    constant TellusimProjectParams&, uint);
+template [[host_name("localSort_project_compact_count_half")]]
+kernel void localSort_project_compact_count<LocalSortPackedWorldHalf, float>(
+    const device LocalSortPackedWorldHalf*, const device float*,
+    device LocalSortCompactedGaussian*, device LocalSortCompactedHeader*,
+    device atomic_uint*, constant LocalSortCameraUniforms&,
+    constant LocalSortProjectParams&, uint);
 
 // Float world, half harmonics (memory bandwidth optimization)
-template [[host_name("tellusim_project_compact_count_float_halfsh")]]
-kernel void tellusim_project_compact_count<TellusimPackedWorld, half>(
-    const device TellusimPackedWorld*, const device half*,
-    device TellusimCompactedGaussian*, device TellusimCompactedHeader*,
-    device atomic_uint*, constant TellusimCameraUniforms&,
-    constant TellusimProjectParams&, uint);
+template [[host_name("localSort_project_compact_count_float_halfsh")]]
+kernel void localSort_project_compact_count<LocalSortPackedWorld, half>(
+    const device LocalSortPackedWorld*, const device half*,
+    device LocalSortCompactedGaussian*, device LocalSortCompactedHeader*,
+    device atomic_uint*, constant LocalSortCameraUniforms&,
+    constant LocalSortProjectParams&, uint);
 
 // Half world, half harmonics (full half precision pipeline)
-template [[host_name("tellusim_project_compact_count_half_halfsh")]]
-kernel void tellusim_project_compact_count<TellusimPackedWorldHalf, half>(
-    const device TellusimPackedWorldHalf*, const device half*,
-    device TellusimCompactedGaussian*, device TellusimCompactedHeader*,
-    device atomic_uint*, constant TellusimCameraUniforms&,
-    constant TellusimProjectParams&, uint);
+template [[host_name("localSort_project_compact_count_half_halfsh")]]
+kernel void localSort_project_compact_count<LocalSortPackedWorldHalf, half>(
+    const device LocalSortPackedWorldHalf*, const device half*,
+    device LocalSortCompactedGaussian*, device LocalSortCompactedHeader*,
+    device atomic_uint*, constant LocalSortCameraUniforms&,
+    constant LocalSortProjectParams&, uint);
 
 // =============================================================================
 // KERNEL 3: PREFIX SCAN (reuse from main file or inline simple version)
@@ -372,7 +372,7 @@ kernel void tellusim_project_compact_count<TellusimPackedWorldHalf, half>(
 #define TELLUSIM_PREFIX_BLOCK_SIZE 256
 #define TELLUSIM_PREFIX_GRAIN_SIZE 4
 
-kernel void tellusim_prefix_scan(
+kernel void localSort_prefix_scan(
     const device uint* input [[buffer(0)]],
     device uint* output [[buffer(1)]],
     constant uint& count [[buffer(2)]],
@@ -426,7 +426,7 @@ kernel void tellusim_prefix_scan(
     }
 }
 
-kernel void tellusim_scan_partial_sums(
+kernel void localSort_scan_partial_sums(
     device uint* partialSums [[buffer(0)]],
     constant uint& numPartials [[buffer(1)]],
     ushort localId [[thread_position_in_threadgroup]]
@@ -450,7 +450,7 @@ kernel void tellusim_scan_partial_sums(
     }
 }
 
-kernel void tellusim_finalize_scan(
+kernel void localSort_finalize_scan(
     device uint* output [[buffer(0)]],
     constant uint& count [[buffer(1)]],
     const device uint* partialSums [[buffer(2)]],
@@ -472,7 +472,7 @@ kernel void tellusim_finalize_scan(
 }
 
 // Fused finalize scan + zero counters (one dispatch instead of two)
-kernel void tellusim_finalize_scan_and_zero(
+kernel void localSort_finalize_scan_and_zero(
     device uint* output [[buffer(0)]],
     device atomic_uint* counters [[buffer(1)]],
     constant uint& count [[buffer(2)]],
@@ -503,8 +503,8 @@ kernel void tellusim_finalize_scan_and_zero(
 // Writes MTLDispatchThreadgroupsIndirectArguments based on visibleCount
 // Uses Metal's built-in MTLDispatchThreadgroupsIndirectArguments struct
 
-kernel void tellusim_prepare_scatter_dispatch(
-    const device TellusimCompactedHeader* header [[buffer(0)]],
+kernel void localSort_prepare_scatter_dispatch(
+    const device LocalSortCompactedHeader* header [[buffer(0)]],
     device MTLDispatchThreadgroupsIndirectArguments* dispatchArgs [[buffer(1)]],
     constant uint& threadgroupWidth [[buffer(2)]]
 ) {
@@ -519,9 +519,9 @@ kernel void tellusim_prepare_scatter_dispatch(
 // KERNEL 4a: COMPUTE PER-GAUSSIAN TILE COUNTS (for balanced scatter)
 // =============================================================================
 
-kernel void tellusim_compute_gaussian_tile_counts(
-    const device TellusimCompactedGaussian* compacted [[buffer(0)]],
-    const device TellusimCompactedHeader* header [[buffer(1)]],
+kernel void localSort_compute_gaussian_tile_counts(
+    const device LocalSortCompactedGaussian* compacted [[buffer(0)]],
+    const device LocalSortCompactedHeader* header [[buffer(1)]],
     device uint* gaussianTileCounts [[buffer(2)]],  // Output: tiles per gaussian
     uint gid [[thread_position_in_grid]]
 ) {
@@ -531,7 +531,7 @@ kernel void tellusim_compute_gaussian_tile_counts(
         return;
     }
 
-    TellusimCompactedGaussian g = compacted[gid];
+    LocalSortCompactedGaussian g = compacted[gid];
     int2 minTile = g.min_tile;
     int2 maxTile = g.max_tile;
 
@@ -549,9 +549,9 @@ kernel void tellusim_compute_gaussian_tile_counts(
 // - Warp-level atomic batching (only lane 0 does atomic)
 // - Each thread computes its write position via popcount
 
-kernel void tellusim_scatter_simd(
-    const device TellusimCompactedGaussian* compacted [[buffer(0)]],
-    const device TellusimCompactedHeader* header [[buffer(1)]],
+kernel void localSort_scatter_simd(
+    const device LocalSortCompactedGaussian* compacted [[buffer(0)]],
+    const device LocalSortCompactedHeader* header [[buffer(1)]],
     device atomic_uint* tileCounters [[buffer(2)]],
     const device uint* offsets [[buffer(3)]],
     device uint* sortKeys [[buffer(4)]],
@@ -577,7 +577,7 @@ kernel void tellusim_scatter_simd(
     if (gaussianIdx >= visibleCount) return;
 
     // Lane 0 loads gaussian data
-    TellusimCompactedGaussian g;
+    LocalSortCompactedGaussian g;
     float3 conic;
     float2 center;
     float power;
@@ -588,8 +588,8 @@ kernel void tellusim_scatter_simd(
         g = compacted[gaussianIdx];
         conic = g.covariance_depth.xyz;
         center = g.position_color.xy;
-        half4 colorOp = tellusim_unpackHalf4(g.position_color.zw);
-        power = tellusim_computePower(float(colorOp.w));
+        half4 colorOp = localSort_unpackHalf4(g.position_color.zw);
+        power = localSort_computePower(float(colorOp.w));
         // 32-bit stable key: (depth16 << 16) | compactedIdx for deterministic tie-breaking
         uint depth16 = ((as_type<uint>(g.covariance_depth.w) ^ 0x80000000u) >> 16u) & 0xFFFFu;
         depthKey = (depth16 << 16) | (gaussianIdx & 0xFFFFu);
@@ -629,8 +629,8 @@ kernel void tellusim_scatter_simd(
         int2 pix_max = int2(pix_min.x + tileWidth - 1, pix_min.y + tileHeight - 1);
 
         // FlashGS intersection test 
-        bool valid = tellusim_blockContainsCenter(pix_min, pix_max, center) ||
-                     tellusim_blockIntersectEllipse(pix_min, pix_max, center, conic, power);
+        bool valid = localSort_blockContainsCenter(pix_min, pix_max, center) ||
+                     localSort_blockIntersectEllipse(pix_min, pix_max, center, conic, power);
 
         // SIMD early-out: skip iteration if no lanes are valid
         simd_vote ballot = simd_ballot(valid);
@@ -659,7 +659,7 @@ kernel void tellusim_scatter_simd(
 
 #define SORT_MAX_SIZE 2048
 
-kernel void tellusim_per_tile_sort(
+kernel void localSort_per_tile_sort(
     device uint* keys [[buffer(0)]],
     device uint* values [[buffer(1)]],
     const device uint* offsets [[buffer(2)]],
@@ -733,7 +733,7 @@ kernel void tellusim_per_tile_sort(
 }
 
 // =============================================================================
-// KERNEL 6: RENDER (Tellusim-style, 8 pixels per thread)
+// KERNEL 6: RENDER (LocalSort-style, 8 pixels per thread)
 // =============================================================================
 // Optimized: No arrays (prevents spilling), half precision, direct memory access
 
@@ -744,14 +744,14 @@ kernel void tellusim_per_tile_sort(
 #define TELLUSIM_PIXELS_X 4
 #define TELLUSIM_PIXELS_Y 2
 
-kernel void tellusim_render(
-    const device TellusimCompactedGaussian* compacted [[buffer(0)]],
+kernel void localSort_render(
+    const device LocalSortCompactedGaussian* compacted [[buffer(0)]],
     const device uint* offsets [[buffer(1)]],
     const device uint* counts [[buffer(2)]],
     const device uint* sortedIndices [[buffer(3)]],
     texture2d<half, access::write> colorOut [[texture(0)]],
     texture2d<half, access::write> depthOut [[texture(1)]],
-    constant TellusimRenderParams& params [[buffer(4)]],
+    constant LocalSortRenderParams& params [[buffer(4)]],
     uint2 groupId [[threadgroup_position_in_grid]],
     uint2 localId [[thread_position_in_threadgroup]],
     uint localIdx [[thread_index_in_threadgroup]],
@@ -786,11 +786,11 @@ kernel void tellusim_render(
     // Process all gaussians
     for (uint i = 0; i < gaussCount; ++i) {
         uint gIdx = sortedIndices[offset + i];
-        TellusimCompactedGaussian g = compacted[gIdx];
+        LocalSortCompactedGaussian g = compacted[gIdx];
 
         half2 gPos = half2(g.position_color.xy);
         half3 cov = half3(g.covariance_depth.xyz);
-        half4 colorOp = tellusim_unpackHalf4(g.position_color.zw);
+        half4 colorOp = localSort_unpackHalf4(g.position_color.zw);
 
         // Match original pipeline's formula exactly
         half cxx = cov.x, cyy = cov.z, cxy2 = 2.0h * cov.y;

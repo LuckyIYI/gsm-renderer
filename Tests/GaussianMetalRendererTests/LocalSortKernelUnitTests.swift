@@ -4,7 +4,7 @@ import simd
 @testable import GaussianMetalRenderer
 
 /// Unit tests for each Tellusim kernel in isolation
-final class TellusimKernelUnitTests: XCTestCase {
+final class LocalSortKernelUnitTests: XCTestCase {
     private let tileWidth = 32
     private let tileHeight = 16
     private let imageWidth = 1920
@@ -17,7 +17,7 @@ final class TellusimKernelUnitTests: XCTestCase {
         let device = renderer.device
         let queue = renderer.queue
 
-        let encoder = try TellusimPipelineEncoder(device: device)
+        let encoder = try LocalSortPipelineEncoder(device: device)
 
         let tilesX = (imageWidth + tileWidth - 1) / tileWidth
         let tilesY = (imageHeight + tileHeight - 1) / tileHeight
@@ -135,7 +135,7 @@ final class TellusimKernelUnitTests: XCTestCase {
         cb.waitUntilCompleted()
 
         // Read results
-        let visibleCount = TellusimPipelineEncoder.readVisibleCount(from: headerBuffer)
+        let visibleCount = LocalSortPipelineEncoder.readVisibleCount(from: headerBuffer)
         print("\n=== Project Results ===")
         print("Visible count: \(visibleCount) / \(gaussianCount)")
 
@@ -192,7 +192,7 @@ final class TellusimKernelUnitTests: XCTestCase {
         let device = renderer.device
         let queue = renderer.queue
 
-        let encoder = try TellusimPipelineEncoder(device: device)
+        let encoder = try LocalSortPipelineEncoder(device: device)
 
         let tilesX = (imageWidth + tileWidth - 1) / tileWidth
         let tilesY = (imageHeight + tileHeight - 1) / tileHeight
@@ -277,7 +277,7 @@ final class TellusimKernelUnitTests: XCTestCase {
         cb.waitUntilCompleted()
 
         // Verify scatter results
-        let visibleCount = TellusimPipelineEncoder.readVisibleCount(from: headerBuffer)
+        let visibleCount = LocalSortPipelineEncoder.readVisibleCount(from: headerBuffer)
         let compactedPtr = compactedBuffer.contents().bindMemory(to: CompactedGaussianSwift.self, capacity: Int(visibleCount))
         let tileOffsetsPtr = tileOffsetsBuffer.contents().bindMemory(to: UInt32.self, capacity: tileCount + 1)
         let tileCountsPtr = tileCountsBuffer.contents().bindMemory(to: UInt32.self, capacity: tileCount)
@@ -333,7 +333,7 @@ final class TellusimKernelUnitTests: XCTestCase {
         let device = renderer.device
         let queue = renderer.queue
 
-        let encoder = try TellusimPipelineEncoder(device: device)
+        let encoder = try LocalSortPipelineEncoder(device: device)
 
         let tilesX = (imageWidth + tileWidth - 1) / tileWidth
         let tilesY = (imageHeight + tileHeight - 1) / tileHeight
@@ -442,7 +442,7 @@ final class TellusimKernelUnitTests: XCTestCase {
         cb.waitUntilCompleted()
 
         // Verify render output
-        let visibleCount = TellusimPipelineEncoder.readVisibleCount(from: headerBuffer)
+        let visibleCount = LocalSortPipelineEncoder.readVisibleCount(from: headerBuffer)
         print("\n=== Render Results ===")
         print("Visible: \(visibleCount)")
 

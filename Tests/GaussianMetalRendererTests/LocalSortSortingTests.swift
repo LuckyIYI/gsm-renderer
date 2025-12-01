@@ -4,13 +4,13 @@ import simd
 @testable import GaussianMetalRenderer
 
 /// Test Tellusim per-tile radix sorting
-final class TellusimSortingTests: XCTestCase {
+final class LocalSortSortingTests: XCTestCase {
 
     /// Helper to load Tellusim library from bundle
     private func loadTellusimLibrary(device: MTLDevice) throws -> MTLLibrary {
         guard let libraryURL = Bundle.module.url(forResource: "TellusimShaders", withExtension: "metallib"),
               let library = try? device.makeLibrary(URL: libraryURL) else {
-            throw NSError(domain: "TellusimSortingTests", code: 1,
+            throw NSError(domain: "LocalSortSortingTests", code: 1,
                          userInfo: [NSLocalizedDescriptionKey: "Failed to load TellusimShaders.metallib"])
         }
         return library

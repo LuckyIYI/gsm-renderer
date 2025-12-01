@@ -23,24 +23,52 @@ public struct PackedWorldBuffersHalf {
 }
 
 final class ProjectEncoder {
-    private let pipelineFloatHalf: MTLComputePipelineState   // float input -> half output
-    private let pipelineFloatFloat: MTLComputePipelineState  // float input -> float output
-    private let pipelineHalfHalf: MTLComputePipelineState    // half input -> half output
+    // SH degree-specific pipelines (function constants for unrolled loops)
+    // Key: SH degree (0-3)
+    private var pipelinesFloatHalfBySHDegree: [UInt32: MTLComputePipelineState] = [:]
+    private var pipelinesFloatFloatBySHDegree: [UInt32: MTLComputePipelineState] = [:]
+    private var pipelinesHalfHalfBySHDegree: [UInt32: MTLComputePipelineState] = [:]
+
+    /// Map shComponents count to SH degree (0-3)
+    private static func shDegree(from shComponents: UInt32) -> UInt32 {
+        switch shComponents {
+        case 0, 1: return 0     // DC only
+        case 2...4: return 1    // Degree 1 (4 coeffs)
+        case 5...9: return 2    // Degree 2 (9 coeffs)
+        default: return 3       // Degree 3 (16 coeffs)
+        }
+    }
 
     init(device: MTLDevice, library: MTLLibrary) throws {
-        guard let fnFloatHalf = library.makeFunction(name: "projectGaussiansPacked_float_half") else {
-            fatalError("projectGaussiansPacked_float_half not found")
-        }
-        guard let fnFloatFloat = library.makeFunction(name: "projectGaussiansPacked_float_float") else {
-            fatalError("projectGaussiansPacked_float_float not found")
-        }
-        guard let fnHalfHalf = library.makeFunction(name: "projectGaussiansPacked_half_half") else {
-            fatalError("projectGaussiansPacked_half_half not found")
+        // Create SH degree-specific pipeline variants (function constants for unrolled loops)
+        // This gives significant speedup by allowing the compiler to fully unroll SH loops
+        for degree: UInt32 in 0...3 {
+            let constantValues = MTLFunctionConstantValues()
+            var shDegree = degree
+            constantValues.setConstantValue(&shDegree, type: .uint, index: 0) // SH_DEGREE at index 0
+
+            // Float input -> Half output
+            if let fn = try? library.makeFunction(name: "projectGaussiansPacked_float_half", constantValues: constantValues) {
+                self.pipelinesFloatHalfBySHDegree[degree] = try? device.makeComputePipelineState(function: fn)
+            }
+
+            // Float input -> Float output
+            if let fn = try? library.makeFunction(name: "projectGaussiansPacked_float_float", constantValues: constantValues) {
+                self.pipelinesFloatFloatBySHDegree[degree] = try? device.makeComputePipelineState(function: fn)
+            }
+
+            // Half input -> Half output
+            if let fn = try? library.makeFunction(name: "projectGaussiansPacked_half_half", constantValues: constantValues) {
+                self.pipelinesHalfHalfBySHDegree[degree] = try? device.makeComputePipelineState(function: fn)
+            }
         }
 
-        self.pipelineFloatHalf = try device.makeComputePipelineState(function: fnFloatHalf)
-        self.pipelineFloatFloat = try device.makeComputePipelineState(function: fnFloatFloat)
-        self.pipelineHalfHalf = try device.makeComputePipelineState(function: fnHalfHalf)
+        // Verify we have at least degree 0 pipelines
+        guard pipelinesFloatHalfBySHDegree[0] != nil,
+              pipelinesFloatFloatBySHDegree[0] != nil,
+              pipelinesHalfHalfBySHDegree[0] != nil else {
+            fatalError("Failed to create projection pipelines")
+        }
     }
 
     /// Encode projection from packed world buffers (optimized memory access)
@@ -55,7 +83,14 @@ final class ProjectEncoder {
         guard let encoder = commandBuffer.makeComputeCommandEncoder() else { return }
         encoder.label = "ProjectGaussiansPacked"
 
-        let pipeline = precision == .float16 ? pipelineFloatHalf : pipelineFloatFloat
+        // Select pipeline with correct SH degree for optimized unrolled loops
+        let shDegree = Self.shDegree(from: cameraUniforms.shComponents)
+        let pipeline: MTLComputePipelineState
+        if precision == .float16 {
+            pipeline = pipelinesFloatHalfBySHDegree[shDegree] ?? pipelinesFloatHalfBySHDegree[0]!
+        } else {
+            pipeline = pipelinesFloatFloatBySHDegree[shDegree] ?? pipelinesFloatFloatBySHDegree[0]!
+        }
 
         encoder.setComputePipelineState(pipeline)
 
@@ -92,7 +127,11 @@ final class ProjectEncoder {
         guard let encoder = commandBuffer.makeComputeCommandEncoder() else { return }
         encoder.label = "ProjectGaussiansPacked_HalfHalf"
 
-        encoder.setComputePipelineState(pipelineHalfHalf)
+        // Select pipeline with correct SH degree for optimized unrolled loops
+        let shDegree = Self.shDegree(from: cameraUniforms.shComponents)
+        let pipeline = pipelinesHalfHalfBySHDegree[shDegree] ?? pipelinesHalfHalfBySHDegree[0]!
+
+        encoder.setComputePipelineState(pipeline)
 
         // Input buffers (half-precision packed format)
         encoder.setBuffer(packedWorldBuffersHalf.packedGaussians, offset: 0, index: 0)
@@ -111,7 +150,7 @@ final class ProjectEncoder {
         encoder.setBytes(&cam, length: MemoryLayout<CameraUniformsSwift>.stride, index: 9)
 
         let threads = MTLSize(width: gaussianCount, height: 1, depth: 1)
-        let tg = MTLSize(width: pipelineHalfHalf.threadExecutionWidth, height: 1, depth: 1)
+        let tg = MTLSize(width: pipeline.threadExecutionWidth, height: 1, depth: 1)
         encoder.dispatchThreads(threads, threadsPerThreadgroup: tg)
         encoder.endEncoding()
     }

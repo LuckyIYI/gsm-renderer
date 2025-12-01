@@ -33,7 +33,7 @@ final class SortStageTimingTests: XCTestCase {
                 gaussianCount: UInt32(count)
             )
 
-            let renderer = Renderer.shared
+            let renderer = GlobalSortRenderer(limits: RendererLimits(maxGaussians: 1_000_000, maxWidth: 1024, maxHeight: 1024))
             let (means, conics, colors, opacities, depths, radii) = makeInputs(count: count, width: width, height: height, tile: tile)
 
             func prepareInputs() -> GaussianInputBuffers? {

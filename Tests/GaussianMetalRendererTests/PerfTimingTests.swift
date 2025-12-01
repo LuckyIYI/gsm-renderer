@@ -166,10 +166,8 @@ final class PerfTimingTests: XCTestCase {
     func testStartupTiming() throws {
         let startTime = CFAbsoluteTimeGetCurrent()
 
-        let renderer = Renderer(
-            precision: .float32,
-            usePreciseIntersection: true,
-            useFusedCoverageScatter: true,
+        let renderer = GlobalSortRenderer(
+            precision: Precision.float32,
             useHeapAllocation: false,
             limits: RendererLimits(maxGaussians: 1_000_000, maxWidth: 1920, maxHeight: 1080)
         )
@@ -188,10 +186,8 @@ final class PerfTimingTests: XCTestCase {
     func testRenderWallTime() throws {
         let width = 1024
         let height = 768
-        let renderer = Renderer(
-            precision: .float16,
-            usePreciseIntersection: true,
-            useFusedCoverageScatter: true,
+        let renderer = GlobalSortRenderer(
+            precision: Precision.float16,
             useHeapAllocation: false,
             textureOnly: true,
             limits: RendererLimits(maxGaussians: 200_000, maxWidth: width, maxHeight: height)
@@ -268,11 +264,8 @@ final class PerfTimingTests: XCTestCase {
     func test4MScale() throws {
         let width = 1920
         let height = 1080
-        let renderer = Renderer(
-            precision: .float16,
-            useMultiPixelRendering: true,  // Enable 32x16 tiles for V2/V3 kernel
-            usePreciseIntersection: true,
-            useFusedCoverageScatter: true,
+        let renderer = GlobalSortRenderer(
+            precision: Precision.float16,
             useHeapAllocation: false,
             textureOnly: true,
             limits: RendererLimits(maxGaussians: 4_500_000, maxWidth: width, maxHeight: height)
@@ -305,7 +298,7 @@ final class PerfTimingTests: XCTestCase {
             let frameParams = FrameParams(gaussianCount: count, whiteBackground: false)
 
             // Test V1 (original multi-pixel)
-            renderer.fusedPipelineEncoder?.renderVersion = 1
+            renderer.fusedPipelineEncoder.renderVersion = 1
             for _ in 0..<2 {
                 guard let cb = renderer.queue.makeCommandBuffer() else { continue }
                 _ = renderer.encodeRenderToTextureHalf(commandBuffer: cb, gaussianCount: count, packedWorldBuffersHalf: packedBuffersHalf, cameraUniforms: camera, frameParams: frameParams)
@@ -321,7 +314,7 @@ final class PerfTimingTests: XCTestCase {
             }
 
             // Test V2 (shared mem, 4 pixels/thread)
-            renderer.fusedPipelineEncoder?.renderVersion = 2
+            renderer.fusedPipelineEncoder.renderVersion = 2
             for _ in 0..<2 {
                 guard let cb = renderer.queue.makeCommandBuffer() else { continue }
                 _ = renderer.encodeRenderToTextureHalf(commandBuffer: cb, gaussianCount: count, packedWorldBuffersHalf: packedBuffersHalf, cameraUniforms: camera, frameParams: frameParams)
@@ -337,7 +330,7 @@ final class PerfTimingTests: XCTestCase {
             }
 
             // Test V3 (Tellusim-style: no shared mem, 8 pixels/thread)
-            renderer.fusedPipelineEncoder?.renderVersion = 3
+            renderer.fusedPipelineEncoder.renderVersion = 3
             for _ in 0..<2 {
                 guard let cb = renderer.queue.makeCommandBuffer() else { continue }
                 _ = renderer.encodeRenderToTextureHalf(commandBuffer: cb, gaussianCount: count, packedWorldBuffersHalf: packedBuffersHalf, cameraUniforms: camera, frameParams: frameParams)
@@ -375,10 +368,8 @@ final class PerfTimingTests: XCTestCase {
     func testPreciseScaleTiming() throws {
         let width = 1920
         let height = 1080
-        let renderer = Renderer(
-            precision: .float16,
-            usePreciseIntersection: true,
-            useFusedCoverageScatter: true,
+        let renderer = GlobalSortRenderer(
+            precision: Precision.float16,
             useHeapAllocation: false,
             textureOnly: true,
             limits: RendererLimits(maxGaussians: 1_000_000, maxWidth: width, maxHeight: height)

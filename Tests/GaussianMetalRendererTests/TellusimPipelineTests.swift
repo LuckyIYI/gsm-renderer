@@ -12,7 +12,7 @@ final class TellusimPipelineTests: XCTestCase {
 
     /// Test basic pipeline execution and verify visible count
     func testBasicPipelineExecution() throws {
-        let renderer = Renderer.shared
+        let renderer = GlobalSortRenderer(limits: RendererLimits(maxGaussians: 1_000_000, maxWidth: 1024, maxHeight: 1024))
         let device = renderer.device
         let library = renderer.library
         let queue = renderer.queue
@@ -140,7 +140,7 @@ final class TellusimPipelineTests: XCTestCase {
 
     /// Test full pipeline including render and verify output
     func testFullPipelineWithRender() throws {
-        let renderer = Renderer.shared
+        let renderer = GlobalSortRenderer(limits: RendererLimits(maxGaussians: 1_000_000, maxWidth: 1024, maxHeight: 1024))
         let device = renderer.device
         let library = renderer.library
         let queue = renderer.queue
@@ -327,7 +327,7 @@ final class TellusimPipelineTests: XCTestCase {
 
     /// Full end-to-end performance test including render
     func testEndToEndPerformance() throws {
-        let renderer = Renderer.shared
+        let renderer = GlobalSortRenderer(limits: RendererLimits(maxGaussians: 1_000_000, maxWidth: 1024, maxHeight: 1024))
         let device = renderer.device
         let library = renderer.library
         let queue = renderer.queue
@@ -549,7 +549,7 @@ final class TellusimPipelineTests: XCTestCase {
 
     /// Test pipeline stages separately to identify bottleneck
     func testPipelineStageBreakdown() throws {
-        let renderer = Renderer.shared
+        let renderer = GlobalSortRenderer(limits: RendererLimits(maxGaussians: 1_000_000, maxWidth: 1024, maxHeight: 1024))
         let device = renderer.device
         let library = renderer.library
         let queue = renderer.queue
@@ -804,7 +804,7 @@ final class TellusimPipelineTests: XCTestCase {
 
     /// Stage breakdown at 2M gaussians to identify bottlenecks
     func testStageBreakdown2M() throws {
-        let renderer = Renderer.shared
+        let renderer = GlobalSortRenderer(limits: RendererLimits(maxGaussians: 1_000_000, maxWidth: 1024, maxHeight: 1024))
         let device = renderer.device
         let library = renderer.library
         let queue = renderer.queue
@@ -1059,7 +1059,7 @@ final class TellusimPipelineTests: XCTestCase {
 
     /// Performance test at 2M gaussians (target: 60 FPS / 16.67ms, stretch: 120 FPS / 8.33ms)
     func testPerformance2M() throws {
-        let renderer = Renderer.shared
+        let renderer = GlobalSortRenderer(limits: RendererLimits(maxGaussians: 1_000_000, maxWidth: 1024, maxHeight: 1024))
         let device = renderer.device
         let library = renderer.library
         let queue = renderer.queue
@@ -1303,7 +1303,7 @@ final class TellusimPipelineTests: XCTestCase {
 
     /// Performance test comparing old pipeline vs Tellusim pipeline
     func testPipelinePerformance() throws {
-        let renderer = Renderer.shared
+        let renderer = GlobalSortRenderer(limits: RendererLimits(maxGaussians: 1_000_000, maxWidth: 1024, maxHeight: 1024))
         let device = renderer.device
         let library = renderer.library
         let queue = renderer.queue

@@ -3,127 +3,13 @@
 
 #include <metal_stdlib>
 #include <metal_atomic>
+#include "GaussianShared.h"
+#include "GaussianHelpers.h"
 using namespace metal;
 
-// =============================================================================
-// SHARED CONSTANTS
-// =============================================================================
-
-// SH coefficients
-constant float SH_C0 = 0.28209479177387814f;
-constant float SH_C1 = 0.4886025119029199f;
-constant float SH_C2_0 = 1.0925484305920792f;
-constant float SH_C2_1 = -1.0925484305920792f;
-constant float SH_C2_2 = 0.31539156525252005f;
-constant float SH_C2_3 = -1.0925484305920792f;
-constant float SH_C2_4 = 0.5462742152960396f;
-constant float SH_C3_0 = -0.5900435899266435f;
-constant float SH_C3_1 = 2.890611442640554f;
-constant float SH_C3_2 = -0.4570457994644658f;
-constant float SH_C3_3 = 0.3731763325901154f;
-constant float SH_C3_4 = -0.4570457994644658f;
-constant float SH_C3_5 = 1.445305721320277f;
-constant float SH_C3_6 = -0.5900435899266435f;
-
-// =============================================================================
-// FUNCTION CONSTANTS FOR SH DEGREE
-// Compiler eliminates branches and unrolls loops at compile time
-// =============================================================================
-// SH degree: 0 = DC only (1 coeff), 1 = 4 coeffs, 2 = 9 coeffs, 3 = 16 coeffs
-constant uint SH_DEGREE [[function_constant(0)]];
-constant bool SH_DEGREE_0 = (SH_DEGREE == 0);
-constant bool SH_DEGREE_1 = (SH_DEGREE == 1);
-constant bool SH_DEGREE_2 = (SH_DEGREE == 2);
-constant bool SH_DEGREE_3 = (SH_DEGREE == 3);
-
-// =============================================================================
-// OPTIMIZED SH COMPUTATION (compile-time branching, fully unrolled)
-// =============================================================================
-template<typename HarmonicsT>
-inline float3 tellusim_computeSHColor(
-    const device HarmonicsT* harmonics,
-    uint gid,
-    float3 pos,
-    float3 cameraCenter,
-    uint shComponents  // runtime fallback if function constant not set
-) {
-    // DC only - no direction needed
-    if (SH_DEGREE_0 || shComponents == 0) {
-        uint base = gid * 3u;
-        return float3(harmonics[base], harmonics[base + 1], harmonics[base + 2]);
-    }
-
-    // Compute view direction
-    float3 dir = normalize(cameraCenter - pos);
-    float xx = dir.x * dir.x, yy = dir.y * dir.y, zz = dir.z * dir.z;
-    float xy = dir.x * dir.y, yz = dir.y * dir.z, xz = dir.x * dir.z;
-
-    // SH basis (compute only what we need based on degree)
-    float shBasis[16];
-    shBasis[0] = SH_C0;
-
-    if (SH_DEGREE_1 || SH_DEGREE_2 || SH_DEGREE_3 || shComponents >= 4) {
-        shBasis[1] = -SH_C1 * dir.y;
-        shBasis[2] = SH_C1 * dir.z;
-        shBasis[3] = -SH_C1 * dir.x;
-    }
-
-    if (SH_DEGREE_2 || SH_DEGREE_3 || shComponents >= 9) {
-        shBasis[4] = SH_C2_0 * xy;
-        shBasis[5] = SH_C2_1 * yz;
-        shBasis[6] = SH_C2_2 * (2.0f * zz - xx - yy);
-        shBasis[7] = SH_C2_3 * xz;
-        shBasis[8] = SH_C2_4 * (xx - yy);
-    }
-
-    if (SH_DEGREE_3 || shComponents >= 16) {
-        shBasis[9] = SH_C3_0 * dir.y * (3.0f * xx - yy);
-        shBasis[10] = SH_C3_1 * xy * dir.z;
-        shBasis[11] = SH_C3_2 * dir.y * (4.0f * zz - xx - yy);
-        shBasis[12] = SH_C3_3 * dir.z * (2.0f * zz - 3.0f * xx - 3.0f * yy);
-        shBasis[13] = SH_C3_4 * dir.x * (4.0f * zz - xx - yy);
-        shBasis[14] = SH_C3_5 * dir.z * (xx - yy);
-        shBasis[15] = SH_C3_6 * dir.x * (xx - 3.0f * yy);
-    }
-
-    // Accumulate color - fully unrolled based on function constant
-    float3 color = float3(0.0f);
-    uint coeffs = SH_DEGREE_0 ? 1 : (SH_DEGREE_1 ? 4 : (SH_DEGREE_2 ? 9 : (SH_DEGREE_3 ? 16 : shComponents)));
-    uint base = gid * coeffs * 3u;
-
-    // Unrolled loops for each degree - compiler eliminates dead branches
-    if (SH_DEGREE_1) {
-        #pragma unroll
-        for (uint i = 0; i < 4; ++i) {
-            color.x += float(harmonics[base + i]) * shBasis[i];
-            color.y += float(harmonics[base + 4 + i]) * shBasis[i];
-            color.z += float(harmonics[base + 8 + i]) * shBasis[i];
-        }
-    } else if (SH_DEGREE_2) {
-        #pragma unroll
-        for (uint i = 0; i < 9; ++i) {
-            color.x += float(harmonics[base + i]) * shBasis[i];
-            color.y += float(harmonics[base + 9 + i]) * shBasis[i];
-            color.z += float(harmonics[base + 18 + i]) * shBasis[i];
-        }
-    } else if (SH_DEGREE_3) {
-        #pragma unroll
-        for (uint i = 0; i < 16; ++i) {
-            color.x += float(harmonics[base + i]) * shBasis[i];
-            color.y += float(harmonics[base + 16 + i]) * shBasis[i];
-            color.z += float(harmonics[base + 32 + i]) * shBasis[i];
-        }
-    } else {
-        // Runtime fallback (shouldn't happen with proper function constants)
-        for (uint i = 0; i < min(coeffs, 16u); ++i) {
-            color.x += float(harmonics[base + i]) * shBasis[i];
-            color.y += float(harmonics[base + coeffs + i]) * shBasis[i];
-            color.z += float(harmonics[base + coeffs * 2u + i]) * shBasis[i];
-        }
-    }
-
-    return color;
-}
+// SH constants and computeSHColor function now defined in GaussianShared.h
+// Math helpers (matrixFromRows, normalizeQuaternion, buildCovariance3D, projectCovariance,
+// computeConicAndRadius) now defined in GaussianHelpers.h
 
 // =============================================================================
 // DATA STRUCTURES
@@ -207,149 +93,8 @@ struct TellusimRenderParams {
 };
 
 // =============================================================================
-// HELPER FUNCTIONS
+// HELPER FUNCTIONS (Tellusim-specific - shared math helpers in GaussianHelpers.h)
 // =============================================================================
-
-inline float3x3 tellusim_matrixFromRows(float3 r0, float3 r1, float3 r2) {
-    return float3x3(
-        float3(r0.x, r1.x, r2.x),
-        float3(r0.y, r1.y, r2.y),
-        float3(r0.z, r1.z, r2.z)
-    );
-}
-
-inline float4 tellusim_normalizeQuat(float4 q) {
-    // Fast rsqrt-based normalization
-    float d = dot(q, q);
-    float r = rsqrt(max(d, 1e-8f));
-    return q * r;
-}
-
-// Optimized: Fused quaternion to rotation + scale + covariance
-inline void tellusim_buildCov3D_fast(float3 scale, float4 q,
-                                      thread float& cov00, thread float& cov01, thread float& cov02,
-                                      thread float& cov11, thread float& cov12, thread float& cov22) {
-    // Quaternion to rotation matrix elements
-    float x = q.x, y = q.y, z = q.z, w = q.w;
-    float x2 = x + x, y2 = y + y, z2 = z + z;
-    float xx = x * x2, xy = x * y2, xz = x * z2;
-    float yy = y * y2, yz = y * z2, zz = z * z2;
-    float wx = w * x2, wy = w * y2, wz = w * z2;
-
-    // R = rotation matrix columns
-    float3 R0 = float3(1 - (yy + zz), xy + wz, xz - wy);
-    float3 R1 = float3(xy - wz, 1 - (xx + zz), yz + wx);
-    float3 R2 = float3(xz + wy, yz - wx, 1 - (xx + yy));
-
-    // M = S * R^T (scale applied to rows)
-    float3 M0 = R0 * scale.x;
-    float3 M1 = R1 * scale.y;
-    float3 M2 = R2 * scale.z;
-
-    // Covariance = M * M^T (only upper triangle needed)
-    cov00 = dot(M0, M0);
-    cov01 = dot(M0, M1);
-    cov02 = dot(M0, M2);
-    cov11 = dot(M1, M1);
-    cov12 = dot(M1, M2);
-    cov22 = dot(M2, M2);
-}
-
-// Optimized: Direct 2D covariance from 3D elements
-inline float3 tellusim_projectCov_fast(float cov00, float cov01, float cov02,
-                                        float cov11, float cov12, float cov22,
-                                        float3 viewPos, float3x3 viewRot,
-                                        float fx, float fy, float W, float H) {
-    float z = viewPos.z;
-    float z2 = z * z;
-    // Match original: tanHalfFovX = W / (2 * fx), limit = 1.3 * tanHalfFovX
-    float limX = 1.3f * W / (2.0f * fx);
-    float limY = 1.3f * H / (2.0f * fy);
-
-    float tx = clamp(viewPos.x / z, -limX, limX) * z;
-    float ty = clamp(viewPos.y / z, -limY, limY) * z;
-
-    // J * viewRot = T (only first two rows matter)
-    float fxz = fx / z, fyz = fy / z;
-    float fxtx = -fx * tx / z2, fyty = -fy * ty / z2;
-
-    // T[0] = fxz * viewRot[0] + fxtx * viewRot[2]
-    // T[1] = fyz * viewRot[1] + fyty * viewRot[2]
-    float3 T0 = fxz * viewRot[0] + fxtx * viewRot[2];
-    float3 T1 = fyz * viewRot[1] + fyty * viewRot[2];
-
-    // cov2d = T * cov3d * T^T (only 2x2 result needed)
-    // cov3d is symmetric, represented as upper triangle
-    float3 cov3d_col0 = float3(cov00, cov01, cov02);
-    float3 cov3d_col1 = float3(cov01, cov11, cov12);
-    float3 cov3d_col2 = float3(cov02, cov12, cov22);
-
-    // T * cov3d
-    float3 TC0 = T0.x * cov3d_col0 + T0.y * cov3d_col1 + T0.z * cov3d_col2;
-    float3 TC1 = T1.x * cov3d_col0 + T1.y * cov3d_col1 + T1.z * cov3d_col2;
-
-    // (T * cov3d) * T^T
-    float c00 = dot(TC0, T0) + 0.3f;
-    float c01 = dot(TC0, T1);
-    float c11 = dot(TC1, T1) + 0.3f;
-
-    return float3(c00, c01, c11);
-}
-
-inline float3x3 tellusim_buildCov3D(float3 scale, float4 q) {
-    // Quaternion to rotation matrix - must match original pipeline exactly
-    // Convention: q = (x, y, z, w) where w is scalar/real part
-    float x = q.x, y = q.y, z = q.z, w = q.w;
-    float x2 = x + x, y2 = y + y, z2 = z + z;
-    float xx = x * x2, xy = x * y2, xz = x * z2;
-    float yy = y * y2, yz = y * z2, zz = z * z2;
-    float wx = w * x2, wy = w * y2, wz = w * z2;
-
-    // Column-major rotation matrix (matches original quaternionToMatrix + matrixFromRows)
-    float3x3 R = float3x3(
-        float3(1 - (yy + zz), xy + wz, xz - wy),  // col0
-        float3(xy - wz, 1 - (xx + zz), yz + wx),  // col1
-        float3(xz + wy, yz - wx, 1 - (xx + yy))   // col2
-    );
-
-    // RS = R * diag(scale) - scale each column
-    float3x3 M = float3x3(
-        R[0] * scale.x,
-        R[1] * scale.y,
-        R[2] * scale.z
-    );
-
-    // Cov = RS * RS^T
-    return M * transpose(M);
-}
-
-inline float2x2 tellusim_projectCov(float3x3 cov3d, float3 viewPos, float3x3 viewRot,
-                                     float fx, float fy, float W, float H) {
-    float z = viewPos.z;
-    // Match original: tanHalfFovX = W / (2 * fx), limit = 1.3 * tanHalfFovX
-    float limX = 1.3f * W / (2.0f * fx);
-    float limY = 1.3f * H / (2.0f * fy);
-
-    float invZ = 1.0f / max(1e-4f, z);
-    float invZ2 = invZ * invZ;
-
-    float x = clamp(viewPos.x * invZ, -limX, limX) * z;
-    float y = clamp(viewPos.y * invZ, -limY, limY) * z;
-
-    // Jacobian columns (must match original exactly)
-    float3 col0 = float3(fx * invZ, 0.0f, 0.0f);
-    float3 col1 = float3(0.0f, fy * invZ, 0.0f);
-    float3 col2 = float3(-(fx * x) * invZ2, -(fy * y) * invZ2, 0.0f);
-    float3x3 J = float3x3(col0, col1, col2);
-
-    float3x3 T = J * viewRot;
-    float3x3 cov2d_full = T * cov3d * transpose(T);
-
-    return float2x2(
-        cov2d_full[0][0] + 0.3f, cov2d_full[0][1],
-        cov2d_full[0][1], cov2d_full[1][1] + 0.3f
-    );
-}
 
 // Pack half4 to float2
 inline float2 tellusim_packHalf4(half4 v) {
@@ -430,7 +175,21 @@ inline float tellusim_computePower(float opacity) {
 }
 
 // =============================================================================
-// KERNEL 1: CLEAR
+// KERNEL: ZERO TILE COUNTS (simple version for external use)
+// =============================================================================
+
+kernel void tileBinningZeroCountsKernel(
+    device uint* counts [[buffer(0)]],
+    constant uint& tileCount [[buffer(1)]],
+    uint gid [[thread_position_in_grid]]
+) {
+    if (gid < tileCount) {
+        counts[gid] = 0;
+    }
+}
+
+// =============================================================================
+// KERNEL 1: CLEAR (full reset including header)
 // =============================================================================
 
 kernel void tellusim_clear(
@@ -502,29 +261,24 @@ kernel void tellusim_project_compact_count(
     float px = ((ndcX + 1.0f) * camera.width - 1.0f) * 0.5f;
     float py = ((ndcY + 1.0f) * camera.height - 1.0f) * 0.5f;
 
-    // Covariance (scale already loaded in early cull)
-    float4 quat = tellusim_normalizeQuat(float4(g.rotation));
-    float3x3 cov3d = tellusim_buildCov3D(scale, quat);
+    // Covariance (scale already loaded in early cull) - using shared functions from GaussianHelpers.h
+    float4 quat = normalizeQuaternion(float4(g.rotation));
+    float3x3 cov3d = buildCovariance3D(scale, quat);
 
     float3 vr0 = float3(camera.viewMatrix[0][0], camera.viewMatrix[1][0], camera.viewMatrix[2][0]);
     float3 vr1 = float3(camera.viewMatrix[0][1], camera.viewMatrix[1][1], camera.viewMatrix[2][1]);
     float3 vr2 = float3(camera.viewMatrix[0][2], camera.viewMatrix[1][2], camera.viewMatrix[2][2]);
-    float3x3 viewRot = tellusim_matrixFromRows(vr0, vr1, vr2);
+    float3x3 viewRot = matrixFromRows(vr0, vr1, vr2);
 
-    float2x2 cov2d = tellusim_projectCov(cov3d, viewPos.xyz, viewRot,
-                                          camera.focalX, camera.focalY,
-                                          camera.width, camera.height);
+    float2x2 cov2d = projectCovariance(cov3d, viewPos.xyz, viewRot,
+                                        camera.focalX, camera.focalY,
+                                        camera.width, camera.height);
 
-    float a = cov2d[0][0], b = cov2d[0][1], c = cov2d[1][1];
-    float det = a * c - b * b;
-    if (det <= 1e-6f) return;
-
-    float idet = 1.0f / det;
-    float3 conic = float3(c * idet, -b * idet, a * idet);
-
-    float mid = 0.5f * (a + c);
-    float lambda1 = mid + sqrt(max(0.1f, mid * mid - det));
-    float radius = ceil(3.0f * sqrt(lambda1));
+    // Compute conic and radius using shared function
+    float4 conic4;
+    float radius;
+    computeConicAndRadius(cov2d, conic4, radius);
+    float3 conic = conic4.xyz;
 
     if (radius < 0.5f) return;
 
@@ -561,7 +315,7 @@ kernel void tellusim_project_compact_count(
     }
 
     // Compute color (SH) - uses function constant for compile-time optimization
-    float3 color = tellusim_computeSHColor(harmonics, gid, pos, camera.cameraCenter, camera.shComponents);
+    float3 color = computeSHColor(harmonics, gid, pos, camera.cameraCenter, camera.shComponents);
     color = max(color + 0.5f, float3(0.0f));
 
     // Compact: write visible gaussian

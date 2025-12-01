@@ -14,7 +14,7 @@ public struct PackedWorldBuffers {
 /// Packed world gaussian buffers (float16) - half the memory of PackedWorldBuffers
 public struct PackedWorldBuffersHalf {
     public let packedGaussians: MTLBuffer  // PackedWorldGaussianHalf array (24 bytes each)
-    public let harmonics: MTLBuffer         // Separate buffer for variable-size SH data (still float for accuracy)
+    public let harmonics: MTLBuffer         // Half-precision SH data (Float16)
 
     public init(packedGaussians: MTLBuffer, harmonics: MTLBuffer) {
         self.packedGaussians = packedGaussians

@@ -13,7 +13,7 @@ final class TellusimKernelUnitTests: XCTestCase {
     // MARK: - Test 1: Project + Compact + Count
 
     func testProjectCompactCount() throws {
-        let renderer = Renderer.shared
+        let renderer = GlobalSortRenderer(limits: RendererLimits(maxGaussians: 1_000_000, maxWidth: 1024, maxHeight: 1024))
         let device = renderer.device
         let queue = renderer.queue
 
@@ -188,7 +188,7 @@ final class TellusimKernelUnitTests: XCTestCase {
     // MARK: - Test 2: Scatter kernel
 
     func testScatterKernel() throws {
-        let renderer = Renderer.shared
+        let renderer = GlobalSortRenderer(limits: RendererLimits(maxGaussians: 1_000_000, maxWidth: 1024, maxHeight: 1024))
         let device = renderer.device
         let queue = renderer.queue
 
@@ -329,7 +329,7 @@ final class TellusimKernelUnitTests: XCTestCase {
     // MARK: - Test 3: Full pipeline visual output
 
     func testFullPipelineRender() throws {
-        let renderer = Renderer.shared
+        let renderer = GlobalSortRenderer(limits: RendererLimits(maxGaussians: 1_000_000, maxWidth: 1024, maxHeight: 1024))
         let device = renderer.device
         let queue = renderer.queue
 

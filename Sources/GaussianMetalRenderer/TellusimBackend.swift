@@ -1,10 +1,10 @@
 import simd
 import Metal
 
-/// Standalone Tellusim-style renderer backend
-/// Drop-in replacement that uses the optimized Tellusim pipeline
-public final class TellusimBackend {
-    private let device: MTLDevice
+/// Fast Gaussian splatting renderer using per-tile local sort
+/// Conforms to GaussianRenderer protocol with exactly 2 render methods
+public final class LocalSortRenderer: GaussianRenderer, @unchecked Sendable {
+    public let device: MTLDevice
     private let queue: MTLCommandQueue
     private let encoder: TellusimPipelineEncoder
 
@@ -37,7 +37,25 @@ public final class TellusimBackend {
     public var useSharedBuffers: Bool = false  // Set to true for debugging (slower but CPU-readable)
     public var useTexturedRender: Bool = false  // Use texture cache for render (TLB optimization)
 
+    // Renderer configuration
+    private let config: RendererConfig
+
     public init(device: MTLDevice) throws {
+        self.device = device
+        self.config = RendererConfig()
+        guard let queue = device.makeCommandQueue() else {
+            throw TellusimError.failedToCreateQueue
+        }
+        self.queue = queue
+        self.encoder = try TellusimPipelineEncoder(device: device)
+    }
+
+    /// Initialize with configuration
+    public init(config: RendererConfig = RendererConfig()) throws {
+        self.config = config
+        guard let device = MTLCreateSystemDefaultDevice() else {
+            throw TellusimError.failedToCreateQueue
+        }
         self.device = device
         guard let queue = device.makeCommandQueue() else {
             throw TellusimError.failedToCreateQueue
@@ -46,10 +64,93 @@ public final class TellusimBackend {
         self.encoder = try TellusimPipelineEncoder(device: device)
     }
 
-    /// Render gaussians to texture
-    /// - Returns: Color texture with rendered output, or nil on failure
-    /// - Parameter useHalfWorld: If true, expects worldGaussians in half16 format (24 bytes/gaussian)
+    // MARK: - GaussianRenderer Protocol Methods
+
+    /// Render to GPU textures (protocol method)
     public func render(
+        toTexture commandBuffer: MTLCommandBuffer,
+        input: GaussianInput,
+        camera: CameraParams,
+        width: Int,
+        height: Int,
+        whiteBackground: Bool
+    ) -> TextureRenderResult? {
+        guard let colorTex = renderInternal(
+            commandBuffer: commandBuffer,
+            worldGaussians: input.gaussians,
+            harmonics: input.harmonics,
+            gaussianCount: input.gaussianCount,
+            viewMatrix: camera.viewMatrix,
+            projectionMatrix: camera.projectionMatrix,
+            cameraPosition: camera.position,
+            focalX: camera.focalX,
+            focalY: camera.focalY,
+            width: width,
+            height: height,
+            shComponents: input.shComponents,
+            whiteBackground: whiteBackground,
+            useHalfWorld: config.precision == .float16
+        ) else { return nil }
+
+        return TextureRenderResult(color: colorTex, depth: depthTexture, alpha: nil)
+    }
+
+    /// Render to CPU-readable buffers (protocol method)
+    /// Note: LocalSortRenderer only supports texture output, not buffer output
+    public func render(
+        toBuffer commandBuffer: MTLCommandBuffer,
+        input: GaussianInput,
+        camera: CameraParams,
+        width: Int,
+        height: Int,
+        whiteBackground: Bool
+    ) -> BufferRenderResult? {
+        // LocalSortRenderer does not support buffer output
+        // Use GlobalSortRenderer for CPU-readable buffer output
+        return nil
+    }
+
+    // MARK: - Direct Render Method
+
+    /// Render with explicit parameters (for direct testing)
+    public func render(
+        commandBuffer: MTLCommandBuffer,
+        worldGaussians: MTLBuffer,
+        harmonics: MTLBuffer,
+        gaussianCount: Int,
+        viewMatrix: simd_float4x4,
+        projectionMatrix: simd_float4x4,
+        cameraPosition: SIMD3<Float>,
+        focalX: Float,
+        focalY: Float,
+        width: Int,
+        height: Int,
+        shComponents: Int = 0,
+        whiteBackground: Bool = false,
+        useHalfWorld: Bool = false
+    ) -> MTLTexture? {
+        return renderInternal(
+            commandBuffer: commandBuffer,
+            worldGaussians: worldGaussians,
+            harmonics: harmonics,
+            gaussianCount: gaussianCount,
+            viewMatrix: viewMatrix,
+            projectionMatrix: projectionMatrix,
+            cameraPosition: cameraPosition,
+            focalX: focalX,
+            focalY: focalY,
+            width: width,
+            height: height,
+            shComponents: shComponents,
+            whiteBackground: whiteBackground,
+            useHalfWorld: useHalfWorld
+        )
+    }
+
+    // MARK: - Internal Render Implementation
+
+    /// Internal render implementation
+    private func renderInternal(
         commandBuffer: MTLCommandBuffer,
         worldGaussians: MTLBuffer,
         harmonics: MTLBuffer,

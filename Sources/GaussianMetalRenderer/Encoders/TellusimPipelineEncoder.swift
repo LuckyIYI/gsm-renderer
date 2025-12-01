@@ -119,11 +119,9 @@ public final class TellusimPipelineEncoder {
             self.renderTexturedPipeline = nil
         }
 
-        // Zero kernel - reuse from main library for now
-        let mainLibraryURL = Bundle.module.url(forResource: "GaussianMetalRenderer", withExtension: "metallib")!
-        let mainLibrary = try device.makeLibrary(URL: mainLibraryURL)
-        guard let zeroFn = mainLibrary.makeFunction(name: "tileBinningZeroCountsKernel") else {
-            fatalError("Missing tileBinningZeroCountsKernel")
+        // Zero kernel - from Tellusim library
+        guard let zeroFn = library.makeFunction(name: "tileBinningZeroCountsKernel") else {
+            fatalError("Missing tileBinningZeroCountsKernel in TellusimShaders")
         }
         self.zeroPipeline = try device.makeComputePipelineState(function: zeroFn)
     }

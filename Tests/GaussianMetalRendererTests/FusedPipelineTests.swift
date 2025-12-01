@@ -168,8 +168,8 @@ final class FusedPipelineTests: XCTestCase {
     func testFusedHalfPrecision() throws {
         let width = 256
         let height = 256
-        let renderer = Renderer(
-            precision: .float16,
+        let renderer = GlobalSortRenderer(
+            precision: Precision.float16,
             useHeapAllocation: false,
             limits: RendererLimits(maxGaussians: 10_000, maxWidth: width, maxHeight: height)
         )
@@ -208,15 +208,15 @@ final class FusedPipelineTests: XCTestCase {
         XCTAssertNotNil(textures, "Should return textures")
         commandBuffer.commit()
         commandBuffer.waitUntilCompleted()
-        XCTAssertEqual(commandBuffer.status, .completed)
+        XCTAssertEqual(commandBuffer.status, MTLCommandBufferStatus.completed)
     }
 
     /// Test fused pipeline at 10K scale
     func testFusedAtScale() throws {
         let width = 512
         let height = 512
-        let renderer = Renderer(
-            precision: .float32,
+        let renderer = GlobalSortRenderer(
+            precision: Precision.float32,
             useHeapAllocation: false,
             limits: RendererLimits(maxGaussians: 50_000, maxWidth: width, maxHeight: height)
         )
@@ -255,17 +255,15 @@ final class FusedPipelineTests: XCTestCase {
         XCTAssertNotNil(textures, "Should return textures")
         commandBuffer.commit()
         commandBuffer.waitUntilCompleted()
-        XCTAssertEqual(commandBuffer.status, .completed)
+        XCTAssertEqual(commandBuffer.status, MTLCommandBufferStatus.completed)
     }
 
     /// Test fused pipeline at 100K scale
     func testFusedAt100KScale() throws {
         let width = 1024
         let height = 768
-        let renderer = Renderer(
-            precision: .float32,
-            usePreciseIntersection: true,
-            useFusedCoverageScatter: true,
+        let renderer = GlobalSortRenderer(
+            precision: Precision.float32,
             useHeapAllocation: false,
             limits: RendererLimits(maxGaussians: 200_000, maxWidth: width, maxHeight: height)
         )
@@ -304,17 +302,15 @@ final class FusedPipelineTests: XCTestCase {
         XCTAssertNotNil(textures, "Should return textures")
         commandBuffer.commit()
         commandBuffer.waitUntilCompleted()
-        XCTAssertEqual(commandBuffer.status, .completed)
+        XCTAssertEqual(commandBuffer.status, MTLCommandBufferStatus.completed)
     }
 
     /// Test fused pipeline at 500K scale
     func testFusedAt500KScale() throws {
         let width = 1920
         let height = 1080
-        let renderer = Renderer(
-            precision: .float16,
-            usePreciseIntersection: true,
-            useFusedCoverageScatter: true,
+        let renderer = GlobalSortRenderer(
+            precision: Precision.float16,
             useHeapAllocation: false,
             textureOnly: true,
             limits: RendererLimits(maxGaussians: 600_000, maxWidth: width, maxHeight: height)
@@ -354,18 +350,15 @@ final class FusedPipelineTests: XCTestCase {
         XCTAssertNotNil(textures, "Should return textures")
         commandBuffer.commit()
         commandBuffer.waitUntilCompleted()
-        XCTAssertEqual(commandBuffer.status, .completed)
+        XCTAssertEqual(commandBuffer.status, MTLCommandBufferStatus.completed)
     }
 
     /// Test 32x16 tile configuration with fused pipeline
     func testFused32x16Tiles() throws {
         let width = 256
         let height = 256
-        let renderer = Renderer(
-            precision: .float32,
-            useMultiPixelRendering: true,  // Uses 32x16 tiles
-            usePreciseIntersection: true,
-            useFusedCoverageScatter: true,
+        let renderer = GlobalSortRenderer(
+            precision: Precision.float32,
             useHeapAllocation: false,
             limits: RendererLimits(maxGaussians: 10_000, maxWidth: width, maxHeight: height, tileWidth: 32, tileHeight: 16)
         )
@@ -411,11 +404,8 @@ final class FusedPipelineTests: XCTestCase {
     func testFused32x16AtScale() throws {
         let width = 1024
         let height = 768
-        let renderer = Renderer(
-            precision: .float16,
-            useMultiPixelRendering: true,
-            usePreciseIntersection: true,
-            useFusedCoverageScatter: true,
+        let renderer = GlobalSortRenderer(
+            precision: Precision.float16,
             useHeapAllocation: false,
             limits: RendererLimits(maxGaussians: 100_000, maxWidth: width, maxHeight: height, tileWidth: 32, tileHeight: 16)
         )
@@ -461,10 +451,8 @@ final class FusedPipelineTests: XCTestCase {
     func testGPUTimingMeasurement() throws {
         let width = 512
         let height = 512
-        let renderer = Renderer(
-            precision: .float32,
-            usePreciseIntersection: true,
-            useFusedCoverageScatter: true,
+        let renderer = GlobalSortRenderer(
+            precision: Precision.float32,
             useHeapAllocation: false,
             limits: RendererLimits(maxGaussians: 50_000, maxWidth: width, maxHeight: height)
         )

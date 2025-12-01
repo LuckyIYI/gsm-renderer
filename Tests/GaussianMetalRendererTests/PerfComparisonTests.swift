@@ -22,8 +22,8 @@ final class PerfComparisonTests: XCTestCase {
 
     private func comparePerformance(gaussianCount: Int, label: String) throws {
         // Create OLD renderer with appropriate limits
-        let oldRenderer = Renderer(
-            precision: .float32,
+        let oldRenderer = GlobalSortRenderer(
+            precision: Precision.float32,
             useHeapAllocation: false,
             limits: RendererLimits(
                 maxGaussians: gaussianCount,
@@ -136,7 +136,7 @@ final class PerfComparisonTests: XCTestCase {
         }
 
         // ============ BENCHMARK NEW (TELLUSIM) RENDERER ============
-        let tellusim = try TellusimBackend(device: device)
+        let tellusim = try LocalSortRenderer(device: device)
         var newTimes = [Double]()
 
         // Warmup + benchmark Tellusim renderer

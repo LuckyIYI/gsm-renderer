@@ -11,7 +11,7 @@ final class ProjectionTests: XCTestCase {
 
     override func setUp() {
         super.setUp()
-        let renderer = Renderer.shared
+        let renderer = GlobalSortRenderer(limits: RendererLimits(maxGaussians: 1_000_000, maxWidth: 1024, maxHeight: 1024))
         self.device = renderer.device
         self.library = renderer.library
         self.queue = renderer.queue
@@ -97,7 +97,7 @@ final class ProjectionTests: XCTestCase {
             packedWorldBuffers: packedWorldBuffers,
             cameraUniforms: camera,
             gaussianBuffers: gaussianBuffers,
-            precision: .float32
+            precision: Precision.float32
         )
 
         commandBuffer.commit()
@@ -219,7 +219,7 @@ final class ProjectionTests: XCTestCase {
             packedWorldBuffers: packedWorldBuffers,
             cameraUniforms: camera,
             gaussianBuffers: gaussianBuffers,
-            precision: .float32
+            precision: Precision.float32
         )
 
         commandBuffer.commit()

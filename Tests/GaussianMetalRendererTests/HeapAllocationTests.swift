@@ -14,7 +14,7 @@ final class HeapAllocationTests: XCTestCase {
             maxPerTile: 512
         )
         // Explicitly enable heap allocation for this test (it's disabled by default)
-        let renderer = Renderer(useHeapAllocation: true, limits: limits)
+        let renderer = GlobalSortRenderer(useHeapAllocation: true, limits: limits)
 
         // Heap should exist and be non-zero.
         guard let heapSize = renderer.debugHeapSizeBytes() else {

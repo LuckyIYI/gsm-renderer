@@ -5,12 +5,12 @@ import simd
 
 final class RenderTests: XCTestCase {
 
-    var renderer: Renderer!
+    var renderer: GlobalSortRenderer!
 
     override func setUp() {
         super.setUp()
-        renderer = Renderer(
-            precision: .float32,
+        renderer = GlobalSortRenderer(
+            precision: Precision.float32,
             useHeapAllocation: false,
             limits: RendererLimits(maxGaussians: 100_000, maxWidth: 1024, maxHeight: 1024, tileWidth: 16, tileHeight: 16)
         )
@@ -147,8 +147,8 @@ final class RenderTests: XCTestCase {
     func testRenderSingleGaussian() throws {
         let width = 32
         let height = 32
-        let renderer = Renderer(
-            precision: .float32,
+        let renderer = GlobalSortRenderer(
+            precision: Precision.float32,
             useHeapAllocation: false,
             limits: RendererLimits(maxGaussians: 1024, maxWidth: width, maxHeight: height, tileWidth: 16, tileHeight: 16)
         )
@@ -192,15 +192,15 @@ final class RenderTests: XCTestCase {
         commandBuffer.commit()
         commandBuffer.waitUntilCompleted()
 
-        XCTAssertEqual(commandBuffer.status, .completed, "Command buffer should complete")
+        XCTAssertEqual(commandBuffer.status, MTLCommandBufferStatus.completed, "Command buffer should complete")
     }
 
     /// Test rendering multiple gaussians in a grid pattern
     func testRenderGridPattern() throws {
         let width = 64
         let height = 64
-        let renderer = Renderer(
-            precision: .float32,
+        let renderer = GlobalSortRenderer(
+            precision: Precision.float32,
             useHeapAllocation: false,
             limits: RendererLimits(maxGaussians: 1024, maxWidth: width, maxHeight: height, tileWidth: 16, tileHeight: 16)
         )
@@ -262,15 +262,15 @@ final class RenderTests: XCTestCase {
         commandBuffer.commit()
         commandBuffer.waitUntilCompleted()
 
-        XCTAssertEqual(commandBuffer.status, .completed, "Command buffer should complete")
+        XCTAssertEqual(commandBuffer.status, MTLCommandBufferStatus.completed, "Command buffer should complete")
     }
 
     /// Test rendering gaussian that spans multiple tiles
     func testRenderGaussianSpanningTiles() throws {
         let width = 64
         let height = 64
-        let renderer = Renderer(
-            precision: .float32,
+        let renderer = GlobalSortRenderer(
+            precision: Precision.float32,
             useHeapAllocation: false,
             limits: RendererLimits(maxGaussians: 1024, maxWidth: width, maxHeight: height, tileWidth: 16, tileHeight: 16)
         )
@@ -315,15 +315,15 @@ final class RenderTests: XCTestCase {
         commandBuffer.commit()
         commandBuffer.waitUntilCompleted()
 
-        XCTAssertEqual(commandBuffer.status, .completed, "Command buffer should complete")
+        XCTAssertEqual(commandBuffer.status, MTLCommandBufferStatus.completed, "Command buffer should complete")
     }
 
     /// Test checkerboard pattern with gaussians in alternating tiles
     func testRenderCheckerboardPattern() throws {
         let width = 64
         let height = 64
-        let renderer = Renderer(
-            precision: .float32,
+        let renderer = GlobalSortRenderer(
+            precision: Precision.float32,
             useHeapAllocation: false,
             limits: RendererLimits(maxGaussians: 1024, maxWidth: width, maxHeight: height, tileWidth: 16, tileHeight: 16)
         )
@@ -384,7 +384,7 @@ final class RenderTests: XCTestCase {
         commandBuffer.commit()
         commandBuffer.waitUntilCompleted()
 
-        XCTAssertEqual(commandBuffer.status, .completed, "Command buffer should complete")
+        XCTAssertEqual(commandBuffer.status, MTLCommandBufferStatus.completed, "Command buffer should complete")
     }
 
     // MARK: - Half Precision Tests
@@ -393,8 +393,8 @@ final class RenderTests: XCTestCase {
     func testRenderHalfPrecisionOutput() throws {
         let width = 32
         let height = 32
-        let renderer = Renderer(
-            precision: .float16,
+        let renderer = GlobalSortRenderer(
+            precision: Precision.float16,
             useHeapAllocation: false,
             limits: RendererLimits(maxGaussians: 1024, maxWidth: width, maxHeight: height, tileWidth: 16, tileHeight: 16)
         )
@@ -448,7 +448,7 @@ final class RenderTests: XCTestCase {
         commandBuffer.commit()
         commandBuffer.waitUntilCompleted()
 
-        XCTAssertEqual(commandBuffer.status, .completed, "Command buffer should complete")
+        XCTAssertEqual(commandBuffer.status, MTLCommandBufferStatus.completed, "Command buffer should complete")
 
         if let textures = textures {
             XCTAssertGreaterThanOrEqual(textures.color.width, width)
@@ -463,8 +463,8 @@ final class RenderTests: XCTestCase {
     func testRenderWorldAsyncNonBlocking() throws {
         let width = 64
         let height = 64
-        let renderer = Renderer(
-            precision: .float32,
+        let renderer = GlobalSortRenderer(
+            precision: Precision.float32,
             useHeapAllocation: false,
             limits: RendererLimits(maxGaussians: 10_000, maxWidth: width, maxHeight: height, tileWidth: 16, tileHeight: 16)
         )
@@ -526,15 +526,15 @@ final class RenderTests: XCTestCase {
         commandBuffer.commit()
         commandBuffer.waitUntilCompleted()
 
-        XCTAssertEqual(commandBuffer.status, .completed, "Command buffer should complete")
+        XCTAssertEqual(commandBuffer.status, MTLCommandBufferStatus.completed, "Command buffer should complete")
     }
 
     /// Test half precision pipeline integrity with verification
     func testHalfPrecisionPipelineIntegrity() throws {
         let width = 32
         let height = 32
-        let renderer = Renderer(
-            precision: .float16,
+        let renderer = GlobalSortRenderer(
+            precision: Precision.float16,
             useHeapAllocation: false,
             limits: RendererLimits(maxGaussians: 1024, maxWidth: width, maxHeight: height, tileWidth: 16, tileHeight: 16)
         )
@@ -579,7 +579,7 @@ final class RenderTests: XCTestCase {
         commandBuffer.commit()
         commandBuffer.waitUntilCompleted()
 
-        XCTAssertEqual(commandBuffer.status, .completed, "Command buffer should complete")
+        XCTAssertEqual(commandBuffer.status, MTLCommandBufferStatus.completed, "Command buffer should complete")
     }
 
     // MARK: - Scale Tests
@@ -588,8 +588,8 @@ final class RenderTests: XCTestCase {
     func testRenderAtScale10K() throws {
         let width = 512
         let height = 512
-        let renderer = Renderer(
-            precision: .float16,
+        let renderer = GlobalSortRenderer(
+            precision: Precision.float16,
             useHeapAllocation: false,
             limits: RendererLimits(maxGaussians: 20_000, maxWidth: width, maxHeight: height, tileWidth: 16, tileHeight: 16)
         )
@@ -650,6 +650,6 @@ final class RenderTests: XCTestCase {
         commandBuffer.commit()
         commandBuffer.waitUntilCompleted()
 
-        XCTAssertEqual(commandBuffer.status, .completed, "Command buffer should complete for 10K gaussians")
+        XCTAssertEqual(commandBuffer.status, MTLCommandBufferStatus.completed, "Command buffer should complete for 10K gaussians")
     }
 }

@@ -300,11 +300,11 @@ final class FrameResources {
     }
 }
 
-// MARK: - Renderer
+// MARK: - Global Sort Renderer
 
-public final class Renderer: @unchecked Sendable {
-    public static let shared = Renderer(limits: RendererLimits(maxGaussians: 1_000_000, maxWidth: 1024, maxHeight: 1024))
-
+/// High-quality Gaussian splatting renderer using global radix sort
+/// Conforms to GaussianRenderer protocol with exactly 2 render methods
+public final class GlobalSortRenderer: GaussianRenderer, @unchecked Sendable {
     private static let supportedMaxGaussians = 10_000_000
 
     public let device: MTLDevice
@@ -314,29 +314,19 @@ public final class Renderer: @unchecked Sendable {
     
     // Encoders
     let tileBoundsEncoder: TileBoundsEncoder
-    let coverageEncoder: CoverageEncoder
-    let scatterEncoder: ScatterEncoder
     let sortKeyGenEncoder: SortKeyGenEncoder
     let bitonicSortEncoder: BitonicSortEncoder
     let radixSortEncoder: RadixSortEncoder
     let packEncoder: PackEncoder
-    let tileBinningEncoder: TileBinningEncoder
     let renderEncoder: RenderEncoder
     let projectEncoder: ProjectEncoder
     let dispatchEncoder: DispatchEncoder
 
-    // Fused pipeline encoder (optional - for interleaved data optimization)
-    var fusedPipelineEncoder: FusedPipelineEncoder?
-
-    // Fused coverage+scatter encoder (eliminates prefix scan)
-    var fusedCoverageScatterEncoder: FusedCoverageScatterEncoder?
-    public let useFusedCoverageScatter: Bool
+    // Fused pipeline encoder (for interleaved data optimization)
+    let fusedPipelineEncoder: FusedPipelineEncoder
 
     // SIMD-optimized fused coverage+scatter V2 encoder
-    // Reduced TG memory (512B vs 8KB) = ~8x occupancy
-    // SIMD ballot/prefix for tile counting
-    var fusedCoverageScatterEncoderV2: FusedCoverageScatterEncoderV2?
-    public let useFusedCoverageScatterV2: Bool
+    let fusedCoverageScatterEncoderV2: FusedCoverageScatterEncoderV2
 
     // Reset tile builder state pipeline (replaces blit for lower overhead)
     private let resetTileBuilderStatePipeline: MTLComputePipelineState
@@ -379,55 +369,26 @@ public final class Renderer: @unchecked Sendable {
     /// Last GPU execution time in seconds (from command buffer GPUStartTime/GPUEndTime)
     public private(set) var lastGPUTime: Double?
 
-    /// Enable multi-pixel rendering (4x2 pixels per thread, 64 threads per 32x16 tile)
-    /// This can improve performance by reducing thread divergence and memory loads
-    /// When enabled, caller should use tileWidth=32, tileHeight=16 in RenderParams
-    public let useMultiPixelRendering: Bool
-    /// Multi-pixel rendering is always available through the fused pipeline
-    public var isMultiPixelAvailable: Bool { true }
-
-    /// FlashGS-style precise ellipse-tile intersection
-    /// Eliminates tiles in AABB that don't actually intersect the gaussian ellipse
-    /// Reduces wasted gaussian-tile pairs, especially for elongated/rotated gaussians
-    public let usePreciseIntersection: Bool
-    /// Tile-binning + scatter pipeline (Tellusim-style) for better occupancy
-    public let useTileBinningPipeline: Bool
-    public var isPreciseIntersectionAvailable: Bool {
-        self.coverageEncoder.isPreciseAvailable && self.scatterEncoder.isPreciseAvailable
-    }
-
-    /// Fused pipeline: interleaved data structures for cache-efficient rendering
-    /// Uses single struct reads instead of 5 scattered buffer reads
-    // useFusedPipeline is always enabled - fused pipeline is always better
-
     /// Residency set for efficient GPU memory management (macOS 15+ / iOS 18+)
-    /// Attached to command queue for minimal CPU overhead
     private var residencySet: (any MTLResidencySet)?
 
     /// Use heap allocation for frame buffers (reduces TLB misses)
     public let useHeapAllocation: Bool
     private let limits: RendererLimits
     let frameLayout: FrameResourceLayout  // internal for tests
-    public var isFusedPipelineAvailable: Bool { self.fusedPipelineEncoder != nil }
 
-    /// Recommended tile size for current rendering mode
-    public var recommendedTileWidth: UInt32 { useMultiPixelRendering ? 32 : 16 }
-    public var recommendedTileHeight: UInt32 { useMultiPixelRendering ? 16 : 16 }
+    /// Recommended tile size (32x16 for multi-pixel rendering)
+    public var recommendedTileWidth: UInt32 { 32 }
+    public var recommendedTileHeight: UInt32 { 16 }
 
     public init(
         precision: Precision = .float32,
-        useIndirectBitonic: Bool = false,
         sortAlgorithm: SortAlgorithm = .radix,
-        useMultiPixelRendering: Bool = true,
-        usePreciseIntersection: Bool = true,
-        useTileBinningPipeline: Bool = true,
-        useFusedCoverageScatter: Bool = true,  // Fused coverage+scatter (eliminates prefix scan)
-        useFusedCoverageScatterV2: Bool = true,  // SIMD-optimized V2 (reduced TG memory, higher occupancy)
         useHeapAllocation: Bool = false,
         textureOnly: Bool = false,  // Skip buffer output allocation to save ~20MB
         limits: RendererLimits = RendererLimits(maxGaussians: 1_000_000, maxWidth: 2048, maxHeight: 2048)
     ) {
-        precondition(limits.maxGaussians <= Renderer.supportedMaxGaussians, "Renderer supports up to 10,000,000 gaussians; requested \(limits.maxGaussians)")
+        precondition(limits.maxGaussians <= GlobalSortRenderer.supportedMaxGaussians, "GlobalSortRenderer supports up to 10,000,000 gaussians; requested \(limits.maxGaussians)")
         guard let device = MTLCreateSystemDefaultDevice() else {
             fatalError("Metal device unavailable")
         }
@@ -447,13 +408,10 @@ public final class Renderer: @unchecked Sendable {
             self.effectivePrecision = precision
 
             self.tileBoundsEncoder = try TileBoundsEncoder(device: device, library: library)
-            self.coverageEncoder = try CoverageEncoder(device: device, library: library)
-            self.scatterEncoder = try ScatterEncoder(device: device, library: library)
             self.sortKeyGenEncoder = try SortKeyGenEncoder(device: device, library: library)
-            self.bitonicSortEncoder = try BitonicSortEncoder(device: device, library: library, useIndirect: useIndirectBitonic)
+            self.bitonicSortEncoder = try BitonicSortEncoder(device: device, library: library, useIndirect: false)
             self.radixSortEncoder = try RadixSortEncoder(device: device, library: library)
             self.packEncoder = try PackEncoder(device: device, library: library)
-            self.tileBinningEncoder = try TileBinningEncoder(device: device, library: library)
             self.renderEncoder = try RenderEncoder(device: device, library: library)
             self.projectEncoder = try ProjectEncoder(device: device, library: library)
 
@@ -472,15 +430,8 @@ public final class Renderer: @unchecked Sendable {
             // Fused pipeline encoder (always enabled - better performance)
             self.fusedPipelineEncoder = try FusedPipelineEncoder(device: device, library: library)
 
-            // Fused coverage+scatter encoder (eliminates prefix scan)
-            if useFusedCoverageScatter && usePreciseIntersection {
-                self.fusedCoverageScatterEncoder = try FusedCoverageScatterEncoder(device: device, library: library)
-            }
-
-            // SIMD-optimized V2 encoder (reduced TG memory, higher occupancy)
-            if useFusedCoverageScatterV2 && usePreciseIntersection {
-                self.fusedCoverageScatterEncoderV2 = try FusedCoverageScatterEncoderV2(device: device, library: library)
-            }
+            // SIMD-optimized V2 encoder for coverage+scatter
+            self.fusedCoverageScatterEncoderV2 = try FusedCoverageScatterEncoderV2(device: device, library: library)
 
             // Reset tile builder state pipeline (replaces blit for lower overhead)
             guard let resetFn = library.makeFunction(name: "resetTileBuilderStateKernel") else {
@@ -493,11 +444,6 @@ public final class Renderer: @unchecked Sendable {
         }
         self.precision = precision
         self.sortAlgorithm = sortAlgorithm
-        self.useMultiPixelRendering = useMultiPixelRendering
-        self.usePreciseIntersection = usePreciseIntersection
-        self.useTileBinningPipeline = useTileBinningPipeline
-        self.useFusedCoverageScatter = useFusedCoverageScatter && usePreciseIntersection
-        self.useFusedCoverageScatterV2 = useFusedCoverageScatterV2 && usePreciseIntersection
         self.useHeapAllocation = useHeapAllocation
         self.limits = limits
 
@@ -513,11 +459,11 @@ public final class Renderer: @unchecked Sendable {
         }
 
         // Compute layout once using max precision for safety
-        self.frameLayout = Renderer.computeLayout(
+        self.frameLayout = GlobalSortRenderer.computeLayout(
             limits: limits,
             sortAlgorithm: sortAlgorithm,
             useFusedPipeline: true,  // Always enabled
-            precision: .float32,
+            precision: Precision.float32,
             device: device,
             radixSortEncoder: self.radixSortEncoder
         )
@@ -582,7 +528,138 @@ public final class Renderer: @unchecked Sendable {
         self.gaussianRadiiCache = makeShared(g * 4, "GaussianRadii")
         self.gaussianMaskCache = makeShared(g, "GaussianMask")
     }
-    
+
+    /// Convenience initializer from RendererConfig
+    public convenience init(config: RendererConfig) {
+        let limits = RendererLimits(
+            maxGaussians: config.maxGaussians,
+            maxWidth: config.maxWidth,
+            maxHeight: config.maxHeight
+        )
+        let precision: Precision = config.precision == .float16 ? .float16 : .float32
+        self.init(
+            precision: precision,
+            sortAlgorithm: .radix,
+            useHeapAllocation: config.useHeapAllocation,
+            textureOnly: false,
+            limits: limits
+        )
+    }
+
+    // MARK: - GaussianRenderer Protocol Methods
+
+    /// Render to GPU textures (protocol method)
+    public func render(
+        toTexture commandBuffer: MTLCommandBuffer,
+        input: GaussianInput,
+        camera: CameraParams,
+        width: Int,
+        height: Int,
+        whiteBackground: Bool
+    ) -> TextureRenderResult? {
+        let cameraUniforms = CameraUniformsSwift(
+            viewMatrix: camera.viewMatrix,
+            projectionMatrix: camera.projectionMatrix,
+            cameraCenter: camera.position,
+            pixelFactor: 1.0,
+            focalX: camera.focalX,
+            focalY: camera.focalY,
+            width: Float(width),
+            height: Float(height),
+            nearPlane: camera.near,
+            farPlane: camera.far,
+            shComponents: UInt32(input.shComponents),
+            gaussianCount: UInt32(input.gaussianCount)
+        )
+
+        let frameParams = FrameParams(
+            gaussianCount: input.gaussianCount,
+            whiteBackground: whiteBackground
+        )
+
+        let output: RenderOutputTextures?
+
+        if effectivePrecision == .float16 {
+            let packedWorld = PackedWorldBuffersHalf(
+                packedGaussians: input.gaussians,
+                harmonics: input.harmonics
+            )
+            output = encodeRenderToTextureHalf(
+                commandBuffer: commandBuffer,
+                gaussianCount: input.gaussianCount,
+                packedWorldBuffersHalf: packedWorld,
+                cameraUniforms: cameraUniforms,
+                frameParams: frameParams
+            )
+        } else {
+            let packedWorld = PackedWorldBuffers(
+                packedGaussians: input.gaussians,
+                harmonics: input.harmonics
+            )
+            output = encodeRenderToTextures(
+                commandBuffer: commandBuffer,
+                gaussianCount: input.gaussianCount,
+                packedWorldBuffers: packedWorld,
+                cameraUniforms: cameraUniforms,
+                frameParams: frameParams
+            )
+        }
+
+        guard let result = output else { return nil }
+        return TextureRenderResult(color: result.color, depth: result.depth, alpha: result.alpha)
+    }
+
+    /// Render to CPU-readable buffers (protocol method)
+    public func render(
+        toBuffer commandBuffer: MTLCommandBuffer,
+        input: GaussianInput,
+        camera: CameraParams,
+        width: Int,
+        height: Int,
+        whiteBackground: Bool
+    ) -> BufferRenderResult? {
+        let cameraUniforms = CameraUniformsSwift(
+            viewMatrix: camera.viewMatrix,
+            projectionMatrix: camera.projectionMatrix,
+            cameraCenter: camera.position,
+            pixelFactor: 1.0,
+            focalX: camera.focalX,
+            focalY: camera.focalY,
+            width: Float(width),
+            height: Float(height),
+            nearPlane: camera.near,
+            farPlane: camera.far,
+            shComponents: UInt32(input.shComponents),
+            gaussianCount: UInt32(input.gaussianCount)
+        )
+
+        let frameParams = FrameParams(
+            gaussianCount: input.gaussianCount,
+            whiteBackground: whiteBackground
+        )
+
+        let packedWorld = PackedWorldBuffers(
+            packedGaussians: input.gaussians,
+            harmonics: input.harmonics
+        )
+
+        guard let output = encodeRender(
+            commandBuffer: commandBuffer,
+            gaussianCount: input.gaussianCount,
+            packedWorldBuffers: packedWorld,
+            cameraUniforms: cameraUniforms,
+            frameParams: frameParams
+        ) else { return nil }
+
+        return BufferRenderResult(
+            color: output.colorOutGPU,
+            depth: output.depthOutGPU,
+            alpha: output.alphaOutGPU
+        )
+    }
+
+    // MARK: - Internal Methods
+
     func triggerCapture(path: String) {
         self.nextFrameCapturePath = path
     }
@@ -867,10 +944,10 @@ public final class Renderer: @unchecked Sendable {
         let dispatchArgs = frame.dispatchArgs
 
         // Fused render: single-struct reads for cache efficiency
-        guard let fusedEncoder = self.fusedPipelineEncoder, ordered.packedGaussiansFused != nil else {
+        guard ordered.packedGaussiansFused != nil else {
             fatalError("[encodeRenderToTextures] Fused pipeline unavailable")
         }
-        fusedEncoder.encodeCompleteFusedRender(
+        self.fusedPipelineEncoder.encodeCompleteFusedRender(
             commandBuffer: commandBuffer,
             orderedBuffers: ordered,
             outputTextures: textures,
@@ -961,10 +1038,10 @@ public final class Renderer: @unchecked Sendable {
         let dispatchArgs = frame.dispatchArgs
 
         // Fused render: single-struct reads for cache efficiency
-        guard let fusedEncoder = self.fusedPipelineEncoder, ordered.packedGaussiansFused != nil else {
+        guard ordered.packedGaussiansFused != nil else {
             fatalError("[encodeRenderToTextureHalf] Fused pipeline unavailable")
         }
-        fusedEncoder.encodeCompleteFusedRender(
+        self.fusedPipelineEncoder.encodeCompleteFusedRender(
             commandBuffer: commandBuffer,
             orderedBuffers: ordered,
             outputTextures: textures,
@@ -1052,10 +1129,10 @@ public final class Renderer: @unchecked Sendable {
         )
 
         // Fused render: single-struct reads for cache efficiency
-        guard let fusedEncoder = self.fusedPipelineEncoder, ordered.packedGaussiansFused != nil else {
+        guard ordered.packedGaussiansFused != nil else {
             fatalError("[encodeRenderToTargetTexture] Fused pipeline unavailable")
         }
-        fusedEncoder.encodeCompleteFusedRender(
+        self.fusedPipelineEncoder.encodeCompleteFusedRender(
             commandBuffer: commandBuffer,
             orderedBuffers: ordered,
             outputTextures: outputTextures,
@@ -1128,126 +1205,24 @@ public final class Renderer: @unchecked Sendable {
             precision: precision
         )
 
-        // SIMD-optimized fused coverage+scatter V2 (preferred - highest occupancy)
-        if self.useFusedCoverageScatterV2, let fusedEncoderV2 = self.fusedCoverageScatterEncoderV2 {
-            fusedEncoderV2.encode(
-                commandBuffer: commandBuffer,
-                gaussianCount: gaussianCount,
-                tileWidth: Int(params.tileWidth),
-                tileHeight: Int(params.tileHeight),
-                tilesX: Int(params.tilesX),
-                maxAssignments: frame.tileAssignmentMaxAssignments,
-                boundsBuffer: frame.boundsBuffer,
-                coverageBuffer: frame.coverageBuffer,
-                opacitiesBuffer: gaussianBuffers.opacities,
-                meansBuffer: gaussianBuffers.means,
-                conicsBuffer: gaussianBuffers.conics,
-                tileIndicesBuffer: frame.tileIndices,
-                tileIdsBuffer: frame.tileIds,
-                tileAssignmentHeader: frame.tileAssignmentHeader,
-                precision: precision
-            )
-
-        // Tellusim-style tile binning pipeline (precise intersection + per-tile offsets)
-        } else if self.usePreciseIntersection && self.useTileBinningPipeline {
-            self.tileBinningEncoder.encode(
-                commandBuffer: commandBuffer,
-                gaussianCount: gaussianCount,
-                tilesX: Int(params.tilesX),
-                tilesY: Int(params.tilesY),
-                tileWidth: Int(params.tileWidth),
-                tileHeight: Int(params.tileHeight),
-                boundsBuffer: frame.boundsBuffer,
-                meansBuffer: gaussianBuffers.means,
-                conicsBuffer: gaussianBuffers.conics,
-                opacitiesBuffer: gaussianBuffers.opacities,
-                coverageBuffer: frame.coverageBuffer,          // reused as per-tile counts
-                offsetsBuffer: frame.offsetsBuffer,            // per-tile prefix
-                partialSumsBuffer: frame.partialSumsBuffer,
-                tileAssignmentHeader: frame.tileAssignmentHeader,
-                tileIndicesBuffer: frame.tileIndices,
-                tileIdsBuffer: frame.tileIds,
-                precision: precision
-            )
-
-        // Fused coverage+scatter V1: single pass with atomic allocation (eliminates prefix scan)
-        } else if self.useFusedCoverageScatter, let fusedEncoder = self.fusedCoverageScatterEncoder {
-            fusedEncoder.encode(
-                commandBuffer: commandBuffer,
-                gaussianCount: gaussianCount,
-                tileWidth: Int(params.tileWidth),
-                tileHeight: Int(params.tileHeight),
-                tilesX: Int(params.tilesX),
-                maxAssignments: frame.tileAssignmentMaxAssignments,
-                boundsBuffer: frame.boundsBuffer,
-                coverageBuffer: frame.coverageBuffer,
-                opacitiesBuffer: gaussianBuffers.opacities,
-                meansBuffer: gaussianBuffers.means,
-                conicsBuffer: gaussianBuffers.conics,
-                tileIndicesBuffer: frame.tileIndices,
-                tileIdsBuffer: frame.tileIds,
-                tileAssignmentHeader: frame.tileAssignmentHeader,
-                precision: precision
-            )
-        } else if self.usePreciseIntersection && self.isPreciseIntersectionAvailable {
-            // Fallback: separate coverage + scatter with prefix scan
-            self.coverageEncoder.encodePrecise(
-                commandBuffer: commandBuffer,
-                gaussianCount: gaussianCount,
-                tileWidth: Int(params.tileWidth),
-                tileHeight: Int(params.tileHeight),
-                boundsBuffer: frame.boundsBuffer,
-                opacitiesBuffer: gaussianBuffers.opacities,
-                meansBuffer: gaussianBuffers.means,
-                conicsBuffer: gaussianBuffers.conics,
-                coverageBuffer: frame.coverageBuffer,
-                offsetsBuffer: frame.offsetsBuffer,
-                partialSumsBuffer: frame.partialSumsBuffer,
-                tileAssignmentHeader: frame.tileAssignmentHeader,
-                precision: precision
-            )
-            self.scatterEncoder.encodePrecise(
-                commandBuffer: commandBuffer,
-                gaussianCount: gaussianCount,
-                tilesX: Int(params.tilesX),
-                tileWidth: Int(params.tileWidth),
-                tileHeight: Int(params.tileHeight),
-                offsetsBuffer: frame.offsetsBuffer,
-                dispatchBuffer: frame.scatterDispatchBuffer,
-                boundsBuffer: frame.boundsBuffer,
-                tileIndicesBuffer: frame.tileIndices,
-                tileIdsBuffer: frame.tileIds,
-                tileAssignmentHeader: frame.tileAssignmentHeader,
-                meansBuffer: gaussianBuffers.means,
-                conicsBuffer: gaussianBuffers.conics,
-                opacitiesBuffer: gaussianBuffers.opacities,
-                precision: precision
-            )
-        } else {
-            // Non-precise fallback: AABB coverage + balanced scatter
-            self.coverageEncoder.encode(
-                commandBuffer: commandBuffer,
-                gaussianCount: gaussianCount,
-                boundsBuffer: frame.boundsBuffer,
-                opacitiesBuffer: gaussianBuffers.opacities,
-                coverageBuffer: frame.coverageBuffer,
-                offsetsBuffer: frame.offsetsBuffer,
-                partialSumsBuffer: frame.partialSumsBuffer,
-                tileAssignmentHeader: frame.tileAssignmentHeader,
-                precision: precision
-            )
-            self.scatterEncoder.encodeBalanced(
-                commandBuffer: commandBuffer,
-                gaussianCount: gaussianCount,
-                tilesX: Int(params.tilesX),
-                offsetsBuffer: frame.offsetsBuffer,
-                dispatchBuffer: frame.scatterDispatchBuffer,
-                boundsBuffer: frame.boundsBuffer,
-                tileIndicesBuffer: frame.tileIndices,
-                tileIdsBuffer: frame.tileIds,
-                tileAssignmentHeader: frame.tileAssignmentHeader
-            )
-        }
+        // SIMD-optimized fused coverage+scatter V2
+        self.fusedCoverageScatterEncoderV2.encode(
+            commandBuffer: commandBuffer,
+            gaussianCount: gaussianCount,
+            tileWidth: Int(params.tileWidth),
+            tileHeight: Int(params.tileHeight),
+            tilesX: Int(params.tilesX),
+            maxAssignments: frame.tileAssignmentMaxAssignments,
+            boundsBuffer: frame.boundsBuffer,
+            coverageBuffer: frame.coverageBuffer,
+            opacitiesBuffer: gaussianBuffers.opacities,
+            meansBuffer: gaussianBuffers.means,
+            conicsBuffer: gaussianBuffers.conics,
+            tileIndicesBuffer: frame.tileIndices,
+            tileIdsBuffer: frame.tileIds,
+            tileAssignmentHeader: frame.tileAssignmentHeader,
+            precision: precision
+        )
         
         return TileAssignmentBuffers(
             tileCount: tileCount,
@@ -1362,7 +1337,6 @@ public final class Renderer: @unchecked Sendable {
 
         // Check if we can use texture-only fused path (skip redundant standard pack payload)
         let canUseFusedOnly = textureOnlyFused &&
-                              self.fusedPipelineEncoder != nil &&
                               frame.interleavedGaussians != nil &&
                               frame.packedGaussiansFused != nil
 
@@ -1379,7 +1353,7 @@ public final class Renderer: @unchecked Sendable {
                 activeTileCount: frame.activeTileCount
             )
 
-            let fusedEncoder = self.fusedPipelineEncoder!
+            let fusedEncoder = self.fusedPipelineEncoder
             let interleavedBuffer = frame.interleavedGaussians!
             let packedFusedBuffer = frame.packedGaussiansFused!
 

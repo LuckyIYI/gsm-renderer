@@ -30,7 +30,7 @@ final class SortPerfTests: XCTestCase {
     }
 
     func testSortPerfRadixVsBitonic() throws {
-        let renderer = Renderer.shared
+        let renderer = GlobalSortRenderer(limits: RendererLimits(maxGaussians: 1_000_000, maxWidth: 1024, maxHeight: 1024))
         let device = renderer.device
         let library = renderer.library
         let queue = renderer.queue

@@ -11,7 +11,7 @@ final class EncoderTests: XCTestCase {
     
     override func setUp() {
         super.setUp()
-        let renderer = Renderer.shared
+        let renderer = GlobalSortRenderer(limits: RendererLimits(maxGaussians: 1_000_000, maxWidth: 1024, maxHeight: 1024))
         self.device = renderer.device
         self.library = renderer.library
         self.queue = renderer.queue

@@ -18,7 +18,7 @@ final class RenderV2PerfTests: XCTestCase {
     private let imageHeight = 1080
 
     func testRenderV1vsV2Performance() throws {
-        let renderer = Renderer.shared
+        let renderer = GlobalSortRenderer(limits: RendererLimits(maxGaussians: 1_000_000, maxWidth: 1024, maxHeight: 1024))
         let device = renderer.device
         let library = renderer.library
         let queue = renderer.queue
@@ -123,7 +123,7 @@ final class RenderV2PerfTests: XCTestCase {
                     tileIndicesBuffer: tileIndicesBuffer,
                     tileIdsBuffer: tileIdsBuffer,
                     tileAssignmentHeader: headerBuffer,
-                    precision: .float16
+                    precision: Precision.float16
                 )
                 cb.commit()
                 cb.waitUntilCompleted()
@@ -187,7 +187,7 @@ final class RenderV2PerfTests: XCTestCase {
                         params: params,
                         dispatchArgs: dispatchArgsBuffer,
                         dispatchOffset: 0,
-                        precision: .float16
+                        precision: Precision.float16
                     )
                     cb.commit()
                     cb.waitUntilCompleted()
@@ -207,7 +207,7 @@ final class RenderV2PerfTests: XCTestCase {
                         params: params,
                         dispatchArgs: dispatchArgsBuffer,
                         dispatchOffset: 0,
-                        precision: .float16
+                        precision: Precision.float16
                     )
                     cb.commit()
                     cb.waitUntilCompleted()
@@ -231,7 +231,7 @@ final class RenderV2PerfTests: XCTestCase {
                     params: params,
                     dispatchArgs: dispatchArgsBuffer,
                     dispatchOffset: 0,
-                    precision: .float16
+                    precision: Precision.float16
                 )
                 cb.commit()
                 cb.waitUntilCompleted()
@@ -256,7 +256,7 @@ final class RenderV2PerfTests: XCTestCase {
                     params: params,
                     dispatchArgs: dispatchArgsBuffer,
                     dispatchOffset: 0,
-                    precision: .float16
+                    precision: Precision.float16
                 )
                 cb.commit()
                 cb.waitUntilCompleted()

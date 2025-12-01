@@ -167,11 +167,9 @@ final class RadixIntegrationTests: XCTestCase {
     func testRadixSortRenderOutput() throws {
         let width = 512
         let height = 512
-        let renderer = Renderer(
-            precision: .float32,
+        let renderer = GlobalSortRenderer(
+            precision: Precision.float32,
             sortAlgorithm: .radix,
-            usePreciseIntersection: true,
-            useFusedCoverageScatter: true,
             useHeapAllocation: false,
             limits: RendererLimits(maxGaussians: 50_000, maxWidth: width, maxHeight: height)
         )
@@ -210,18 +208,16 @@ final class RadixIntegrationTests: XCTestCase {
         XCTAssertNotNil(textures, "Should return textures")
         commandBuffer.commit()
         commandBuffer.waitUntilCompleted()
-        XCTAssertEqual(commandBuffer.status, .completed, "Radix sort render should complete")
+        XCTAssertEqual(commandBuffer.status, MTLCommandBufferStatus.completed, "Radix sort render should complete")
     }
 
     /// Test radix sort at larger scale (100k gaussians)
     func testRadixSortAtScale() throws {
         let width = 1024
         let height = 768
-        let renderer = Renderer(
-            precision: .float16,
+        let renderer = GlobalSortRenderer(
+            precision: Precision.float16,
             sortAlgorithm: .radix,
-            usePreciseIntersection: true,
-            useFusedCoverageScatter: true,
             useHeapAllocation: false,
             textureOnly: true,
             limits: RendererLimits(maxGaussians: 200_000, maxWidth: width, maxHeight: height)
@@ -261,7 +257,7 @@ final class RadixIntegrationTests: XCTestCase {
         XCTAssertNotNil(textures, "Should return textures")
         commandBuffer.commit()
         commandBuffer.waitUntilCompleted()
-        XCTAssertEqual(commandBuffer.status, .completed, "Radix sort at scale should complete")
+        XCTAssertEqual(commandBuffer.status, MTLCommandBufferStatus.completed, "Radix sort at scale should complete")
     }
 
     /// Test that radix and bitonic produce consistent output (both complete without error)
@@ -273,15 +269,15 @@ final class RadixIntegrationTests: XCTestCase {
         let (positions, scales, rotations, opacities, colors) = generateRandomGaussians(count: count)
 
         // Create renderers with different sort algorithms
-        let radixRenderer = Renderer(
-            precision: .float32,
+        let radixRenderer = GlobalSortRenderer(
+            precision: Precision.float32,
             sortAlgorithm: .radix,
             useHeapAllocation: false,
             limits: RendererLimits(maxGaussians: 10_000, maxWidth: width, maxHeight: height)
         )
 
-        let bitonicRenderer = Renderer(
-            precision: .float32,
+        let bitonicRenderer = GlobalSortRenderer(
+            precision: Precision.float32,
             sortAlgorithm: .bitonic,
             useHeapAllocation: false,
             limits: RendererLimits(maxGaussians: 10_000, maxWidth: width, maxHeight: height)
@@ -318,7 +314,7 @@ final class RadixIntegrationTests: XCTestCase {
         XCTAssertNotNil(radixTextures)
         radixCmd.commit()
         radixCmd.waitUntilCompleted()
-        XCTAssertEqual(radixCmd.status, .completed, "Radix render should complete")
+        XCTAssertEqual(radixCmd.status, MTLCommandBufferStatus.completed, "Radix render should complete")
 
         // Test bitonic renderer
         guard let bitonicBuffers = createPackedWorldBuffers(
@@ -348,6 +344,6 @@ final class RadixIntegrationTests: XCTestCase {
         XCTAssertNotNil(bitonicTextures)
         bitonicCmd.commit()
         bitonicCmd.waitUntilCompleted()
-        XCTAssertEqual(bitonicCmd.status, .completed, "Bitonic render should complete")
+        XCTAssertEqual(bitonicCmd.status, MTLCommandBufferStatus.completed, "Bitonic render should complete")
     }
 }

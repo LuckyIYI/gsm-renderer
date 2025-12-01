@@ -18,7 +18,7 @@ final class TellusimSortingTests: XCTestCase {
 
     /// Test that per-tile sort correctly sorts depth keys
     func testPerTileSortCorrectness() throws {
-        let renderer = Renderer.shared
+        let renderer = GlobalSortRenderer(limits: RendererLimits(maxGaussians: 1_000_000, maxWidth: 1024, maxHeight: 1024))
         let device = renderer.device
         let queue = renderer.queue
 
@@ -127,7 +127,7 @@ final class TellusimSortingTests: XCTestCase {
 
     /// Test sort stability with many identical keys
     func testSortWithIdenticalKeys() throws {
-        let renderer = Renderer.shared
+        let renderer = GlobalSortRenderer(limits: RendererLimits(maxGaussians: 1_000_000, maxWidth: 1024, maxHeight: 1024))
         let device = renderer.device
         let queue = renderer.queue
 
@@ -203,7 +203,7 @@ final class TellusimSortingTests: XCTestCase {
 
     /// Test sort with large tile counts (stress test)
     func testSortLargeTileCount() throws {
-        let renderer = Renderer.shared
+        let renderer = GlobalSortRenderer(limits: RendererLimits(maxGaussians: 1_000_000, maxWidth: 1024, maxHeight: 1024))
         let device = renderer.device
         let queue = renderer.queue
 

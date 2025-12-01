@@ -11,7 +11,7 @@ final class PackTests: XCTestCase {
     
     override func setUp() {
         super.setUp()
-        let renderer = Renderer.shared
+        let renderer = GlobalSortRenderer(limits: RendererLimits(maxGaussians: 1_000_000, maxWidth: 1024, maxHeight: 1024))
         self.device = renderer.device
         self.library = renderer.library
         self.queue = renderer.queue
@@ -103,7 +103,7 @@ final class PackTests: XCTestCase {
             dispatchOffset: 0,
             activeTileIndices: activeTileIndices,
             activeTileCount: activeTileCount,
-            precision: .float32
+            precision: Precision.float32
         )
         
         commandBuffer.commit()

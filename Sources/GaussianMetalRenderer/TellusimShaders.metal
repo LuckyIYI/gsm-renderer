@@ -26,6 +26,106 @@ constant float SH_C3_5 = 1.445305721320277f;
 constant float SH_C3_6 = -0.5900435899266435f;
 
 // =============================================================================
+// FUNCTION CONSTANTS FOR SH DEGREE
+// Compiler eliminates branches and unrolls loops at compile time
+// =============================================================================
+// SH degree: 0 = DC only (1 coeff), 1 = 4 coeffs, 2 = 9 coeffs, 3 = 16 coeffs
+constant uint SH_DEGREE [[function_constant(0)]];
+constant bool SH_DEGREE_0 = (SH_DEGREE == 0);
+constant bool SH_DEGREE_1 = (SH_DEGREE == 1);
+constant bool SH_DEGREE_2 = (SH_DEGREE == 2);
+constant bool SH_DEGREE_3 = (SH_DEGREE == 3);
+
+// =============================================================================
+// OPTIMIZED SH COMPUTATION (compile-time branching, fully unrolled)
+// =============================================================================
+template<typename HarmonicsT>
+inline float3 tellusim_computeSHColor(
+    const device HarmonicsT* harmonics,
+    uint gid,
+    float3 pos,
+    float3 cameraCenter,
+    uint shComponents  // runtime fallback if function constant not set
+) {
+    // DC only - no direction needed
+    if (SH_DEGREE_0 || shComponents == 0) {
+        uint base = gid * 3u;
+        return float3(harmonics[base], harmonics[base + 1], harmonics[base + 2]);
+    }
+
+    // Compute view direction
+    float3 dir = normalize(cameraCenter - pos);
+    float xx = dir.x * dir.x, yy = dir.y * dir.y, zz = dir.z * dir.z;
+    float xy = dir.x * dir.y, yz = dir.y * dir.z, xz = dir.x * dir.z;
+
+    // SH basis (compute only what we need based on degree)
+    float shBasis[16];
+    shBasis[0] = SH_C0;
+
+    if (SH_DEGREE_1 || SH_DEGREE_2 || SH_DEGREE_3 || shComponents >= 4) {
+        shBasis[1] = -SH_C1 * dir.y;
+        shBasis[2] = SH_C1 * dir.z;
+        shBasis[3] = -SH_C1 * dir.x;
+    }
+
+    if (SH_DEGREE_2 || SH_DEGREE_3 || shComponents >= 9) {
+        shBasis[4] = SH_C2_0 * xy;
+        shBasis[5] = SH_C2_1 * yz;
+        shBasis[6] = SH_C2_2 * (2.0f * zz - xx - yy);
+        shBasis[7] = SH_C2_3 * xz;
+        shBasis[8] = SH_C2_4 * (xx - yy);
+    }
+
+    if (SH_DEGREE_3 || shComponents >= 16) {
+        shBasis[9] = SH_C3_0 * dir.y * (3.0f * xx - yy);
+        shBasis[10] = SH_C3_1 * xy * dir.z;
+        shBasis[11] = SH_C3_2 * dir.y * (4.0f * zz - xx - yy);
+        shBasis[12] = SH_C3_3 * dir.z * (2.0f * zz - 3.0f * xx - 3.0f * yy);
+        shBasis[13] = SH_C3_4 * dir.x * (4.0f * zz - xx - yy);
+        shBasis[14] = SH_C3_5 * dir.z * (xx - yy);
+        shBasis[15] = SH_C3_6 * dir.x * (xx - 3.0f * yy);
+    }
+
+    // Accumulate color - fully unrolled based on function constant
+    float3 color = float3(0.0f);
+    uint coeffs = SH_DEGREE_0 ? 1 : (SH_DEGREE_1 ? 4 : (SH_DEGREE_2 ? 9 : (SH_DEGREE_3 ? 16 : shComponents)));
+    uint base = gid * coeffs * 3u;
+
+    // Unrolled loops for each degree - compiler eliminates dead branches
+    if (SH_DEGREE_1) {
+        #pragma unroll
+        for (uint i = 0; i < 4; ++i) {
+            color.x += float(harmonics[base + i]) * shBasis[i];
+            color.y += float(harmonics[base + 4 + i]) * shBasis[i];
+            color.z += float(harmonics[base + 8 + i]) * shBasis[i];
+        }
+    } else if (SH_DEGREE_2) {
+        #pragma unroll
+        for (uint i = 0; i < 9; ++i) {
+            color.x += float(harmonics[base + i]) * shBasis[i];
+            color.y += float(harmonics[base + 9 + i]) * shBasis[i];
+            color.z += float(harmonics[base + 18 + i]) * shBasis[i];
+        }
+    } else if (SH_DEGREE_3) {
+        #pragma unroll
+        for (uint i = 0; i < 16; ++i) {
+            color.x += float(harmonics[base + i]) * shBasis[i];
+            color.y += float(harmonics[base + 16 + i]) * shBasis[i];
+            color.z += float(harmonics[base + 32 + i]) * shBasis[i];
+        }
+    } else {
+        // Runtime fallback (shouldn't happen with proper function constants)
+        for (uint i = 0; i < min(coeffs, 16u); ++i) {
+            color.x += float(harmonics[base + i]) * shBasis[i];
+            color.y += float(harmonics[base + coeffs + i]) * shBasis[i];
+            color.z += float(harmonics[base + coeffs * 2u + i]) * shBasis[i];
+        }
+    }
+
+    return color;
+}
+
+// =============================================================================
 // DATA STRUCTURES
 // =============================================================================
 
@@ -428,16 +528,25 @@ kernel void tellusim_project_compact_count(
 
     if (radius < 0.5f) return;
 
-    // Tile bounds
+    // Tile bounds - ALIGNED WITH TEMPORAL PIPELINE
+    // 1. Clamp pixel coords to screen bounds first
+    float maxW = float(params.surfaceWidth - 1);
+    float maxH = float(params.surfaceHeight - 1);
+    float xmin = clamp(px - radius, 0.0f, maxW);
+    float xmax = clamp(px + radius, 0.0f, maxW);
+    float ymin = clamp(py - radius, 0.0f, maxH);
+    float ymax = clamp(py + radius, 0.0f, maxH);
+
+    // 2. Compute tile bounds (EXCLUSIVE max - matches scatter_simd interpretation)
     int tileW = int(params.tileWidth);
     int tileH = int(params.tileHeight);
     int2 minTile = int2(
-        max(0, int(floor((px - radius) / float(tileW)))),
-        max(0, int(floor((py - radius) / float(tileH))))
+        max(0, int(floor(xmin / float(tileW)))),
+        max(0, int(floor(ymin / float(tileH))))
     );
     int2 maxTile = int2(
-        min(int(params.tilesX), int(ceil((px + radius) / float(tileW)))),
-        min(int(params.tilesY), int(ceil((py + radius) / float(tileH))))
+        min(int(params.tilesX), int(ceil(xmax / float(tileW)))),
+        min(int(params.tilesY), int(ceil(ymax / float(tileH))))
     );
 
     // Cull: zero coverage
@@ -451,41 +560,8 @@ kernel void tellusim_project_compact_count(
         }
     }
 
-    // Compute color (SH)
-    float3 color = float3(0.0f);
-    if (camera.shComponents == 0) {
-        uint base = gid * 3u;
-        color = float3(harmonics[base], harmonics[base + 1], harmonics[base + 2]);
-    } else {
-        float3 dir = normalize(camera.cameraCenter - pos);
-        float shBasis[16];
-        shBasis[0] = SH_C0;
-        shBasis[1] = -SH_C1 * dir.y;
-        shBasis[2] = SH_C1 * dir.z;
-        shBasis[3] = -SH_C1 * dir.x;
-        float xx = dir.x * dir.x, yy = dir.y * dir.y, zz = dir.z * dir.z;
-        float xy = dir.x * dir.y, yz = dir.y * dir.z, xz = dir.x * dir.z;
-        shBasis[4] = SH_C2_0 * xy;
-        shBasis[5] = SH_C2_1 * yz;
-        shBasis[6] = SH_C2_2 * (2.0f * zz - xx - yy);
-        shBasis[7] = SH_C2_3 * xz;
-        shBasis[8] = SH_C2_4 * (xx - yy);
-        shBasis[9] = SH_C3_0 * dir.y * (3.0f * xx - yy);
-        shBasis[10] = SH_C3_1 * xy * dir.z;
-        shBasis[11] = SH_C3_2 * dir.y * (4.0f * zz - xx - yy);
-        shBasis[12] = SH_C3_3 * dir.z * (2.0f * zz - 3.0f * xx - 3.0f * yy);
-        shBasis[13] = SH_C3_4 * dir.x * (4.0f * zz - xx - yy);
-        shBasis[14] = SH_C3_5 * dir.z * (xx - yy);
-        shBasis[15] = SH_C3_6 * dir.x * (xx - 3.0f * yy);
-
-        uint coeffs = camera.shComponents;
-        uint base = gid * coeffs * 3u;
-        for (uint i = 0; i < min(coeffs, 16u); ++i) {
-            color.x += harmonics[base + i] * shBasis[i];
-            color.y += harmonics[base + coeffs + i] * shBasis[i];
-            color.z += harmonics[base + coeffs * 2u + i] * shBasis[i];
-        }
-    }
+    // Compute color (SH) - uses function constant for compile-time optimization
+    float3 color = tellusim_computeSHColor(harmonics, gid, pos, camera.cameraCenter, camera.shComponents);
     color = max(color + 0.5f, float3(0.0f));
 
     // Compact: write visible gaussian
@@ -709,59 +785,6 @@ kernel void tellusim_compute_gaussian_tile_counts(
     gaussianTileCounts[gid] = tileCount;
 }
 
-// =============================================================================
-// KERNEL 4b: BALANCED SCATTER (kept for API compatibility)
-// =============================================================================
-// Uses atomic scatter but with better load distribution via prefix-sum dispatch
-
-kernel void tellusim_scatter_balanced(
-    const device TellusimCompactedGaussian* compacted [[buffer(0)]],
-    const device TellusimCompactedHeader* header [[buffer(1)]],
-    device atomic_uint* tileCounters [[buffer(2)]],
-    const device uint* tileOffsets [[buffer(3)]],
-    device uint* sortKeys [[buffer(4)]],
-    device uint* sortIndices [[buffer(5)]],
-    constant uint& tilesX [[buffer(6)]],
-    constant uint& maxAssignments [[buffer(7)]],
-    const device uint* gaussianOffsets [[buffer(8)]],
-    uint gid [[thread_position_in_grid]]
-) {
-    uint visibleCount = atomic_load_explicit(&header->visibleCount, memory_order_relaxed);
-    uint totalAssignments = gaussianOffsets[visibleCount];
-    if (gid >= totalAssignments) return;
-
-    // Binary search to find gaussian that owns this slot
-    uint lo = 0, hi = visibleCount;
-    while (lo < hi) {
-        uint mid = (lo + hi + 1) >> 1;
-        if (gaussianOffsets[mid] <= gid) lo = mid;
-        else hi = mid - 1;
-    }
-    uint gaussianIdx = lo;
-    uint localSlot = gid - gaussianOffsets[gaussianIdx];
-
-    TellusimCompactedGaussian g = compacted[gaussianIdx];
-    float depth = g.covariance_depth.w;
-    uint depthKey = (as_type<uint>(depth) ^ 0x80000000u) >> 8u;
-
-    int2 minTile = g.min_tile;
-    int2 maxTile = g.max_tile;
-    int width = maxTile.x - minTile.x;
-    int localY = int(localSlot) / width;
-    int localX = int(localSlot) % width;
-    int tx = minTile.x + localX;
-    int ty = minTile.y + localY;
-    uint tileId = uint(ty) * tilesX + uint(tx);
-
-    // Atomic to get position - still needed but load is balanced now
-    uint localIdx = atomic_fetch_add_explicit(&tileCounters[tileId], 1u, memory_order_relaxed);
-    uint writePos = tileOffsets[tileId] + localIdx;
-
-    if (writePos < maxAssignments) {
-        sortKeys[writePos] = depthKey;
-        sortIndices[writePos] = gaussianIdx;
-    }
-}
 
 // =============================================================================
 // KERNEL 4: SIMD-COOPERATIVE SCATTER (FlashGS-style)
@@ -813,7 +836,9 @@ kernel void tellusim_scatter_simd(
         center = g.position_color.xy;
         half4 colorOp = tellusim_unpackHalf4(g.position_color.zw);
         power = tellusim_computePower(float(colorOp.w));
-        depthKey = (as_type<uint>(g.covariance_depth.w) ^ 0x80000000u) >> 8u;
+        // 32-bit stable key: (depth16 << 16) | compactedIdx for deterministic tie-breaking
+        uint depth16 = ((as_type<uint>(g.covariance_depth.w) ^ 0x80000000u) >> 16u) & 0xFFFFu;
+        depthKey = (depth16 << 16) | (gaussianIdx & 0xFFFFu);
         minTX = g.min_tile.x;
         minTY = g.min_tile.y;
         maxTX = g.max_tile.x;
@@ -849,22 +874,15 @@ kernel void tellusim_scatter_simd(
         int2 pix_min = int2(tx * tileWidth, ty * tileHeight);
         int2 pix_max = int2(pix_min.x + tileWidth - 1, pix_min.y + tileHeight - 1);
 
-        // FlashGS intersection test
+        // FlashGS intersection test 
         bool valid = tellusim_blockContainsCenter(pix_min, pix_max, center) ||
                      tellusim_blockIntersectEllipse(pix_min, pix_max, center, conic, power);
 
-        // SIMD ballot for warp-level coordination
+        // SIMD early-out: skip iteration if no lanes are valid
         simd_vote ballot = simd_ballot(valid);
-        uint simdMask = uint(simd_vote::vote_t(ballot) & 0xFFFFFFFFull);
-        uint simdCount = popcount(simdMask);
+        if (simd_vote::vote_t(ballot) == 0) continue;
 
-        if (simdCount == 0) continue;
-
-        // Compute prefix within SIMD group for write position
-        uint lowerMask = (1u << simd_lane) - 1u;
-        uint simdPrefix = popcount(simdMask & lowerMask);
-
-        // Each valid lane writes to its tile
+        // Valid lanes write to their tiles (parallel atomics across SIMD)
         if (valid) {
             uint tileId = uint(ty) * tilesX + uint(tx);
             uint localIdx = atomic_fetch_add_explicit(&tileCounters[tileId], 1u, memory_order_relaxed);
@@ -905,8 +923,10 @@ kernel void tellusim_per_tile_sort(
 
     uint n = min(count, uint(SORT_MAX_SIZE));
 
-    // Pack key-value pairs into uint2 for better memory access
-    threadgroup uint2 shared[SORT_MAX_SIZE];  // 16KB
+    // 32-bit keys for stable sorting (depth16 << 16 | compactedIdx16)
+    // This allows deterministic tie-breaking when depths are equal
+    threadgroup uint sharedKeys[SORT_MAX_SIZE];
+    threadgroup uint sharedVals[SORT_MAX_SIZE];
 
     // Pad to next power of 2
     uint padded = 1;
@@ -915,9 +935,11 @@ kernel void tellusim_per_tile_sort(
     // Parallel load with padding
     for (uint i = localId; i < padded; i += tgSize) {
         if (i < n) {
-            shared[i] = uint2(keys[start + i], values[start + i]);
+            sharedKeys[i] = keys[start + i];  // Full 32-bit key
+            sharedVals[i] = values[start + i];
         } else {
-            shared[i] = uint2(0xFFFFFFFFu, 0);  // Max key for padding
+            sharedKeys[i] = 0xFFFFFFFFu;  // Max key for padding
+            sharedVals[i] = 0;
         }
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -929,15 +951,19 @@ kernel void tellusim_per_tile_sort(
             for (uint i = localId; i < padded; i += tgSize) {
                 uint ixj = i ^ j;
                 if (ixj > i) {
-                    uint2 a = shared[i];
-                    uint2 b = shared[ixj];
+                    uint aKey = sharedKeys[i];
+                    uint bKey = sharedKeys[ixj];
+                    uint aVal = sharedVals[i];
+                    uint bVal = sharedVals[ixj];
 
                     bool ascending = ((i & k) == 0);
-                    bool needSwap = ascending ? (a.x > b.x) : (a.x < b.x);
+                    bool needSwap = ascending ? (aKey > bKey) : (aKey < bKey);
 
                     if (needSwap) {
-                        shared[i] = b;
-                        shared[ixj] = a;
+                        sharedKeys[i] = bKey;
+                        sharedKeys[ixj] = aKey;
+                        sharedVals[i] = bVal;
+                        sharedVals[ixj] = aVal;
                     }
                 }
             }
@@ -947,9 +973,8 @@ kernel void tellusim_per_tile_sort(
 
     // Parallel write back
     for (uint i = localId; i < n; i += tgSize) {
-        uint2 kv = shared[i];
-        keys[start + i] = kv.x;
-        values[start + i] = kv.y;
+        keys[start + i] = uint(sharedKeys[i]);
+        values[start + i] = sharedVals[i];
     }
 }
 
@@ -975,7 +1000,8 @@ kernel void tellusim_render(
     constant TellusimRenderParams& params [[buffer(4)]],
     uint2 groupId [[threadgroup_position_in_grid]],
     uint2 localId [[thread_position_in_threadgroup]],
-    uint localIdx [[thread_index_in_threadgroup]]
+    uint localIdx [[thread_index_in_threadgroup]],
+    uint simd_lane [[thread_index_in_simdgroup]]
 ) {
     // Shared memory for tile info only
     threadgroup uint tileGaussianCount;
@@ -1052,10 +1078,12 @@ kernel void tellusim_render(
         t01 *= (1.0h - a01); t11 *= (1.0h - a11);
         t21 *= (1.0h - a21); t31 *= (1.0h - a31);
 
-        // Early exit
+        // SIMD-coordinated early exit - no warp divergence
+        // Exit only when ALL threads in SIMD group are saturated
         half maxT = max(max(max(t00, t10), max(t20, t30)),
                        max(max(t01, t11), max(t21, t31)));
-        if (maxT < 0.004h) break;
+        bool threadSaturated = maxT < 0.004h;
+        if (simd_all(threadSaturated)) break;
     }
 
     // Background
@@ -1076,3 +1104,4 @@ kernel void tellusim_render(
     if (bx+2 < w && by+1 < h) { colorOut.write(half4(c21, 1.0h - t21), uint2(bx+2, by+1)); depthOut.write(half4(0), uint2(bx+2, by+1)); }
     if (bx+3 < w && by+1 < h) { colorOut.write(half4(c31, 1.0h - t31), uint2(bx+3, by+1)); depthOut.write(half4(0), uint2(bx+3, by+1)); }
 }
+

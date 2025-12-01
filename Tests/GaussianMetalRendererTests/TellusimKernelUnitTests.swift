@@ -478,6 +478,7 @@ final class TellusimKernelUnitTests: XCTestCase {
 
     // MARK: - Helpers
 
+
     private func createTestCamera() -> CameraUniformsSwift {
         let aspect = Float(imageWidth) / Float(imageHeight)
         let fov: Float = 60.0 * .pi / 180.0

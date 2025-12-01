@@ -25,7 +25,9 @@ let package = Package(
                 .process("GaussianMetalRenderer/GaussianMetalRenderer.metallib"),
                 .process("GaussianMetalRenderer/GaussianMetalRenderer.metal"),
                 .process("GaussianMetalRenderer/TellusimShaders.metallib"),
-                .process("GaussianMetalRenderer/TellusimShaders.metal")
+                .process("GaussianMetalRenderer/TellusimShaders.metal"),
+                .process("GaussianMetalRenderer/TemporalShaders.metallib"),
+                .process("GaussianMetalRenderer/TemporalShaders.metal")
             ]
         ),
         .testTarget(

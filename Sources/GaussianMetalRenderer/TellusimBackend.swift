@@ -12,7 +12,7 @@ public final class TellusimBackend {
     private let tileWidth = 32
     private let tileHeight = 16
 
-    // Buffers - lazily allocated
+    // Buffers - lazily allocated (standard pipeline)
     private var compactedBuffer: MTLBuffer?
     private var headerBuffer: MTLBuffer?
     private var tileCountsBuffer: MTLBuffer?
@@ -24,6 +24,7 @@ public final class TellusimBackend {
     private var tempSortIndicesBuffer: MTLBuffer?
     private var colorTexture: MTLTexture?
     private var depthTexture: MTLTexture?
+    private var gaussianRenderTexture: MTLTexture?  // Texture cache for gaussian data
 
     // Current allocation sizes
     private var allocatedGaussianCapacity: Int = 0
@@ -34,6 +35,7 @@ public final class TellusimBackend {
     public var flipY: Bool = false  // Set to true if your projection has Y inverted
     public var debugPrint: Bool = false
     public var useSharedBuffers: Bool = false  // Set to true for debugging (slower but CPU-readable)
+    public var useTexturedRender: Bool = false  // Use texture cache for render (TLB optimization)
 
     public init(device: MTLDevice) throws {
         self.device = device
@@ -115,51 +117,81 @@ public final class TellusimBackend {
             print("  focalX: \(focalX), focalY: \(focalY)")
         }
 
-        // Encode pipeline
+        // Standard pipeline
         encoder.encode(
-            commandBuffer: commandBuffer,
-            worldGaussians: worldGaussians,
-            harmonics: harmonics,
-            camera: camera,
-            gaussianCount: gaussianCount,
-            tilesX: tilesX,
-            tilesY: tilesY,
-            tileWidth: tileWidth,
-            tileHeight: tileHeight,
-            surfaceWidth: width,
-            surfaceHeight: height,
-            compactedGaussians: compacted,
-            compactedHeader: header,
-            tileCounts: tileCounts,
-            tileOffsets: tileOffsets,
-            partialSums: partialSums,
-            sortKeys: sortKeys,
-            sortIndices: sortIndices,
-            maxCompacted: maxCompacted,
-            maxAssignments: maxAssignments,
-            useHalfWorld: useHalfWorld,
-            skipSort: false,
-            tempSortKeys: tempSortKeys,
-            tempSortIndices: tempSortIndices
-        )
+                commandBuffer: commandBuffer,
+                worldGaussians: worldGaussians,
+                harmonics: harmonics,
+                camera: camera,
+                gaussianCount: gaussianCount,
+                tilesX: tilesX,
+                tilesY: tilesY,
+                tileWidth: tileWidth,
+                tileHeight: tileHeight,
+                surfaceWidth: width,
+                surfaceHeight: height,
+                compactedGaussians: compacted,
+                compactedHeader: header,
+                tileCounts: tileCounts,
+                tileOffsets: tileOffsets,
+                partialSums: partialSums,
+                sortKeys: sortKeys,
+                sortIndices: sortIndices,
+                maxCompacted: maxCompacted,
+                maxAssignments: maxAssignments,
+                useHalfWorld: useHalfWorld,
+                skipSort: false,
+                tempSortKeys: tempSortKeys,
+                tempSortIndices: tempSortIndices
+            )
 
-        // Encode render
-        encoder.encodeRender(
-            commandBuffer: commandBuffer,
-            compactedGaussians: compacted,
-            tileOffsets: tileOffsets,
-            tileCounts: tileCounts,
-            sortedIndices: sortIndices,
-            colorTexture: colorTex,
-            depthTexture: depthTex,
-            tilesX: tilesX,
-            tilesY: tilesY,
-            width: width,
-            height: height,
-            tileWidth: tileWidth,
-            tileHeight: tileHeight,
-            whiteBackground: whiteBackground
-        )
+            // Encode render - use textured path if available for TLB optimization
+            if useTexturedRender, encoder.hasTexturedRender, let gaussianTex = gaussianRenderTexture {
+                // Pack gaussian data into texture
+                encoder.encodePackRenderTexture(
+                    commandBuffer: commandBuffer,
+                    compactedGaussians: compacted,
+                    compactedHeader: header,
+                    renderTexture: gaussianTex,
+                    maxGaussians: maxCompacted
+                )
+
+                // Render using texture cache
+                encoder.encodeRenderTextured(
+                    commandBuffer: commandBuffer,
+                    gaussianTexture: gaussianTex,
+                    tileOffsets: tileOffsets,
+                    tileCounts: tileCounts,
+                    sortedIndices: sortIndices,
+                    colorTexture: colorTex,
+                    depthTexture: depthTex,
+                    tilesX: tilesX,
+                    tilesY: tilesY,
+                    width: width,
+                    height: height,
+                    tileWidth: tileWidth,
+                    tileHeight: tileHeight,
+                    whiteBackground: whiteBackground
+                )
+            } else {
+                // Standard buffer-based render
+                encoder.encodeRender(
+                    commandBuffer: commandBuffer,
+                    compactedGaussians: compacted,
+                    tileOffsets: tileOffsets,
+                    tileCounts: tileCounts,
+                    sortedIndices: sortIndices,
+                    colorTexture: colorTex,
+                    depthTexture: depthTex,
+                    tilesX: tilesX,
+                    tilesY: tilesY,
+                    width: width,
+                    height: height,
+                    tileWidth: tileWidth,
+                    tileHeight: tileHeight,
+                    whiteBackground: whiteBackground
+                )
+            }
 
         return colorTex
     }
@@ -299,8 +331,25 @@ public final class TellusimBackend {
         depthDesc.storageMode = .private
         depthTexture = device.makeTexture(descriptor: depthDesc)
 
+        // Gaussian render texture for texture-cached rendering
+        // Each gaussian uses 2 texels (covariance_depth + position_color)
+        // Layout: width = RENDER_TEX_WIDTH (4096), height = ceil(gaussianCount * 2 / 4096)
+        let renderTexWidth = TellusimPipelineEncoder.renderTexWidth
+        let texelCount = maxCompacted * 2
+        let renderTexHeight = (texelCount + renderTexWidth - 1) / renderTexWidth
+        let gaussianTexDesc = MTLTextureDescriptor.texture2DDescriptor(
+            pixelFormat: .rgba32Float,  // float4 per texel
+            width: renderTexWidth,
+            height: max(1, renderTexHeight),
+            mipmapped: false
+        )
+        gaussianTexDesc.usage = [.shaderRead, .shaderWrite]
+        gaussianTexDesc.storageMode = .private
+        gaussianRenderTexture = device.makeTexture(descriptor: gaussianTexDesc)
+
         if debugPrint {
             print("[TellusimBackend] Allocated buffers for \(gaussianCount) gaussians, \(width)x\(height)")
+            print("  Gaussian render texture: \(renderTexWidth)x\(renderTexHeight)")
         }
     }
 }

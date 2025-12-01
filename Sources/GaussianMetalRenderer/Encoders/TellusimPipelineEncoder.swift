@@ -4,10 +4,19 @@ import Metal
 /// Uses dedicated TellusimShaders.metallib for clean, optimized implementation
 /// Pipeline: Clear → Project+Compact+Count → PrefixScan → Scatter → PerTileSort → Render
 public final class TellusimPipelineEncoder {
+    // Device and library for creating function constant variants
+    private let device: MTLDevice
+    private let tellusimLibrary: MTLLibrary
+
     // Pipeline states from TellusimShaders.metallib
     private let clearPipeline: MTLComputePipelineState
     private let projectCompactCountPipeline: MTLComputePipelineState
     private let projectCompactCountHalfPipeline: MTLComputePipelineState?
+
+    // SH degree-specific pipelines (function constants for unrolled loops)
+    // Key: SH degree (0-3)
+    private var projectPipelinesBySHDegree: [UInt32: MTLComputePipelineState] = [:]
+    private var projectHalfPipelinesBySHDegree: [UInt32: MTLComputePipelineState] = [:]
     private let prefixScanPipeline: MTLComputePipelineState
     private let scanPartialSumsPipeline: MTLComputePipelineState
     private let finalizeScanPipeline: MTLComputePipelineState
@@ -18,19 +27,41 @@ public final class TellusimPipelineEncoder {
     private let renderPipeline: MTLComputePipelineState
     private let zeroPipeline: MTLComputePipelineState
 
+    // Texture-cached render (optional - for TLB optimization)
+    private let packRenderTexturePipeline: MTLComputePipelineState?
+    private let renderTexturedPipeline: MTLComputePipelineState?
+
     private let prefixBlockSize = 256
     private let prefixGrainSize = 4
 
+    /// Map shComponents count to SH degree (0-3)
+    private static func shDegree(from shComponents: UInt32) -> UInt32 {
+        switch shComponents {
+        case 0, 1: return 0     // DC only
+        case 2...4: return 1    // Degree 1 (4 coeffs)
+        case 5...9: return 2    // Degree 2 (9 coeffs)
+        default: return 3       // Degree 3 (16 coeffs)
+        }
+    }
+
     public init(device: MTLDevice) throws {
+        self.device = device
+
         // Load Tellusim shader library
         guard let libraryURL = Bundle.module.url(forResource: "TellusimShaders", withExtension: "metallib"),
               let library = try? device.makeLibrary(URL: libraryURL) else {
             fatalError("Failed to load TellusimShaders.metallib")
         }
+        self.tellusimLibrary = library
 
         // Load all kernel functions
+        // Default function constant values (degree 3 = 16 SH coeffs, for functions that use SH)
+        let defaultConstants = MTLFunctionConstantValues()
+        var defaultDegree: UInt32 = 3
+        defaultConstants.setConstantValue(&defaultDegree, type: .uint, index: 0)
+
         guard let clearFn = library.makeFunction(name: "tellusim_clear"),
-              let projectFn = library.makeFunction(name: "tellusim_project_compact_count_float"),
+              let projectFn = try? library.makeFunction(name: "tellusim_project_compact_count_float", constantValues: defaultConstants),
               let prefixFn = library.makeFunction(name: "tellusim_prefix_scan"),
               let partialFn = library.makeFunction(name: "tellusim_scan_partial_sums"),
               let finalizeFn = library.makeFunction(name: "tellusim_finalize_scan"),
@@ -54,10 +85,38 @@ public final class TellusimPipelineEncoder {
         self.renderPipeline = try device.makeComputePipelineState(function: renderFn)
 
         // Half precision project kernel (half world + half harmonics for bandwidth)
-        if let projectHalfFn = library.makeFunction(name: "tellusim_project_compact_count_half_halfsh") {
+        if let projectHalfFn = try? library.makeFunction(name: "tellusim_project_compact_count_half_halfsh", constantValues: defaultConstants) {
             self.projectCompactCountHalfPipeline = try? device.makeComputePipelineState(function: projectHalfFn)
         } else {
             self.projectCompactCountHalfPipeline = nil
+        }
+
+        // Create SH degree-specific pipeline variants (function constants for unrolled loops)
+        // This gives significant speedup by allowing the compiler to fully unroll SH loops
+        for degree: UInt32 in 0...3 {
+            let constantValues = MTLFunctionConstantValues()
+            var shDegree = degree
+            constantValues.setConstantValue(&shDegree, type: .uint, index: 0) // SH_DEGREE at index 0
+
+            // Float world + float harmonics variant
+            if let fn = try? library.makeFunction(name: "tellusim_project_compact_count_float", constantValues: constantValues) {
+                self.projectPipelinesBySHDegree[degree] = try? device.makeComputePipelineState(function: fn)
+            }
+
+            // Half world + half harmonics variant
+            if let fn = try? library.makeFunction(name: "tellusim_project_compact_count_half_halfsh", constantValues: constantValues) {
+                self.projectHalfPipelinesBySHDegree[degree] = try? device.makeComputePipelineState(function: fn)
+            }
+        }
+
+        // Texture-cached render pipelines (optional, for TLB optimization)
+        if let packFn = library.makeFunction(name: "tellusim_pack_render_texture"),
+           let renderTexFn = library.makeFunction(name: "tellusim_render_textured") {
+            self.packRenderTexturePipeline = try? device.makeComputePipelineState(function: packFn)
+            self.renderTexturedPipeline = try? device.makeComputePipelineState(function: renderTexFn)
+        } else {
+            self.packRenderTexturePipeline = nil
+            self.renderTexturedPipeline = nil
         }
 
         // Zero kernel - reuse from main library for now
@@ -146,11 +205,13 @@ public final class TellusimPipelineEncoder {
         if let encoder = commandBuffer.makeComputeCommandEncoder() {
             encoder.label = "Tellusim_ProjectCompactCount"
 
+            // Select pipeline with SH function constant for optimized unrolled loops
+            let shDegree = Self.shDegree(from: camera.shComponents)
             let pipeline: MTLComputePipelineState
-            if useHalfWorld, let halfPipe = projectCompactCountHalfPipeline {
-                pipeline = halfPipe
+            if useHalfWorld {
+                pipeline = projectHalfPipelinesBySHDegree[shDegree] ?? projectCompactCountHalfPipeline ?? projectCompactCountPipeline
             } else {
-                pipeline = projectCompactCountPipeline
+                pipeline = projectPipelinesBySHDegree[shDegree] ?? projectCompactCountPipeline
             }
             encoder.setComputePipelineState(pipeline)
 
@@ -315,6 +376,92 @@ public final class TellusimPipelineEncoder {
         }
     }
 
+    /// Texture width for render texture (must match RENDER_TEX_WIDTH in shader)
+    public static let renderTexWidth = 4096
+
+    /// Check if textured render is available
+    public var hasTexturedRender: Bool {
+        return packRenderTexturePipeline != nil && renderTexturedPipeline != nil
+    }
+
+    /// Encode the pack pass to copy gaussian data to texture
+    public func encodePackRenderTexture(
+        commandBuffer: MTLCommandBuffer,
+        compactedGaussians: MTLBuffer,
+        compactedHeader: MTLBuffer,
+        renderTexture: MTLTexture,
+        maxGaussians: Int
+    ) {
+        guard let packPipeline = packRenderTexturePipeline else { return }
+
+        if let encoder = commandBuffer.makeComputeCommandEncoder() {
+            encoder.label = "Tellusim_PackRenderTexture"
+            encoder.setComputePipelineState(packPipeline)
+            encoder.setBuffer(compactedGaussians, offset: 0, index: 0)
+            encoder.setBuffer(compactedHeader, offset: 0, index: 1)
+            encoder.setTexture(renderTexture, index: 0)
+
+            // One thread per gaussian
+            let threadsPerGroup = 256
+            let numGroups = (maxGaussians + threadsPerGroup - 1) / threadsPerGroup
+            encoder.dispatchThreadgroups(MTLSize(width: numGroups, height: 1, depth: 1),
+                                         threadsPerThreadgroup: MTLSize(width: threadsPerGroup, height: 1, depth: 1))
+            encoder.endEncoding()
+        }
+    }
+
+    /// Encode render pass using texture-cached gaussian data (for TLB optimization)
+    public func encodeRenderTextured(
+        commandBuffer: MTLCommandBuffer,
+        gaussianTexture: MTLTexture,
+        tileOffsets: MTLBuffer,
+        tileCounts: MTLBuffer,
+        sortedIndices: MTLBuffer,
+        colorTexture: MTLTexture,
+        depthTexture: MTLTexture,
+        tilesX: Int,
+        tilesY: Int,
+        width: Int,
+        height: Int,
+        tileWidth: Int,
+        tileHeight: Int,
+        whiteBackground: Bool = false
+    ) {
+        guard let renderTexPipeline = renderTexturedPipeline else {
+            // Fall back to buffer-based render
+            return
+        }
+
+        var params = TellusimRenderParamsSwift(
+            width: UInt32(width),
+            height: UInt32(height),
+            tileWidth: UInt32(tileWidth),
+            tileHeight: UInt32(tileHeight),
+            tilesX: UInt32(tilesX),
+            tilesY: UInt32(tilesY),
+            whiteBackground: whiteBackground ? 1 : 0,
+            _pad: 0
+        )
+
+        if let encoder = commandBuffer.makeComputeCommandEncoder() {
+            encoder.label = "Tellusim_RenderTextured"
+            encoder.setComputePipelineState(renderTexPipeline)
+            encoder.setTexture(gaussianTexture, index: 0)
+            encoder.setBuffer(tileOffsets, offset: 0, index: 0)
+            encoder.setBuffer(tileCounts, offset: 0, index: 1)
+            encoder.setBuffer(sortedIndices, offset: 0, index: 2)
+            encoder.setTexture(colorTexture, index: 1)
+            encoder.setTexture(depthTexture, index: 2)
+            encoder.setBytes(&params, length: MemoryLayout<TellusimRenderParamsSwift>.stride, index: 3)
+
+            // 8x8 threadgroup, one per tile
+            let tgs = MTLSize(width: tilesX, height: tilesY, depth: 1)
+            let tg = MTLSize(width: 8, height: 8, depth: 1)
+            encoder.dispatchThreadgroups(tgs, threadsPerThreadgroup: tg)
+            encoder.endEncoding()
+        }
+    }
+
     /// Read visible count from header buffer (call after command buffer completes)
     public static func readVisibleCount(from header: MTLBuffer) -> UInt32 {
         let ptr = header.contents().bindMemory(to: CompactedHeaderSwift.self, capacity: 1)
@@ -342,6 +489,102 @@ public final class TellusimPipelineEncoder {
     public static func readOverflow(from header: MTLBuffer) -> Bool {
         let ptr = header.contents().bindMemory(to: CompactedHeaderSwift.self, capacity: 1)
         return ptr.pointee.overflow != 0
+    }
+
+    /// Clear just the header buffer (for temporal mode which clears separately)
+    public func encodeClearHeader(
+        commandBuffer: MTLCommandBuffer,
+        header: MTLBuffer,
+        maxCompacted: Int
+    ) {
+        // Zero out the header (visibleCount = 0, overflow = 0)
+        if let blitEncoder = commandBuffer.makeBlitCommandEncoder() {
+            blitEncoder.label = "Tellusim_ClearHeader"
+            blitEncoder.fill(buffer: header, range: 0..<MemoryLayout<CompactedHeaderSwift>.stride, value: 0)
+            blitEncoder.endEncoding()
+        }
+    }
+
+    // MARK: - Project + Compact Only
+
+    /// Encode just project + compact (for temporal mode which skips prefix scan)
+    public func encodeProjectCompact(
+        commandBuffer: MTLCommandBuffer,
+        worldGaussians: MTLBuffer,
+        harmonics: MTLBuffer,
+        camera: CameraUniformsSwift,
+        gaussianCount: Int,
+        tilesX: Int,
+        tilesY: Int,
+        tileWidth: Int,
+        tileHeight: Int,
+        surfaceWidth: Int,
+        surfaceHeight: Int,
+        compactedGaussians: MTLBuffer,
+        compactedHeader: MTLBuffer,
+        tileCounts: MTLBuffer,
+        maxCompacted: Int,
+        useHalfWorld: Bool = false
+    ) {
+        let tileCount = tilesX * tilesY
+
+        var params = ProjectCompactParamsSwift(
+            gaussianCount: UInt32(gaussianCount),
+            tilesX: UInt32(tilesX),
+            tilesY: UInt32(tilesY),
+            tileWidth: UInt32(tileWidth),
+            tileHeight: UInt32(tileHeight),
+            surfaceWidth: UInt32(surfaceWidth),
+            surfaceHeight: UInt32(surfaceHeight),
+            maxCompacted: UInt32(maxCompacted)
+        )
+
+        var tileCountU = UInt32(tileCount)
+        var maxCompactedU = UInt32(maxCompacted)
+        var cameraUniforms = camera
+
+        // === 1. CLEAR ===
+        if let encoder = commandBuffer.makeComputeCommandEncoder() {
+            encoder.label = "Tellusim_Clear"
+            encoder.setComputePipelineState(clearPipeline)
+            encoder.setBuffer(tileCounts, offset: 0, index: 0)
+            encoder.setBuffer(compactedHeader, offset: 0, index: 1)
+            encoder.setBytes(&tileCountU, length: MemoryLayout<UInt32>.stride, index: 2)
+            encoder.setBytes(&maxCompactedU, length: MemoryLayout<UInt32>.stride, index: 3)
+
+            let threads = MTLSize(width: max(tileCount, 1), height: 1, depth: 1)
+            let tg = MTLSize(width: clearPipeline.threadExecutionWidth, height: 1, depth: 1)
+            encoder.dispatchThreads(threads, threadsPerThreadgroup: tg)
+            encoder.endEncoding()
+        }
+
+        // === 2. PROJECT + COMPACT + COUNT ===
+        if let encoder = commandBuffer.makeComputeCommandEncoder() {
+            encoder.label = "Tellusim_ProjectCompactCount"
+
+            // Select pipeline with SH function constant for optimized unrolled loops
+            let shDegree = Self.shDegree(from: camera.shComponents)
+            let pipeline: MTLComputePipelineState
+            if useHalfWorld {
+                pipeline = projectHalfPipelinesBySHDegree[shDegree] ?? projectCompactCountHalfPipeline ?? projectCompactCountPipeline
+            } else {
+                pipeline = projectPipelinesBySHDegree[shDegree] ?? projectCompactCountPipeline
+            }
+            encoder.setComputePipelineState(pipeline)
+
+            encoder.setBuffer(worldGaussians, offset: 0, index: 0)
+            encoder.setBuffer(harmonics, offset: 0, index: 1)
+            encoder.setBuffer(compactedGaussians, offset: 0, index: 2)
+            encoder.setBuffer(compactedHeader, offset: 0, index: 3)
+            encoder.setBuffer(tileCounts, offset: 0, index: 4)
+            encoder.setBytes(&cameraUniforms, length: MemoryLayout<CameraUniformsSwift>.stride, index: 5)
+            encoder.setBytes(&params, length: MemoryLayout<ProjectCompactParamsSwift>.stride, index: 6)
+
+            let threads = MTLSize(width: gaussianCount, height: 1, depth: 1)
+            let tg = MTLSize(width: pipeline.threadExecutionWidth, height: 1, depth: 1)
+            encoder.dispatchThreads(threads, threadsPerThreadgroup: tg)
+            encoder.endEncoding()
+        }
     }
 }
 

@@ -1495,6 +1495,7 @@ final class TellusimPipelineTests: XCTestCase {
         }
     }
 
+
     private func createTestCamera() -> CameraUniformsSwift {
         // Simple perspective camera looking down -Z
         let aspect = Float(imageWidth) / Float(imageHeight)

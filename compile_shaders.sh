@@ -40,3 +40,22 @@ xcrun -sdk $SDK metallib \
 
 echo "Done: $LIB2"
 
+# Temporal shaders (standalone archive)
+SRC3="Sources/GaussianMetalRenderer/TemporalShaders.metal"
+AIR3="Sources/GaussianMetalRenderer/TemporalShaders.air"
+LIB3="Sources/GaussianMetalRenderer/TemporalShaders.metallib"
+
+echo ""
+echo "Compiling Temporal Shaders..."
+xcrun -sdk $SDK metal \
+  -frecord-sources -gline-tables-only \
+  -c "$SRC3" \
+  -o "$AIR3"
+
+echo "Linking Temporal Metal Library..."
+xcrun -sdk $SDK metallib \
+  "$AIR3" \
+  -o "$LIB3"
+
+echo "Done: $LIB3"
+

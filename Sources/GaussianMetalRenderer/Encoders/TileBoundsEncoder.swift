@@ -1,4 +1,5 @@
 import Metal
+import GaussianMetalRendererTypes
 
 final class TileBoundsEncoder {
     private let pipeline: MTLComputePipelineState

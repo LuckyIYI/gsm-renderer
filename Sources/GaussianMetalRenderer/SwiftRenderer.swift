@@ -1,6 +1,7 @@
 import Foundation
 import simd
 @preconcurrency import Metal
+import GaussianMetalRendererTypes
 
 public struct RendererLimits: Sendable {
     public let maxGaussians: Int
@@ -593,7 +594,8 @@ public final class GlobalSortRenderer: GaussianRenderer, @unchecked Sendable {
         func strideForColors() -> Int { precision == .float16 ? MemoryLayout<UInt16>.stride * 3 : 12 }
         func strideForOpacities() -> Int { precision == .float16 ? MemoryLayout<UInt16>.stride : 4 }
         func strideForDepths() -> Int { precision == .float16 ? MemoryLayout<UInt16>.stride : 4 }
-        func strideForInterleaved() -> Int { precision == .float16 ? 24 : 48 }
+        // Metal half4 requires 8-byte alignment (28 bytes) + struct padding to 32 for stride
+        func strideForInterleaved() -> Int { precision == .float16 ? 32 : 48 }
 
         let prefixBlockSize = 256
         let prefixGrainSize = 4

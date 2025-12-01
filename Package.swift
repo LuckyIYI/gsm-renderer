@@ -18,16 +18,23 @@ let package = Package(
     ],
     dependencies: [],
     targets: [
+        // C target exposing shared types for Swift/Metal interop
+        .target(
+            name: "GaussianMetalRendererTypes",
+            path: "Sources/GaussianMetalRendererTypes",
+            publicHeadersPath: "include"
+        ),
         .target(
             name: "GaussianMetalRenderer",
-            path: "Sources",
+            dependencies: ["GaussianMetalRendererTypes"],
+            path: "Sources/GaussianMetalRenderer",
             resources: [
-                .process("GaussianMetalRenderer/GaussianMetalRenderer.metallib"),
-                .process("GaussianMetalRenderer/GaussianMetalRenderer.metal"),
-                .process("GaussianMetalRenderer/LocalSortShaders.metallib"),
-                .process("GaussianMetalRenderer/LocalSortShaders.metal"),
-                .process("GaussianMetalRenderer/TemporalShaders.metallib"),
-                .process("GaussianMetalRenderer/TemporalShaders.metal")
+                .process("GaussianMetalRenderer.metallib"),
+                .process("GaussianMetalRenderer.metal"),
+                .process("LocalSortShaders.metallib"),
+                .process("LocalSortShaders.metal"),
+                .process("TemporalShaders.metallib"),
+                .process("TemporalShaders.metal")
             ]
         ),
         .testTarget(

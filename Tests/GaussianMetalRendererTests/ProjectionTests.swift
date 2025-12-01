@@ -33,9 +33,9 @@ final class ProjectionTests: XCTestCase {
             useHalf: false
         )
 
-        // Output buffers - packed GaussianRenderData (24 bytes)
+        // Output buffers - packed GaussianRenderData (32 bytes stride with half4 alignment)
         let stride = MemoryLayout<GaussianRenderDataSwift>.stride
-        XCTAssertEqual(stride, 24, "GaussianRenderDataSwift should be 24 bytes")
+        XCTAssertEqual(stride, 32, "GaussianRenderDataSwift should be 32 bytes stride")
 
         let renderDataOut = device.makeBuffer(length: count * stride, options: .storageModeShared)!
         let radiiOut = device.makeBuffer(length: count * 4, options: .storageModeShared)!

@@ -1,4 +1,0 @@
-module GaussianMetalRenderer [system] {
-  header "GaussianMetalRenderer-Swift.h"
-  export *
-}

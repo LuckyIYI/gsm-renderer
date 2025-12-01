@@ -1,4 +1,5 @@
 import Metal
+import GaussianMetalRendererTypes
 
 /// Encoder for fused pipeline operations using AoS (Array of Structures) data
 /// Unified with LocalSort approach: index-based render, no alpha texture, half precision

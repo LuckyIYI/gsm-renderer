@@ -1,4 +1,5 @@
 import Metal
+import GaussianMetalRendererTypes
 
 /// Encoder for buffer-based rendering (for Python/MLX readback)
 /// Texture-based rendering uses FusedPipelineEncoder instead

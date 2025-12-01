@@ -3,33 +3,27 @@
 
 #include <metal_stdlib>
 #include <metal_atomic>
+#include "BridgingTypes.h"
 #include "GaussianShared.h"
 #include "GaussianHelpers.h"
-#include "GaussianStructs.h"
 using namespace metal;
 
 // SH constants and computeSHColor function now defined in GaussianShared.h
 // Math helpers (matrixFromRows, normalizeQuaternion, buildCovariance3D, projectCovariance,
 // computeConicAndRadius) now defined in GaussianHelpers.h
-// Shared structures (CameraUniforms, PackedWorldGaussian, PackedWorldGaussianHalf)
-// now defined in GaussianStructs.h
+// Shared structures (CameraUniforms, PackedWorldGaussian, CompactedGaussian, etc.) now in BridgingTypes.h
 
 // =============================================================================
-// DATA STRUCTURES (LocalSort-specific)
+// STRUCT ACCESSOR HELPERS - Work with individual fields from BridgingTypes.h
 // =============================================================================
 
-/// Compacted gaussian (after projection + culling) - 48 bytes
-/// Matches LocalSort's layout for optimal render performance
-struct CompactedGaussian {
-    float4 covariance_depth;    // conic.xyz + depth (16 bytes)
-    float4 position_color;      // pos.xy + packed_half4(color,opacity) (16 bytes)
-    int2 min_tile;              // 8 bytes
-    int2 max_tile;              // 8 bytes
-};
+// Get rotation from PackedWorldGaussian (has simd_float4 rotation)
+inline float4 getRotation(PackedWorldGaussian g) { return g.rotation; }
 
-// TileBinningParams from GaussianStructs.h used for project params
-// TileAssignmentHeaderAtomic from GaussianStructs.h used for compacted header
-// RenderParams from GaussianStructs.h used for render params
+// Get rotation from PackedWorldGaussianHalf (has individual rx,ry,rz,rw)
+inline float4 getRotation(PackedWorldGaussianHalf g) {
+    return float4(half(g.rx), half(g.ry), half(g.rz), half(g.rw));
+}
 
 // =============================================================================
 // HELPER FUNCTIONS (LocalSort-specific - shared math helpers in GaussianHelpers.h)
@@ -133,7 +127,7 @@ kernel void tileBinningZeroCountsKernel(
 
 kernel void localSortClear(
     device atomic_uint* tileCounts [[buffer(0)]],
-    device TileAssignmentHeaderAtomic* header [[buffer(1)]],
+    device TileAssignmentHeader* header [[buffer(1)]],
     constant uint& tileCount [[buffer(2)]],
     constant uint& maxCapacity [[buffer(3)]],
     uint gid [[thread_position_in_grid]]
@@ -142,7 +136,7 @@ kernel void localSortClear(
         atomic_store_explicit(&tileCounts[gid], 0u, memory_order_relaxed);
     }
     if (gid == 0u) {
-        atomic_store_explicit(&header->visibleCount, 0u, memory_order_relaxed);
+        atomic_store_explicit((device atomic_uint*)&header->totalAssignments, 0u, memory_order_relaxed);
         header->maxCapacity = maxCapacity;
         header->overflow = 0u;
     }
@@ -158,7 +152,7 @@ kernel void localSortProjectCompactCount(
     const device PackedWorldT* worldGaussians [[buffer(0)]],
     const device HarmonicsT* harmonics [[buffer(1)]],
     device CompactedGaussian* compacted [[buffer(2)]],
-    device TileAssignmentHeaderAtomic* header [[buffer(3)]],
+    device TileAssignmentHeader* header [[buffer(3)]],
     device atomic_uint* tileCounts [[buffer(4)]],
     constant CameraUniforms& camera [[buffer(5)]],
     constant TileBinningParams& params [[buffer(6)]],
@@ -170,11 +164,11 @@ kernel void localSortProjectCompactCount(
     PackedWorldT g = worldGaussians[gid];
 
     // Early cull: skip tiny gaussians (scale < 0.001)
-    float3 scale = float3(g.scale);
+    float3 scale = float3(g.sx, g.sy, g.sz);
     float maxScale = max(scale.x, max(scale.y, scale.z));
     if (maxScale < 0.0005f) return;  // Skip near-invisible gaussians
 
-    float3 pos = float3(g.position);
+    float3 pos = float3(g.px, g.py, g.pz);
     float4 viewPos = camera.viewMatrix * float4(pos, 1.0f);
 
     // Cull: behind camera - match original pipeline EXACTLY
@@ -201,7 +195,7 @@ kernel void localSortProjectCompactCount(
     float py = ((ndcY + 1.0f) * camera.height - 1.0f) * 0.5f;
 
     // Covariance (scale already loaded in early cull) - using shared functions from GaussianHelpers.h
-    float4 quat = normalizeQuaternion(float4(g.rotation));
+    float4 quat = normalizeQuaternion(getRotation(g));
     float3x3 cov3d = buildCovariance3D(scale, quat);
 
     float3 vr0 = float3(camera.viewMatrix[0][0], camera.viewMatrix[1][0], camera.viewMatrix[2][0]);
@@ -258,7 +252,7 @@ kernel void localSortProjectCompactCount(
     color = max(color + 0.5f, float3(0.0f));
 
     // Compact: write visible gaussian
-    uint idx = atomic_fetch_add_explicit(&header->visibleCount, 1u, memory_order_relaxed);
+    uint idx = atomic_fetch_add_explicit((device atomic_uint*)&header->totalAssignments, 1u, memory_order_relaxed);
     if (idx >= params.maxCapacity) {
         header->overflow = 1u;
         return;
@@ -278,7 +272,7 @@ kernel void localSortProjectCompactCount(
 template [[host_name("localSortProjectCompactCountFloat")]]
 kernel void localSortProjectCompactCount<PackedWorldGaussian, float>(
     const device PackedWorldGaussian*, const device float*,
-    device CompactedGaussian*, device TileAssignmentHeaderAtomic*,
+    device CompactedGaussian*, device TileAssignmentHeader*,
     device atomic_uint*, constant CameraUniforms&,
     constant TileBinningParams&, uint);
 
@@ -286,7 +280,7 @@ kernel void localSortProjectCompactCount<PackedWorldGaussian, float>(
 template [[host_name("localSortProjectCompactCountHalf")]]
 kernel void localSortProjectCompactCount<PackedWorldGaussianHalf, float>(
     const device PackedWorldGaussianHalf*, const device float*,
-    device CompactedGaussian*, device TileAssignmentHeaderAtomic*,
+    device CompactedGaussian*, device TileAssignmentHeader*,
     device atomic_uint*, constant CameraUniforms&,
     constant TileBinningParams&, uint);
 
@@ -294,7 +288,7 @@ kernel void localSortProjectCompactCount<PackedWorldGaussianHalf, float>(
 template [[host_name("localSortProjectCompactCountFloatHalfSh")]]
 kernel void localSortProjectCompactCount<PackedWorldGaussian, half>(
     const device PackedWorldGaussian*, const device half*,
-    device CompactedGaussian*, device TileAssignmentHeaderAtomic*,
+    device CompactedGaussian*, device TileAssignmentHeader*,
     device atomic_uint*, constant CameraUniforms&,
     constant TileBinningParams&, uint);
 
@@ -302,7 +296,7 @@ kernel void localSortProjectCompactCount<PackedWorldGaussian, half>(
 template [[host_name("localSortProjectCompactCountHalfHalfSh")]]
 kernel void localSortProjectCompactCount<PackedWorldGaussianHalf, half>(
     const device PackedWorldGaussianHalf*, const device half*,
-    device CompactedGaussian*, device TileAssignmentHeaderAtomic*,
+    device CompactedGaussian*, device TileAssignmentHeader*,
     device atomic_uint*, constant CameraUniforms&,
     constant TileBinningParams&, uint);
 
@@ -445,11 +439,11 @@ kernel void localSortFinalizeScanAndZero(
 // Uses Metal's built-in MTLDispatchThreadgroupsIndirectArguments struct
 
 kernel void localSortPrepareScatterDispatch(
-    const device TileAssignmentHeaderAtomic* header [[buffer(0)]],
+    const device TileAssignmentHeader* header [[buffer(0)]],
     device MTLDispatchThreadgroupsIndirectArguments* dispatchArgs [[buffer(1)]],
     constant uint& threadgroupWidth [[buffer(2)]]
 ) {
-    uint visibleCount = atomic_load_explicit(&header->visibleCount, memory_order_relaxed);
+    uint visibleCount = atomic_load_explicit((const device atomic_uint*)&header->totalAssignments, memory_order_relaxed);
     uint threadgroups = (visibleCount + threadgroupWidth - 1) / threadgroupWidth;
     dispatchArgs->threadgroupsPerGrid[0] = max(threadgroups, 1u);
     dispatchArgs->threadgroupsPerGrid[1] = 1;
@@ -462,11 +456,11 @@ kernel void localSortPrepareScatterDispatch(
 
 kernel void localSortComputeGaussianTileCounts(
     const device CompactedGaussian* compacted [[buffer(0)]],
-    const device TileAssignmentHeaderAtomic* header [[buffer(1)]],
+    const device TileAssignmentHeader* header [[buffer(1)]],
     device uint* gaussianTileCounts [[buffer(2)]],  // Output: tiles per gaussian
     uint gid [[thread_position_in_grid]]
 ) {
-    uint visibleCount = atomic_load_explicit(&header->visibleCount, memory_order_relaxed);
+    uint visibleCount = atomic_load_explicit((const device atomic_uint*)&header->totalAssignments, memory_order_relaxed);
     if (gid >= visibleCount) {
         gaussianTileCounts[gid] = 0;
         return;
@@ -492,7 +486,7 @@ kernel void localSortComputeGaussianTileCounts(
 
 kernel void localSortScatterSimd(
     const device CompactedGaussian* compacted [[buffer(0)]],
-    const device TileAssignmentHeaderAtomic* header [[buffer(1)]],
+    const device TileAssignmentHeader* header [[buffer(1)]],
     device atomic_uint* tileCounters [[buffer(2)]],
     const device uint* offsets [[buffer(3)]],
     device uint* sortKeys [[buffer(4)]],
@@ -508,7 +502,7 @@ kernel void localSortScatterSimd(
 ) {
     // Each SIMD group (32 threads) processes gaussians cooperatively
     // Thread group: multiple SIMD groups, each processing different gaussians
-    uint visibleCount = atomic_load_explicit(&header->visibleCount, memory_order_relaxed);
+    uint visibleCount = atomic_load_explicit((const device atomic_uint*)&header->totalAssignments, memory_order_relaxed);
 
     // Calculate which gaussian this SIMD group is responsible for
     uint simd_groups_per_tg = 4;  // 128 threads / 32 = 4 SIMD groups per threadgroup

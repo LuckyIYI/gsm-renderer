@@ -1,10 +1,32 @@
 #include <metal_stdlib>
 #include <metal_atomic>
+#include "BridgingTypes.h"
 #include "GaussianShared.h"
-#include "GaussianStructs.h"
 #include "GaussianPrefixScan.h"
 #include "GaussianHelpers.h"
 using namespace metal;
+
+// =============================================================================
+// STRUCT ACCESSOR HELPERS - Work with individual fields from BridgingTypes.h
+// =============================================================================
+
+// Get rotation from PackedWorldGaussian (has simd_float4 rotation)
+inline float4 getRotation(PackedWorldGaussian g) { return g.rotation; }
+
+// Get rotation from PackedWorldGaussianHalf (has individual rx,ry,rz,rw)
+inline float4 getRotation(PackedWorldGaussianHalf g) {
+    return float4(half(g.rx), half(g.ry), half(g.rz), half(g.rw));
+}
+
+// GaussianRenderData accessors (device address space)
+inline half2 getMean(const device GaussianRenderData& g) { return half2(g.meanX, g.meanY); }
+inline half4 getConic(const device GaussianRenderData& g) { return half4(g.conicA, g.conicB, g.conicC, g.conicD); }
+inline half3 getColor(const device GaussianRenderData& g) { return half3(g.colorR, g.colorG, g.colorB); }
+
+// GaussianRenderData accessors (thread address space)
+inline half2 getMean(const thread GaussianRenderData& g) { return half2(g.meanX, g.meanY); }
+inline half4 getConic(const thread GaussianRenderData& g) { return half4(g.conicA, g.conicB, g.conicC, g.conicD); }
+inline half3 getColor(const thread GaussianRenderData& g) { return half3(g.colorR, g.colorG, g.colorB); }
 
 // =============================================================================
 // PROJECTION KERNEL - Outputs to packed GaussianRenderData struct
@@ -27,7 +49,7 @@ kernel void projectGaussians(
     PackedWorldT g = worldGaussians[gid];
 
     // Extract and promote to float for computation accuracy
-    float3 position = float3(g.position);
+    float3 position = float3(g.px, g.py, g.pz);
     float4 viewPos4 = camera.viewMatrix * float4(position, 1.0f);
     float depth = safeDepthComponent(viewPos4.z);
 
@@ -56,8 +78,8 @@ kernel void projectGaussians(
         return;
     }
 
-    float3 scale = float3(g.scale);
-    float4 quat = float4(g.rotation);
+    float3 scale = float3(g.sx, g.sy, g.sz);
+    float4 quat = normalizeQuaternion(getRotation(g));
     float3x3 cov3d = buildCovariance3D(scale, quat);
 
     float3 viewRow0 = float3(camera.viewMatrix[0][0], camera.viewMatrix[1][0], camera.viewMatrix[2][0]);
@@ -90,11 +112,17 @@ kernel void projectGaussians(
 
     // Write AoS output - single struct write
     RenderDataT renderData;
-    renderData.mean = decltype(renderData.mean)(px, py);
-    renderData.conic = decltype(renderData.conic)(conic);
-    renderData.color = decltype(renderData.color)(color);
-    renderData.opacity = decltype(renderData.opacity)(opacity);
-    renderData.depth = decltype(renderData.depth)(depth);
+    renderData.meanX = half(px);
+    renderData.meanY = half(py);
+    renderData.conicA = half(conic.x);
+    renderData.conicB = half(conic.y);
+    renderData.conicC = half(conic.z);
+    renderData.conicD = half(conic.w);
+    renderData.colorR = half(color.x);
+    renderData.colorG = half(color.y);
+    renderData.colorB = half(color.z);
+    renderData.opacity = half(opacity);
+    renderData.depth = half(depth);
     outRenderData[gid] = renderData;
 
     outRadii[gid] = radius;
@@ -371,7 +399,7 @@ kernel void tileBoundsKernel(
         return;
     }
 
-    float2 mean = float2(renderData[idx].mean);
+    float2 mean = float2(getMean(renderData[idx]));
     float radius = radii[idx];
 
     float xmin = mean.x - radius;
@@ -877,8 +905,9 @@ kernel void fusedCoverageScatterKernelV2(
     const uint tilesX = params.tilesX;
     const bool needsPrecise = (aabbCount > FUSED_V2_PRECISE_THRESHOLD);
 
-    const float2 center = float2(g.mean);
-    const float3 conic = float3(float(g.conic.x), float(g.conic.y), float(g.conic.z));
+    const float2 center = float2(getMean(g));
+    const half4 conicH = getConic(g);
+    const float3 conic = float3(float(conicH.x), float(conicH.y), float(conicH.z));
     const float qMax = computeQMax(alpha, GAUSSIAN_TAU);
 
     // Pre-compute expanded qMax for tile-center test
@@ -1657,23 +1686,25 @@ kernel void globalSortRender(
         if (gaussianIdx < 0) continue;
         GaussianRenderData g = gaussians[gaussianIdx];
 
-        // Precompute covariance terms
-        half cxx = g.conic.x;
-        half cyy = g.conic.z;
-        half cxy2 = 2.0h * g.conic.y;
+        // Precompute covariance terms (using accessor functions)
+        half4 gConic = getConic(g);
+        half cxx = gConic.x;
+        half cyy = gConic.z;
+        half cxy2 = 2.0h * gConic.y;
         half opacity = g.opacity;
-        half3 gColor = half3(g.color);
+        half3 gColor = getColor(g);
         half gDepth = g.depth;
 
         // Direction vectors for 8 pixels
-        half2 d00 = pos00 - g.mean;
-        half2 d10 = pos10 - g.mean;
-        half2 d20 = pos20 - g.mean;
-        half2 d30 = pos30 - g.mean;
-        half2 d01 = pos01 - g.mean;
-        half2 d11 = pos11 - g.mean;
-        half2 d21 = pos21 - g.mean;
-        half2 d31 = pos31 - g.mean;
+        half2 gMean = getMean(g);
+        half2 d00 = pos00 - gMean;
+        half2 d10 = pos10 - gMean;
+        half2 d20 = pos20 - gMean;
+        half2 d30 = pos30 - gMean;
+        half2 d01 = pos01 - gMean;
+        half2 d11 = pos11 - gMean;
+        half2 d21 = pos21 - gMean;
+        half2 d31 = pos31 - gMean;
 
         // Quadratic form: power = cxx*dx*dx + cyy*dy*dy + cxy2*dx*dy
         half p00 = d00.x*d00.x*cxx + d00.y*d00.y*cyy + d00.x*d00.y*cxy2;

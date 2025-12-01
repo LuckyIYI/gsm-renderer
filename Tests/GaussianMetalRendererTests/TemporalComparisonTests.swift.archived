@@ -7,13 +7,13 @@ import simd
 final class TemporalComparisonTests: XCTestCase {
     var device: MTLDevice!
     var queue: MTLCommandQueue!
-    var encoder: TellusimPipelineEncoder!
+    var encoder: LocalPipelineEncoder!
 
     override func setUp() {
         super.setUp()
         device = MTLCreateSystemDefaultDevice()!
         queue = device.makeCommandQueue()!
-        encoder = try! TellusimPipelineEncoder(device: device)
+        encoder = try! LocalPipelineEncoder(device: device)
     }
 
     /// Helper to create camera uniforms
@@ -1384,13 +1384,13 @@ final class TemporalComparisonTests: XCTestCase {
         print("ProjectWithMapping: visible=\(mappingVisible)")
 
         // Calculate expected tile assignments from stored bounds
-        struct TellusimCompactedLayout {
+        struct LocalCompactedLayout {
             var covariance_depth: SIMD4<Float>
             var position_color: SIMD4<Float>
             var min_tile: SIMD2<Int32>
             var max_tile: SIMD2<Int32>
         }
-        let compactedPtr = tmpCompacted.contents().bindMemory(to: TellusimCompactedLayout.self, capacity: maxCompacted)
+        let compactedPtr = tmpCompacted.contents().bindMemory(to: LocalCompactedLayout.self, capacity: maxCompacted)
         var expectedTileAssignments: UInt32 = 0
         var maxTilesWide: Int32 = 0
         var maxTilesHigh: Int32 = 0

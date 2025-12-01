@@ -3,15 +3,15 @@ import Metal
 import simd
 @testable import GaussianMetalRenderer
 
-/// Test Tellusim per-tile radix sorting
+/// Test Local per-tile radix sorting
 final class LocalSortSortingTests: XCTestCase {
 
-    /// Helper to load Tellusim library from bundle
-    private func loadTellusimLibrary(device: MTLDevice) throws -> MTLLibrary {
-        guard let libraryURL = Bundle.module.url(forResource: "TellusimShaders", withExtension: "metallib"),
+    /// Helper to load Local library from bundle
+    private func loadLocalLibrary(device: MTLDevice) throws -> MTLLibrary {
+        guard let libraryURL = Bundle.module.url(forResource: "LocalSortShaders", withExtension: "metallib"),
               let library = try? device.makeLibrary(URL: libraryURL) else {
             throw NSError(domain: "LocalSortSortingTests", code: 1,
-                         userInfo: [NSLocalizedDescriptionKey: "Failed to load TellusimShaders.metallib"])
+                         userInfo: [NSLocalizedDescriptionKey: "Failed to load LocalSortShaders.metallib"])
         }
         return library
     }
@@ -22,10 +22,10 @@ final class LocalSortSortingTests: XCTestCase {
         let device = renderer.device
         let queue = renderer.queue
 
-        // Load Tellusim library
-        let library = try loadTellusimLibrary(device: device)
+        // Load Local library
+        let library = try loadLocalLibrary(device: device)
 
-        guard let sortFn = library.makeFunction(name: "tellusim_per_tile_sort") else {
+        guard let sortFn = library.makeFunction(name: "localSort_per_tile_sort") else {
             XCTFail("Missing sort function")
             return
         }
@@ -115,7 +115,7 @@ final class LocalSortSortingTests: XCTestCase {
         }
 
         print("\n╔═══════════════════════════════════════════════════════════╗")
-        print("║  TELLUSIM SORTING TEST                                     ║")
+        print("║  LOCAL SORT SORTING TEST                                     ║")
         print("╠═══════════════════════════════════════════════════════════╣")
         print("║  Tiles: \(tileCount), Gaussians/tile: \(gaussiansPerTile)")
         print("║  Sort errors: \(sortErrors)")
@@ -131,9 +131,9 @@ final class LocalSortSortingTests: XCTestCase {
         let device = renderer.device
         let queue = renderer.queue
 
-        let library = try loadTellusimLibrary(device: device)
+        let library = try loadLocalLibrary(device: device)
 
-        guard let sortFn = library.makeFunction(name: "tellusim_per_tile_sort") else {
+        guard let sortFn = library.makeFunction(name: "localSort_per_tile_sort") else {
             XCTFail("Missing sort function")
             return
         }
@@ -207,9 +207,9 @@ final class LocalSortSortingTests: XCTestCase {
         let device = renderer.device
         let queue = renderer.queue
 
-        let library = try loadTellusimLibrary(device: device)
+        let library = try loadLocalLibrary(device: device)
 
-        guard let sortFn = library.makeFunction(name: "tellusim_per_tile_sort") else {
+        guard let sortFn = library.makeFunction(name: "localSort_per_tile_sort") else {
             XCTFail("Missing sort function")
             return
         }

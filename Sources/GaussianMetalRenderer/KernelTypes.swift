@@ -199,7 +199,7 @@ public struct RenderParams {
 }
 
 // =============================================================================
-// TELLUSIM-STYLE PIPELINE TYPES
+// LOCAL-STYLE PIPELINE TYPES
 // =============================================================================
 
 /// Compacted gaussian for local sort pipeline (matches Metal struct)

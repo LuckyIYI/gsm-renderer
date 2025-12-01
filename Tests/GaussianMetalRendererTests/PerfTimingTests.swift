@@ -329,7 +329,7 @@ final class PerfTimingTests: XCTestCase {
                 if gpuTime > 0 { timesV2.append(gpuTime * 1000) }
             }
 
-            // Test V3 (Tellusim-style: no shared mem, 8 pixels/thread)
+            // Test V3 (Local-style: no shared mem, 8 pixels/thread)
             renderer.fusedPipelineEncoder.renderVersion = 3
             for _ in 0..<2 {
                 guard let cb = renderer.queue.makeCommandBuffer() else { continue }

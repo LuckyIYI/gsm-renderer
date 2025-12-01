@@ -3,14 +3,14 @@ import Metal
 import simd
 @testable import GaussianMetalRenderer
 
-/// Compare Tellusim pipeline output to original pipeline output
+/// Compare Local pipeline output to original pipeline output
 final class LocalSortComparisonTests: XCTestCase {
     private let imageWidth = 1920
     private let imageHeight = 1080
     private let tileWidth = 32
     private let tileHeight = 16
 
-    /// Compare projection outputs between original and Tellusim pipelines
+    /// Compare projection outputs between original and Local pipelines
     func testCompareProjection() throws {
         let renderer = GlobalSortRenderer(limits: RendererLimits(maxGaussians: 1_000_000, maxWidth: 1024, maxHeight: 1024))
         let device = renderer.device
@@ -123,9 +123,9 @@ final class LocalSortComparisonTests: XCTestCase {
         }
 
         // ============================================
-        // Run TELLUSIM pipeline projection
+        // Run LOCAL SORT pipeline projection
         // ============================================
-        let tellusimEncoder = try LocalSortPipelineEncoder(device: device, library: library)
+        let localEncoder = try LocalSortPipelineEncoder(device: device, library: library)
 
         let tilesX = (imageWidth + tileWidth - 1) / tileWidth
         let tilesY = (imageHeight + tileHeight - 1) / tileHeight
@@ -133,22 +133,22 @@ final class LocalSortComparisonTests: XCTestCase {
         let maxCompacted = gaussianCount
         let maxAssignments = gaussianCount * 64
 
-        let tellusimCompacted = device.makeBuffer(
+        let localCompacted = device.makeBuffer(
             length: maxCompacted * MemoryLayout<CompactedGaussianSwift>.stride,
             options: .storageModeShared
         )!
-        let tellusimHeader = device.makeBuffer(
+        let localHeader = device.makeBuffer(
             length: MemoryLayout<CompactedHeaderSwift>.stride,
             options: .storageModeShared
         )!
-        let tellusimTileCounts = device.makeBuffer(length: tileCount * MemoryLayout<UInt32>.stride, options: .storageModeShared)!
-        let tellusimTileOffsets = device.makeBuffer(length: (tileCount + 1) * MemoryLayout<UInt32>.stride, options: .storageModeShared)!
-        let tellusimPartialSums = device.makeBuffer(length: 1024 * MemoryLayout<UInt32>.stride, options: .storageModeShared)!
-        let tellusimSortKeys = device.makeBuffer(length: maxAssignments * MemoryLayout<UInt32>.stride, options: .storageModeShared)!
-        let tellusimSortIndices = device.makeBuffer(length: maxAssignments * MemoryLayout<UInt32>.stride, options: .storageModeShared)!
+        let localTileCounts = device.makeBuffer(length: tileCount * MemoryLayout<UInt32>.stride, options: .storageModeShared)!
+        let localTileOffsets = device.makeBuffer(length: (tileCount + 1) * MemoryLayout<UInt32>.stride, options: .storageModeShared)!
+        let localPartialSums = device.makeBuffer(length: 1024 * MemoryLayout<UInt32>.stride, options: .storageModeShared)!
+        let localSortKeys = device.makeBuffer(length: maxAssignments * MemoryLayout<UInt32>.stride, options: .storageModeShared)!
+        let localSortIndices = device.makeBuffer(length: maxAssignments * MemoryLayout<UInt32>.stride, options: .storageModeShared)!
 
         if let cb = queue.makeCommandBuffer() {
-            tellusimEncoder.encode(
+            localEncoder.encode(
                 commandBuffer: cb,
                 worldGaussians: worldBuffer,
                 harmonics: harmonicsBuffer,
@@ -160,13 +160,13 @@ final class LocalSortComparisonTests: XCTestCase {
                 tileHeight: tileHeight,
                 surfaceWidth: imageWidth,
                 surfaceHeight: imageHeight,
-                compactedGaussians: tellusimCompacted,
-                compactedHeader: tellusimHeader,
-                tileCounts: tellusimTileCounts,
-                tileOffsets: tellusimTileOffsets,
-                partialSums: tellusimPartialSums,
-                sortKeys: tellusimSortKeys,
-                sortIndices: tellusimSortIndices,
+                compactedGaussians: localCompacted,
+                compactedHeader: localHeader,
+                tileCounts: localTileCounts,
+                tileOffsets: localTileOffsets,
+                partialSums: localPartialSums,
+                sortKeys: localSortKeys,
+                sortIndices: localSortIndices,
                 maxCompacted: maxCompacted,
                 maxAssignments: maxAssignments,
                 skipSort: true
@@ -182,8 +182,8 @@ final class LocalSortComparisonTests: XCTestCase {
         let origMask = origMaskBuffer.contents().bindMemory(to: UInt8.self, capacity: gaussianCount)
         let origDepth = origDepthBuffer.contents().bindMemory(to: Float.self, capacity: gaussianCount)
 
-        let tellusimVisibleCount = LocalSortPipelineEncoder.readVisibleCount(from: tellusimHeader)
-        let tellusimCompactedPtr = tellusimCompacted.contents().bindMemory(to: CompactedGaussianSwift.self, capacity: Int(tellusimVisibleCount))
+        let localVisibleCount = LocalSortPipelineEncoder.readVisibleCount(from: localHeader)
+        let localCompactedPtr = localCompacted.contents().bindMemory(to: CompactedGaussianSwift.self, capacity: Int(localVisibleCount))
 
         print("\n╔═══════════════════════════════════════════════════════════╗")
         print("║  PIPELINE COMPARISON TEST                                  ║")
@@ -198,7 +198,7 @@ final class LocalSortComparisonTests: XCTestCase {
         }
 
         print("║  Original visible: \(origVisibleCount) / \(gaussianCount)")
-        print("║  Tellusim visible: \(tellusimVisibleCount) / \(gaussianCount)")
+        print("║  Local visible: \(localVisibleCount) / \(gaussianCount)")
 
         // Also get original colors (packed_float3 = 12 bytes = 3 floats) and conics
         let origColorFloats = origColorBuffer.contents().bindMemory(to: Float.self, capacity: gaussianCount * 3)
@@ -224,9 +224,9 @@ final class LocalSortComparisonTests: XCTestCase {
         }
 
         print("╠═══════════════════════════════════════════════════════════╣")
-        print("║  TELLUSIM (first 10 visible):                             ║")
-        for i in 0..<min(10, Int(tellusimVisibleCount)) {
-            let g = tellusimCompactedPtr[i]
+        print("║  LOCAL SORT (first 10 visible):                             ║")
+        for i in 0..<min(10, Int(localVisibleCount)) {
+            let g = localCompactedPtr[i]
             let pos = SIMD2<Float>(g.position_color.x, g.position_color.y)
             let d = g.covariance_depth.w
             let conic = SIMD3<Float>(g.covariance_depth.x, g.covariance_depth.y, g.covariance_depth.z)
@@ -247,14 +247,14 @@ final class LocalSortComparisonTests: XCTestCase {
 
         // Assertions
         XCTAssertGreaterThan(origVisibleCount, 0, "Original should have visible gaussians")
-        XCTAssertGreaterThan(tellusimVisibleCount, 0, "Tellusim should have visible gaussians")
+        XCTAssertGreaterThan(localVisibleCount, 0, "Local should have visible gaussians")
 
-        // Note: Tellusim culls off-screen gaussians more aggressively, so count may differ
-        // The original keeps all gaussians even if off-screen, Tellusim culls based on tile coverage
-        print("║  Note: Count difference is expected - Tellusim culls off-screen gaussians")
+        // Note: Local culls off-screen gaussians more aggressively, so count may differ
+        // The original keeps all gaussians even if off-screen, Local culls based on tile coverage
+        print("║  Note: Count difference is expected - Local culls off-screen gaussians")
     }
 
-    /// Test PIXEL-PERFECT end-to-end comparison between original and Tellusim pipelines
+    /// Test PIXEL-PERFECT end-to-end comparison between original and Local pipelines
     func testPixelPerfectComparison() throws {
         let width = 128
         let height = 128
@@ -269,9 +269,9 @@ final class LocalSortComparisonTests: XCTestCase {
         let device = origRenderer.device
         let queue = origRenderer.queue
 
-        // Create Tellusim backend
-        let tellusimBackend = try LocalSortRenderer(device: device)
-        tellusimBackend.debugPrint = false
+        // Create Local backend
+        let localBackend = try LocalSortRenderer(device: device)
+        localBackend.debugPrint = false
 
         // Create test data - 4x4 grid of gaussians with varying colors
         var positions: [SIMD3<Float>] = []
@@ -382,11 +382,11 @@ final class LocalSortComparisonTests: XCTestCase {
         }
 
         // ============================================
-        // RENDER WITH TELLUSIM PIPELINE
+        // RENDER WITH LOCAL SORT PIPELINE
         // ============================================
-        var tellusimColorData: [Float16]?
+        var localColorData: [Float16]?
         if let cb = queue.makeCommandBuffer() {
-            if let tex = tellusimBackend.render(
+            if let tex = localBackend.render(
                 commandBuffer: cb,
                 worldGaussians: packedBuf,
                 harmonics: harmonicsBuf,
@@ -418,7 +418,7 @@ final class LocalSortComparisonTests: XCTestCase {
                     blitEnc.endEncoding()
                     blitCb.commit()
                     blitCb.waitUntilCompleted()
-                    tellusimColorData = Array(UnsafeBufferPointer(
+                    localColorData = Array(UnsafeBufferPointer(
                         start: readBuf.contents().bindMemory(to: Float16.self, capacity: width * height * 4),
                         count: width * height * 4
                     ))
@@ -429,23 +429,23 @@ final class LocalSortComparisonTests: XCTestCase {
         // ============================================
         // COMPARE PIXEL DATA
         // ============================================
-        guard let orig = origColorData, let tellusim = tellusimColorData else {
+        guard let orig = origColorData, let local = localColorData else {
             XCTFail("Failed to get texture data from one or both pipelines")
             return
         }
 
-        XCTAssertEqual(orig.count, tellusim.count, "Buffer sizes should match")
+        XCTAssertEqual(orig.count, local.count, "Buffer sizes should match")
 
         var maxDiff: Float = 0
         var totalDiff: Float = 0
         var diffCount = 0
         var coloredPixelCount = 0
         var coloredDiffCount = 0
-        var samplePixels: [(orig: SIMD4<Float>, tellusim: SIMD4<Float>, idx: Int)] = []
+        var samplePixels: [(orig: SIMD4<Float>, local: SIMD4<Float>, idx: Int)] = []
 
-        for i in stride(from: 0, to: min(orig.count, tellusim.count), by: 4) {
+        for i in stride(from: 0, to: min(orig.count, local.count), by: 4) {
             let oR = Float(orig[i]), oG = Float(orig[i+1]), oB = Float(orig[i+2]), oA = Float(orig[i+3])
-            let tR = Float(tellusim[i]), tG = Float(tellusim[i+1]), tB = Float(tellusim[i+2]), tA = Float(tellusim[i+3])
+            let tR = Float(local[i]), tG = Float(local[i+1]), tB = Float(local[i+2]), tA = Float(local[i+3])
 
             // Check if either has color (not just background)
             let origHasContent = oR > 0.01 || oG > 0.01 || oB > 0.01
@@ -466,7 +466,7 @@ final class LocalSortComparisonTests: XCTestCase {
                     if samplePixels.count < 5 {
                         samplePixels.append((
                             orig: SIMD4<Float>(oR, oG, oB, oA),
-                            tellusim: SIMD4<Float>(tR, tG, tB, tA),
+                            local: SIMD4<Float>(tR, tG, tB, tA),
                             idx: i / 4
                         ))
                     }
@@ -497,7 +497,7 @@ final class LocalSortComparisonTests: XCTestCase {
                 let px = sample.idx % width
                 let py = sample.idx / width
                 print("║  [\(px),\(py)] orig=(\(String(format: "%.3f", sample.orig.x)),\(String(format: "%.3f", sample.orig.y)),\(String(format: "%.3f", sample.orig.z)),\(String(format: "%.3f", sample.orig.w)))")
-                print("║         tell=(\(String(format: "%.3f", sample.tellusim.x)),\(String(format: "%.3f", sample.tellusim.y)),\(String(format: "%.3f", sample.tellusim.z)),\(String(format: "%.3f", sample.tellusim.w)))")
+                print("║         tell=(\(String(format: "%.3f", sample.local.x)),\(String(format: "%.3f", sample.local.y)),\(String(format: "%.3f", sample.local.z)),\(String(format: "%.3f", sample.local.w)))")
             }
         } else if coloredPixelCount > 0 {
             print("║  No RGB differences in colored pixels!")
@@ -527,9 +527,9 @@ final class LocalSortComparisonTests: XCTestCase {
         let device = origRenderer.device
         let queue = origRenderer.queue
 
-        // Create Tellusim backend
-        let tellusimBackend = try LocalSortRenderer(device: device)
-        tellusimBackend.debugPrint = false
+        // Create Local backend
+        let localBackend = try LocalSortRenderer(device: device)
+        localBackend.debugPrint = false
 
         // Create test data - simple grid of identical gaussians
         var packed: [PackedWorldGaussian] = []
@@ -622,10 +622,10 @@ final class LocalSortComparisonTests: XCTestCase {
             }
         }
 
-        // Render with Tellusim pipeline
-        var tellusimColorData: [Float16]?
+        // Render with Local pipeline
+        var localColorData: [Float16]?
         if let cb = queue.makeCommandBuffer() {
-            if let tex = tellusimBackend.render(
+            if let tex = localBackend.render(
                 commandBuffer: cb,
                 worldGaussians: packedBuf,
                 harmonics: harmonicsBuf,
@@ -656,7 +656,7 @@ final class LocalSortComparisonTests: XCTestCase {
                     blitEnc.endEncoding()
                     blitCb.commit()
                     blitCb.waitUntilCompleted()
-                    tellusimColorData = Array(UnsafeBufferPointer(
+                    localColorData = Array(UnsafeBufferPointer(
                         start: readBuf.contents().bindMemory(to: Float16.self, capacity: width * height * 4),
                         count: width * height * 4
                     ))
@@ -665,20 +665,20 @@ final class LocalSortComparisonTests: XCTestCase {
         }
 
         // Compare pixels with strict tolerance
-        guard let orig = origColorData, let tellusim = tellusimColorData else {
+        guard let orig = origColorData, let local = localColorData else {
             XCTFail("Failed to get texture data from one or both pipelines")
             return
         }
 
-        XCTAssertEqual(orig.count, tellusim.count, "Buffer sizes should match")
+        XCTAssertEqual(orig.count, local.count, "Buffer sizes should match")
 
         var maxDiff: Float = 0
         var exceededToleranceCount = 0
         var totalPixels = orig.count / 4
 
-        for i in stride(from: 0, to: min(orig.count, tellusim.count), by: 4) {
+        for i in stride(from: 0, to: min(orig.count, local.count), by: 4) {
             let oR = Float(orig[i]), oG = Float(orig[i+1]), oB = Float(orig[i+2]), oA = Float(orig[i+3])
-            let tR = Float(tellusim[i]), tG = Float(tellusim[i+1]), tB = Float(tellusim[i+2]), tA = Float(tellusim[i+3])
+            let tR = Float(local[i]), tG = Float(local[i+1]), tB = Float(local[i+2]), tA = Float(local[i+3])
 
             let dR = abs(oR - tR), dG = abs(oG - tG), dB = abs(oB - tB), dA = abs(oA - tA)
             let maxChannelDiff = max(max(dR, dG), max(dB, dA))
@@ -701,9 +701,9 @@ final class LocalSortComparisonTests: XCTestCase {
         // This is informational - the actual pass/fail uses visual similarity threshold
         let visualTolerance: Float = 0.1  // 10% difference is visually acceptable
         var visuallyDifferent = 0
-        for i in stride(from: 0, to: min(orig.count, tellusim.count), by: 4) {
+        for i in stride(from: 0, to: min(orig.count, local.count), by: 4) {
             let oR = Float(orig[i]), oG = Float(orig[i+1]), oB = Float(orig[i+2])
-            let tR = Float(tellusim[i]), tG = Float(tellusim[i+1]), tB = Float(tellusim[i+2])
+            let tR = Float(local[i]), tG = Float(local[i+1]), tB = Float(local[i+2])
             let dR = abs(oR - tR), dG = abs(oG - tG), dB = abs(oB - tB)
             if max(max(dR, dG), dB) > visualTolerance {
                 visuallyDifferent += 1
@@ -727,7 +727,7 @@ final class LocalSortComparisonTests: XCTestCase {
         XCTAssertLessThan(visualDiffPercent, 15.0, "More than 15% of pixels have visual differences > 10% - pipelines may have diverged")
     }
 
-    /// Test full render comparison between original and Tellusim
+    /// Test full render comparison between original and Local
     func testCompareFullRender() throws {
         let renderer = GlobalSortRenderer(limits: RendererLimits(maxGaussians: 1_000_000, maxWidth: 1024, maxHeight: 1024))
         let device = renderer.device
@@ -784,7 +784,7 @@ final class LocalSortComparisonTests: XCTestCase {
         let focalX = f * Float(width) / 2.0
         let focalY = f * Float(height) / 2.0
 
-        // Create Tellusim backend and render
+        // Create Local backend and render
         let backend = try LocalSortRenderer(device: device)
         backend.debugPrint = false
 

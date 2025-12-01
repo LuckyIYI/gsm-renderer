@@ -5,51 +5,18 @@
 #include <metal_atomic>
 #include "GaussianShared.h"
 #include "GaussianHelpers.h"
+#include "GaussianStructs.h"
 using namespace metal;
 
 // SH constants and computeSHColor function now defined in GaussianShared.h
 // Math helpers (matrixFromRows, normalizeQuaternion, buildCovariance3D, projectCovariance,
 // computeConicAndRadius) now defined in GaussianHelpers.h
+// Shared structures (CameraUniforms, PackedWorldGaussian, PackedWorldGaussianHalf)
+// now defined in GaussianStructs.h
 
 // =============================================================================
-// DATA STRUCTURES
+// DATA STRUCTURES (LocalSort-specific)
 // =============================================================================
-
-/// Camera uniforms (matches Swift CameraUniformsSwift)
-struct LocalSortCameraUniforms {
-    float4x4 viewMatrix;
-    float4x4 projectionMatrix;
-    float3 cameraCenter;
-    float pixelFactor;
-    float focalX;
-    float focalY;
-    float width;
-    float height;
-    float nearPlane;
-    float farPlane;
-    uint shComponents;
-    uint gaussianCount;
-    uint padding0;
-    uint padding1;
-};
-
-/// Packed world gaussian input (float32) - 48 bytes
-struct LocalSortPackedWorld {
-    packed_float3 position;   // 12 bytes
-    float         opacity;    // 4 bytes
-    packed_float3 scale;      // 12 bytes
-    float         _pad0;      // 4 bytes
-    float4        rotation;   // 16 bytes
-};
-
-/// Packed world gaussian input (half16) - 24 bytes
-struct LocalSortPackedWorldHalf {
-    packed_half3  position;   // 6 bytes
-    half          opacity;    // 2 bytes
-    packed_half3  scale;      // 6 bytes
-    half          _pad0;      // 2 bytes
-    half4         rotation;   // 8 bytes
-};
 
 /// Compacted gaussian (after projection + culling) - 48 bytes
 /// Matches LocalSort's layout for optimal render performance
@@ -72,7 +39,7 @@ struct LocalSortProjectParams {
     uint maxCompacted;
 };
 
-/// Header for compacted gaussians
+/// Header for compacted gaussians (uses atomic_uint for GPU atomics)
 struct LocalSortCompactedHeader {
     atomic_uint visibleCount;
     uint maxCompacted;
@@ -80,7 +47,7 @@ struct LocalSortCompactedHeader {
     uint _pad;
 };
 
-/// Render parameters
+/// Render parameters (simplified version of RenderParams for LocalSort)
 struct LocalSortRenderParams {
     uint width;
     uint height;
@@ -221,7 +188,7 @@ kernel void localSort_project_compact_count(
     device LocalSortCompactedGaussian* compacted [[buffer(2)]],
     device LocalSortCompactedHeader* header [[buffer(3)]],
     device atomic_uint* tileCounts [[buffer(4)]],
-    constant LocalSortCameraUniforms& camera [[buffer(5)]],
+    constant CameraUniforms& camera [[buffer(5)]],
     constant LocalSortProjectParams& params [[buffer(6)]],
     uint gid [[thread_position_in_grid]]
 ) {
@@ -333,44 +300,46 @@ kernel void localSort_project_compact_count(
 }
 
 // Instantiate all combinations: World(float/half) x Harmonics(float/half)
+// Uses shared structures from GaussianStructs.h: PackedWorldGaussian, PackedWorldGaussianHalf, CameraUniforms
+
 // Float world, float harmonics (original)
 template [[host_name("localSort_project_compact_count_float")]]
-kernel void localSort_project_compact_count<LocalSortPackedWorld, float>(
-    const device LocalSortPackedWorld*, const device float*,
+kernel void localSort_project_compact_count<PackedWorldGaussian, float>(
+    const device PackedWorldGaussian*, const device float*,
     device LocalSortCompactedGaussian*, device LocalSortCompactedHeader*,
-    device atomic_uint*, constant LocalSortCameraUniforms&,
+    device atomic_uint*, constant CameraUniforms&,
     constant LocalSortProjectParams&, uint);
 
 // Half world, float harmonics
 template [[host_name("localSort_project_compact_count_half")]]
-kernel void localSort_project_compact_count<LocalSortPackedWorldHalf, float>(
-    const device LocalSortPackedWorldHalf*, const device float*,
+kernel void localSort_project_compact_count<PackedWorldGaussianHalf, float>(
+    const device PackedWorldGaussianHalf*, const device float*,
     device LocalSortCompactedGaussian*, device LocalSortCompactedHeader*,
-    device atomic_uint*, constant LocalSortCameraUniforms&,
+    device atomic_uint*, constant CameraUniforms&,
     constant LocalSortProjectParams&, uint);
 
 // Float world, half harmonics (memory bandwidth optimization)
 template [[host_name("localSort_project_compact_count_float_halfsh")]]
-kernel void localSort_project_compact_count<LocalSortPackedWorld, half>(
-    const device LocalSortPackedWorld*, const device half*,
+kernel void localSort_project_compact_count<PackedWorldGaussian, half>(
+    const device PackedWorldGaussian*, const device half*,
     device LocalSortCompactedGaussian*, device LocalSortCompactedHeader*,
-    device atomic_uint*, constant LocalSortCameraUniforms&,
+    device atomic_uint*, constant CameraUniforms&,
     constant LocalSortProjectParams&, uint);
 
 // Half world, half harmonics (full half precision pipeline)
 template [[host_name("localSort_project_compact_count_half_halfsh")]]
-kernel void localSort_project_compact_count<LocalSortPackedWorldHalf, half>(
-    const device LocalSortPackedWorldHalf*, const device half*,
+kernel void localSort_project_compact_count<PackedWorldGaussianHalf, half>(
+    const device PackedWorldGaussianHalf*, const device half*,
     device LocalSortCompactedGaussian*, device LocalSortCompactedHeader*,
-    device atomic_uint*, constant LocalSortCameraUniforms&,
+    device atomic_uint*, constant CameraUniforms&,
     constant LocalSortProjectParams&, uint);
 
 // =============================================================================
 // KERNEL 3: PREFIX SCAN (reuse from main file or inline simple version)
 // =============================================================================
 
-#define TELLUSIM_PREFIX_BLOCK_SIZE 256
-#define TELLUSIM_PREFIX_GRAIN_SIZE 4
+#define LOCAL_SORT_PREFIX_BLOCK_SIZE 256
+#define LOCAL_SORT_PREFIX_GRAIN_SIZE 4
 
 kernel void localSort_prefix_scan(
     const device uint* input [[buffer(0)]],
@@ -380,34 +349,34 @@ kernel void localSort_prefix_scan(
     uint groupId [[threadgroup_position_in_grid]],
     ushort localId [[thread_position_in_threadgroup]]
 ) {
-    threadgroup uint shared[TELLUSIM_PREFIX_BLOCK_SIZE * TELLUSIM_PREFIX_GRAIN_SIZE];
+    threadgroup uint shared[LOCAL_SORT_PREFIX_BLOCK_SIZE * LOCAL_SORT_PREFIX_GRAIN_SIZE];
 
-    uint elementsPerGroup = TELLUSIM_PREFIX_BLOCK_SIZE * TELLUSIM_PREFIX_GRAIN_SIZE;
+    uint elementsPerGroup = LOCAL_SORT_PREFIX_BLOCK_SIZE * LOCAL_SORT_PREFIX_GRAIN_SIZE;
     uint globalOffset = groupId * elementsPerGroup;
 
     // Load
-    for (ushort i = 0; i < TELLUSIM_PREFIX_GRAIN_SIZE; ++i) {
-        uint idx = globalOffset + localId * TELLUSIM_PREFIX_GRAIN_SIZE + i;
-        shared[localId * TELLUSIM_PREFIX_GRAIN_SIZE + i] = (idx < count) ? input[idx] : 0u;
+    for (ushort i = 0; i < LOCAL_SORT_PREFIX_GRAIN_SIZE; ++i) {
+        uint idx = globalOffset + localId * LOCAL_SORT_PREFIX_GRAIN_SIZE + i;
+        shared[localId * LOCAL_SORT_PREFIX_GRAIN_SIZE + i] = (idx < count) ? input[idx] : 0u;
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
     // Local prefix sum
     uint localSum = 0;
-    for (ushort i = 0; i < TELLUSIM_PREFIX_GRAIN_SIZE; ++i) {
-        uint val = shared[localId * TELLUSIM_PREFIX_GRAIN_SIZE + i];
-        shared[localId * TELLUSIM_PREFIX_GRAIN_SIZE + i] = localSum;
+    for (ushort i = 0; i < LOCAL_SORT_PREFIX_GRAIN_SIZE; ++i) {
+        uint val = shared[localId * LOCAL_SORT_PREFIX_GRAIN_SIZE + i];
+        shared[localId * LOCAL_SORT_PREFIX_GRAIN_SIZE + i] = localSum;
         localSum += val;
     }
 
     // Threadgroup scan (simple serial for now)
-    threadgroup uint blockSums[TELLUSIM_PREFIX_BLOCK_SIZE];
+    threadgroup uint blockSums[LOCAL_SORT_PREFIX_BLOCK_SIZE];
     blockSums[localId] = localSum;
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
     if (localId == 0) {
         uint sum = 0;
-        for (ushort i = 0; i < TELLUSIM_PREFIX_BLOCK_SIZE; ++i) {
+        for (ushort i = 0; i < LOCAL_SORT_PREFIX_BLOCK_SIZE; ++i) {
             uint val = blockSums[i];
             blockSums[i] = sum;
             sum += val;
@@ -418,10 +387,10 @@ kernel void localSort_prefix_scan(
 
     // Add block sum to local values
     uint blockSum = blockSums[localId];
-    for (ushort i = 0; i < TELLUSIM_PREFIX_GRAIN_SIZE; ++i) {
-        uint idx = globalOffset + localId * TELLUSIM_PREFIX_GRAIN_SIZE + i;
+    for (ushort i = 0; i < LOCAL_SORT_PREFIX_GRAIN_SIZE; ++i) {
+        uint idx = globalOffset + localId * LOCAL_SORT_PREFIX_GRAIN_SIZE + i;
         if (idx < count) {
-            output[idx] = shared[localId * TELLUSIM_PREFIX_GRAIN_SIZE + i] + blockSum;
+            output[idx] = shared[localId * LOCAL_SORT_PREFIX_GRAIN_SIZE + i] + blockSum;
         }
     }
 }
@@ -431,13 +400,13 @@ kernel void localSort_scan_partial_sums(
     constant uint& numPartials [[buffer(1)]],
     ushort localId [[thread_position_in_threadgroup]]
 ) {
-    threadgroup uint shared[TELLUSIM_PREFIX_BLOCK_SIZE];
+    threadgroup uint shared[LOCAL_SORT_PREFIX_BLOCK_SIZE];
     shared[localId] = (localId < numPartials) ? partialSums[localId] : 0u;
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
     if (localId == 0) {
         uint sum = 0;
-        for (ushort i = 0; i < TELLUSIM_PREFIX_BLOCK_SIZE; ++i) {
+        for (ushort i = 0; i < LOCAL_SORT_PREFIX_BLOCK_SIZE; ++i) {
             uint val = shared[i];
             shared[i] = sum;
             sum += val;
@@ -459,12 +428,12 @@ kernel void localSort_finalize_scan(
 ) {
     if (groupId == 0) return;  // First group doesn't need adjustment
 
-    uint elementsPerGroup = TELLUSIM_PREFIX_BLOCK_SIZE * TELLUSIM_PREFIX_GRAIN_SIZE;
+    uint elementsPerGroup = LOCAL_SORT_PREFIX_BLOCK_SIZE * LOCAL_SORT_PREFIX_GRAIN_SIZE;
     uint globalOffset = groupId * elementsPerGroup;
     uint blockSum = partialSums[groupId];
 
-    for (ushort i = 0; i < TELLUSIM_PREFIX_GRAIN_SIZE; ++i) {
-        uint idx = globalOffset + localId * TELLUSIM_PREFIX_GRAIN_SIZE + i;
+    for (ushort i = 0; i < LOCAL_SORT_PREFIX_GRAIN_SIZE; ++i) {
+        uint idx = globalOffset + localId * LOCAL_SORT_PREFIX_GRAIN_SIZE + i;
         if (idx < count) {
             output[idx] += blockSum;
         }
@@ -480,12 +449,12 @@ kernel void localSort_finalize_scan_and_zero(
     uint groupId [[threadgroup_position_in_grid]],
     ushort localId [[thread_position_in_threadgroup]]
 ) {
-    uint elementsPerGroup = TELLUSIM_PREFIX_BLOCK_SIZE * TELLUSIM_PREFIX_GRAIN_SIZE;
+    uint elementsPerGroup = LOCAL_SORT_PREFIX_BLOCK_SIZE * LOCAL_SORT_PREFIX_GRAIN_SIZE;
     uint globalOffset = groupId * elementsPerGroup;
     uint blockSum = (groupId > 0) ? partialSums[groupId] : 0u;
 
-    for (ushort i = 0; i < TELLUSIM_PREFIX_GRAIN_SIZE; ++i) {
-        uint idx = globalOffset + localId * TELLUSIM_PREFIX_GRAIN_SIZE + i;
+    for (ushort i = 0; i < LOCAL_SORT_PREFIX_GRAIN_SIZE; ++i) {
+        uint idx = globalOffset + localId * LOCAL_SORT_PREFIX_GRAIN_SIZE + i;
         if (idx < count) {
             // Finalize scan (add block sum)
             if (groupId > 0) {
@@ -655,9 +624,9 @@ kernel void localSort_scatter_simd(
 // =============================================================================
 // Fast bitonic sort with SIMD optimizations
 // Uses packed key-value pairs to reduce memory traffic
-// Limit 2048 elements to fit in 32KB threadgroup memory
+// 4096 elements * 4 bytes * 2 arrays = 32KB (fits in threadgroup memory)
 
-#define SORT_MAX_SIZE 2048
+#define SORT_MAX_SIZE 4096
 
 kernel void localSort_per_tile_sort(
     device uint* keys [[buffer(0)]],
@@ -737,12 +706,12 @@ kernel void localSort_per_tile_sort(
 // =============================================================================
 // Optimized: No arrays (prevents spilling), half precision, direct memory access
 
-#define TELLUSIM_TILE_WIDTH 32
-#define TELLUSIM_TILE_HEIGHT 16
-#define TELLUSIM_TG_WIDTH 8
-#define TELLUSIM_TG_HEIGHT 8
-#define TELLUSIM_PIXELS_X 4
-#define TELLUSIM_PIXELS_Y 2
+#define LOCAL_SORT_TILE_WIDTH 32
+#define LOCAL_SORT_TILE_HEIGHT 16
+#define LOCAL_SORT_TG_WIDTH 8
+#define LOCAL_SORT_TG_HEIGHT 8
+#define LOCAL_SORT_PIXELS_X 4
+#define LOCAL_SORT_PIXELS_Y 2
 
 kernel void localSort_render(
     const device LocalSortCompactedGaussian* compacted [[buffer(0)]],
@@ -774,8 +743,8 @@ kernel void localSort_render(
     uint offset = tileDataOffset;
 
     // Base pixel position
-    half px0 = half(groupId.x * TELLUSIM_TILE_WIDTH + localId.x * TELLUSIM_PIXELS_X);
-    half py0 = half(groupId.y * TELLUSIM_TILE_HEIGHT + localId.y * TELLUSIM_PIXELS_Y);
+    half px0 = half(groupId.x * LOCAL_SORT_TILE_WIDTH + localId.x * LOCAL_SORT_PIXELS_X);
+    half py0 = half(groupId.y * LOCAL_SORT_TILE_HEIGHT + localId.y * LOCAL_SORT_PIXELS_Y);
 
     // Explicit accumulators - no arrays to prevent register spilling
     half3 c00 = 0, c10 = 0, c20 = 0, c30 = 0;

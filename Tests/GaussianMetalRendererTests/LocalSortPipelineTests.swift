@@ -3,7 +3,7 @@ import Metal
 import simd
 @testable import GaussianMetalRenderer
 
-/// Tests for the Tellusim-style pipeline (fused project + compact + count + scatter)
+/// Tests for the Local-style pipeline (fused project + compact + count + scatter)
 final class LocalSortPipelineTests: XCTestCase {
     private let tileWidth = 32
     private let tileHeight = 16
@@ -534,7 +534,7 @@ final class LocalSortPipelineTests: XCTestCase {
         }
 
         print("\n╔═════════════════════════════════════════════╗")
-        print("║  TELLUSIM PIPELINE - FULL END-TO-END        ║")
+        print("║  LOCAL SORT PIPELINE - FULL END-TO-END        ║")
         print("║  (Project + Scan + Scatter + Sort + Render) ║")
         print("╠═════════════════════════════════════════════╣")
         for summary in summaries {
@@ -1284,7 +1284,7 @@ final class LocalSortPipelineTests: XCTestCase {
         let fps = 1000.0 / avg
 
         print("\n╔═══════════════════════════════════════════════════════════╗")
-        print("║  TELLUSIM PIPELINE @ 2M GAUSSIANS                         ║")
+        print("║  LOCAL SORT PIPELINE @ 2M GAUSSIANS                         ║")
         print("╠═══════════════════════════════════════════════════════════╣")
         print("║  Visible: \(visibleCount) / \(gaussianCount) (\(String(format: "%.1f", Double(visibleCount) / Double(gaussianCount) * 100))%)")
         print("║  Overflow: \(overflow)")
@@ -1301,7 +1301,7 @@ final class LocalSortPipelineTests: XCTestCase {
         // This test documents current performance, doesn't fail
     }
 
-    /// Performance test comparing old pipeline vs Tellusim pipeline
+    /// Performance test comparing old pipeline vs Local pipeline
     func testPipelinePerformance() throws {
         let renderer = GlobalSortRenderer(limits: RendererLimits(maxGaussians: 1_000_000, maxWidth: 1024, maxHeight: 1024))
         let device = renderer.device
@@ -1439,7 +1439,7 @@ final class LocalSortPipelineTests: XCTestCase {
             summaries.append("\(gaussianCount/1000)k: \(String(format: "%.2f", avg))ms (visible: \(visibleCount))")
         }
 
-        print("\n[Tellusim Pipeline Performance]")
+        print("\n[Local Pipeline Performance]")
         for summary in summaries {
             print(summary)
         }

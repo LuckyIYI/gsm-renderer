@@ -3,7 +3,7 @@ import Metal
 import simd
 @testable import GaussianMetalRenderer
 
-/// Performance comparison: OLD renderer vs NEW (Tellusim) renderer
+/// Performance comparison: OLD renderer vs NEW (Local) renderer
 final class PerfComparisonTests: XCTestCase {
     private let imageWidth = 1920
     private let imageHeight = 1080
@@ -135,16 +135,16 @@ final class PerfComparisonTests: XCTestCase {
             if i >= 2 { oldTimes.append(CACurrentMediaTime() - start) }
         }
 
-        // ============ BENCHMARK NEW (TELLUSIM) RENDERER ============
-        let tellusim = try LocalSortRenderer(device: device)
+        // ============ BENCHMARK NEW (LOCAL SORT) RENDERER ============
+        let local = try LocalSortRenderer(device: device)
         var newTimes = [Double]()
 
-        // Warmup + benchmark Tellusim renderer
+        // Warmup + benchmark Local renderer
         for i in 0..<iterations + 2 {
             guard let cb = queue.makeCommandBuffer() else { continue }
             let start = CACurrentMediaTime()
 
-            _ = tellusim.render(
+            _ = local.render(
                 commandBuffer: cb,
                 worldGaussians: packedBuffers.packedGaussians,
                 harmonics: packedBuffers.harmonics,
@@ -174,7 +174,7 @@ final class PerfComparisonTests: XCTestCase {
         let newMax = newTimes.max()! * 1000
 
         let speedup = oldAvg / newAvg
-        let winner = newAvg < oldAvg ? "NEW (Tellusim)" : "OLD"
+        let winner = newAvg < oldAvg ? "NEW (Local)" : "OLD"
 
         print("\n╔═══════════════════════════════════════════════════════════════════╗")
         print("║  PERFORMANCE COMPARISON: \(label) GAUSSIANS @ \(imageWidth)x\(imageHeight)")
@@ -183,7 +183,7 @@ final class PerfComparisonTests: XCTestCase {
         print("║    Avg: \(String(format: "%7.2f", oldAvg))ms  (\(String(format: "%5.1f", 1000/oldAvg)) FPS)")
         print("║    Min: \(String(format: "%7.2f", oldMin))ms  Max: \(String(format: "%.2f", oldMax))ms")
         print("╠───────────────────────────────────────────────────────────────────╣")
-        print("║  NEW Renderer (Tellusim):")
+        print("║  NEW Renderer (Local):")
         print("║    Avg: \(String(format: "%7.2f", newAvg))ms  (\(String(format: "%5.1f", 1000/newAvg)) FPS)")
         print("║    Min: \(String(format: "%7.2f", newMin))ms  Max: \(String(format: "%.2f", newMax))ms")
         print("╠═══════════════════════════════════════════════════════════════════╣")

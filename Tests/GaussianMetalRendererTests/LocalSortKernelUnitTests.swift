@@ -3,7 +3,7 @@ import Metal
 import simd
 @testable import GaussianMetalRenderer
 
-/// Unit tests for each Tellusim kernel in isolation
+/// Unit tests for each Local kernel in isolation
 final class LocalSortKernelUnitTests: XCTestCase {
     private let tileWidth = 32
     private let tileHeight = 16

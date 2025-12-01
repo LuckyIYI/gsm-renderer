@@ -25,7 +25,7 @@ final class FusedPipelineEncoder {
     let renderV2ThreadgroupSize: MTLSize  // 16x8 for 32x16 tiles (2x2 pixels/thread)
     let renderV3ThreadgroupSize: MTLSize  // 8x8 for 32x16 tiles (4x2 pixels/thread) - local sort style
 
-    /// Render kernel version: 1=original, 2=shared mem, 3=Tellusim (no shared mem, 8 pixels/thread)
+    /// Render kernel version: 1=original, 2=shared mem, 3=Local (no shared mem, 8 pixels/thread)
     public var renderVersion: Int = 2  // Default to V2 (shared mem, lower register pressure)
 
     init(device: MTLDevice, library: MTLLibrary) throws {

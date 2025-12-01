@@ -15,8 +15,8 @@ final class TemporalInsertionSortTests: XCTestCase {
         device = MTLCreateSystemDefaultDevice()!
         queue = device.makeCommandQueue()!
 
-        // Load Tellusim library
-        let libraryURL = Bundle.module.url(forResource: "TellusimShaders", withExtension: "metallib")!
+        // Load Local library
+        let libraryURL = Bundle.module.url(forResource: "LocalShaders", withExtension: "metallib")!
         library = try! device.makeLibrary(URL: libraryURL)
     }
 

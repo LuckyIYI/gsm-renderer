@@ -531,11 +531,11 @@ kernel void localSortScatterSimd(
 
     // Lane 0 loads gaussian data
     CompactedGaussian g;
-    float3 conic;
-    float2 center;
-    float power;
-    uint depthKey;
-    int minTX, minTY, maxTX, maxTY;
+    float3 conic = 0;
+    float2 center = 0;
+    float power = 0;
+    uint depthKey = 0;
+    int minTX = 0, minTY = 0, maxTX = 0, maxTY = 0;
 
     if (simd_lane == 0) {
         g = compacted[gaussianIdx];
@@ -612,6 +612,295 @@ kernel void localSortScatterSimd(
 // Reduced from 4096 to avoid potential memory issues on some GPUs
 
 #define SORT_MAX_SIZE 2048
+
+// Tile dimensions for render kernels
+#define LOCAL_SORT_TILE_WIDTH 32
+#define LOCAL_SORT_TILE_HEIGHT 16
+#define LOCAL_SORT_TG_WIDTH 8
+#define LOCAL_SORT_TG_HEIGHT 8
+#define LOCAL_SORT_PIXELS_X 4
+#define LOCAL_SORT_PIXELS_Y 2
+
+// =============================================================================
+// EXPERIMENTAL: 16-BIT SORT for reduced threadgroup memory
+// =============================================================================
+// Uses 16-bit depth keys + 16-bit local indices = 8KB threadgroup (vs 16KB)
+// Requires separate globalIndices buffer for mapping local → compacted idx
+// Trade-off: 50% less threadgroup memory for one extra indirection in render
+
+kernel void localSortPerTileSort16(
+    const device ushort* depthKeys [[buffer(0)]],     // 16-bit normalized depth
+    const device uint* globalIndices [[buffer(1)]],    // local idx → compacted gaussian idx
+    device ushort* sortedLocalIdx [[buffer(2)]],       // output: sorted local indices
+    const device uint* offsets [[buffer(3)]],
+    const device uint* counts [[buffer(4)]],
+    uint tileId [[threadgroup_position_in_grid]],
+    ushort localId [[thread_position_in_threadgroup]],
+    ushort tgSize [[threads_per_threadgroup]]
+) {
+    uint start = offsets[tileId];
+    uint count = counts[tileId];
+
+    if (count <= 1) {
+        // Single element - just copy
+        if (count == 1 && localId == 0) {
+            sortedLocalIdx[start] = 0;
+        }
+        return;
+    }
+
+    uint n = min(count, uint(SORT_MAX_SIZE));
+
+    // 16-bit arrays = 4KB + 4KB = 8KB threadgroup memory (vs 16KB)
+    threadgroup ushort sharedKeys[SORT_MAX_SIZE];
+    threadgroup ushort sharedVals[SORT_MAX_SIZE];
+
+    // Pad to next power of 2
+    uint padded = 1;
+    while (padded < n) padded <<= 1;
+
+    // Parallel load with padding
+    for (uint i = localId; i < padded; i += tgSize) {
+        if (i < n) {
+            sharedKeys[i] = depthKeys[start + i];
+            sharedVals[i] = ushort(i);  // Local index 0..n-1
+        } else {
+            sharedKeys[i] = 0xFFFFu;  // Max key for padding
+            sharedVals[i] = ushort(i);
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // Bitonic sort
+    for (uint k = 2; k <= padded; k <<= 1) {
+        for (uint j = k >> 1; j > 0; j >>= 1) {
+            for (uint i = localId; i < padded; i += tgSize) {
+                uint ixj = i ^ j;
+                if (ixj > i) {
+                    ushort aKey = sharedKeys[i];
+                    ushort bKey = sharedKeys[ixj];
+                    ushort aVal = sharedVals[i];
+                    ushort bVal = sharedVals[ixj];
+
+                    bool ascending = ((i & k) == 0);
+                    bool needSwap = ascending ? (aKey > bKey) : (aKey < bKey);
+
+                    if (needSwap) {
+                        sharedKeys[i] = bKey;
+                        sharedKeys[ixj] = aKey;
+                        sharedVals[i] = bVal;
+                        sharedVals[ixj] = aVal;
+                    }
+                }
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+        }
+    }
+
+    // Parallel write sorted local indices
+    for (uint i = localId; i < n; i += tgSize) {
+        sortedLocalIdx[start + i] = sharedVals[i];
+    }
+}
+
+// Scatter kernel variant that writes 16-bit depth keys for 16-bit sort
+kernel void localSortScatterSimd16(
+    const device CompactedGaussian* compacted [[buffer(0)]],
+    const device TileAssignmentHeader* header [[buffer(1)]],
+    device atomic_uint* tileCounters [[buffer(2)]],
+    const device uint* offsets [[buffer(3)]],
+    device ushort* depthKeys16 [[buffer(4)]],      // 16-bit depth keys
+    device uint* globalIndices [[buffer(5)]],       // local → global mapping
+    constant uint& tilesX [[buffer(6)]],
+    constant uint& maxCapacity [[buffer(7)]],
+    constant int& tileWidth [[buffer(8)]],
+    constant int& tileHeight [[buffer(9)]],
+    uint gid [[thread_position_in_grid]],
+    uint simd_lane [[thread_index_in_simdgroup]],
+    uint simd_group_id [[simdgroup_index_in_threadgroup]],
+    uint tg_id [[threadgroup_position_in_grid]]
+) {
+    uint visibleCount = atomic_load_explicit((const device atomic_uint*)&header->totalAssignments, memory_order_relaxed);
+
+    uint simd_groups_per_tg = 4;
+    uint global_simd_id = tg_id * simd_groups_per_tg + simd_group_id;
+    uint gaussianIdx = global_simd_id;
+
+    if (gaussianIdx >= visibleCount) return;
+
+    // Lane 0 loads gaussian data
+    CompactedGaussian g;
+    float3 conic = 0;
+    float2 center = 0;
+    float power = 0;
+    ushort depth16 = 0;
+    int minTX = 0, minTY = 0, maxTX = 0, maxTY = 0;
+
+    if (simd_lane == 0) {
+        g = compacted[gaussianIdx];
+        conic = g.covariance_depth.xyz;
+        center = g.position_color.xy;
+        half4 colorOp = localSortUnpackHalf4(g.position_color.zw);
+        power = localSortComputePower(float(colorOp.w));
+        // Convert depth to 16-bit (flip sign bit for proper sorting)
+        depth16 = ushort((as_type<uint>(g.covariance_depth.w) ^ 0x80000000u) >> 16u);
+        minTX = g.min_tile.x;
+        minTY = g.min_tile.y;
+        maxTX = g.max_tile.x;
+        maxTY = g.max_tile.y;
+    }
+
+    // Broadcast to all lanes
+    conic.x = simd_shuffle(conic.x, 0);
+    conic.y = simd_shuffle(conic.y, 0);
+    conic.z = simd_shuffle(conic.z, 0);
+    center.x = simd_shuffle(center.x, 0);
+    center.y = simd_shuffle(center.y, 0);
+    power = simd_shuffle(power, 0);
+    depth16 = simd_shuffle(depth16, 0);
+    minTX = simd_shuffle(minTX, 0);
+    minTY = simd_shuffle(minTY, 0);
+    maxTX = simd_shuffle(maxTX, 0);
+    maxTY = simd_shuffle(maxTY, 0);
+
+    int tileRangeX = maxTX - minTX;
+    int tileRangeY = maxTY - minTY;
+    int totalTiles = tileRangeX * tileRangeY;
+
+    for (int tileIdx = int(simd_lane); tileIdx < totalTiles; tileIdx += 32) {
+        int localY = tileIdx / tileRangeX;
+        int localX = tileIdx % tileRangeX;
+        int tx = minTX + localX;
+        int ty = minTY + localY;
+
+        int2 pix_min = int2(tx * tileWidth, ty * tileHeight);
+        int2 pix_max = int2(pix_min.x + tileWidth - 1, pix_min.y + tileHeight - 1);
+
+        bool valid = localSortBlockContainsCenter(pix_min, pix_max, center) ||
+                     localSortBlockIntersectEllipse(pix_min, pix_max, center, conic, power);
+
+        simd_vote ballot = simd_ballot(valid);
+        if (simd_vote::vote_t(ballot) == 0) continue;
+
+        if (valid) {
+            uint tileId = uint(ty) * tilesX + uint(tx);
+            uint localIdx = atomic_fetch_add_explicit(&tileCounters[tileId], 1u, memory_order_relaxed);
+            uint writePos = offsets[tileId] + localIdx;
+
+            if (writePos < maxCapacity) {
+                depthKeys16[writePos] = depth16;
+                globalIndices[writePos] = gaussianIdx;
+            }
+        }
+    }
+}
+
+// Render kernel variant that uses 16-bit sorted indices with indirection
+kernel void localSortRender16(
+    const device CompactedGaussian* compacted [[buffer(0)]],
+    const device uint* offsets [[buffer(1)]],
+    const device uint* counts [[buffer(2)]],
+    const device ushort* sortedLocalIdx [[buffer(3)]],  // Sorted local indices
+    const device uint* globalIndices [[buffer(4)]],      // Local → global mapping
+    texture2d<half, access::write> colorOut [[texture(0)]],
+    texture2d<half, access::write> depthOut [[texture(1)]],
+    constant RenderParams& params [[buffer(5)]],
+    uint2 groupId [[threadgroup_position_in_grid]],
+    uint2 localId [[thread_position_in_threadgroup]],
+    uint localIdx [[thread_index_in_threadgroup]],
+    uint simd_lane [[thread_index_in_simdgroup]]
+) {
+    threadgroup uint tileGaussianCount;
+    threadgroup uint tileDataOffset;
+
+    if (localIdx == 0) {
+        uint tileId = groupId.y * params.tilesX + groupId.x;
+        tileGaussianCount = counts[tileId];
+        tileDataOffset = offsets[tileId];
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    uint gaussCount = tileGaussianCount;
+    if (gaussCount == 0) return;
+
+    uint offset = tileDataOffset;
+
+    half px0 = half(groupId.x * LOCAL_SORT_TILE_WIDTH + localId.x * LOCAL_SORT_PIXELS_X);
+    half py0 = half(groupId.y * LOCAL_SORT_TILE_HEIGHT + localId.y * LOCAL_SORT_PIXELS_Y);
+
+    half3 c00 = 0, c10 = 0, c20 = 0, c30 = 0;
+    half3 c01 = 0, c11 = 0, c21 = 0, c31 = 0;
+    half t00 = 1, t10 = 1, t20 = 1, t30 = 1;
+    half t01 = 1, t11 = 1, t21 = 1, t31 = 1;
+
+    for (uint i = 0; i < gaussCount; ++i) {
+        // Two-level indirection: sortedLocalIdx → globalIndices → compacted
+        ushort localSortedIdx = sortedLocalIdx[offset + i];
+        uint gIdx = globalIndices[offset + localSortedIdx];
+        CompactedGaussian g = compacted[gIdx];
+
+        half2 gPos = half2(g.position_color.xy);
+        half3 cov = half3(g.covariance_depth.xyz);
+        half4 colorOp = localSortUnpackHalf4(g.position_color.zw);
+
+        half cxx = cov.x, cyy = cov.z, cxy2 = 2.0h * cov.y;
+        half3 gColor = colorOp.xyz;
+        half opacity = colorOp.w;
+
+        half dx0 = px0 - gPos.x, dx1 = px0 + 1.0h - gPos.x;
+        half dx2 = px0 + 2.0h - gPos.x, dx3 = px0 + 3.0h - gPos.x;
+        half dy0 = py0 - gPos.y, dy1 = py0 + 1.0h - gPos.y;
+
+        half p00 = dx0*dx0*cxx + dy0*dy0*cyy + dx0*dy0*cxy2;
+        half p10 = dx1*dx1*cxx + dy0*dy0*cyy + dx1*dy0*cxy2;
+        half p20 = dx2*dx2*cxx + dy0*dy0*cyy + dx2*dy0*cxy2;
+        half p30 = dx3*dx3*cxx + dy0*dy0*cyy + dx3*dy0*cxy2;
+        half p01 = dx0*dx0*cxx + dy1*dy1*cyy + dx0*dy1*cxy2;
+        half p11 = dx1*dx1*cxx + dy1*dy1*cyy + dx1*dy1*cxy2;
+        half p21 = dx2*dx2*cxx + dy1*dy1*cyy + dx2*dy1*cxy2;
+        half p31 = dx3*dx3*cxx + dy1*dy1*cyy + dx3*dy1*cxy2;
+
+        half a00 = min(opacity * exp(-0.5h * p00), 0.99h);
+        half a10 = min(opacity * exp(-0.5h * p10), 0.99h);
+        half a20 = min(opacity * exp(-0.5h * p20), 0.99h);
+        half a30 = min(opacity * exp(-0.5h * p30), 0.99h);
+        half a01 = min(opacity * exp(-0.5h * p01), 0.99h);
+        half a11 = min(opacity * exp(-0.5h * p11), 0.99h);
+        half a21 = min(opacity * exp(-0.5h * p21), 0.99h);
+        half a31 = min(opacity * exp(-0.5h * p31), 0.99h);
+
+        c00 += gColor * (a00 * t00); c10 += gColor * (a10 * t10);
+        c20 += gColor * (a20 * t20); c30 += gColor * (a30 * t30);
+        c01 += gColor * (a01 * t01); c11 += gColor * (a11 * t11);
+        c21 += gColor * (a21 * t21); c31 += gColor * (a31 * t31);
+
+        t00 *= (1.0h - a00); t10 *= (1.0h - a10);
+        t20 *= (1.0h - a20); t30 *= (1.0h - a30);
+        t01 *= (1.0h - a01); t11 *= (1.0h - a11);
+        t21 *= (1.0h - a21); t31 *= (1.0h - a31);
+
+        half maxT = max(max(max(t00, t10), max(t20, t30)),
+                       max(max(t01, t11), max(t21, t31)));
+        bool threadSaturated = maxT < 0.004h;
+        if (simd_all(threadSaturated)) break;
+    }
+
+    half bg = params.whiteBackground ? 1.0h : 0.0h;
+    c00 += t00 * bg; c10 += t10 * bg; c20 += t20 * bg; c30 += t30 * bg;
+    c01 += t01 * bg; c11 += t11 * bg; c21 += t21 * bg; c31 += t31 * bg;
+
+    uint w = params.width, h = params.height;
+    uint bx = uint(px0), by = uint(py0);
+
+    if (bx < w && by < h)     { colorOut.write(half4(c00, 1.0h - t00), uint2(bx, by));     depthOut.write(half4(0), uint2(bx, by)); }
+    if (bx+1 < w && by < h)   { colorOut.write(half4(c10, 1.0h - t10), uint2(bx+1, by));   depthOut.write(half4(0), uint2(bx+1, by)); }
+    if (bx+2 < w && by < h)   { colorOut.write(half4(c20, 1.0h - t20), uint2(bx+2, by));   depthOut.write(half4(0), uint2(bx+2, by)); }
+    if (bx+3 < w && by < h)   { colorOut.write(half4(c30, 1.0h - t30), uint2(bx+3, by));   depthOut.write(half4(0), uint2(bx+3, by)); }
+    if (bx < w && by+1 < h)   { colorOut.write(half4(c01, 1.0h - t01), uint2(bx, by+1));   depthOut.write(half4(0), uint2(bx, by+1)); }
+    if (bx+1 < w && by+1 < h) { colorOut.write(half4(c11, 1.0h - t11), uint2(bx+1, by+1)); depthOut.write(half4(0), uint2(bx+1, by+1)); }
+    if (bx+2 < w && by+1 < h) { colorOut.write(half4(c21, 1.0h - t21), uint2(bx+2, by+1)); depthOut.write(half4(0), uint2(bx+2, by+1)); }
+    if (bx+3 < w && by+1 < h) { colorOut.write(half4(c31, 1.0h - t31), uint2(bx+3, by+1)); depthOut.write(half4(0), uint2(bx+3, by+1)); }
+}
 
 kernel void localSortPerTileSort(
     device uint* keys [[buffer(0)]],
@@ -690,13 +979,6 @@ kernel void localSortPerTileSort(
 // KERNEL 6: RENDER (LocalSort-style, 8 pixels per thread)
 // =============================================================================
 // Optimized: No arrays (prevents spilling), half precision, direct memory access
-
-#define LOCAL_SORT_TILE_WIDTH 32
-#define LOCAL_SORT_TILE_HEIGHT 16
-#define LOCAL_SORT_TG_WIDTH 8
-#define LOCAL_SORT_TG_HEIGHT 8
-#define LOCAL_SORT_PIXELS_X 4
-#define LOCAL_SORT_PIXELS_Y 2
 
 kernel void localSortRender(
     const device CompactedGaussian* compacted [[buffer(0)]],

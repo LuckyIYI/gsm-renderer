@@ -11,17 +11,26 @@ public struct PackedWorldBuffers {
     }
 }
 
-/// Output buffer set for projection (packed render data + radii + mask)
+/// Output buffer set for fused projection (packed render data + bounds + mask)
+/// Note: radii buffer is no longer needed - tile bounds computed directly in projection
 public struct ProjectionOutput {
     public let renderData: MTLBuffer   // GaussianRenderData array (packed)
-    public let radii: MTLBuffer        // float array (for tileBounds)
+    public let bounds: MTLBuffer       // int4 array (tile bounds, replaces radii)
     public let mask: MTLBuffer         // uchar array (for culling)
 
-    public init(renderData: MTLBuffer, radii: MTLBuffer, mask: MTLBuffer) {
+    public init(renderData: MTLBuffer, bounds: MTLBuffer, mask: MTLBuffer) {
         self.renderData = renderData
-        self.radii = radii
+        self.bounds = bounds
         self.mask = mask
     }
+}
+
+/// Parameters for fused projection kernel (matches Metal struct)
+struct ProjectFusedParams {
+    var tileWidth: UInt32
+    var tileHeight: UInt32
+    var tilesX: UInt32
+    var tilesY: UInt32
 }
 
 final class ProjectEncoder {
@@ -44,7 +53,7 @@ final class ProjectEncoder {
     }
 
     init(device: MTLDevice, library: MTLLibrary) throws {
-        // Create pipelines for each SH degree, with and without cluster culling
+        // Create fused projection pipelines for each SH degree, with and without cluster culling
         for degree: UInt32 in 0...3 {
             // Without cluster culling (USE_CLUSTER_CULL=false)
             let noCullConstants = MTLFunctionConstantValues()
@@ -53,10 +62,10 @@ final class ProjectEncoder {
             noCullConstants.setConstantValue(&shDegree, type: .uint, index: 0)
             noCullConstants.setConstantValue(&useClusterCull, type: .bool, index: 1)
 
-            if let fn = try? library.makeFunction(name: "projectGaussiansKernel", constantValues: noCullConstants) {
+            if let fn = try? library.makeFunction(name: "projectGaussiansFusedKernel", constantValues: noCullConstants) {
                 self.floatPipelines[degree] = try? device.makeComputePipelineState(function: fn)
             }
-            if let fn = try? library.makeFunction(name: "projectGaussiansKernelHalf", constantValues: noCullConstants) {
+            if let fn = try? library.makeFunction(name: "projectGaussiansFusedKernelHalf", constantValues: noCullConstants) {
                 self.halfPipelines[degree] = try? device.makeComputePipelineState(function: fn)
             }
 
@@ -66,21 +75,25 @@ final class ProjectEncoder {
             cullConstants.setConstantValue(&shDegree, type: .uint, index: 0)
             cullConstants.setConstantValue(&useCull, type: .bool, index: 1)
 
-            if let fn = try? library.makeFunction(name: "projectGaussiansKernel", constantValues: cullConstants) {
+            if let fn = try? library.makeFunction(name: "projectGaussiansFusedKernel", constantValues: cullConstants) {
                 self.floatCullPipelines[degree] = try? device.makeComputePipelineState(function: fn)
             }
-            if let fn = try? library.makeFunction(name: "projectGaussiansKernelHalf", constantValues: cullConstants) {
+            if let fn = try? library.makeFunction(name: "projectGaussiansFusedKernelHalf", constantValues: cullConstants) {
                 self.halfCullPipelines[degree] = try? device.makeComputePipelineState(function: fn)
             }
         }
 
         guard floatPipelines[0] != nil else {
-            fatalError("Failed to create projection pipeline")
+            fatalError("Failed to create fused projection pipeline")
         }
     }
 
-    /// Encode projection - outputs to packed GaussianRenderData struct + radii + mask
+    /// Encode fused projection + tile bounds - outputs to packed GaussianRenderData struct + bounds + mask
     /// - Parameters:
+    ///   - tileWidth: Width of tiles in pixels
+    ///   - tileHeight: Height of tiles in pixels
+    ///   - tilesX: Number of tiles horizontally
+    ///   - tilesY: Number of tiles vertically
     ///   - clusterVisibility: Optional - when provided, enables skip-based cluster culling
     ///   - clusterSize: Size of clusters (only used when clusterVisibility is provided)
     ///   - useHalfWorld: If true, interpret input as PackedWorldGaussianHalf + half harmonics
@@ -90,12 +103,16 @@ final class ProjectEncoder {
         packedWorldBuffers: PackedWorldBuffers,
         cameraUniforms: CameraUniformsSwift,
         output: ProjectionOutput,
+        tileWidth: UInt32,
+        tileHeight: UInt32,
+        tilesX: UInt32,
+        tilesY: UInt32,
         clusterVisibility: MTLBuffer? = nil,
         clusterSize: UInt32 = 1024,
         useHalfWorld: Bool = false
     ) {
         guard let encoder = commandBuffer.makeComputeCommandEncoder() else { return }
-        encoder.label = clusterVisibility != nil ? "ProjectGaussians_Cull" : "ProjectGaussians"
+        encoder.label = clusterVisibility != nil ? "ProjectGaussiansFused_Cull" : "ProjectGaussiansFused"
 
         let shDegree = Self.shDegree(from: cameraUniforms.shComponents)
         let useClusterCull = clusterVisibility != nil
@@ -124,17 +141,26 @@ final class ProjectEncoder {
 
         // Output buffers
         encoder.setBuffer(output.renderData, offset: 0, index: 2)
-        encoder.setBuffer(output.radii, offset: 0, index: 3)
+        encoder.setBuffer(output.bounds, offset: 0, index: 3)  // int4 tile bounds (replaces radii)
         encoder.setBuffer(output.mask, offset: 0, index: 4)
 
         var cam = cameraUniforms
         encoder.setBytes(&cam, length: MemoryLayout<CameraUniformsSwift>.stride, index: 5)
 
+        // Tile parameters for fused tile bounds computation
+        var tileParams = ProjectFusedParams(
+            tileWidth: tileWidth,
+            tileHeight: tileHeight,
+            tilesX: tilesX,
+            tilesY: tilesY
+        )
+        encoder.setBytes(&tileParams, length: MemoryLayout<ProjectFusedParams>.stride, index: 6)
+
         // Cluster visibility (only bound when USE_CLUSTER_CULL=true pipeline is used)
         if let visibility = clusterVisibility {
-            encoder.setBuffer(visibility, offset: 0, index: 6)
+            encoder.setBuffer(visibility, offset: 0, index: 7)
             var size = clusterSize
-            encoder.setBytes(&size, length: MemoryLayout<UInt32>.stride, index: 7)
+            encoder.setBytes(&size, length: MemoryLayout<UInt32>.stride, index: 8)
         }
 
         let threads = MTLSize(width: gaussianCount, height: 1, depth: 1)

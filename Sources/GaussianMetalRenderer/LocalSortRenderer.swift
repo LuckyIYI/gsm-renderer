@@ -27,6 +27,10 @@ public final class LocalSortRenderer: GaussianRenderer, @unchecked Sendable {
     private var depthTexture: MTLTexture?
     private var gaussianRenderTexture: MTLTexture?
 
+    // 16-bit sort buffers (experimental - 50% less threadgroup memory)
+    private var depthKeys16Buffer: MTLBuffer?       // ushort buffer for 16-bit depth keys
+    private var sortedLocalIdx16Buffer: MTLBuffer?  // ushort buffer for sorted local indices
+
     // Current allocation sizes
     private var allocatedGaussianCapacity: Int = 0
     private var allocatedWidth: Int = 0
@@ -37,6 +41,8 @@ public final class LocalSortRenderer: GaussianRenderer, @unchecked Sendable {
     public var debugPrint: Bool = false
     public var useSharedBuffers: Bool = false
     public var useTexturedRender: Bool = false
+    /// Use 16-bit sort (experimental - 50% less threadgroup memory, slightly faster render)
+    public var use16BitSort: Bool = false
 
     // Renderer configuration
     private let config: RendererConfig
@@ -201,7 +207,14 @@ public final class LocalSortRenderer: GaussianRenderer, @unchecked Sendable {
             print("[LocalSortRenderer] Rendering \(gaussianCount) gaussians at \(width)x\(height)")
         }
 
+        let tileCount = tilesX * tilesY
+
+        // Check if 16-bit sort is available and enabled
+        let effective16BitSort = use16BitSort && encoder.has16BitSort &&
+            sortedLocalIdx16Buffer != nil && depthKeys16Buffer != nil
+
         // Standard pipeline with optional cluster visibility
+        // For 16-bit sort, we use 16-bit scatter and skip 32-bit sort
         encoder.encode(
             commandBuffer: commandBuffer,
             worldGaussians: worldGaussians,
@@ -224,15 +237,48 @@ public final class LocalSortRenderer: GaussianRenderer, @unchecked Sendable {
             maxCompacted: maxCompacted,
             maxAssignments: maxAssignments,
             useHalfWorld: useHalfWorld,
-            skipSort: false,
-            tempSortKeys: tempSortKeys,
-            tempSortIndices: tempSortIndices,
+            skipSort: effective16BitSort,  // Skip 32-bit sort if using 16-bit
+            tempSortKeys: effective16BitSort ? nil : tempSortKeys,
+            tempSortIndices: effective16BitSort ? nil : tempSortIndices,
             clusterVisibility: clusterVisibility,
-            clusterSize: clusterSize
+            clusterSize: clusterSize,
+            use16BitSort: effective16BitSort,
+            depthKeys16: depthKeys16Buffer
         )
 
-        // Encode render
-        if useTexturedRender, encoder.hasTexturedRender, let gaussianTex = gaussianRenderTexture {
+        // 16-bit sort path (experimental)
+        if effective16BitSort, let sortedLocal16 = sortedLocalIdx16Buffer, let depth16 = depthKeys16Buffer {
+            // 16-bit per-tile sort (8KB threadgroup vs 16KB)
+            encoder.encodeSort16(
+                commandBuffer: commandBuffer,
+                depthKeys16: depth16,       // ushort buffer with 16-bit depth keys
+                globalIndices: sortIndices,
+                sortedLocalIdx: sortedLocal16,
+                tileOffsets: tileOffsets,
+                tileCounts: tileCounts,
+                tileCount: tileCount
+            )
+
+            // 16-bit render (two-level indirection)
+            encoder.encodeRender16(
+                commandBuffer: commandBuffer,
+                compactedGaussians: compacted,
+                tileOffsets: tileOffsets,
+                tileCounts: tileCounts,
+                sortedLocalIdx: sortedLocal16,
+                globalIndices: sortIndices,
+                colorTexture: colorTex,
+                depthTexture: depthTex,
+                tilesX: tilesX,
+                tilesY: tilesY,
+                width: width,
+                height: height,
+                tileWidth: tileWidth,
+                tileHeight: tileHeight,
+                whiteBackground: whiteBackground
+            )
+        } else if useTexturedRender, encoder.hasTexturedRender, let gaussianTex = gaussianRenderTexture {
+            // Textured render path
             encoder.encodePackRenderTexture(
                 commandBuffer: commandBuffer,
                 compactedGaussians: compacted,
@@ -258,6 +304,7 @@ public final class LocalSortRenderer: GaussianRenderer, @unchecked Sendable {
                 whiteBackground: whiteBackground
             )
         } else {
+            // Standard 32-bit render path
             encoder.encodeRender(
                 commandBuffer: commandBuffer,
                 compactedGaussians: compacted,
@@ -345,6 +392,16 @@ public final class LocalSortRenderer: GaussianRenderer, @unchecked Sendable {
         )
         tempSortIndicesBuffer = device.makeBuffer(
             length: maxAssignments * MemoryLayout<UInt32>.stride,
+            options: priv
+        )
+
+        // 16-bit sort buffers (ushort = 2 bytes per element)
+        depthKeys16Buffer = device.makeBuffer(
+            length: maxAssignments * MemoryLayout<UInt16>.stride,
+            options: priv
+        )
+        sortedLocalIdx16Buffer = device.makeBuffer(
+            length: maxAssignments * MemoryLayout<UInt16>.stride,
             options: priv
         )
 

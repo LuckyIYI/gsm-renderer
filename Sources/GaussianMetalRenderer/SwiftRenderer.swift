@@ -239,7 +239,7 @@ public final class GlobalSortRenderer: GaussianRenderer, @unchecked Sendable {
     private var nextFrameCapturePath: String?
     
     // Encoders
-    let tileBoundsEncoder: TileBoundsEncoder
+    // Note: tileBoundsEncoder removed - tile bounds now computed in fused projection kernel
     let sortKeyGenEncoder: SortKeyGenEncoder
     let bitonicSortEncoder: BitonicSortEncoder
     let radixSortEncoder: RadixSortEncoder
@@ -276,7 +276,7 @@ public final class GlobalSortRenderer: GaussianRenderer, @unchecked Sendable {
     
     // Gaussian input (projection stage) buffers (Shared/Transient)
     private var gaussianMeansCache: MTLBuffer?
-    private var gaussianRadiiCache: MTLBuffer?
+    private var gaussianBoundsCache: MTLBuffer?  // int4 tile bounds (replaces radii)
     private var gaussianMaskCache: MTLBuffer?
     private var gaussianDepthsCache: MTLBuffer?
     private var gaussianConicsCache: MTLBuffer?
@@ -330,7 +330,7 @@ public final class GlobalSortRenderer: GaussianRenderer, @unchecked Sendable {
             self.library = library
             self.effectivePrecision = precision
 
-            self.tileBoundsEncoder = try TileBoundsEncoder(device: device, library: library)
+            // Note: tileBoundsEncoder removed - tile bounds now computed in fused projection kernel
             self.sortKeyGenEncoder = try SortKeyGenEncoder(device: device, library: library)
             self.bitonicSortEncoder = try BitonicSortEncoder(device: device, library: library, useIndirect: false)
             self.radixSortEncoder = try RadixSortEncoder(device: device, library: library)
@@ -433,8 +433,9 @@ public final class GlobalSortRenderer: GaussianRenderer, @unchecked Sendable {
             self.gaussianOpacitiesHalfCache = makeShared(g * 2, "GaussianOpacitiesHalf")
         }
 
-        // Radii and Mask always float (used for tile bounds in all modes)
-        self.gaussianRadiiCache = makeShared(g * 4, "GaussianRadii")
+        // Bounds (int4) and Mask (used for tile assignment in all modes)
+        // Note: radii no longer needed - tile bounds computed directly in fused projection
+        self.gaussianBoundsCache = makeShared(g * MemoryLayout<SIMD4<Int32>>.stride, "GaussianBounds")
         self.gaussianMaskCache = makeShared(g, "GaussianMask")
     }
 
@@ -709,12 +710,17 @@ public final class GlobalSortRenderer: GaussianRenderer, @unchecked Sendable {
             return nil
         }
 
+        // Fused projection + tile bounds (single pass)
         self.projectEncoder.encode(
             commandBuffer: commandBuffer,
             gaussianCount: gaussianCount,
             packedWorldBuffers: packedWorldBuffers,
             cameraUniforms: cameraUniforms,
             output: projectionOutput,
+            tileWidth: params.tileWidth,
+            tileHeight: params.tileHeight,
+            tilesX: params.tilesX,
+            tilesY: UInt32(limits.tilesY),
             useHalfWorld: effectivePrecision == .float16
         )
 
@@ -824,7 +830,7 @@ public final class GlobalSortRenderer: GaussianRenderer, @unchecked Sendable {
             fatalError("[encodeRenderToTextures] prepareProjectionOutput failed")
         }
 
-        // Project world gaussians to packed GaussianRenderData
+        // Fused projection + tile bounds (single pass)
         // (with optional cluster culling when mortonSorted=true)
         self.projectEncoder.encode(
             commandBuffer: commandBuffer,
@@ -832,6 +838,10 @@ public final class GlobalSortRenderer: GaussianRenderer, @unchecked Sendable {
             packedWorldBuffers: packedWorldBuffers,
             cameraUniforms: cameraUniforms,
             output: projectionOutput,
+            tileWidth: params.tileWidth,
+            tileHeight: params.tileHeight,
+            tilesX: params.tilesX,
+            tilesY: UInt32(limits.tilesY),
             clusterVisibility: clusterVisibility,
             clusterSize: clusterSize,
             useHalfWorld: effectivePrecision == .float16
@@ -913,12 +923,17 @@ public final class GlobalSortRenderer: GaussianRenderer, @unchecked Sendable {
             return false
         }
 
+        // Fused projection + tile bounds (single pass)
         self.projectEncoder.encode(
             commandBuffer: commandBuffer,
             gaussianCount: gaussianCount,
             packedWorldBuffers: packedWorldBuffers,
             cameraUniforms: cameraUniforms,
             output: projectionOutput,
+            tileWidth: params.tileWidth,
+            tileHeight: params.tileHeight,
+            tilesX: params.tilesX,
+            tilesY: UInt32(limits.tilesY),
             useHalfWorld: effectivePrecision == .float16
         )
 
@@ -1020,18 +1035,12 @@ public final class GlobalSortRenderer: GaussianRenderer, @unchecked Sendable {
 
         resetTileBuilderState(commandBuffer: commandBuffer, frame: frame)
 
-        // TileBounds - reads mean from packed GaussianRenderData
-        self.tileBoundsEncoder.encode(
-            commandBuffer: commandBuffer,
-            renderData: projectionOutput.renderData,
-            radii: projectionOutput.radii,
-            mask: projectionOutput.mask,
-            boundsBuffer: frame.boundsBuffer,
-            params: params,
-            gaussianCount: gaussianCount
-        )
+        // Note: tileBoundsEncoder removed - bounds already computed in fused projection kernel
+        // Copy bounds from projection output to frame's boundsBuffer for coverage+scatter
+        // Actually, we can use projectionOutput.bounds directly!
 
         // Fused coverage+scatter - reads mean/conic/opacity from packed GaussianRenderData
+        // Bounds are already computed in the fused projection kernel (projectionOutput.bounds)
         self.fusedCoverageScatterEncoderV2.encode(
             commandBuffer: commandBuffer,
             gaussianCount: gaussianCount,
@@ -1039,7 +1048,7 @@ public final class GlobalSortRenderer: GaussianRenderer, @unchecked Sendable {
             tileHeight: Int(params.tileHeight),
             tilesX: Int(params.tilesX),
             maxAssignments: frame.tileAssignmentMaxAssignments,
-            boundsBuffer: frame.boundsBuffer,
+            boundsBuffer: projectionOutput.bounds,  // Use bounds from fused projection (not frame.boundsBuffer)
             coverageBuffer: frame.coverageBuffer,
             renderData: projectionOutput.renderData,
             tileIndicesBuffer: frame.tileIndices,
@@ -1287,18 +1296,18 @@ public final class GlobalSortRenderer: GaussianRenderer, @unchecked Sendable {
 
     /* REMOVED: prepareWorldBuffers - was for C API with non-packed buffers */
     
-    /// Prepare ProjectionOutput for projection kernel output
-    /// Uses frame's interleavedGaussians for packed render data, shared caches for radii/mask
+    /// Prepare ProjectionOutput for fused projection kernel output
+    /// Uses frame's interleavedGaussians for packed render data, shared caches for bounds/mask
     internal func prepareProjectionOutput(frame: FrameResources) -> ProjectionOutput? {
         guard
             let renderData = frame.interleavedGaussians,
-            let radii = self.gaussianRadiiCache,
+            let bounds = self.gaussianBoundsCache,
             let mask = self.gaussianMaskCache
         else { return nil }
 
         return ProjectionOutput(
             renderData: renderData,
-            radii: radii,
+            bounds: bounds,  // int4 tile bounds (computed directly in fused projection)
             mask: mask
         )
     }

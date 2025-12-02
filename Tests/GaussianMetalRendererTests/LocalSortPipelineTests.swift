@@ -1532,4 +1532,245 @@ final class LocalSortPipelineTests: XCTestCase {
             gaussianCount: 0  // Will be set per-frame
         )
     }
+
+    // MARK: - 16-bit Sort Experimental Tests
+
+    /// Test 16-bit sort pipeline availability
+    func test16BitSortAvailable() throws {
+        let renderer = GlobalSortRenderer(limits: RendererLimits(maxGaussians: 1_000_000, maxWidth: 1024, maxHeight: 1024))
+        let device = renderer.device
+        let library = renderer.library
+
+        let encoder = try LocalSortPipelineEncoder(device: device, library: library)
+
+        if encoder.has16BitSort {
+            print("[16-bit Sort] Available ✓")
+        } else {
+            print("[16-bit Sort] Not available - kernels not found")
+        }
+
+        // This test just checks availability, doesn't fail
+    }
+
+    /// Test that 16-bit sort doesn't crash and produces valid output
+    func test16BitSortCorrectness() throws {
+        let device = MTLCreateSystemDefaultDevice()!
+        let queue = device.makeCommandQueue()!
+
+        // Create renderer with 16-bit sort enabled
+        let renderer = try LocalSortRenderer(device: device)
+        renderer.use16BitSort = true
+        renderer.useSharedBuffers = true  // Enable shared for debugging
+
+        let gaussianCount = 10_000
+        let width = 512
+        let height = 384
+
+        // Create shared input buffers
+        let worldBuffer = device.makeBuffer(
+            length: gaussianCount * MemoryLayout<PackedWorldGaussian>.stride,
+            options: .storageModeShared
+        )!
+        let harmonicsBuffer = device.makeBuffer(
+            length: gaussianCount * 3 * MemoryLayout<Float>.stride,
+            options: .storageModeShared
+        )!
+
+        // Populate test data with deterministic values
+        let worldPtr = worldBuffer.contents().bindMemory(to: PackedWorldGaussian.self, capacity: gaussianCount)
+        let harmonicsPtr = harmonicsBuffer.contents().bindMemory(to: Float.self, capacity: gaussianCount * 3)
+
+        srand48(42)  // Deterministic seed
+        for i in 0..<gaussianCount {
+            let x = Float(drand48()) * 10 - 5
+            let y = Float(drand48()) * 6 - 3
+            let z = Float(drand48()) * 8 + 2
+            let scale = Float(drand48()) * 0.09 + 0.01
+
+            worldPtr[i] = PackedWorldGaussian(
+                position: SIMD3<Float>(x, y, z),
+                scale: SIMD3<Float>(scale, scale, scale),
+                rotation: SIMD4<Float>(0, 0, 0, 1),
+                opacity: Float(drand48()) * 0.5 + 0.5
+            )
+
+            harmonicsPtr[i * 3 + 0] = Float(drand48())
+            harmonicsPtr[i * 3 + 1] = Float(drand48())
+            harmonicsPtr[i * 3 + 2] = Float(drand48())
+        }
+
+        let camera = CameraParams(
+            viewMatrix: simd_float4x4(1.0),
+            projectionMatrix: simd_float4x4(columns: (
+                SIMD4<Float>(2.0 / Float(width), 0, 0, 0),
+                SIMD4<Float>(0, 2.0 / Float(height), 0, 0),
+                SIMD4<Float>(0, 0, -0.02, 0),
+                SIMD4<Float>(0, 0, -1.0, 1)
+            )),
+            position: SIMD3<Float>(0, 0, 0),
+            focalX: Float(width) / 2.0,
+            focalY: Float(height) / 2.0
+        )
+
+        let input = GaussianInput(
+            gaussians: worldBuffer,
+            harmonics: harmonicsBuffer,
+            gaussianCount: gaussianCount,
+            shComponents: 0
+        )
+
+        // Render with 16-bit sort
+        guard let cb = queue.makeCommandBuffer() else {
+            XCTFail("Failed to create command buffer")
+            return
+        }
+
+        let result = renderer.render(
+            toTexture: cb,
+            input: input,
+            camera: camera,
+            width: width,
+            height: height,
+            whiteBackground: false,
+            mortonSorted: false
+        )
+
+        cb.commit()
+        cb.waitUntilCompleted()
+
+        // Check that render succeeded
+        XCTAssertNotNil(result, "16-bit sort render should succeed")
+
+        // Check command buffer status
+        XCTAssertEqual(cb.status, .completed, "Command buffer should complete without error")
+
+        let visibleCount = renderer.getVisibleCount()
+        let hadOverflow = renderer.hadOverflow()
+
+        print("\n╔═══════════════════════════════════════════════════════════════╗")
+        print("║  16-BIT SORT CORRECTNESS TEST                                  ║")
+        print("╠═══════════════════════════════════════════════════════════════╣")
+        print("║  Gaussians: \(gaussianCount)")
+        print("║  Resolution: \(width)x\(height)")
+        print("║  Visible count: \(visibleCount)")
+        print("║  Overflow: \(hadOverflow)")
+        print("║  Result: \(result != nil ? "SUCCESS" : "FAILED")")
+        print("╚═══════════════════════════════════════════════════════════════╝\n")
+
+        XCTAssertGreaterThan(visibleCount, 0, "Should have visible gaussians")
+        XCTAssertFalse(hadOverflow, "Should not overflow")
+    }
+
+    /// Benchmark 16-bit vs 32-bit full pipeline using LocalSortRenderer
+    func testSort16vs32Benchmark() throws {
+        let device = MTLCreateSystemDefaultDevice()!
+        let queue = device.makeCommandQueue()!
+
+        // Create two renderers - one 32-bit, one 16-bit
+        let renderer32 = try LocalSortRenderer(device: device)
+        let renderer16 = try LocalSortRenderer(device: device)
+        renderer16.use16BitSort = true
+
+        let gaussianCount = 500_000
+        let width = 1920
+        let height = 1080
+        let iterations = 10
+
+        // Create shared input buffers
+        let worldBuffer = device.makeBuffer(
+            length: gaussianCount * MemoryLayout<PackedWorldGaussian>.stride,
+            options: .storageModeShared
+        )!
+        let harmonicsBuffer = device.makeBuffer(
+            length: gaussianCount * 3 * MemoryLayout<Float>.stride,
+            options: .storageModeShared
+        )!
+
+        // Populate test data
+        populateTestData(worldBuffer: worldBuffer, harmonicsBuffer: harmonicsBuffer, count: gaussianCount)
+        let camera = createTestCamera()
+
+        let input = GaussianInput(
+            gaussians: worldBuffer,
+            harmonics: harmonicsBuffer,
+            gaussianCount: gaussianCount,
+            shComponents: 0
+        )
+
+        let cameraParams = CameraParams(
+            viewMatrix: camera.viewMatrix,
+            projectionMatrix: camera.projectionMatrix,
+            position: camera.cameraCenter,
+            focalX: camera.focalX,
+            focalY: camera.focalY
+        )
+
+        // Warm up both renderers
+        for _ in 0..<3 {
+            if let cb = queue.makeCommandBuffer() {
+                _ = renderer32.render(toTexture: cb, input: input, camera: cameraParams,
+                                      width: width, height: height, whiteBackground: false, mortonSorted: false)
+                cb.commit()
+                cb.waitUntilCompleted()
+            }
+            if let cb = queue.makeCommandBuffer() {
+                _ = renderer16.render(toTexture: cb, input: input, camera: cameraParams,
+                                      width: width, height: height, whiteBackground: false, mortonSorted: false)
+                cb.commit()
+                cb.waitUntilCompleted()
+            }
+        }
+
+        // Benchmark 32-bit full pipeline
+        var times32: [Double] = []
+        for _ in 0..<iterations {
+            guard let cb = queue.makeCommandBuffer() else { continue }
+            _ = renderer32.render(toTexture: cb, input: input, camera: cameraParams,
+                                  width: width, height: height, whiteBackground: false, mortonSorted: false)
+            cb.commit()
+            cb.waitUntilCompleted()
+            let gpuTime = cb.gpuEndTime - cb.gpuStartTime
+            if gpuTime > 0 { times32.append(gpuTime * 1000) }
+        }
+
+        // Benchmark 16-bit full pipeline
+        var times16: [Double] = []
+        for _ in 0..<iterations {
+            guard let cb = queue.makeCommandBuffer() else { continue }
+            _ = renderer16.render(toTexture: cb, input: input, camera: cameraParams,
+                                  width: width, height: height, whiteBackground: false, mortonSorted: false)
+            cb.commit()
+            cb.waitUntilCompleted()
+            let gpuTime = cb.gpuEndTime - cb.gpuStartTime
+            if gpuTime > 0 { times16.append(gpuTime * 1000) }
+        }
+
+        // Results
+        let avg32 = times32.reduce(0, +) / Double(max(1, times32.count))
+        let avg16 = times16.reduce(0, +) / Double(max(1, times16.count))
+        let speedup = avg32 > 0 ? ((avg32 - avg16) / avg32 * 100) : 0
+
+        let visibleCount32 = renderer32.getVisibleCount()
+        let visibleCount16 = renderer16.getVisibleCount()
+
+        print("\n╔═══════════════════════════════════════════════════════════════╗")
+        print("║  16-BIT vs 32-BIT FULL PIPELINE BENCHMARK                      ║")
+        print("╠═══════════════════════════════════════════════════════════════╣")
+        print("║  Gaussians: \(gaussianCount)")
+        print("║  Resolution: \(width)x\(height)")
+        print("║  Visible (32-bit): \(visibleCount32)")
+        print("║  Visible (16-bit): \(visibleCount16)")
+        print("╠═══════════════════════════════════════════════════════════════╣")
+        print("║  32-bit pipeline: \(String(format: "%.2f", avg32))ms")
+        print("║  16-bit pipeline: \(String(format: "%.2f", avg16))ms")
+        print("║  Speedup: \(String(format: "%.1f", speedup))%")
+        print("╠═══════════════════════════════════════════════════════════════╣")
+        print("║  Threadgroup memory:")
+        print("║    32-bit: 16KB (2048 × 4B × 2)")
+        print("║    16-bit: 8KB (2048 × 2B × 2)")
+        print("╚═══════════════════════════════════════════════════════════════╝\n")
+
+        // Verify both produce same visible count
+        XCTAssertEqual(visibleCount32, visibleCount16, "Both paths should produce same visible count")
+    }
 }

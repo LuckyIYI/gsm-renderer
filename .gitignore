@@ -7,3 +7,7 @@ DerivedData/
 .swiftpm/xcode/package.xcworkspace/contents.xcworkspacedata
 .netrc
 .claude/
+
+# Compiled Metal shaders
+*.metallib
+*.air

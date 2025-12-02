@@ -29,25 +29,33 @@ inline half4 getConic(const thread GaussianRenderData& g) { return half4(g.conic
 inline half3 getColor(const thread GaussianRenderData& g) { return half3(g.colorR, g.colorG, g.colorB); }
 
 // =============================================================================
-// PROJECTION KERNEL - Outputs to packed GaussianRenderData struct
-// Single coalesced read per gaussian, single write to packed output
-// Optional cluster culling via function constant (buffers 6-7 only bound when enabled)
+// FUSED PROJECTION + TILE BOUNDS KERNEL
+// Combines projection and tile bounds computation in a single pass
+// Eliminates separate radii buffer and tileBounds kernel dispatch
 // =============================================================================
 
 // Function constant for cluster culling (index 1, index 0 is SH_DEGREE)
 constant bool USE_CLUSTER_CULL [[function_constant(1)]];
 
+struct ProjectFusedParams {
+    uint tileWidth;
+    uint tileHeight;
+    uint tilesX;
+    uint tilesY;
+};
+
 template <typename PackedWorldT, typename HarmonicT, typename RenderDataT>
-kernel void projectGaussians(
+kernel void projectGaussiansFused(
     const device PackedWorldT* worldGaussians [[buffer(0)]],
     const device HarmonicT* harmonics [[buffer(1)]],
     device RenderDataT* outRenderData [[buffer(2)]],      // AoS packed output
-    device float* outRadii [[buffer(3)]],                 // Still separate for tileBounds
-    device uchar* outMask [[buffer(4)]],                  // Still separate for culling
+    device int4* outBounds [[buffer(3)]],                 // Tile bounds directly (replaces radii)
+    device uchar* outMask [[buffer(4)]],
     constant CameraUniforms& camera [[buffer(5)]],
+    constant ProjectFusedParams& tileParams [[buffer(6)]],
     // Optional cluster culling buffers (only bound when USE_CLUSTER_CULL is true)
-    const device uchar* clusterVisible [[buffer(6), function_constant(USE_CLUSTER_CULL)]],
-    constant uint& clusterSize [[buffer(7), function_constant(USE_CLUSTER_CULL)]],
+    const device uchar* clusterVisible [[buffer(7), function_constant(USE_CLUSTER_CULL)]],
+    constant uint& clusterSize [[buffer(8), function_constant(USE_CLUSTER_CULL)]],
     uint gid [[thread_position_in_grid]]
 ) {
     if (gid >= camera.gaussianCount) { return; }
@@ -57,13 +65,22 @@ kernel void projectGaussians(
         uint clusterId = gid / clusterSize;
         if (clusterVisible[clusterId] == 0) {
             outMask[gid] = 0;
-            outRadii[gid] = 0.0f;
+            outBounds[gid] = int4(0, -1, 0, -1);  // Empty bounds
             return;
         }
     }
 
     // SINGLE coalesced read for all core gaussian data
     PackedWorldT g = worldGaussians[gid];
+
+    // Early cull: skip tiny gaussians (scale < 0.001)
+    float3 scale = float3(g.sx, g.sy, g.sz);
+    float maxScale = max(scale.x, max(scale.y, scale.z));
+    if (maxScale < 0.0005f) {
+        outMask[gid] = 0;
+        outBounds[gid] = int4(0, -1, 0, -1);
+        return;
+    }
 
     // Extract and promote to float for computation accuracy
     float3 position = float3(g.px, g.py, g.pz);
@@ -72,14 +89,14 @@ kernel void projectGaussians(
 
     if (depth <= camera.nearPlane) {
         outMask[gid] = 0;
-        outRadii[gid] = 0.0f;
+        outBounds[gid] = int4(0, -1, 0, -1);
         return;
     }
 
     float4 clip = camera.projectionMatrix * viewPos4;
     if (fabs(clip.w) < 1e-6f) {
         outMask[gid] = 2;
-        outRadii[gid] = 0.0f;
+        outBounds[gid] = int4(0, -1, 0, -1);
         return;
     }
 
@@ -91,11 +108,10 @@ kernel void projectGaussians(
     float opacity = float(g.opacity);
     if (opacity < 1e-4f) {
         outMask[gid] = 0;
-        outRadii[gid] = 0.0f;
+        outBounds[gid] = int4(0, -1, 0, -1);
         return;
     }
 
-    float3 scale = float3(g.sx, g.sy, g.sz);
     float4 quat = normalizeQuaternion(getRotation(g));
     float3x3 cov3d = buildCovariance3D(scale, quat);
 
@@ -111,7 +127,7 @@ kernel void projectGaussians(
 
     if (radius < 0.5f) {
         outMask[gid] = 0;
-        outRadii[gid] = 0.0f;
+        outBounds[gid] = int4(0, -1, 0, -1);
         return;
     }
 
@@ -119,7 +135,7 @@ kernel void projectGaussians(
     if (px + radius < 0.0f || px - radius > camera.width ||
         py + radius < 0.0f || py - radius > camera.height) {
         outMask[gid] = 0;
-        outRadii[gid] = 0.0f;
+        outBounds[gid] = int4(0, -1, 0, -1);
         return;
     }
 
@@ -142,28 +158,51 @@ kernel void projectGaussians(
     renderData.depth = half(depth);
     outRenderData[gid] = renderData;
 
-    outRadii[gid] = radius;
+    // =========================================================================
+    // FUSED TILE BOUNDS COMPUTATION (previously separate tileBoundsKernel)
+    // =========================================================================
+    float xmin = px - radius;
+    float xmax = px + radius;
+    float ymin = py - radius;
+    float ymax = py + radius;
+
+    float maxW = camera.width - 1.0f;
+    float maxH = camera.height - 1.0f;
+
+    xmin = clamp(xmin, 0.0f, maxW);
+    xmax = clamp(xmax, 0.0f, maxW);
+    ymin = clamp(ymin, 0.0f, maxH);
+    ymax = clamp(ymax, 0.0f, maxH);
+
+    int minTileX = int(floor(xmin / float(tileParams.tileWidth)));
+    int maxTileX = int(ceil(xmax / float(tileParams.tileWidth))) - 1;
+    int minTileY = int(floor(ymin / float(tileParams.tileHeight)));
+    int maxTileY = int(ceil(ymax / float(tileParams.tileHeight))) - 1;
+
+    minTileX = max(minTileX, 0);
+    minTileY = max(minTileY, 0);
+    maxTileX = min(maxTileX, int(tileParams.tilesX) - 1);
+    maxTileY = min(maxTileY, int(tileParams.tilesY) - 1);
+
+    outBounds[gid] = int4(minTileX, maxTileX, minTileY, maxTileY);
     outMask[gid] = 1;
 }
 
-// Projection kernel instantiation (outputs to packed GaussianRenderData)
-// Note: clusterVisible and clusterSize are optional via function_constant(USE_CLUSTER_CULL)
-// When USE_CLUSTER_CULL=false, those parameters are not bound
-
+// Fused projection + tile bounds kernel instantiation
 // Float world input
-template [[host_name("projectGaussiansKernel")]]
-kernel void projectGaussians<PackedWorldGaussian, float, GaussianRenderData>(
+template [[host_name("projectGaussiansFusedKernel")]]
+kernel void projectGaussiansFused<PackedWorldGaussian, float, GaussianRenderData>(
     const device PackedWorldGaussian*, const device float*,
-    device GaussianRenderData*, device float*, device uchar*,
-    constant CameraUniforms&,
+    device GaussianRenderData*, device int4*, device uchar*,
+    constant CameraUniforms&, constant ProjectFusedParams&,
     const device uchar*, constant uint&, uint);
 
 // Half world input (for bandwidth optimization)
-template [[host_name("projectGaussiansKernelHalf")]]
-kernel void projectGaussians<PackedWorldGaussianHalf, half, GaussianRenderData>(
+template [[host_name("projectGaussiansFusedKernelHalf")]]
+kernel void projectGaussiansFused<PackedWorldGaussianHalf, half, GaussianRenderData>(
     const device PackedWorldGaussianHalf*, const device half*,
-    device GaussianRenderData*, device float*, device uchar*,
-    constant CameraUniforms&,
+    device GaussianRenderData*, device int4*, device uchar*,
+    constant CameraUniforms&, constant ProjectFusedParams&,
     const device uchar*, constant uint&, uint);
 
 // Fast exp approximation for Gaussian weight calculation
@@ -403,59 +442,8 @@ kernel void resetTileBuilderStateKernel(
     }
 }
 
-// Tile bounds kernel - reads mean from packed GaussianRenderData
-template <typename RenderDataT>
-kernel void tileBoundsKernel(
-    const device RenderDataT* renderData [[buffer(0)]],
-    const device float* radii [[buffer(1)]],
-    const device uchar* mask [[buffer(2)]],
-    device int4* bounds [[buffer(3)]],
-    constant TileBoundsParams& params [[buffer(4)]],
-    uint idx [[thread_position_in_grid]]
-) {
-    if (idx >= params.gaussianCount) {
-        return;
-    }
-    if (mask[idx] == 0) {
-        bounds[idx] = int4(0, -1, 0, -1);
-        return;
-    }
-
-    float2 mean = float2(getMean(renderData[idx]));
-    float radius = radii[idx];
-
-    float xmin = mean.x - radius;
-    float xmax = mean.x + radius;
-    float ymin = mean.y - radius;
-    float ymax = mean.y + radius;
-
-    float maxW = float(params.width - 1);
-    float maxH = float(params.height - 1);
-
-    xmin = clamp(xmin, 0.0f, maxW);
-    xmax = clamp(xmax, 0.0f, maxW);
-    ymin = clamp(ymin, 0.0f, maxH);
-    ymax = clamp(ymax, 0.0f, maxH);
-
-    int minX = (int)floor(xmin / float(params.tileWidth));
-    int maxX = (int)ceil(xmax / float(params.tileWidth)) - 1;
-    int minY = (int)floor(ymin / float(params.tileHeight));
-    int maxY = (int)ceil(ymax / float(params.tileHeight)) - 1;
-
-    minX = max(minX, 0);
-    minY = max(minY, 0);
-    maxX = min(maxX, int(params.tilesX) - 1);
-    maxY = min(maxY, int(params.tilesY) - 1);
-
-    bounds[idx] = int4(minX, maxX, minY, maxY);
-}
-
-template [[host_name("tileBoundsKernel")]]
-kernel void tileBoundsKernel<GaussianRenderData>(
-    const device GaussianRenderData*, const device float*, const device uchar*,
-    device int4*, constant TileBoundsParams&, uint);
-
-// Ellipse intersection functions are now in GaussianHelpers.h
+// Note: tileBoundsKernel has been removed - tile bounds are now computed
+// directly in projectGaussiansFused kernel, eliminating the separate pass
 
 // Sort key generation - reads depth from packed GaussianRenderData
 template <typename RenderDataT>

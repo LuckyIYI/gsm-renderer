@@ -38,12 +38,18 @@ final class ProjectionTests: XCTestCase {
         XCTAssertEqual(stride, 32, "GaussianRenderDataSwift should be 32 bytes stride")
 
         let renderDataOut = device.makeBuffer(length: count * stride, options: .storageModeShared)!
-        let radiiOut = device.makeBuffer(length: count * 4, options: .storageModeShared)!
+        let boundsOut = device.makeBuffer(length: count * MemoryLayout<SIMD4<Int32>>.stride, options: .storageModeShared)!
         let maskOut = device.makeBuffer(length: count, options: .storageModeShared)!
+
+        // Tile parameters for fused projection
+        let tileWidth: UInt32 = 16
+        let tileHeight: UInt32 = 16
+        let tilesX: UInt32 = (100 + 15) / 16  // width=100
+        let tilesY: UInt32 = (100 + 15) / 16  // height=100
 
         let projectionOutput = ProjectionOutput(
             renderData: renderDataOut,
-            radii: radiiOut,
+            bounds: boundsOut,
             mask: maskOut
         )
 
@@ -54,17 +60,22 @@ final class ProjectionTests: XCTestCase {
             packedWorldBuffers: packedWorldBuffers,
             cameraUniforms: camera,
             output: projectionOutput,
+            tileWidth: tileWidth,
+            tileHeight: tileHeight,
+            tilesX: tilesX,
+            tilesY: tilesY,
             useHalfWorld: false
         )
         commandBuffer.commit()
         commandBuffer.waitUntilCompleted()
 
         let renderData = renderDataOut.contents().bindMemory(to: GaussianRenderDataSwift.self, capacity: count)
-        let radii = radiiOut.contents().bindMemory(to: Float.self, capacity: 1)
+        let bounds = boundsOut.contents().bindMemory(to: SIMD4<Int32>.self, capacity: 1)
         let mask = maskOut.contents().bindMemory(to: UInt8.self, capacity: 1)
 
         XCTAssertEqual(mask[0], 1, "Gaussian should be visible")
-        XCTAssertGreaterThan(radii[0], 0.0, "Radius should be positive")
+        // Bounds should be valid (minX <= maxX, minY <= maxY)
+        XCTAssertLessThanOrEqual(bounds[0].x, bounds[0].y, "Bounds minX <= maxX")
 
         let g = renderData[0]
         XCTAssertEqual(g.mean.x, 49.5, accuracy: 0.5, "Mean X should be ~49.5")
@@ -104,12 +115,18 @@ final class ProjectionTests: XCTestCase {
 
         let stride = MemoryLayout<GaussianRenderDataSwift>.stride
         let renderDataOut = device.makeBuffer(length: count * stride, options: .storageModeShared)!
-        let radiiOut = device.makeBuffer(length: count * 4, options: .storageModeShared)!
+        let boundsOut = device.makeBuffer(length: count * MemoryLayout<SIMD4<Int32>>.stride, options: .storageModeShared)!
         let maskOut = device.makeBuffer(length: count, options: .storageModeShared)!
+
+        // Tile parameters for fused projection
+        let tileWidth: UInt32 = 16
+        let tileHeight: UInt32 = 16
+        let tilesX: UInt32 = (100 + 15) / 16
+        let tilesY: UInt32 = (100 + 15) / 16
 
         let projectionOutput = ProjectionOutput(
             renderData: renderDataOut,
-            radii: radiiOut,
+            bounds: boundsOut,
             mask: maskOut
         )
 
@@ -120,6 +137,10 @@ final class ProjectionTests: XCTestCase {
             packedWorldBuffers: packedWorldBuffers,
             cameraUniforms: camera,
             output: projectionOutput,
+            tileWidth: tileWidth,
+            tileHeight: tileHeight,
+            tilesX: tilesX,
+            tilesY: tilesY,
             useHalfWorld: false
         )
         commandBuffer.commit()
@@ -127,12 +148,13 @@ final class ProjectionTests: XCTestCase {
 
         let renderData = renderDataOut.contents().bindMemory(to: GaussianRenderDataSwift.self, capacity: count)
         let mask = maskOut.contents().bindMemory(to: UInt8.self, capacity: count)
-        let radii = radiiOut.contents().bindMemory(to: Float.self, capacity: count)
+        let bounds = boundsOut.contents().bindMemory(to: SIMD4<Int32>.self, capacity: count)
 
         let expectedDepths: [Float] = [10.0, 10.0, 15.0, 8.0]
         for i in 0..<count {
             XCTAssertEqual(mask[i], 1, "Gaussian \(i) should be visible")
-            XCTAssertGreaterThan(radii[i], 0, "Gaussian \(i) should have positive radius")
+            // Bounds should be valid (minX <= maxX for visible gaussians)
+            XCTAssertLessThanOrEqual(bounds[i].x, bounds[i].y, "Gaussian \(i) bounds minX <= maxX")
             XCTAssertEqual(Float(renderData[i].depth), expectedDepths[i], accuracy: 0.5, "Gaussian \(i) depth")
         }
     }
@@ -173,12 +195,18 @@ final class ProjectionTests: XCTestCase {
 
         let stride = MemoryLayout<GaussianRenderDataSwift>.stride
         let renderDataOut = device.makeBuffer(length: count * stride, options: .storageModeShared)!
-        let radiiOut = device.makeBuffer(length: count * 4, options: .storageModeShared)!
+        let boundsOut = device.makeBuffer(length: count * MemoryLayout<SIMD4<Int32>>.stride, options: .storageModeShared)!
         let maskOut = device.makeBuffer(length: count, options: .storageModeShared)!
+
+        // Tile parameters for fused projection
+        let tileWidth: UInt32 = 16
+        let tileHeight: UInt32 = 16
+        let tilesX: UInt32 = (100 + 15) / 16
+        let tilesY: UInt32 = (100 + 15) / 16
 
         let projectionOutput = ProjectionOutput(
             renderData: renderDataOut,
-            radii: radiiOut,
+            bounds: boundsOut,
             mask: maskOut
         )
 
@@ -189,6 +217,10 @@ final class ProjectionTests: XCTestCase {
             packedWorldBuffers: packedWorldBuffers,
             cameraUniforms: camera,
             output: projectionOutput,
+            tileWidth: tileWidth,
+            tileHeight: tileHeight,
+            tilesX: tilesX,
+            tilesY: tilesY,
             useHalfWorld: true
         )
         commandBuffer.commit()
@@ -196,12 +228,13 @@ final class ProjectionTests: XCTestCase {
 
         let renderData = renderDataOut.contents().bindMemory(to: GaussianRenderDataSwift.self, capacity: count)
         let mask = maskOut.contents().bindMemory(to: UInt8.self, capacity: count)
-        let radii = radiiOut.contents().bindMemory(to: Float.self, capacity: count)
+        let bounds = boundsOut.contents().bindMemory(to: SIMD4<Int32>.self, capacity: count)
 
         let expectedDepths: [Float] = [10.0, 10.0, 15.0, 8.0]
         for i in 0..<count {
             XCTAssertEqual(mask[i], 1, "Gaussian \(i) should be visible")
-            XCTAssertGreaterThan(radii[i], 0, "Gaussian \(i) should have positive radius")
+            // Bounds should be valid (minX <= maxX for visible gaussians)
+            XCTAssertLessThanOrEqual(bounds[i].x, bounds[i].y, "Gaussian \(i) bounds minX <= maxX")
             XCTAssertEqual(Float(renderData[i].depth), expectedDepths[i], accuracy: 0.5, "Gaussian \(i) depth")
         }
     }

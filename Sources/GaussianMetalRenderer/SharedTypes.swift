@@ -56,13 +56,6 @@ public struct FusedCoverageScatterParamsSwift {
     }
 }
 
-
-// PackParamsSwift - Swift-only (no C equivalent)
-public struct PackParamsSwift {
-    public var totalAssignments: UInt32
-    public var padding: UInt32 = 0
-}
-
 // RenderDispatchParamsSwift - Swift-only (no C equivalent)
 public struct RenderDispatchParamsSwift {
     public var tileCount: UInt32

@@ -119,6 +119,32 @@ public protocol GaussianRenderer: AnyObject, Sendable {
     var device: MTLDevice { get }
 
     /// Render to GPU textures (fastest path, no CPU readback)
+    /// - Parameter mortonSorted: If true, enables cluster-level culling optimization for Morton-sorted gaussians
+    func render(
+        toTexture commandBuffer: MTLCommandBuffer,
+        input: GaussianInput,
+        camera: CameraParams,
+        width: Int,
+        height: Int,
+        whiteBackground: Bool,
+        mortonSorted: Bool
+    ) -> TextureRenderResult?
+
+    /// Render to CPU-readable buffers
+    /// - Parameter mortonSorted: If true, enables cluster-level culling optimization for Morton-sorted gaussians
+    func render(
+        toBuffer commandBuffer: MTLCommandBuffer,
+        input: GaussianInput,
+        camera: CameraParams,
+        width: Int,
+        height: Int,
+        whiteBackground: Bool,
+        mortonSorted: Bool
+    ) -> BufferRenderResult?
+}
+
+/// Default parameter extension
+public extension GaussianRenderer {
     func render(
         toTexture commandBuffer: MTLCommandBuffer,
         input: GaussianInput,
@@ -126,9 +152,11 @@ public protocol GaussianRenderer: AnyObject, Sendable {
         width: Int,
         height: Int,
         whiteBackground: Bool
-    ) -> TextureRenderResult?
+    ) -> TextureRenderResult? {
+        render(toTexture: commandBuffer, input: input, camera: camera,
+               width: width, height: height, whiteBackground: whiteBackground, mortonSorted: false)
+    }
 
-    /// Render to CPU-readable buffers
     func render(
         toBuffer commandBuffer: MTLCommandBuffer,
         input: GaussianInput,
@@ -136,7 +164,10 @@ public protocol GaussianRenderer: AnyObject, Sendable {
         width: Int,
         height: Int,
         whiteBackground: Bool
-    ) -> BufferRenderResult?
+    ) -> BufferRenderResult? {
+        render(toBuffer: commandBuffer, input: input, camera: camera,
+               width: width, height: height, whiteBackground: whiteBackground, mortonSorted: false)
+    }
 }
 
 // MARK: - Errors

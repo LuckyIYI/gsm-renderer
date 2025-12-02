@@ -8,6 +8,9 @@
 #include "GaussianHelpers.h"
 using namespace metal;
 
+// Function constant for optional cluster culling (index 1, matches GaussianMetalRenderer.metal)
+constant bool USE_CLUSTER_CULL [[function_constant(1)]];
+
 // SH constants and computeSHColor function now defined in GaussianShared.h
 // Math helpers (matrixFromRows, normalizeQuaternion, buildCovariance3D, projectCovariance,
 // computeConicAndRadius) now defined in GaussianHelpers.h
@@ -146,6 +149,7 @@ kernel void localSortClear(
 // KERNEL 2: FUSED PROJECT + COMPACT + COUNT
 // =============================================================================
 // Templated on world gaussian type and harmonics type for maximum flexibility
+// Optional cluster culling via USE_CLUSTER_CULL function constant
 
 template <typename PackedWorldT, typename HarmonicsT>
 kernel void localSortProjectCompactCount(
@@ -156,9 +160,18 @@ kernel void localSortProjectCompactCount(
     device atomic_uint* tileCounts [[buffer(4)]],
     constant CameraUniforms& camera [[buffer(5)]],
     constant TileBinningParams& params [[buffer(6)]],
+    // Optional cluster culling buffers (only bound when USE_CLUSTER_CULL is true)
+    const device uchar* clusterVisible [[buffer(7), function_constant(USE_CLUSTER_CULL)]],
+    constant uint& clusterSize [[buffer(8), function_constant(USE_CLUSTER_CULL)]],
     uint gid [[thread_position_in_grid]]
 ) {
     if (gid >= params.gaussianCount) return;
+
+    // Skip-based cluster culling (only when enabled via function constant)
+    if (USE_CLUSTER_CULL) {
+        uint clusterId = gid / clusterSize;
+        if (clusterVisible[clusterId] == 0) return;
+    }
 
     // Load
     PackedWorldT g = worldGaussians[gid];
@@ -266,15 +279,17 @@ kernel void localSortProjectCompactCount(
 }
 
 // Instantiate all combinations: World(float/half) x Harmonics(float/half)
-// Uses shared structures from GaussianStructs.h: PackedWorldGaussian, PackedWorldGaussianHalf, CameraUniforms
+// Note: clusterVisible and clusterSize are optional via function_constant(USE_CLUSTER_CULL)
+// When USE_CLUSTER_CULL=false, those parameters are not bound
 
-// Float world, float harmonics (original)
+// Float world, float harmonics
 template [[host_name("localSortProjectCompactCountFloat")]]
 kernel void localSortProjectCompactCount<PackedWorldGaussian, float>(
     const device PackedWorldGaussian*, const device float*,
     device CompactedGaussian*, device TileAssignmentHeader*,
     device atomic_uint*, constant CameraUniforms&,
-    constant TileBinningParams&, uint);
+    constant TileBinningParams&,
+    const device uchar*, constant uint&, uint);
 
 // Half world, float harmonics
 template [[host_name("localSortProjectCompactCountHalf")]]
@@ -282,15 +297,17 @@ kernel void localSortProjectCompactCount<PackedWorldGaussianHalf, float>(
     const device PackedWorldGaussianHalf*, const device float*,
     device CompactedGaussian*, device TileAssignmentHeader*,
     device atomic_uint*, constant CameraUniforms&,
-    constant TileBinningParams&, uint);
+    constant TileBinningParams&,
+    const device uchar*, constant uint&, uint);
 
-// Float world, half harmonics (memory bandwidth optimization)
+// Float world, half harmonics
 template [[host_name("localSortProjectCompactCountFloatHalfSh")]]
 kernel void localSortProjectCompactCount<PackedWorldGaussian, half>(
     const device PackedWorldGaussian*, const device half*,
     device CompactedGaussian*, device TileAssignmentHeader*,
     device atomic_uint*, constant CameraUniforms&,
-    constant TileBinningParams&, uint);
+    constant TileBinningParams&,
+    const device uchar*, constant uint&, uint);
 
 // Half world, half harmonics (full half precision pipeline)
 template [[host_name("localSortProjectCompactCountHalfHalfSh")]]
@@ -298,7 +315,8 @@ kernel void localSortProjectCompactCount<PackedWorldGaussianHalf, half>(
     const device PackedWorldGaussianHalf*, const device half*,
     device CompactedGaussian*, device TileAssignmentHeader*,
     device atomic_uint*, constant CameraUniforms&,
-    constant TileBinningParams&, uint);
+    constant TileBinningParams&,
+    const device uchar*, constant uint&, uint);
 
 // =============================================================================
 // KERNEL 3: PREFIX SCAN (reuse from main file or inline simple version)
@@ -590,9 +608,10 @@ kernel void localSortScatterSimd(
 // =============================================================================
 // Fast bitonic sort with SIMD optimizations
 // Uses packed key-value pairs to reduce memory traffic
-// 4096 elements * 4 bytes * 2 arrays = 32KB (fits in threadgroup memory)
+// 2048 elements * 4 bytes * 2 arrays = 16KB (safely fits in threadgroup memory)
+// Reduced from 4096 to avoid potential memory issues on some GPUs
 
-#define SORT_MAX_SIZE 4096
+#define SORT_MAX_SIZE 2048
 
 kernel void localSortPerTileSort(
     device uint* keys [[buffer(0)]],

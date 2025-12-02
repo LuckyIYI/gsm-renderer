@@ -59,3 +59,22 @@ xcrun -sdk $SDK metallib \
 
 echo "Done: $LIB3"
 
+# ClusterCull shaders (cluster-level culling for Morton-sorted gaussians)
+SRC4="Sources/GaussianMetalRenderer/ClusterCullShaders.metal"
+AIR4="Sources/GaussianMetalRenderer/ClusterCullShaders.air"
+LIB4="Sources/GaussianMetalRenderer/ClusterCullShaders.metallib"
+
+echo ""
+echo "Compiling ClusterCull Shaders..."
+xcrun -sdk $SDK metal \
+  -frecord-sources -gline-tables-only \
+  -c "$SRC4" \
+  -o "$AIR4"
+
+echo "Linking ClusterCull Metal Library..."
+xcrun -sdk $SDK metallib \
+  "$AIR4" \
+  -o "$LIB4"
+
+echo "Done: $LIB4"
+

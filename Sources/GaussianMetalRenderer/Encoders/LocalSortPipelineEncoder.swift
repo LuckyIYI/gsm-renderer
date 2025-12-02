@@ -8,15 +8,23 @@ public final class LocalSortPipelineEncoder {
     private let device: MTLDevice
     private let localSortLibrary: MTLLibrary
 
+    /// Public access to the Metal library for shared encoders (e.g., ClusterCullEncoder)
+    public var library: MTLLibrary { localSortLibrary }
+
     // Pipeline states from LocalSortShaders.metallib
     private let clearPipeline: MTLComputePipelineState
     private let projectCompactCountPipeline: MTLComputePipelineState
     private let projectCompactCountHalfPipeline: MTLComputePipelineState?
 
     // SH degree-specific pipelines (function constants for unrolled loops)
-    // Key: SH degree (0-3)
-    private var projectPipelinesBySHDegree: [UInt32: MTLComputePipelineState] = [:]
-    private var projectHalfPipelinesBySHDegree: [UInt32: MTLComputePipelineState] = [:]
+    // Key: (SH degree, USE_CLUSTER_CULL) - 8 variants per precision
+    private var projectFloatPipelines: [UInt64: MTLComputePipelineState] = [:]  // Float world
+    private var projectHalfPipelines: [UInt64: MTLComputePipelineState] = [:]   // Half world
+
+    /// Create pipeline key from SH degree and cluster cull flag
+    private static func pipelineKey(shDegree: UInt32, useClusterCull: Bool) -> UInt64 {
+        return UInt64(shDegree) | (useClusterCull ? 0x100 : 0)
+    }
     private let prefixScanPipeline: MTLComputePipelineState
     private let scanPartialSumsPipeline: MTLComputePipelineState
     private let finalizeScanPipeline: MTLComputePipelineState
@@ -55,10 +63,12 @@ public final class LocalSortPipelineEncoder {
         self.localSortLibrary = library
 
         // Load all kernel functions
-        // Default function constant values (degree 3 = 16 SH coeffs, for functions that use SH)
+        // Default function constant values (degree 3 = 16 SH coeffs, no cluster cull)
         let defaultConstants = MTLFunctionConstantValues()
         var defaultDegree: UInt32 = 3
-        defaultConstants.setConstantValue(&defaultDegree, type: .uint, index: 0)
+        var defaultCull: Bool = false
+        defaultConstants.setConstantValue(&defaultDegree, type: .uint, index: 0)  // SH_DEGREE
+        defaultConstants.setConstantValue(&defaultCull, type: .bool, index: 1)    // USE_CLUSTER_CULL
 
         guard let clearFn = library.makeFunction(name: "localSortClear"),
               let projectFn = try? library.makeFunction(name: "localSortProjectCompactCountFloat", constantValues: defaultConstants),
@@ -91,21 +101,26 @@ public final class LocalSortPipelineEncoder {
             self.projectCompactCountHalfPipeline = nil
         }
 
-        // Create SH degree-specific pipeline variants (function constants for unrolled loops)
-        // This gives significant speedup by allowing the compiler to fully unroll SH loops
+        // Create all pipeline variants: SH degree (0-3) x cluster cull (true/false) x precision (float/half)
         for degree: UInt32 in 0...3 {
-            let constantValues = MTLFunctionConstantValues()
-            var shDegree = degree
-            constantValues.setConstantValue(&shDegree, type: .uint, index: 0) // SH_DEGREE at index 0
+            for useClusterCull in [false, true] {
+                let constantValues = MTLFunctionConstantValues()
+                var shDegree = degree
+                var cullEnabled = useClusterCull
+                constantValues.setConstantValue(&shDegree, type: .uint, index: 0)      // SH_DEGREE
+                constantValues.setConstantValue(&cullEnabled, type: .bool, index: 1)   // USE_CLUSTER_CULL
 
-            // Float world + float harmonics variant
-            if let fn = try? library.makeFunction(name: "localSortProjectCompactCountFloat", constantValues: constantValues) {
-                self.projectPipelinesBySHDegree[degree] = try? device.makeComputePipelineState(function: fn)
-            }
+                let key = Self.pipelineKey(shDegree: degree, useClusterCull: useClusterCull)
 
-            // Half world + half harmonics variant
-            if let fn = try? library.makeFunction(name: "localSortProjectCompactCountHalfHalfSh", constantValues: constantValues) {
-                self.projectHalfPipelinesBySHDegree[degree] = try? device.makeComputePipelineState(function: fn)
+                // Float world pipeline
+                if let fn = try? library.makeFunction(name: "localSortProjectCompactCountFloat", constantValues: constantValues) {
+                    self.projectFloatPipelines[key] = try? device.makeComputePipelineState(function: fn)
+                }
+
+                // Half world pipeline
+                if let fn = try? library.makeFunction(name: "localSortProjectCompactCountHalfHalfSh", constantValues: constantValues) {
+                    self.projectHalfPipelines[key] = try? device.makeComputePipelineState(function: fn)
+                }
             }
         }
 
@@ -161,7 +176,10 @@ public final class LocalSortPipelineEncoder {
         skipSort: Bool = false,
         // For sort
         tempSortKeys: MTLBuffer? = nil,
-        tempSortIndices: MTLBuffer? = nil
+        tempSortIndices: MTLBuffer? = nil,
+        // Skip-based cluster culling (no compaction)
+        clusterVisibility: MTLBuffer? = nil,
+        clusterSize: UInt32 = 1024
     ) {
         let tileCount = tilesX * tilesY
         let elementsPerGroup = prefixBlockSize * prefixGrainSize
@@ -201,15 +219,18 @@ public final class LocalSortPipelineEncoder {
 
         // === 2. PROJECT + COMPACT + COUNT ===
         if let encoder = commandBuffer.makeComputeCommandEncoder() {
-            encoder.label = "LocalSort_ProjectCompactCount"
+            encoder.label = clusterVisibility != nil ? "LocalSort_ProjectCompactCount_Cull" : "LocalSort_ProjectCompactCount"
 
-            // Select pipeline with SH function constant for optimized unrolled loops
+            // Select pipeline - unified kernel with function constants for SH degree and cluster cull
             let shDegree = Self.shDegree(from: camera.shComponents)
+            let useClusterCull = clusterVisibility != nil
+            let key = Self.pipelineKey(shDegree: shDegree, useClusterCull: useClusterCull)
+
             let pipeline: MTLComputePipelineState
             if useHalfWorld {
-                pipeline = projectHalfPipelinesBySHDegree[shDegree] ?? projectCompactCountHalfPipeline ?? projectCompactCountPipeline
+                pipeline = projectHalfPipelines[key] ?? projectCompactCountHalfPipeline ?? projectCompactCountPipeline
             } else {
-                pipeline = projectPipelinesBySHDegree[shDegree] ?? projectCompactCountPipeline
+                pipeline = projectFloatPipelines[key] ?? projectCompactCountPipeline
             }
             encoder.setComputePipelineState(pipeline)
 
@@ -221,8 +242,15 @@ public final class LocalSortPipelineEncoder {
             encoder.setBytes(&cameraUniforms, length: MemoryLayout<CameraUniformsSwift>.stride, index: 5)
             encoder.setBytes(&params, length: MemoryLayout<ProjectCompactParamsSwift>.stride, index: 6)
 
-            let threads = MTLSize(width: gaussianCount, height: 1, depth: 1)
+            // Add cluster visibility buffer for skip-based culling
+            if let visibilityBuffer = clusterVisibility {
+                encoder.setBuffer(visibilityBuffer, offset: 0, index: 7)
+                var clusterSizeVar = clusterSize
+                encoder.setBytes(&clusterSizeVar, length: MemoryLayout<UInt32>.stride, index: 8)
+            }
+
             let tg = MTLSize(width: pipeline.threadExecutionWidth, height: 1, depth: 1)
+            let threads = MTLSize(width: gaussianCount, height: 1, depth: 1)
             encoder.dispatchThreads(threads, threadsPerThreadgroup: tg)
             encoder.endEncoding()
         }
@@ -564,13 +592,15 @@ public final class LocalSortPipelineEncoder {
         if let encoder = commandBuffer.makeComputeCommandEncoder() {
             encoder.label = "LocalSort_ProjectCompactCount"
 
-            // Select pipeline with SH function constant for optimized unrolled loops
+            // Select pipeline with SH function constant (no cluster cull in this method)
             let shDegree = Self.shDegree(from: camera.shComponents)
+            let key = Self.pipelineKey(shDegree: shDegree, useClusterCull: false)
+
             let pipeline: MTLComputePipelineState
             if useHalfWorld {
-                pipeline = projectHalfPipelinesBySHDegree[shDegree] ?? projectCompactCountHalfPipeline ?? projectCompactCountPipeline
+                pipeline = projectHalfPipelines[key] ?? projectCompactCountHalfPipeline ?? projectCompactCountPipeline
             } else {
-                pipeline = projectPipelinesBySHDegree[shDegree] ?? projectCompactCountPipeline
+                pipeline = projectFloatPipelines[key] ?? projectCompactCountPipeline
             }
             encoder.setComputePipelineState(pipeline)
 

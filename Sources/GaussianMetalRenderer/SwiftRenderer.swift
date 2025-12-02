@@ -254,6 +254,9 @@ public final class GlobalSortRenderer: GaussianRenderer, @unchecked Sendable {
     // SIMD-optimized fused coverage+scatter V2 encoder
     let fusedCoverageScatterEncoderV2: FusedCoverageScatterEncoderV2
 
+    // Skip-based cluster culling encoder for Morton-sorted gaussians
+    private var clusterCullEncoder: ClusterCullEncoder?
+
     // Reset tile builder state pipeline (replaces blit for lower overhead)
     private let resetTileBuilderStatePipeline: MTLComputePipelineState
     
@@ -454,13 +457,15 @@ public final class GlobalSortRenderer: GaussianRenderer, @unchecked Sendable {
     // MARK: - GaussianRenderer Protocol Methods
 
     /// Render to GPU textures (protocol method)
+    /// - Parameter mortonSorted: If true, enables cluster-level culling optimization for Morton-sorted gaussians
     public func render(
         toTexture commandBuffer: MTLCommandBuffer,
         input: GaussianInput,
         camera: CameraParams,
         width: Int,
         height: Int,
-        whiteBackground: Bool
+        whiteBackground: Bool,
+        mortonSorted: Bool
     ) -> TextureRenderResult? {
         let cameraUniforms = CameraUniformsSwift(
             viewMatrix: camera.viewMatrix,
@@ -492,20 +497,23 @@ public final class GlobalSortRenderer: GaussianRenderer, @unchecked Sendable {
             gaussianCount: input.gaussianCount,
             packedWorldBuffers: packedWorld,
             cameraUniforms: cameraUniforms,
-            frameParams: frameParams
+            frameParams: frameParams,
+            mortonSorted: mortonSorted
         ) else { return nil }
 
         return TextureRenderResult(color: output.color, depth: output.depth, alpha: nil)
     }
 
     /// Render to CPU-readable buffers (protocol method)
+    /// - Parameter mortonSorted: If true, enables cluster-level culling optimization for Morton-sorted gaussians
     public func render(
         toBuffer commandBuffer: MTLCommandBuffer,
         input: GaussianInput,
         camera: CameraParams,
         width: Int,
         height: Int,
-        whiteBackground: Bool
+        whiteBackground: Bool,
+        mortonSorted: Bool
     ) -> BufferRenderResult? {
         let cameraUniforms = CameraUniformsSwift(
             viewMatrix: camera.viewMatrix,
@@ -532,6 +540,7 @@ public final class GlobalSortRenderer: GaussianRenderer, @unchecked Sendable {
             harmonics: input.harmonics
         )
 
+        // Note: Buffer render path doesn't support mortonSorted yet
         guard let output = encodeRender(
             commandBuffer: commandBuffer,
             gaussianCount: input.gaussianCount,
@@ -671,7 +680,7 @@ public final class GlobalSortRenderer: GaussianRenderer, @unchecked Sendable {
        and were for the disabled C API. Use encodeRender/encodeRenderToTextures instead.
     */
 
-    public func encodeRender(
+    func encodeRender(
         commandBuffer: MTLCommandBuffer,
         gaussianCount: Int,
         packedWorldBuffers: PackedWorldBuffers,
@@ -758,13 +767,39 @@ public final class GlobalSortRenderer: GaussianRenderer, @unchecked Sendable {
     }
     
     /// Render to textures using packed GaussianRenderData pipeline
-    public func encodeRenderToTextures(
+    /// - Parameter mortonSorted: If true, enables cluster-level culling optimization for Morton-sorted gaussians
+    func encodeRenderToTextures(
         commandBuffer: MTLCommandBuffer,
         gaussianCount: Int,
         packedWorldBuffers: PackedWorldBuffers,
         cameraUniforms: CameraUniformsSwift,
-        frameParams: FrameParams
+        frameParams: FrameParams,
+        mortonSorted: Bool = false
     ) -> RenderOutputTextures? {
+        // Prepare cluster visibility if Morton-sorted (optional optimization)
+        var clusterVisibility: MTLBuffer? = nil
+        var clusterSize: UInt32 = 1024
+
+        if mortonSorted {
+            // Initialize cluster cull encoder if needed
+            if clusterCullEncoder == nil {
+                clusterCullEncoder = try? ClusterCullEncoder(device: device)
+            }
+            if let cullEncoder = clusterCullEncoder {
+                let bytesPerGaussian = packedWorldBuffers.packedGaussians.length / gaussianCount
+                let inputIsHalf = bytesPerGaussian <= 24
+                clusterVisibility = cullEncoder.encodeCull(
+                    commandBuffer: commandBuffer,
+                    worldGaussians: packedWorldBuffers.packedGaussians,
+                    gaussianCount: gaussianCount,
+                    viewMatrix: cameraUniforms.viewMatrix,
+                    projectionMatrix: cameraUniforms.projectionMatrix,
+                    useHalfWorld: inputIsHalf
+                )
+                clusterSize = cullEncoder.clusterSize
+            }
+        }
+
         let params = limits.buildParams(from: frameParams)
         guard self.validateLimits(gaussianCount: gaussianCount) else {
             fatalError("[encodeRenderToTextures] validateLimits failed")
@@ -790,12 +825,15 @@ public final class GlobalSortRenderer: GaussianRenderer, @unchecked Sendable {
         }
 
         // Project world gaussians to packed GaussianRenderData
+        // (with optional cluster culling when mortonSorted=true)
         self.projectEncoder.encode(
             commandBuffer: commandBuffer,
             gaussianCount: gaussianCount,
             packedWorldBuffers: packedWorldBuffers,
             cameraUniforms: cameraUniforms,
             output: projectionOutput,
+            clusterVisibility: clusterVisibility,
+            clusterSize: clusterSize,
             useHalfWorld: effectivePrecision == .float16
         )
 
@@ -853,7 +891,7 @@ public final class GlobalSortRenderer: GaussianRenderer, @unchecked Sendable {
 
     /// Render to user-provided texture (most direct path).
     /// Allows GSViewer to pass its own drawable texture for zero-copy rendering.
-    public func encodeRenderToTargetTexture(
+    func encodeRenderToTargetTexture(
         commandBuffer: MTLCommandBuffer,
         gaussianCount: Int,
         packedWorldBuffers: PackedWorldBuffers,

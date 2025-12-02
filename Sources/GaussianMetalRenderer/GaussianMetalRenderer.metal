@@ -31,7 +31,11 @@ inline half3 getColor(const thread GaussianRenderData& g) { return half3(g.color
 // =============================================================================
 // PROJECTION KERNEL - Outputs to packed GaussianRenderData struct
 // Single coalesced read per gaussian, single write to packed output
+// Optional cluster culling via function constant (buffers 6-7 only bound when enabled)
 // =============================================================================
+
+// Function constant for cluster culling (index 1, index 0 is SH_DEGREE)
+constant bool USE_CLUSTER_CULL [[function_constant(1)]];
 
 template <typename PackedWorldT, typename HarmonicT, typename RenderDataT>
 kernel void projectGaussians(
@@ -41,9 +45,22 @@ kernel void projectGaussians(
     device float* outRadii [[buffer(3)]],                 // Still separate for tileBounds
     device uchar* outMask [[buffer(4)]],                  // Still separate for culling
     constant CameraUniforms& camera [[buffer(5)]],
+    // Optional cluster culling buffers (only bound when USE_CLUSTER_CULL is true)
+    const device uchar* clusterVisible [[buffer(6), function_constant(USE_CLUSTER_CULL)]],
+    constant uint& clusterSize [[buffer(7), function_constant(USE_CLUSTER_CULL)]],
     uint gid [[thread_position_in_grid]]
 ) {
     if (gid >= camera.gaussianCount) { return; }
+
+    // Skip-based cluster culling (only when enabled via function constant)
+    if (USE_CLUSTER_CULL) {
+        uint clusterId = gid / clusterSize;
+        if (clusterVisible[clusterId] == 0) {
+            outMask[gid] = 0;
+            outRadii[gid] = 0.0f;
+            return;
+        }
+    }
 
     // SINGLE coalesced read for all core gaussian data
     PackedWorldT g = worldGaussians[gid];
@@ -130,19 +147,24 @@ kernel void projectGaussians(
 }
 
 // Projection kernel instantiation (outputs to packed GaussianRenderData)
+// Note: clusterVisible and clusterSize are optional via function_constant(USE_CLUSTER_CULL)
+// When USE_CLUSTER_CULL=false, those parameters are not bound
+
 // Float world input
 template [[host_name("projectGaussiansKernel")]]
 kernel void projectGaussians<PackedWorldGaussian, float, GaussianRenderData>(
     const device PackedWorldGaussian*, const device float*,
     device GaussianRenderData*, device float*, device uchar*,
-    constant CameraUniforms&, uint);
+    constant CameraUniforms&,
+    const device uchar*, constant uint&, uint);
 
 // Half world input (for bandwidth optimization)
 template [[host_name("projectGaussiansKernelHalf")]]
 kernel void projectGaussians<PackedWorldGaussianHalf, half, GaussianRenderData>(
     const device PackedWorldGaussianHalf*, const device half*,
     device GaussianRenderData*, device float*, device uchar*,
-    constant CameraUniforms&, uint);
+    constant CameraUniforms&,
+    const device uchar*, constant uint&, uint);
 
 // Fast exp approximation for Gaussian weight calculation
 // Uses Schraudolph's method - accurate enough for alpha blending
@@ -469,70 +491,6 @@ kernel void computeSortKeysKernel<GaussianRenderData>(
     const device int*, const device int*, const device GaussianRenderData*,
     device uint2*, device int*, const device TileAssignmentHeader&, uint);
 
-struct PackParams {
-    uint totalAssignments;
-    uint padding;
-};
-
-// Template for packTileDataKernel:
-// InT, InVec2, InVec4, InPacked3 - Input types (from gaussian buffers)
-// OutT, OutVec2, OutVec4, OutPacked3 - Output types (to packed buffers)
-template <typename InT, typename InVec2, typename InVec4, typename InPacked3,
-          typename OutT, typename OutVec2, typename OutVec4, typename OutPacked3>
-kernel void packTileDataKernel(
-    const device int* sortedIndices [[buffer(0)]],
-    const device InVec2* means [[buffer(1)]],
-    const device InVec4* conics [[buffer(2)]],
-    const device InPacked3* colors [[buffer(3)]],
-    const device InT* opacities [[buffer(4)]],
-    const device InT* depths [[buffer(5)]],
-    device OutVec2* outMeans [[buffer(6)]],
-    device OutVec4* outConics [[buffer(7)]],
-    device OutPacked3* outColors [[buffer(8)]],
-    device OutT* outOpacities [[buffer(9)]],
-    device OutT* outDepths [[buffer(10)]],
-    const device TileAssignmentHeader* header [[buffer(11)]],
-    const device int* tileIndices [[buffer(12)]],
-    const device int* tileIds [[buffer(13)]],
-    uint gid [[thread_position_in_grid]]
-) {
-    uint total = header->totalAssignments;
-    if (gid >= total) { return; }
-    int src = sortedIndices[gid];
-    if (src < 0) { return; }
-    outMeans[gid] = OutVec2(float2(means[src]));
-    outConics[gid] = OutVec4(float4(conics[src]));
-    outColors[gid] = OutPacked3(float3(colors[src]));
-    outOpacities[gid] = OutT(float(opacities[src]));
-    outDepths[gid] = OutT(float(depths[src]));
-}
-
-#define instantiate_packTileDataKernel(name, hostName, InT, InVec2, InVec4, InPacked3, OutT, OutVec2, OutVec4, OutPacked3) \
-    template [[host_name(hostName)]] \
-    kernel void packTileDataKernel<InT, InVec2, InVec4, InPacked3, OutT, OutVec2, OutVec4, OutPacked3>( \
-        const device int* sortedIndices [[buffer(0)]], \
-        const device InVec2* means [[buffer(1)]], \
-        const device InVec4* conics [[buffer(2)]], \
-        const device InPacked3* colors [[buffer(3)]], \
-        const device InT* opacities [[buffer(4)]], \
-        const device InT* depths [[buffer(5)]], \
-        device OutVec2* outMeans [[buffer(6)]], \
-        device OutVec4* outConics [[buffer(7)]], \
-        device OutPacked3* outColors [[buffer(8)]], \
-        device OutT* outOpacities [[buffer(9)]], \
-        device OutT* outDepths [[buffer(10)]], \
-        const device TileAssignmentHeader* header [[buffer(11)]], \
-        const device int* tileIndices [[buffer(12)]], \
-        const device int* tileIds [[buffer(13)]], \
-        uint gid [[thread_position_in_grid]] \
-    );
-
-// float input -> float output
-instantiate_packTileDataKernel(float, "packTileDataKernelFloat", float, float2, float4, packed_float3, float, float2, float4, packed_float3)
-// half input -> half output
-instantiate_packTileDataKernel(half, "packTileDataKernelHalf", half, half2, half4, packed_half3, half, half2, half4, packed_half3)
-
-#undef instantiate_packTileDataKernel
 
 kernel void buildHeadersFromSortedKernel(
     const device uint2* sortedKeys [[buffer(0)]],

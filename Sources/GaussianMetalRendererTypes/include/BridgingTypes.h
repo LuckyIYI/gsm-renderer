@@ -208,6 +208,31 @@ typedef struct {
 } BitonicParams;
 
 // =============================================================================
+// CLUSTER CULLING (Morton-sorted optimization)
+// =============================================================================
+
+#define CLUSTER_SIZE 1024  // Gaussians per cluster (larger = fewer clusters = faster cull)
+
+typedef struct {
+    simd_float3 minBounds;
+    float       _pad0;
+    simd_float3 maxBounds;
+    float       _pad1;
+} ClusterAABB;  // 32 bytes, aligned
+
+typedef struct {
+    simd_float4 planes[6];  // left, right, bottom, top, near, far
+                            // Each plane: (nx, ny, nz, d) where dot(n, p) + d >= 0 is inside
+} FrustumPlanes;  // 96 bytes
+
+typedef struct {
+    UINT32 totalGaussians;
+    UINT32 clusterCount;
+    UINT32 gaussiansPerCluster;
+    UINT32 shComponents;
+} ClusterCullParams;
+
+// =============================================================================
 // DISPATCH SLOTS ENUM
 // =============================================================================
 

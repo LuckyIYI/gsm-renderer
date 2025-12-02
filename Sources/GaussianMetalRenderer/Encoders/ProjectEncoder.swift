@@ -25,10 +25,13 @@ public struct ProjectionOutput {
 }
 
 final class ProjectEncoder {
-    // Float world input pipelines (by SH degree)
-    private var pipelinesBySHDegree: [UInt32: MTLComputePipelineState] = [:]
-    // Half world input pipelines (by SH degree)
-    private var halfPipelinesBySHDegree: [UInt32: MTLComputePipelineState] = [:]
+    // Pipelines without cluster culling (USE_CLUSTER_CULL=false)
+    private var floatPipelines: [UInt32: MTLComputePipelineState] = [:]
+    private var halfPipelines: [UInt32: MTLComputePipelineState] = [:]
+
+    // Pipelines with cluster culling (USE_CLUSTER_CULL=true)
+    private var floatCullPipelines: [UInt32: MTLComputePipelineState] = [:]
+    private var halfCullPipelines: [UInt32: MTLComputePipelineState] = [:]
 
     /// Map shComponents count to SH degree (0-3)
     private static func shDegree(from shComponents: UInt32) -> UInt32 {
@@ -41,49 +44,76 @@ final class ProjectEncoder {
     }
 
     init(device: MTLDevice, library: MTLLibrary) throws {
-        // Create SH degree-specific pipeline variants (function constants for unrolled loops)
+        // Create pipelines for each SH degree, with and without cluster culling
         for degree: UInt32 in 0...3 {
-            let constantValues = MTLFunctionConstantValues()
+            // Without cluster culling (USE_CLUSTER_CULL=false)
+            let noCullConstants = MTLFunctionConstantValues()
             var shDegree = degree
-            constantValues.setConstantValue(&shDegree, type: .uint, index: 0)
+            var useClusterCull = false
+            noCullConstants.setConstantValue(&shDegree, type: .uint, index: 0)
+            noCullConstants.setConstantValue(&useClusterCull, type: .bool, index: 1)
 
-            // Float world input
-            if let fn = try? library.makeFunction(name: "projectGaussiansKernel", constantValues: constantValues) {
-                self.pipelinesBySHDegree[degree] = try? device.makeComputePipelineState(function: fn)
+            if let fn = try? library.makeFunction(name: "projectGaussiansKernel", constantValues: noCullConstants) {
+                self.floatPipelines[degree] = try? device.makeComputePipelineState(function: fn)
+            }
+            if let fn = try? library.makeFunction(name: "projectGaussiansKernelHalf", constantValues: noCullConstants) {
+                self.halfPipelines[degree] = try? device.makeComputePipelineState(function: fn)
             }
 
-            // Half world input
-            if let fn = try? library.makeFunction(name: "projectGaussiansKernelHalf", constantValues: constantValues) {
-                self.halfPipelinesBySHDegree[degree] = try? device.makeComputePipelineState(function: fn)
+            // With cluster culling (USE_CLUSTER_CULL=true)
+            let cullConstants = MTLFunctionConstantValues()
+            var useCull = true
+            cullConstants.setConstantValue(&shDegree, type: .uint, index: 0)
+            cullConstants.setConstantValue(&useCull, type: .bool, index: 1)
+
+            if let fn = try? library.makeFunction(name: "projectGaussiansKernel", constantValues: cullConstants) {
+                self.floatCullPipelines[degree] = try? device.makeComputePipelineState(function: fn)
+            }
+            if let fn = try? library.makeFunction(name: "projectGaussiansKernelHalf", constantValues: cullConstants) {
+                self.halfCullPipelines[degree] = try? device.makeComputePipelineState(function: fn)
             }
         }
 
-        guard pipelinesBySHDegree[0] != nil else {
+        guard floatPipelines[0] != nil else {
             fatalError("Failed to create projection pipeline")
         }
     }
 
     /// Encode projection - outputs to packed GaussianRenderData struct + radii + mask
-    /// - useHalfWorld: If true, interpret input as PackedWorldGaussianHalf + half harmonics
+    /// - Parameters:
+    ///   - clusterVisibility: Optional - when provided, enables skip-based cluster culling
+    ///   - clusterSize: Size of clusters (only used when clusterVisibility is provided)
+    ///   - useHalfWorld: If true, interpret input as PackedWorldGaussianHalf + half harmonics
     func encode(
         commandBuffer: MTLCommandBuffer,
         gaussianCount: Int,
         packedWorldBuffers: PackedWorldBuffers,
         cameraUniforms: CameraUniformsSwift,
         output: ProjectionOutput,
+        clusterVisibility: MTLBuffer? = nil,
+        clusterSize: UInt32 = 1024,
         useHalfWorld: Bool = false
     ) {
         guard let encoder = commandBuffer.makeComputeCommandEncoder() else { return }
-        encoder.label = "ProjectGaussians"
+        encoder.label = clusterVisibility != nil ? "ProjectGaussians_Cull" : "ProjectGaussians"
 
         let shDegree = Self.shDegree(from: cameraUniforms.shComponents)
+        let useClusterCull = clusterVisibility != nil
 
-        // Select pipeline based on input precision (like LocalSort)
+        // Select pipeline based on precision and culling mode
         let pipeline: MTLComputePipelineState
-        if useHalfWorld {
-            pipeline = halfPipelinesBySHDegree[shDegree] ?? halfPipelinesBySHDegree[0] ?? pipelinesBySHDegree[0]!
+        if useClusterCull {
+            if useHalfWorld {
+                pipeline = halfCullPipelines[shDegree] ?? halfCullPipelines[0] ?? floatCullPipelines[0]!
+            } else {
+                pipeline = floatCullPipelines[shDegree] ?? floatCullPipelines[0]!
+            }
         } else {
-            pipeline = pipelinesBySHDegree[shDegree] ?? pipelinesBySHDegree[0]!
+            if useHalfWorld {
+                pipeline = halfPipelines[shDegree] ?? halfPipelines[0] ?? floatPipelines[0]!
+            } else {
+                pipeline = floatPipelines[shDegree] ?? floatPipelines[0]!
+            }
         }
 
         encoder.setComputePipelineState(pipeline)
@@ -99,6 +129,13 @@ final class ProjectEncoder {
 
         var cam = cameraUniforms
         encoder.setBytes(&cam, length: MemoryLayout<CameraUniformsSwift>.stride, index: 5)
+
+        // Cluster visibility (only bound when USE_CLUSTER_CULL=true pipeline is used)
+        if let visibility = clusterVisibility {
+            encoder.setBuffer(visibility, offset: 0, index: 6)
+            var size = clusterSize
+            encoder.setBytes(&size, length: MemoryLayout<UInt32>.stride, index: 7)
+        }
 
         let threads = MTLSize(width: gaussianCount, height: 1, depth: 1)
         let tg = MTLSize(width: pipeline.threadExecutionWidth, height: 1, depth: 1)

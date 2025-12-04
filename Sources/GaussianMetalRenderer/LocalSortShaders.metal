@@ -198,6 +198,14 @@ kernel void localSortProjectCompactCount(
     // Cull: low opacity - match original pipeline
     if (opacity < 1e-4f) return;
 
+    // ==========================================================================
+    // OPACITY CONTRIBUTION FILTER - Skip gaussians that can't contribute meaningfully
+    // Even at gaussian center (power=0), alpha = opacity * exp(0) = opacity
+    // If opacity is too low, no pixel will get meaningful contribution
+    // Threshold ~1/255 = 0.004 (below visible quantization level)
+    // ==========================================================================
+    if (opacity < 0.004f) return;
+
     // Project - match original pipeline convention exactly
     float4 clip = camera.projectionMatrix * viewPos;
     if (fabs(clip.w) < 1e-6f) return;
@@ -228,7 +236,15 @@ kernel void localSortProjectCompactCount(
 
     if (radius < 0.5f) return;
 
-    // Tile bounds - ALIGNED WITH TEMPORAL PIPELINE
+    // ==========================================================================
+    // TOTAL INK FILTER - Skip gaussians with negligible total contribution
+    // Total integrated alpha = opacity × 2π / √det  (the gaussian's "total ink")
+    // If total ink is too small, the gaussian can't meaningfully contribute anywhere
+    // ==========================================================================
+    float det = conic.x * conic.z - conic.y * conic.y;
+    float totalInk = opacity * 6.283185f / sqrt(max(det, 1e-6f));
+    if (totalInk < 3.0f) return;  // Less than 1 unit of alpha total
+
     // 1. Clamp pixel coords to screen bounds first
     float maxW = float(params.surfaceWidth - 1);
     float maxH = float(params.surfaceHeight - 1);
@@ -276,6 +292,7 @@ kernel void localSortProjectCompactCount(
     compacted[idx].position_color = float4(px, py, localSortPackHalf4(half4(half3(color), half(opacity))));
     compacted[idx].min_tile = minTile;
     compacted[idx].max_tile = maxTile;
+    compacted[idx].originalIdx = gid;  // Store world buffer index for deterministic sorting
 }
 
 // Instantiate all combinations: World(float/half) x Harmonics(float/half)
@@ -468,30 +485,6 @@ kernel void localSortPrepareScatterDispatch(
     dispatchArgs->threadgroupsPerGrid[2] = 1;
 }
 
-// =============================================================================
-// KERNEL 4a: COMPUTE PER-GAUSSIAN TILE COUNTS (for balanced scatter)
-// =============================================================================
-
-kernel void localSortComputeGaussianTileCounts(
-    const device CompactedGaussian* compacted [[buffer(0)]],
-    const device TileAssignmentHeader* header [[buffer(1)]],
-    device uint* gaussianTileCounts [[buffer(2)]],  // Output: tiles per gaussian
-    uint gid [[thread_position_in_grid]]
-) {
-    uint visibleCount = atomic_load_explicit((const device atomic_uint*)&header->totalAssignments, memory_order_relaxed);
-    if (gid >= visibleCount) {
-        gaussianTileCounts[gid] = 0;
-        return;
-    }
-
-    CompactedGaussian g = compacted[gid];
-    int2 minTile = g.min_tile;
-    int2 maxTile = g.max_tile;
-
-    uint tileCount = uint(maxTile.x - minTile.x) * uint(maxTile.y - minTile.y);
-    gaussianTileCounts[gid] = tileCount;
-}
-
 
 // =============================================================================
 // KERNEL 4: SIMD-COOPERATIVE SCATTER (FlashGS-style)
@@ -537,20 +530,24 @@ kernel void localSortScatterSimd(
     uint depthKey = 0;
     int minTX = 0, minTY = 0, maxTX = 0, maxTY = 0;
 
+    float opacity = 0;
     if (simd_lane == 0) {
         g = compacted[gaussianIdx];
         conic = g.covariance_depth.xyz;
         center = g.position_color.xy;
         half4 colorOp = localSortUnpackHalf4(g.position_color.zw);
-        power = localSortComputePower(float(colorOp.w));
-        // 32-bit stable key: (depth16 << 16) | compactedIdx for deterministic tie-breaking
+        opacity = float(colorOp.w);
+        power = localSortComputePower(opacity);
+        // 32-bit stable key: (depth16 << 16) | originalIdx for deterministic tie-breaking
+        // Use originalIdx (world buffer index) instead of compactedIdx to ensure determinism
         uint depth16 = ((as_type<uint>(g.covariance_depth.w) ^ 0x80000000u) >> 16u) & 0xFFFFu;
-        depthKey = (depth16 << 16) | (gaussianIdx & 0xFFFFu);
+        depthKey = (depth16 << 16) | (g.originalIdx & 0xFFFFu);
         minTX = g.min_tile.x;
         minTY = g.min_tile.y;
         maxTX = g.max_tile.x;
         maxTY = g.max_tile.y;
     }
+    opacity = simd_shuffle(opacity, 0);
 
     // Broadcast to all lanes in SIMD group
     conic.x = simd_shuffle(conic.x, 0);
@@ -611,74 +608,88 @@ kernel void localSortScatterSimd(
 // 2048 elements * 4 bytes * 2 arrays = 16KB (safely fits in threadgroup memory)
 // Reduced from 4096 to avoid potential memory issues on some GPUs
 
-#define SORT_MAX_SIZE 2048
+#define SORT_MAX_SIZE 2048      // 32-bit path: 16KB threadgroup (2048 × 4B × 2)
+#define SORT_MAX_SIZE_16 2048   // 16-bit path: 24KB threadgroup (4096 × 4B + 4096 × 2B)
 
 // Tile dimensions for render kernels
-#define LOCAL_SORT_TILE_WIDTH 32
+// Each thread processes 4×2 = 8 pixels (hardcoded in render kernel)
+#define LOCAL_SORT_TILE_WIDTH 16
 #define LOCAL_SORT_TILE_HEIGHT 16
-#define LOCAL_SORT_TG_WIDTH 8
-#define LOCAL_SORT_TG_HEIGHT 8
+#define LOCAL_SORT_TG_WIDTH 4    // 4 threads × 4 pixels = 16
+#define LOCAL_SORT_TG_HEIGHT 8   // 8 threads × 2 pixels = 16
 #define LOCAL_SORT_PIXELS_X 4
 #define LOCAL_SORT_PIXELS_Y 2
 
 // =============================================================================
-// EXPERIMENTAL: 16-BIT SORT for reduced threadgroup memory
+// 16-BIT SORT WITH PER-TILE DEPTH NORMALIZATION + DETERMINISM
 // =============================================================================
-// Uses 16-bit depth keys + 16-bit local indices = 8KB threadgroup (vs 16KB)
-// Requires separate globalIndices buffer for mapping local → compacted idx
-// Trade-off: 50% less threadgroup memory for one extra indirection in render
+// Benefits:
+// - 4K max per tile (vs 2K for 32-bit) - handles denser scenes
+// - Full 16-bit precision within each tile's depth range
+// - Deterministic via originalIdx tie-breaking
+// - 24KB threadgroup memory (vs 16KB for 32-bit)
 
 kernel void localSortPerTileSort16(
-    const device ushort* depthKeys [[buffer(0)]],     // 16-bit normalized depth
-    const device uint* globalIndices [[buffer(1)]],    // local idx → compacted gaussian idx
+    const device ushort* depthKeys16 [[buffer(0)]],    // 16-bit depth keys from scatter (sequential reads!)
+    const device uint* globalIndices [[buffer(1)]],    // local idx → compacted gaussian idx (for render)
     device ushort* sortedLocalIdx [[buffer(2)]],       // output: sorted local indices
     const device uint* offsets [[buffer(3)]],
     const device uint* counts [[buffer(4)]],
     uint tileId [[threadgroup_position_in_grid]],
     ushort localId [[thread_position_in_threadgroup]],
-    ushort tgSize [[threads_per_threadgroup]]
+    ushort tgSize [[threads_per_threadgroup]],
+    ushort simd_lane [[thread_index_in_simdgroup]],
+    ushort simd_id [[simdgroup_index_in_threadgroup]]
 ) {
     uint start = offsets[tileId];
     uint count = counts[tileId];
 
     if (count <= 1) {
-        // Single element - just copy
         if (count == 1 && localId == 0) {
             sortedLocalIdx[start] = 0;
         }
         return;
     }
 
-    uint n = min(count, uint(SORT_MAX_SIZE));
+    uint n = min(count, uint(SORT_MAX_SIZE_16));
 
-    // 16-bit arrays = 4KB + 4KB = 8KB threadgroup memory (vs 16KB)
-    threadgroup ushort sharedKeys[SORT_MAX_SIZE];
-    threadgroup ushort sharedVals[SORT_MAX_SIZE];
+    // Threadgroup memory: 32-bit keys (16KB) + 16-bit vals (8KB) = 24KB (fits in 32KB limit)
+    // Keys: (depth16 << 16) | localIdx for stable sort
+    threadgroup uint sharedKeys[SORT_MAX_SIZE_16];
+    threadgroup ushort sharedVals[SORT_MAX_SIZE_16];    // local indices (output)
 
     // Pad to next power of 2
     uint padded = 1;
     while (padded < n) padded <<= 1;
 
-    // Parallel load with padding
+    // =========================================================================
+    // PHASE 1: Load depthKeys16 directly (sequential 2-byte reads!)
+    // No per-tile normalization - depthKeys16 already has correct sort order
+    // =========================================================================
     for (uint i = localId; i < padded; i += tgSize) {
         if (i < n) {
-            sharedKeys[i] = depthKeys[start + i];
-            sharedVals[i] = ushort(i);  // Local index 0..n-1
+            // Sequential 2-byte read - very cache friendly
+            ushort depth16 = depthKeys16[start + i];
+            // Sort key: (depth16 << 16) | localIdx for stable ordering
+            sharedKeys[i] = (uint(depth16) << 16) | i;
+            sharedVals[i] = ushort(i);  // Local index
         } else {
-            sharedKeys[i] = 0xFFFFu;  // Max key for padding
-            sharedVals[i] = ushort(i);
+            sharedKeys[i] = 0xFFFFFFFF;  // Max value for padding
+            sharedVals[i] = 0;
         }
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
-    // Bitonic sort
+    // =========================================================================
+    // PHASE 2: Bitonic sort on 32-bit keys
+    // =========================================================================
     for (uint k = 2; k <= padded; k <<= 1) {
         for (uint j = k >> 1; j > 0; j >>= 1) {
             for (uint i = localId; i < padded; i += tgSize) {
                 uint ixj = i ^ j;
                 if (ixj > i) {
-                    ushort aKey = sharedKeys[i];
-                    ushort bKey = sharedKeys[ixj];
+                    uint aKey = sharedKeys[i];
+                    uint bKey = sharedKeys[ixj];
                     ushort aVal = sharedVals[i];
                     ushort bVal = sharedVals[ixj];
 
@@ -697,7 +708,9 @@ kernel void localSortPerTileSort16(
         }
     }
 
-    // Parallel write sorted local indices
+    // =========================================================================
+    // PHASE 4: Write sorted local indices
+    // =========================================================================
     for (uint i = localId; i < n; i += tgSize) {
         sortedLocalIdx[start + i] = sharedVals[i];
     }
@@ -709,12 +722,13 @@ kernel void localSortScatterSimd16(
     const device TileAssignmentHeader* header [[buffer(1)]],
     device atomic_uint* tileCounters [[buffer(2)]],
     const device uint* offsets [[buffer(3)]],
-    device ushort* depthKeys16 [[buffer(4)]],      // 16-bit depth keys
-    device uint* globalIndices [[buffer(5)]],       // local → global mapping
+    device ushort* depthKeys16 [[buffer(4)]],      // 16-bit depth keys - used directly by sort16
+    device uint* globalIndices [[buffer(5)]],       // local → global mapping for render
     constant uint& tilesX [[buffer(6)]],
     constant uint& maxCapacity [[buffer(7)]],
     constant int& tileWidth [[buffer(8)]],
     constant int& tileHeight [[buffer(9)]],
+    // buffer(10) removed - sortInfo no longer needed
     uint gid [[thread_position_in_grid]],
     uint simd_lane [[thread_index_in_simdgroup]],
     uint simd_group_id [[simdgroup_index_in_threadgroup]],
@@ -734,16 +748,23 @@ kernel void localSortScatterSimd16(
     float2 center = 0;
     float power = 0;
     ushort depth16 = 0;
+    uint depthBits = 0;
+    uint originalIdx = 0;
     int minTX = 0, minTY = 0, maxTX = 0, maxTY = 0;
 
+    float opacity16 = 0;
     if (simd_lane == 0) {
         g = compacted[gaussianIdx];
         conic = g.covariance_depth.xyz;
         center = g.position_color.xy;
         half4 colorOp = localSortUnpackHalf4(g.position_color.zw);
-        power = localSortComputePower(float(colorOp.w));
-        // Convert depth to 16-bit (flip sign bit for proper sorting)
-        depth16 = ushort((as_type<uint>(g.covariance_depth.w) ^ 0x80000000u) >> 16u);
+        opacity16 = float(colorOp.w);
+        power = localSortComputePower(opacity16);
+        // Full depth bits for sort
+        depthBits = as_type<uint>(g.covariance_depth.w);
+        originalIdx = g.originalIdx;
+        // 16-bit depth (for backwards compat)
+        depth16 = ushort((depthBits ^ 0x80000000u) >> 16u);
         minTX = g.min_tile.x;
         minTY = g.min_tile.y;
         maxTX = g.max_tile.x;
@@ -751,6 +772,7 @@ kernel void localSortScatterSimd16(
     }
 
     // Broadcast to all lanes
+    opacity16 = simd_shuffle(opacity16, 0);
     conic.x = simd_shuffle(conic.x, 0);
     conic.y = simd_shuffle(conic.y, 0);
     conic.z = simd_shuffle(conic.z, 0);
@@ -758,6 +780,8 @@ kernel void localSortScatterSimd16(
     center.y = simd_shuffle(center.y, 0);
     power = simd_shuffle(power, 0);
     depth16 = simd_shuffle(depth16, 0);
+    depthBits = simd_shuffle(depthBits, 0);
+    originalIdx = simd_shuffle(originalIdx, 0);
     minTX = simd_shuffle(minTX, 0);
     minTY = simd_shuffle(minTY, 0);
     maxTX = simd_shuffle(maxTX, 0);
@@ -810,8 +834,8 @@ kernel void localSortRender16(
     uint localIdx [[thread_index_in_threadgroup]],
     uint simd_lane [[thread_index_in_simdgroup]]
 ) {
-    threadgroup uint tileGaussianCount;
-    threadgroup uint tileDataOffset;
+    threadgroup uint tileGaussianCount = 0;  // Init to silence warning (barrier ensures thread 0 writes first)
+    threadgroup uint tileDataOffset = 0;
 
     if (localIdx == 0) {
         uint tileId = groupId.y * params.tilesX + groupId.x;
@@ -860,7 +884,7 @@ kernel void localSortRender16(
         half p21 = dx2*dx2*cxx + dy1*dy1*cyy + dx2*dy1*cxy2;
         half p31 = dx3*dx3*cxx + dy1*dy1*cyy + dx3*dy1*cxy2;
 
-        half a00 = min(opacity * exp(-0.5h * p00), 0.99h);
+        half a00 = min(opacity * half(fast::exp(-0.5h * p00)), 0.99h);
         half a10 = min(opacity * exp(-0.5h * p10), 0.99h);
         half a20 = min(opacity * exp(-0.5h * p20), 0.99h);
         half a30 = min(opacity * exp(-0.5h * p30), 0.99h);
@@ -868,6 +892,9 @@ kernel void localSortRender16(
         half a11 = min(opacity * exp(-0.5h * p11), 0.99h);
         half a21 = min(opacity * exp(-0.5h * p21), 0.99h);
         half a31 = min(opacity * exp(-0.5h * p31), 0.99h);
+
+        // Early exit: skip if all alphas are zero (no contribution to any pixel)
+        if (all(half4(a00, a10, a20, a30) == 0.0h) && all(half4(a01, a11, a21, a31) == 0.0h)) continue;
 
         c00 += gColor * (a00 * t00); c10 += gColor * (a10 * t10);
         c20 += gColor * (a20 * t20); c30 += gColor * (a30 * t30);
@@ -994,8 +1021,8 @@ kernel void localSortRender(
     uint simd_lane [[thread_index_in_simdgroup]]
 ) {
     // Shared memory for tile info only
-    threadgroup uint tileGaussianCount;
-    threadgroup uint tileDataOffset;
+    threadgroup uint tileGaussianCount = 0;  // Init to silence warning
+    threadgroup uint tileDataOffset = 0;
 
     if (localIdx == 0) {
         uint tileId = groupId.y * params.tilesX + groupId.x;
@@ -1057,6 +1084,9 @@ kernel void localSortRender(
         half a11 = min(opacity * exp(-0.5h * p11), 0.99h);
         half a21 = min(opacity * exp(-0.5h * p21), 0.99h);
         half a31 = min(opacity * exp(-0.5h * p31), 0.99h);
+
+        // Early exit: skip if all alphas are zero (no contribution to any pixel)
+        if (all(half4(a00, a10, a20, a30) == 0.0h) && all(half4(a01, a11, a21, a31) == 0.0h)) continue;
 
         c00 += gColor * (a00 * t00); c10 += gColor * (a10 * t10);
         c20 += gColor * (a20 * t20); c30 += gColor * (a30 * t30);

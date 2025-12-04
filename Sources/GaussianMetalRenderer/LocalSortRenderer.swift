@@ -9,47 +9,55 @@ public final class LocalSortRenderer: GaussianRenderer, @unchecked Sendable {
     private let encoder: LocalSortPipelineEncoder
     private var clusterCullEncoder: ClusterCullEncoder?
 
-    // Tile configuration
-    private let tileWidth = 32
+    // Tile configuration (16×16 = 256 pixels per tile)
+    private let tileWidth = 16
     private let tileHeight = 16
 
-    // Buffers - lazily allocated (standard pipeline)
+    // Max gaussians per tile (determines sort buffer allocation)
+    // 32-bit: 2048 (16KB threadgroup), 16-bit: 4096 (12KB threadgroup)
+    private var maxGaussiansPerTile: Int {
+        config.sortMode == .sort16Bit ? 4096 : 2048
+    }
+
+    // Core buffers (always allocated)
     private var compactedBuffer: MTLBuffer?
     private var headerBuffer: MTLBuffer?
     private var tileCountsBuffer: MTLBuffer?
     private var tileOffsetsBuffer: MTLBuffer?
     private var partialSumsBuffer: MTLBuffer?
-    private var sortKeysBuffer: MTLBuffer?
-    private var sortIndicesBuffer: MTLBuffer?
-    private var tempSortKeysBuffer: MTLBuffer?
-    private var tempSortIndicesBuffer: MTLBuffer?
+    private var sortIndicesBuffer: MTLBuffer?  // Used by both 32-bit and 16-bit paths
     private var colorTexture: MTLTexture?
     private var depthTexture: MTLTexture?
-    private var gaussianRenderTexture: MTLTexture?
 
-    // 16-bit sort buffers (experimental - 50% less threadgroup memory)
+    // 32-bit sort buffers (only allocated when sortMode == .sort32Bit)
+    private var sortKeysBuffer: MTLBuffer?
+    private var tempSortKeysBuffer: MTLBuffer?
+    private var tempSortIndicesBuffer: MTLBuffer?
+
+    // 16-bit sort buffers (only allocated when sortMode == .sort16Bit)
     private var depthKeys16Buffer: MTLBuffer?       // ushort buffer for 16-bit depth keys
     private var sortedLocalIdx16Buffer: MTLBuffer?  // ushort buffer for sorted local indices
+    // sortInfoBuffer removed - sort reads depthKeys16 directly
+
+    // Textured render buffer (only allocated when useTexturedRender == true)
+    private var gaussianRenderTexture: MTLTexture?
 
     // Current allocation sizes
     private var allocatedGaussianCapacity: Int = 0
     private var allocatedWidth: Int = 0
     private var allocatedHeight: Int = 0
 
-    // Settings
+    // Settings (non-config)
     public var flipY: Bool = false
     public var debugPrint: Bool = false
     public var useSharedBuffers: Bool = false
-    public var useTexturedRender: Bool = false
-    /// Use 16-bit sort (experimental - 50% less threadgroup memory, slightly faster render)
-    public var use16BitSort: Bool = false
 
-    // Renderer configuration
+    // Renderer configuration (immutable - determines buffer allocation)
     private let config: RendererConfig
 
-    public init(device: MTLDevice) throws {
+    public init(device: MTLDevice, config: RendererConfig = RendererConfig()) throws {
         self.device = device
-        self.config = RendererConfig()
+        self.config = config
         guard let queue = device.makeCommandQueue() else {
             throw LocalSortError.failedToCreateQueue
         }
@@ -164,24 +172,28 @@ public final class LocalSortRenderer: GaussianRenderer, @unchecked Sendable {
         // Continue with rendering using original buffers + visibility mask
         ensureBuffers(gaussianCount: gaussianCount, width: width, height: height)
 
+        // Core buffers required for all modes
         guard let compacted = compactedBuffer,
               let header = headerBuffer,
               let tileCounts = tileCountsBuffer,
               let tileOffsets = tileOffsetsBuffer,
               let partialSums = partialSumsBuffer,
-              let sortKeys = sortKeysBuffer,
               let sortIndices = sortIndicesBuffer,
-              let tempSortKeys = tempSortKeysBuffer,
-              let tempSortIndices = tempSortIndicesBuffer,
               let colorTex = colorTexture,
               let depthTex = depthTexture else {
             return nil
         }
 
+        // Mode-specific buffer validation
+        let sortKeys = sortKeysBuffer        // May be nil in 16-bit mode
+        let tempSortKeys = tempSortKeysBuffer
+        let tempSortIndices = tempSortIndicesBuffer
+
         let tilesX = (width + tileWidth - 1) / tileWidth
         let tilesY = (height + tileHeight - 1) / tileHeight
         let maxCompacted = gaussianCount
-        let maxAssignments = gaussianCount * 64
+        // Tile-bounded: tileCount × maxPerTile (matches ensureBuffers allocation)
+        let maxAssignments = (tilesX * tilesY) * maxGaussiansPerTile
 
         var projMatrix = projectionMatrix
         if flipY {
@@ -209,8 +221,8 @@ public final class LocalSortRenderer: GaussianRenderer, @unchecked Sendable {
 
         let tileCount = tilesX * tilesY
 
-        // Check if 16-bit sort is available and enabled
-        let effective16BitSort = use16BitSort && encoder.has16BitSort &&
+        // Check if 16-bit sort is available and enabled (based on config, not runtime flag)
+        let effective16BitSort = config.sortMode == .sort16Bit && encoder.has16BitSort &&
             sortedLocalIdx16Buffer != nil && depthKeys16Buffer != nil
 
         // Standard pipeline with optional cluster visibility
@@ -246,12 +258,11 @@ public final class LocalSortRenderer: GaussianRenderer, @unchecked Sendable {
             depthKeys16: depthKeys16Buffer
         )
 
-        // 16-bit sort path (experimental)
+        // 16-bit sort path - reads depthKeys16 directly (sequential 2-byte reads!)
         if effective16BitSort, let sortedLocal16 = sortedLocalIdx16Buffer, let depth16 = depthKeys16Buffer {
-            // 16-bit per-tile sort (8KB threadgroup vs 16KB)
             encoder.encodeSort16(
                 commandBuffer: commandBuffer,
-                depthKeys16: depth16,       // ushort buffer with 16-bit depth keys
+                depthKeys16: depth16,  // Sequential 2-byte reads - much faster than sortInfo!
                 globalIndices: sortIndices,
                 sortedLocalIdx: sortedLocal16,
                 tileOffsets: tileOffsets,
@@ -277,7 +288,7 @@ public final class LocalSortRenderer: GaussianRenderer, @unchecked Sendable {
                 tileHeight: tileHeight,
                 whiteBackground: whiteBackground
             )
-        } else if useTexturedRender, encoder.hasTexturedRender, let gaussianTex = gaussianRenderTexture {
+        } else if config.useTexturedRender, encoder.hasTexturedRender, let gaussianTex = gaussianRenderTexture {
             // Textured render path
             encoder.encodePackRenderTexture(
                 commandBuffer: commandBuffer,
@@ -343,7 +354,9 @@ public final class LocalSortRenderer: GaussianRenderer, @unchecked Sendable {
         let tilesY = (height + tileHeight - 1) / tileHeight
         let tileCount = tilesX * tilesY
         let maxCompacted = gaussianCount
-        let maxAssignments = gaussianCount * 64
+        // Tile-bounded allocation: tileCount × maxPerTile (NOT gaussianCount × 64)
+        // This reduces memory from ~1.5GB to ~67MB for sort buffers
+        let maxAssignments = tileCount * maxGaussiansPerTile
 
         let needsRealloc = gaussianCount > allocatedGaussianCapacity ||
                           width != allocatedWidth ||
@@ -358,6 +371,7 @@ public final class LocalSortRenderer: GaussianRenderer, @unchecked Sendable {
         let priv: MTLResourceOptions = useSharedBuffers ? .storageModeShared : .storageModePrivate
         let shared: MTLResourceOptions = .storageModeShared
 
+        // === CORE BUFFERS (always allocated) ===
         compactedBuffer = device.makeBuffer(
             length: maxCompacted * MemoryLayout<CompactedGaussianSwift>.stride,
             options: useSharedBuffers ? shared : priv
@@ -378,33 +392,48 @@ public final class LocalSortRenderer: GaussianRenderer, @unchecked Sendable {
             length: 1024 * MemoryLayout<UInt32>.stride,
             options: priv
         )
-        sortKeysBuffer = device.makeBuffer(
-            length: maxAssignments * MemoryLayout<UInt32>.stride,
-            options: priv
-        )
         sortIndicesBuffer = device.makeBuffer(
             length: maxAssignments * MemoryLayout<UInt32>.stride,
             options: priv
         )
-        tempSortKeysBuffer = device.makeBuffer(
-            length: maxAssignments * MemoryLayout<UInt32>.stride,
-            options: priv
-        )
-        tempSortIndicesBuffer = device.makeBuffer(
-            length: maxAssignments * MemoryLayout<UInt32>.stride,
-            options: priv
-        )
 
-        // 16-bit sort buffers (ushort = 2 bytes per element)
-        depthKeys16Buffer = device.makeBuffer(
-            length: maxAssignments * MemoryLayout<UInt16>.stride,
-            options: priv
-        )
-        sortedLocalIdx16Buffer = device.makeBuffer(
-            length: maxAssignments * MemoryLayout<UInt16>.stride,
-            options: priv
-        )
+        // === MODE-SPECIFIC BUFFERS ===
+        switch config.sortMode {
+        case .sort32Bit:
+            // 32-bit sort buffers
+            sortKeysBuffer = device.makeBuffer(
+                length: maxAssignments * MemoryLayout<UInt32>.stride,
+                options: priv
+            )
+            tempSortKeysBuffer = device.makeBuffer(
+                length: maxAssignments * MemoryLayout<UInt32>.stride,
+                options: priv
+            )
+            tempSortIndicesBuffer = device.makeBuffer(
+                length: maxAssignments * MemoryLayout<UInt32>.stride,
+                options: priv
+            )
+            // Clear 16-bit buffers
+            depthKeys16Buffer = nil
+            sortedLocalIdx16Buffer = nil
 
+        case .sort16Bit:
+            // 16-bit sort buffers only (no sortInfo - sort reads depthKeys16 directly!)
+            depthKeys16Buffer = device.makeBuffer(
+                length: maxAssignments * MemoryLayout<UInt16>.stride,
+                options: priv
+            )
+            sortedLocalIdx16Buffer = device.makeBuffer(
+                length: maxAssignments * MemoryLayout<UInt16>.stride,
+                options: priv
+            )
+            // Clear 32-bit buffers
+            sortKeysBuffer = nil
+            tempSortKeysBuffer = nil
+            tempSortIndicesBuffer = nil
+        }
+
+        // === TEXTURES ===
         let colorDesc = MTLTextureDescriptor.texture2DDescriptor(
             pixelFormat: .rgba16Float,
             width: width,
@@ -425,21 +454,29 @@ public final class LocalSortRenderer: GaussianRenderer, @unchecked Sendable {
         depthDesc.storageMode = .private
         depthTexture = device.makeTexture(descriptor: depthDesc)
 
-        let renderTexWidth = LocalSortPipelineEncoder.renderTexWidth
-        let texelCount = maxCompacted * 2
-        let renderTexHeight = (texelCount + renderTexWidth - 1) / renderTexWidth
-        let gaussianTexDesc = MTLTextureDescriptor.texture2DDescriptor(
-            pixelFormat: .rgba32Float,
-            width: renderTexWidth,
-            height: max(1, renderTexHeight),
-            mipmapped: false
-        )
-        gaussianTexDesc.usage = [.shaderRead, .shaderWrite]
-        gaussianTexDesc.storageMode = .private
-        gaussianRenderTexture = device.makeTexture(descriptor: gaussianTexDesc)
+        // Textured render texture (only if enabled)
+        if config.useTexturedRender {
+            let renderTexWidth = LocalSortPipelineEncoder.renderTexWidth
+            let texelCount = maxCompacted * 2
+            let renderTexHeight = (texelCount + renderTexWidth - 1) / renderTexWidth
+            let gaussianTexDesc = MTLTextureDescriptor.texture2DDescriptor(
+                pixelFormat: .rgba32Float,
+                width: renderTexWidth,
+                height: max(1, renderTexHeight),
+                mipmapped: false
+            )
+            gaussianTexDesc.usage = [.shaderRead, .shaderWrite]
+            gaussianTexDesc.storageMode = .private
+            gaussianRenderTexture = device.makeTexture(descriptor: gaussianTexDesc)
+        } else {
+            gaussianRenderTexture = nil
+        }
 
         if debugPrint {
-            print("[LocalSortRenderer] Allocated buffers for \(gaussianCount) gaussians, \(width)x\(height)")
+            let mode = config.sortMode == .sort16Bit ? "16-bit" : "32-bit"
+            let sortBufferMB = (maxAssignments * 4) / (1024 * 1024)  // sortIndices size
+            print("[LocalSortRenderer] Allocated \(mode) buffers: \(gaussianCount) gaussians, \(width)x\(height)")
+            print("  maxAssignments: \(tileCount) tiles × \(maxGaussiansPerTile)/tile = \(maxAssignments) (~\(sortBufferMB)MB per sort buffer)")
         }
     }
 }

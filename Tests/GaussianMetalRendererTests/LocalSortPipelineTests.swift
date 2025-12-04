@@ -1557,9 +1557,9 @@ final class LocalSortPipelineTests: XCTestCase {
         let device = MTLCreateSystemDefaultDevice()!
         let queue = device.makeCommandQueue()!
 
-        // Create renderer with 16-bit sort enabled
-        let renderer = try LocalSortRenderer(device: device)
-        renderer.use16BitSort = true
+        // Create renderer with 16-bit sort enabled via config
+        let config = RendererConfig(sortMode: .sort16Bit)
+        let renderer = try LocalSortRenderer(device: device, config: config)
         renderer.useSharedBuffers = true  // Enable shared for debugging
 
         let gaussianCount = 10_000
@@ -1666,10 +1666,11 @@ final class LocalSortPipelineTests: XCTestCase {
         let device = MTLCreateSystemDefaultDevice()!
         let queue = device.makeCommandQueue()!
 
-        // Create two renderers - one 32-bit, one 16-bit
-        let renderer32 = try LocalSortRenderer(device: device)
-        let renderer16 = try LocalSortRenderer(device: device)
-        renderer16.use16BitSort = true
+        // Create two renderers - one 32-bit, one 16-bit via config
+        let config32 = RendererConfig(sortMode: .sort32Bit)
+        let config16 = RendererConfig(sortMode: .sort16Bit)
+        let renderer32 = try LocalSortRenderer(device: device, config: config32)
+        let renderer16 = try LocalSortRenderer(device: device, config: config16)
 
         let gaussianCount = 500_000
         let width = 1920
@@ -1765,12 +1766,520 @@ final class LocalSortPipelineTests: XCTestCase {
         print("║  16-bit pipeline: \(String(format: "%.2f", avg16))ms")
         print("║  Speedup: \(String(format: "%.1f", speedup))%")
         print("╠═══════════════════════════════════════════════════════════════╣")
-        print("║  Threadgroup memory:")
-        print("║    32-bit: 16KB (2048 × 4B × 2)")
-        print("║    16-bit: 8KB (2048 × 2B × 2)")
+        print("║  Capacity & memory:")
+        print("║    32-bit: 2K/tile, 16KB TG (2048 × 4B × 2)")
+        print("║    16-bit: 4K/tile, 24KB TG (4096 × 4B + 4096 × 2B)")
         print("╚═══════════════════════════════════════════════════════════════╝\n")
 
         // Verify both produce same visible count
         XCTAssertEqual(visibleCount32, visibleCount16, "Both paths should produce same visible count")
     }
+
+    // MARK: - Scatter Analysis
+
+    /// Analyze scatter distribution to determine if small/large split would help
+    func testScatterDistributionAnalysis() throws {
+        let renderer = GlobalSortRenderer(limits: RendererLimits(maxGaussians: 1_000_000, maxWidth: 1024, maxHeight: 1024))
+        let device = renderer.device
+        let library = renderer.library
+        let queue = renderer.queue
+
+        let encoder = try LocalSortPipelineEncoder(device: device, library: library)
+
+        let tilesX = (imageWidth + tileWidth - 1) / tileWidth
+        let tilesY = (imageHeight + tileHeight - 1) / tileHeight
+        let tileCount = tilesX * tilesY
+
+        let gaussianCount = 500_000
+        let maxCompacted = gaussianCount
+        let maxAssignments = gaussianCount * 32
+
+        // Create buffers - compactedBuffer MUST be .storageModeShared to read back
+        let worldBuffer = device.makeBuffer(
+            length: gaussianCount * MemoryLayout<PackedWorldGaussian>.stride,
+            options: .storageModeShared
+        )!
+        let harmonicsBuffer = device.makeBuffer(
+            length: gaussianCount * 3 * MemoryLayout<Float>.stride,
+            options: .storageModeShared
+        )!
+        let compactedBuffer = device.makeBuffer(
+            length: maxCompacted * MemoryLayout<CompactedGaussianSwift>.stride,
+            options: .storageModeShared  // Shared to read back tile bounds
+        )!
+        let headerBuffer = device.makeBuffer(
+            length: MemoryLayout<CompactedHeaderSwift>.stride,
+            options: .storageModeShared
+        )!
+        let tileCountsBuffer = device.makeBuffer(
+            length: tileCount * MemoryLayout<UInt32>.stride,
+            options: .storageModeShared
+        )!
+        let tileOffsetsBuffer = device.makeBuffer(
+            length: (tileCount + 1) * MemoryLayout<UInt32>.stride,
+            options: .storageModeShared
+        )!
+        let partialSumsBuffer = device.makeBuffer(
+            length: 1024 * MemoryLayout<UInt32>.stride,
+            options: .storageModeShared
+        )!
+        let sortKeysBuffer = device.makeBuffer(
+            length: maxAssignments * MemoryLayout<UInt32>.stride,
+            options: .storageModePrivate
+        )!
+        let sortIndicesBuffer = device.makeBuffer(
+            length: maxAssignments * MemoryLayout<UInt32>.stride,
+            options: .storageModePrivate
+        )!
+
+        populateTestData(worldBuffer: worldBuffer, harmonicsBuffer: harmonicsBuffer, count: gaussianCount)
+        let camera = createTestCamera()
+
+        // Run pipeline to populate compacted gaussians
+        guard let cb = queue.makeCommandBuffer() else {
+            XCTFail("Failed to create command buffer")
+            return
+        }
+
+        encoder.encode(
+            commandBuffer: cb,
+            worldGaussians: worldBuffer,
+            harmonics: harmonicsBuffer,
+            camera: camera,
+            gaussianCount: gaussianCount,
+            tilesX: tilesX,
+            tilesY: tilesY,
+            tileWidth: tileWidth,
+            tileHeight: tileHeight,
+            surfaceWidth: imageWidth,
+            surfaceHeight: imageHeight,
+            compactedGaussians: compactedBuffer,
+            compactedHeader: headerBuffer,
+            tileCounts: tileCountsBuffer,
+            tileOffsets: tileOffsetsBuffer,
+            partialSums: partialSumsBuffer,
+            sortKeys: sortKeysBuffer,
+            sortIndices: sortIndicesBuffer,
+            maxCompacted: maxCompacted,
+            maxAssignments: maxAssignments,
+            skipSort: true  // Skip sort, we just want the scatter distribution
+        )
+
+        cb.commit()
+        cb.waitUntilCompleted()
+
+        let visibleCount = LocalSortPipelineEncoder.readVisibleCount(from: headerBuffer)
+
+        // Read back compacted gaussians and analyze tile distribution
+        let compactedPtr = compactedBuffer.contents().bindMemory(to: CompactedGaussian.self, capacity: Int(visibleCount))
+
+        // Tile count buckets
+        var bucket1 = 0      // 1 tile
+        var bucket2to4 = 0   // 2-4 tiles
+        var bucket5to16 = 0  // 5-16 tiles
+        var bucket17to64 = 0 // 17-64 tiles
+        var bucket65plus = 0 // 65+ tiles
+
+        var totalTiles: UInt64 = 0
+        var maxTileCount: Int32 = 0
+
+        for i in 0..<Int(visibleCount) {
+            let g = compactedPtr[i]
+            let rangeX = g.max_tile.x - g.min_tile.x
+            let rangeY = g.max_tile.y - g.min_tile.y
+            let tiles = rangeX * rangeY
+
+            totalTiles += UInt64(tiles)
+            if tiles > maxTileCount { maxTileCount = tiles }
+
+            switch tiles {
+            case 1:
+                bucket1 += 1
+            case 2...4:
+                bucket2to4 += 1
+            case 5...16:
+                bucket5to16 += 1
+            case 17...64:
+                bucket17to64 += 1
+            default:
+                bucket65plus += 1
+            }
+        }
+
+        let avgTilesPerGaussian = Double(totalTiles) / Double(visibleCount)
+        let smallCount = bucket1 + bucket2to4  // Tiles <= 4
+        let smallPct = Double(smallCount) / Double(visibleCount) * 100
+
+        // Estimate cost: assume SIMD scatter overhead is 32x for small gaussians
+        // Small gaussian: 1 thread could do it, but we use 32 threads
+        // Savings: if 80% of gaussians are small, we save ~75% of scatter cost for them
+        let simdOverhead = 32.0
+        let smallSavingsFactor = (simdOverhead - 1) / simdOverhead  // ~96% savings per small gaussian
+        let potentialSpeedup = smallPct * smallSavingsFactor / 100.0
+
+        print("\n╔═══════════════════════════════════════════════════════════════╗")
+        print("║  SCATTER DISTRIBUTION ANALYSIS                                 ║")
+        print("╠═══════════════════════════════════════════════════════════════╣")
+        print("║  Gaussians: \(gaussianCount) (visible: \(visibleCount))")
+        print("║  Resolution: \(imageWidth)x\(imageHeight)")
+        print("║  Tile size: \(tileWidth)x\(tileHeight)")
+        print("╠═══════════════════════════════════════════════════════════════╣")
+        print("║  TILE COUNT DISTRIBUTION:")
+        print("║    1 tile:      \(bucket1) (\(String(format: "%.1f", Double(bucket1)/Double(visibleCount)*100))%)")
+        print("║    2-4 tiles:   \(bucket2to4) (\(String(format: "%.1f", Double(bucket2to4)/Double(visibleCount)*100))%)")
+        print("║    5-16 tiles:  \(bucket5to16) (\(String(format: "%.1f", Double(bucket5to16)/Double(visibleCount)*100))%)")
+        print("║    17-64 tiles: \(bucket17to64) (\(String(format: "%.1f", Double(bucket17to64)/Double(visibleCount)*100))%)")
+        print("║    65+ tiles:   \(bucket65plus) (\(String(format: "%.1f", Double(bucket65plus)/Double(visibleCount)*100))%)")
+        print("╠═══════════════════════════════════════════════════════════════╣")
+        print("║  STATISTICS:")
+        print("║    Total tile assignments: \(totalTiles)")
+        print("║    Avg tiles/gaussian: \(String(format: "%.1f", avgTilesPerGaussian))")
+        print("║    Max tiles/gaussian: \(maxTileCount)")
+        print("╠═══════════════════════════════════════════════════════════════╣")
+        print("║  SMALL/LARGE SPLIT ANALYSIS (threshold: 4 tiles):")
+        print("║    Small gaussians (≤4 tiles): \(smallCount) (\(String(format: "%.1f", smallPct))%)")
+        print("║    Large gaussians (>4 tiles): \(Int(visibleCount) - smallCount) (\(String(format: "%.1f", 100-smallPct))%)")
+        print("║    Potential scatter speedup: ~\(String(format: "%.0f", potentialSpeedup * 100))%")
+        print("║    (if small use sequential, large use SIMD)")
+        print("╚═══════════════════════════════════════════════════════════════╝\n")
+
+        // Analysis verdict
+        if smallPct > 70 {
+            print("✓ RECOMMENDATION: Small/large split would likely help significantly")
+            print("  Most gaussians (\(String(format: "%.0f", smallPct))%) touch ≤4 tiles")
+        } else if smallPct > 40 {
+            print("~ RECOMMENDATION: Small/large split might help moderately")
+        } else {
+            print("✗ RECOMMENDATION: Small/large split unlikely to help much")
+            print("  Most gaussians touch many tiles - SIMD scatter is appropriate")
+        }
+    }
+
+    // MARK: - Determinism Tests
+
+    /// Test compaction determinism - run multiple times and check if compacted order is consistent
+    func testCompactionDeterminism() throws {
+        let renderer = GlobalSortRenderer(limits: RendererLimits(maxGaussians: 1_000_000, maxWidth: 1024, maxHeight: 1024))
+        let device = renderer.device
+        let library = renderer.library
+        let queue = renderer.queue
+
+        let encoder = try LocalSortPipelineEncoder(device: device, library: library)
+
+        let tilesX = (imageWidth + tileWidth - 1) / tileWidth
+        let tilesY = (imageHeight + tileHeight - 1) / tileHeight
+        let tileCount = tilesX * tilesY
+
+        let gaussianCount = 10_000  // Smaller for faster testing
+        let maxCompacted = gaussianCount
+        let maxAssignments = gaussianCount * 32
+        let runs = 5
+
+        // Create buffers
+        let worldBuffer = device.makeBuffer(
+            length: gaussianCount * MemoryLayout<PackedWorldGaussian>.stride,
+            options: .storageModeShared
+        )!
+        let harmonicsBuffer = device.makeBuffer(
+            length: gaussianCount * 3 * MemoryLayout<Float>.stride,
+            options: .storageModeShared
+        )!
+
+        // Populate ONCE with deterministic data
+        let worldPtr = worldBuffer.contents().bindMemory(to: PackedWorldGaussian.self, capacity: gaussianCount)
+        let harmonicsPtr = harmonicsBuffer.contents().bindMemory(to: Float.self, capacity: gaussianCount * 3)
+        srand48(12345)  // Fixed seed
+        for i in 0..<gaussianCount {
+            let x = Float(drand48()) * 10 - 5
+            let y = Float(drand48()) * 6 - 3
+            let z = Float(drand48()) * 8 + 2
+            let scale = Float(drand48()) * 0.09 + 0.01
+            worldPtr[i] = PackedWorldGaussian(
+                position: SIMD3<Float>(x, y, z),
+                scale: SIMD3<Float>(scale, scale, scale),
+                rotation: SIMD4<Float>(0, 0, 0, 1),
+                opacity: Float(drand48()) * 0.5 + 0.5
+            )
+            harmonicsPtr[i * 3 + 0] = Float(drand48())
+            harmonicsPtr[i * 3 + 1] = Float(drand48())
+            harmonicsPtr[i * 3 + 2] = Float(drand48())
+        }
+
+        let camera = createTestCamera()
+
+        // Store results from each run
+        var compactedResults: [[Float]] = []  // Store depths from compacted buffer
+
+        for run in 0..<runs {
+            let compactedBuffer = device.makeBuffer(
+                length: maxCompacted * MemoryLayout<CompactedGaussianSwift>.stride,
+                options: .storageModeShared
+            )!
+            let headerBuffer = device.makeBuffer(
+                length: MemoryLayout<CompactedHeaderSwift>.stride,
+                options: .storageModeShared
+            )!
+            let tileCountsBuffer = device.makeBuffer(
+                length: tileCount * MemoryLayout<UInt32>.stride,
+                options: .storageModeShared
+            )!
+            let tileOffsetsBuffer = device.makeBuffer(
+                length: (tileCount + 1) * MemoryLayout<UInt32>.stride,
+                options: .storageModeShared
+            )!
+            let partialSumsBuffer = device.makeBuffer(
+                length: 1024 * MemoryLayout<UInt32>.stride,
+                options: .storageModeShared
+            )!
+            let sortKeysBuffer = device.makeBuffer(
+                length: maxAssignments * MemoryLayout<UInt32>.stride,
+                options: .storageModeShared
+            )!
+            let sortIndicesBuffer = device.makeBuffer(
+                length: maxAssignments * MemoryLayout<UInt32>.stride,
+                options: .storageModeShared
+            )!
+
+            guard let cb = queue.makeCommandBuffer() else { continue }
+
+            encoder.encode(
+                commandBuffer: cb,
+                worldGaussians: worldBuffer,
+                harmonics: harmonicsBuffer,
+                camera: camera,
+                gaussianCount: gaussianCount,
+                tilesX: tilesX,
+                tilesY: tilesY,
+                tileWidth: tileWidth,
+                tileHeight: tileHeight,
+                surfaceWidth: imageWidth,
+                surfaceHeight: imageHeight,
+                compactedGaussians: compactedBuffer,
+                compactedHeader: headerBuffer,
+                tileCounts: tileCountsBuffer,
+                tileOffsets: tileOffsetsBuffer,
+                partialSums: partialSumsBuffer,
+                sortKeys: sortKeysBuffer,
+                sortIndices: sortIndicesBuffer,
+                maxCompacted: maxCompacted,
+                maxAssignments: maxAssignments,
+                skipSort: true  // Skip sort to isolate compaction
+            )
+
+            cb.commit()
+            cb.waitUntilCompleted()
+
+            let visibleCount = LocalSortPipelineEncoder.readVisibleCount(from: headerBuffer)
+
+            // Read compacted depths (order matters!)
+            let compactedPtr = compactedBuffer.contents().bindMemory(to: CompactedGaussian.self, capacity: Int(visibleCount))
+            var depths: [Float] = []
+            for i in 0..<min(Int(visibleCount), 1000) {  // First 1000
+                depths.append(compactedPtr[i].covariance_depth.w)
+            }
+            compactedResults.append(depths)
+
+            if run == 0 {
+                print("Run \(run): visible=\(visibleCount), first 5 depths: \(depths.prefix(5))")
+            }
+        }
+
+        // Compare runs
+        var compactionDeterministic = true
+        for run in 1..<runs {
+            if compactedResults[run] != compactedResults[0] {
+                compactionDeterministic = false
+                // Find first difference
+                for i in 0..<min(compactedResults[0].count, compactedResults[run].count) {
+                    if compactedResults[0][i] != compactedResults[run][i] {
+                        print("COMPACTION DIFFERS at index \(i): run0=\(compactedResults[0][i]) vs run\(run)=\(compactedResults[run][i])")
+                        break
+                    }
+                }
+                break
+            }
+        }
+
+        print("\n╔═══════════════════════════════════════════════════════════════╗")
+        print("║  COMPACTION DETERMINISM TEST                                   ║")
+        print("╠═══════════════════════════════════════════════════════════════╣")
+        print("║  Runs: \(runs)")
+        print("║  Gaussians: \(gaussianCount)")
+        print("║  Result: \(compactionDeterministic ? "DETERMINISTIC ✓" : "NON-DETERMINISTIC ✗")")
+        print("╚═══════════════════════════════════════════════════════════════╝\n")
+
+        if !compactionDeterministic {
+            print("→ COMPACTION is the source of non-determinism!")
+            print("  Fix: Use original world index for tie-breaking, not compacted index")
+        }
+    }
+
+    /// Test scatter determinism (after compaction)
+    func testScatterDeterminism() throws {
+        // Debug: Check struct size
+        print("CompactedGaussian size: \(MemoryLayout<CompactedGaussian>.size)")
+        print("CompactedGaussian stride: \(MemoryLayout<CompactedGaussian>.stride)")
+        // Expected: 56 bytes after adding originalIdx + pad
+
+        let renderer = GlobalSortRenderer(limits: RendererLimits(maxGaussians: 1_000_000, maxWidth: 1024, maxHeight: 1024))
+        let device = renderer.device
+        let library = renderer.library
+        let queue = renderer.queue
+
+        let encoder = try LocalSortPipelineEncoder(device: device, library: library)
+
+        let tilesX = (imageWidth + tileWidth - 1) / tileWidth
+        let tilesY = (imageHeight + tileHeight - 1) / tileHeight
+        let tileCount = tilesX * tilesY
+
+        let gaussianCount = 10_000
+        let maxCompacted = gaussianCount
+        let maxAssignments = gaussianCount * 32
+        let runs = 5
+
+        // Create buffers
+        let worldBuffer = device.makeBuffer(
+            length: gaussianCount * MemoryLayout<PackedWorldGaussian>.stride,
+            options: .storageModeShared
+        )!
+        let harmonicsBuffer = device.makeBuffer(
+            length: gaussianCount * 3 * MemoryLayout<Float>.stride,
+            options: .storageModeShared
+        )!
+
+        // Populate with deterministic data
+        let worldPtr = worldBuffer.contents().bindMemory(to: PackedWorldGaussian.self, capacity: gaussianCount)
+        let harmonicsPtr = harmonicsBuffer.contents().bindMemory(to: Float.self, capacity: gaussianCount * 3)
+        srand48(12345)
+        for i in 0..<gaussianCount {
+            let x = Float(drand48()) * 10 - 5
+            let y = Float(drand48()) * 6 - 3
+            let z = Float(drand48()) * 8 + 2
+            let scale = Float(drand48()) * 0.09 + 0.01
+            worldPtr[i] = PackedWorldGaussian(
+                position: SIMD3<Float>(x, y, z),
+                scale: SIMD3<Float>(scale, scale, scale),
+                rotation: SIMD4<Float>(0, 0, 0, 1),
+                opacity: Float(drand48()) * 0.5 + 0.5
+            )
+            harmonicsPtr[i * 3 + 0] = Float(drand48())
+            harmonicsPtr[i * 3 + 1] = Float(drand48())
+            harmonicsPtr[i * 3 + 2] = Float(drand48())
+        }
+
+        let camera = createTestCamera()
+
+        // Store sort keys from each run (before sorting)
+        var sortKeyResults: [[UInt32]] = []
+
+        for run in 0..<runs {
+            let compactedBuffer = device.makeBuffer(
+                length: maxCompacted * MemoryLayout<CompactedGaussianSwift>.stride,
+                options: .storageModeShared
+            )!
+            let headerBuffer = device.makeBuffer(
+                length: MemoryLayout<CompactedHeaderSwift>.stride,
+                options: .storageModeShared
+            )!
+            let tileCountsBuffer = device.makeBuffer(
+                length: tileCount * MemoryLayout<UInt32>.stride,
+                options: .storageModeShared
+            )!
+            let tileOffsetsBuffer = device.makeBuffer(
+                length: (tileCount + 1) * MemoryLayout<UInt32>.stride,
+                options: .storageModeShared
+            )!
+            let partialSumsBuffer = device.makeBuffer(
+                length: 1024 * MemoryLayout<UInt32>.stride,
+                options: .storageModeShared
+            )!
+            let sortKeysBuffer = device.makeBuffer(
+                length: maxAssignments * MemoryLayout<UInt32>.stride,
+                options: .storageModeShared
+            )!
+            let sortIndicesBuffer = device.makeBuffer(
+                length: maxAssignments * MemoryLayout<UInt32>.stride,
+                options: .storageModeShared
+            )!
+
+            guard let cb = queue.makeCommandBuffer() else { continue }
+
+            encoder.encode(
+                commandBuffer: cb,
+                worldGaussians: worldBuffer,
+                harmonics: harmonicsBuffer,
+                camera: camera,
+                gaussianCount: gaussianCount,
+                tilesX: tilesX,
+                tilesY: tilesY,
+                tileWidth: tileWidth,
+                tileHeight: tileHeight,
+                surfaceWidth: imageWidth,
+                surfaceHeight: imageHeight,
+                compactedGaussians: compactedBuffer,
+                compactedHeader: headerBuffer,
+                tileCounts: tileCountsBuffer,
+                tileOffsets: tileOffsetsBuffer,
+                partialSums: partialSumsBuffer,
+                sortKeys: sortKeysBuffer,
+                sortIndices: sortIndicesBuffer,
+                maxCompacted: maxCompacted,
+                maxAssignments: maxAssignments,
+                skipSort: true  // Skip sort to see scatter output
+            )
+
+            cb.commit()
+            cb.waitUntilCompleted()
+
+            // Read sort keys (unsorted, direct from scatter)
+            let keysPtr = sortKeysBuffer.contents().bindMemory(to: UInt32.self, capacity: maxAssignments)
+            var keys: [UInt32] = []
+            for i in 0..<min(5000, maxAssignments) {
+                if keysPtr[i] != 0 {
+                    keys.append(keysPtr[i])
+                }
+            }
+            sortKeyResults.append(keys)
+
+            if run == 0 {
+                print("Run \(run): \(keys.count) non-zero keys, first 5: \(keys.prefix(5))")
+            }
+        }
+
+        // Compare - for scatter, we expect order to differ but SET should be same
+        var scatterOrderDeterministic = true
+        var scatterSetDeterministic = true
+
+        let set0 = Set(sortKeyResults[0])
+        for run in 1..<runs {
+            if sortKeyResults[run] != sortKeyResults[0] {
+                scatterOrderDeterministic = false
+            }
+            let setN = Set(sortKeyResults[run])
+            if setN != set0 {
+                scatterSetDeterministic = false
+            }
+        }
+
+        print("\n╔═══════════════════════════════════════════════════════════════╗")
+        print("║  SCATTER DETERMINISM TEST                                      ║")
+        print("╠═══════════════════════════════════════════════════════════════╣")
+        print("║  Runs: \(runs)")
+        print("║  Order deterministic: \(scatterOrderDeterministic ? "YES ✓" : "NO ✗")")
+        print("║  Set deterministic: \(scatterSetDeterministic ? "YES ✓" : "NO ✗")")
+        print("╚═══════════════════════════════════════════════════════════════╝\n")
+
+        if !scatterOrderDeterministic && scatterSetDeterministic {
+            print("→ SCATTER ORDER is non-deterministic (expected - atomics)")
+            print("  The SET of keys is the same, just in different order")
+            print("  This is OK if sort produces deterministic output")
+        }
+        if !scatterSetDeterministic {
+            print("→ SCATTER SET differs! This indicates depth key non-determinism")
+            print("  Likely cause: compacted index used in depth key tie-breaking")
+        }
+    }
+
+    // NOTE: Depth-First pipeline tests have been moved to a standalone DepthFirstRenderer.
+    // See DepthFirstRenderer.swift for the new two-phase sorting implementation.
 }

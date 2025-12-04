@@ -112,6 +112,18 @@ kernel void projectGaussiansFused(
         return;
     }
 
+    // ==========================================================================
+    // OPACITY CONTRIBUTION FILTER - Skip gaussians that can't contribute meaningfully
+    // Even at gaussian center (power=0), alpha = opacity * exp(0) = opacity
+    // If opacity is too low, no pixel will get meaningful contribution
+    // Threshold ~1/255 = 0.004 (below visible quantization level)
+    // ==========================================================================
+    if (opacity < 0.004f) {
+        outMask[gid] = 0;
+        outBounds[gid] = int4(0, -1, 0, -1);
+        return;
+    }
+
     float4 quat = normalizeQuaternion(getRotation(g));
     float3x3 cov3d = buildCovariance3D(scale, quat);
 
@@ -126,6 +138,19 @@ kernel void projectGaussiansFused(
     computeConicAndRadius(cov2d, conic, radius);
 
     if (radius < 0.5f) {
+        outMask[gid] = 0;
+        outBounds[gid] = int4(0, -1, 0, -1);
+        return;
+    }
+
+    // ==========================================================================
+    // TOTAL INK FILTER - Skip gaussians with negligible total contribution
+    // Total integrated alpha = opacity × 2π / √det  (the gaussian's "total ink")
+    // If total ink is too small, the gaussian can't meaningfully contribute anywhere
+    // ==========================================================================
+    float det = conic.x * conic.z - conic.y * conic.y;
+    float totalInk = opacity * 6.283185f / sqrt(max(det, 1e-6f));
+    if (totalInk < 3.0f) {
         outMask[gid] = 0;
         outBounds[gid] = int4(0, -1, 0, -1);
         return;
@@ -1536,11 +1561,16 @@ kernel void radixScatterKernel(
 kernel void fuseSortKeysKernel(
     const device uint2* input_keys [[buffer(0)]],
     device KeyType* output_keys [[buffer(1)]],
+    const device uint* header [[buffer(2)]],  // TileAssignmentHeader: [totalAssignments, ...]
     uint gid [[thread_position_in_grid]]
 ) {
+    uint count = header[0];  // totalAssignments
+    if (gid >= count) return;
+
     uint2 key = input_keys[gid];
     // Pack tileId in upper bits, 16-bit depth in lower bits
-    // Layout: [depth 0-15, tileId 16-63] for compact radix sort passes
+    // Layout: [depth16 0-15, tileId 16-63] for compact radix sort passes
+    // Radix sort processes LSB first, so depth (secondary) goes low, tileId (primary) goes high
     KeyType fused = (KeyType(key.x) << 16) | KeyType(key.y & 0xFFFFu);
     output_keys[gid] = fused;
 }
@@ -1548,11 +1578,15 @@ kernel void fuseSortKeysKernel(
 kernel void unpackSortKeysKernel(
     const device KeyType* input_keys [[buffer(0)]],
     device uint2* output_keys [[buffer(1)]],
+    const device uint* header [[buffer(2)]],  // TileAssignmentHeader: [totalAssignments, ...]
     uint gid [[thread_position_in_grid]]
 ) {
+    uint count = header[0];  // totalAssignments
+    if (gid >= count) return;
+
     KeyType fused = input_keys[gid];
     uint tile = uint(fused >> 16);
-    uint depthBits = uint(fused & 0xFFFFull);
+    uint depthBits = uint(fused & 0xFFFFull);  // 16-bit depth
     output_keys[gid] = uint2(tile, depthBits);
 }
 
@@ -1671,6 +1705,11 @@ kernel void globalSortRender(
         half a11 = min(opacity * exp(-0.5h * p11), 0.99h);
         half a21 = min(opacity * exp(-0.5h * p21), 0.99h);
         half a31 = min(opacity * exp(-0.5h * p31), 0.99h);
+
+        // Early exit: skip if all alphas are zero (no contribution to any pixel)
+        half4 alphaRow0 = half4(a00, a10, a20, a30);
+        half4 alphaRow1 = half4(a01, a11, a21, a31);
+        if (all(alphaRow0 == 0.0h) && all(alphaRow1 == 0.0h)) continue;
 
         // Blend color and depth
         color00 += gColor * (a00 * trans00); depth00 += gDepth * (a00 * trans00);

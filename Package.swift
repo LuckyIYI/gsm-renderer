@@ -34,7 +34,9 @@ let package = Package(
                 .process("LocalSortShaders.metallib"),
                 .process("LocalSortShaders.metal"),
                 .process("TemporalShaders.metallib"),
-                .process("TemporalShaders.metal")
+                .process("TemporalShaders.metal"),
+                .process("DepthFirstShaders.metallib"),
+                .process("DepthFirstShaders.metal")
             ]
         ),
         .testTarget(

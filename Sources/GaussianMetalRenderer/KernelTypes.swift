@@ -129,7 +129,9 @@ extension TileBinningParams {
         tileHeight: UInt32,
         surfaceWidth: UInt32,
         surfaceHeight: UInt32,
-        maxCapacity: UInt32
+        maxCapacity: UInt32,
+        alphaThreshold: Float = 0.004,
+        minCoverageRatio: Float = 0.05
     ) {
         self.init()
         self.gaussianCount = gaussianCount
@@ -140,6 +142,8 @@ extension TileBinningParams {
         self.surfaceWidth = surfaceWidth
         self.surfaceHeight = surfaceHeight
         self.maxCapacity = maxCapacity
+        self.alphaThreshold = alphaThreshold
+        self.minCoverageRatio = minCoverageRatio
     }
 }
 
@@ -225,34 +229,4 @@ public struct GaussianRenderDataSwift {
     public var color: SIMD3<Float> { SIMD3(Float(colorR), Float(colorG), Float(colorB)) }
 }
 
-/// Project+compact params (same layout as TileBinningParams, different name)
-public struct ProjectCompactParamsSwift {
-    public var gaussianCount: UInt32
-    public var tilesX: UInt32
-    public var tilesY: UInt32
-    public var tileWidth: UInt32
-    public var tileHeight: UInt32
-    public var surfaceWidth: UInt32
-    public var surfaceHeight: UInt32
-    public var maxCompacted: UInt32
-
-    public init(
-        gaussianCount: UInt32,
-        tilesX: UInt32,
-        tilesY: UInt32,
-        tileWidth: UInt32,
-        tileHeight: UInt32,
-        surfaceWidth: UInt32,
-        surfaceHeight: UInt32,
-        maxCompacted: UInt32
-    ) {
-        self.gaussianCount = gaussianCount
-        self.tilesX = tilesX
-        self.tilesY = tilesY
-        self.tileWidth = tileWidth
-        self.tileHeight = tileHeight
-        self.surfaceWidth = surfaceWidth
-        self.surfaceHeight = surfaceHeight
-        self.maxCompacted = maxCompacted
-    }
-}
+// ProjectCompactParamsSwift removed - use TileBinningParams from C header instead

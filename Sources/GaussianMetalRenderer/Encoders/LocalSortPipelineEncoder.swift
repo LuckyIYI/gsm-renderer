@@ -185,14 +185,14 @@ public final class LocalSortPipelineEncoder {
         tileCounts: MTLBuffer,
         tileOffsets: MTLBuffer,
         partialSums: MTLBuffer,
-        sortKeys: MTLBuffer,
+        sortKeys: MTLBuffer?,           // Only needed for 32-bit sort mode
         sortIndices: MTLBuffer,
         maxCompacted: Int,
         maxAssignments: Int,
         // Optional
         useHalfWorld: Bool = false,
         skipSort: Bool = false,
-        // For sort
+        // For 32-bit sort
         tempSortKeys: MTLBuffer? = nil,
         tempSortIndices: MTLBuffer? = nil,
         // Skip-based cluster culling (no compaction)
@@ -200,13 +200,13 @@ public final class LocalSortPipelineEncoder {
         clusterSize: UInt32 = 1024,
         // 16-bit sort (experimental)
         use16BitSort: Bool = false,
-        depthKeys16: MTLBuffer? = nil  // Required when use16BitSort=true (ushort buffer)
+        depthKeys16: MTLBuffer? = nil   // Required when use16BitSort=true (ushort buffer)
     ) {
         let tileCount = tilesX * tilesY
         let elementsPerGroup = prefixBlockSize * prefixGrainSize
         let actualGroups = max(1, (tileCount + elementsPerGroup - 1) / elementsPerGroup)
 
-        var params = ProjectCompactParamsSwift(
+        var params = TileBinningParams(
             gaussianCount: UInt32(gaussianCount),
             tilesX: UInt32(tilesX),
             tilesY: UInt32(tilesY),
@@ -214,7 +214,7 @@ public final class LocalSortPipelineEncoder {
             tileHeight: UInt32(tileHeight),
             surfaceWidth: UInt32(surfaceWidth),
             surfaceHeight: UInt32(surfaceHeight),
-            maxCompacted: UInt32(maxCompacted)
+            maxCapacity: UInt32(maxCompacted)
         )
 
         var tileCountU = UInt32(tileCount)
@@ -261,7 +261,7 @@ public final class LocalSortPipelineEncoder {
             encoder.setBuffer(compactedHeader, offset: 0, index: 3)
             encoder.setBuffer(tileCounts, offset: 0, index: 4)
             encoder.setBytes(&cameraUniforms, length: MemoryLayout<CameraUniformsSwift>.stride, index: 5)
-            encoder.setBytes(&params, length: MemoryLayout<ProjectCompactParamsSwift>.stride, index: 6)
+            encoder.setBytes(&params, length: MemoryLayout<TileBinningParams>.stride, index: 6)
 
             // Add cluster visibility buffer for skip-based culling
             if let visibilityBuffer = clusterVisibility {
@@ -336,7 +336,7 @@ public final class LocalSortPipelineEncoder {
         let effective16Bit = use16BitSort && scatter16Pipeline != nil && depthKeys16 != nil
         if let encoder = commandBuffer.makeComputeCommandEncoder() {
             if effective16Bit, let scatter16 = scatter16Pipeline, let depth16 = depthKeys16 {
-                // 16-bit scatter: writes separate depthKeys16 (ushort) + sortIndices (uint)
+                // 16-bit scatter: writes depthKeys16 (ushort) + sortIndices (uint) - sortInfo removed!
                 encoder.label = "LocalSort_Scatter16_SIMD"
                 encoder.setComputePipelineState(scatter16)
                 encoder.setBuffer(compactedGaussians, offset: 0, index: 0)
@@ -351,7 +351,8 @@ public final class LocalSortPipelineEncoder {
                 var tileH = Int32(tileHeight)
                 encoder.setBytes(&tileW, length: MemoryLayout<Int32>.stride, index: 8)
                 encoder.setBytes(&tileH, length: MemoryLayout<Int32>.stride, index: 9)
-            } else {
+                // buffer(10) removed - sortInfo no longer needed
+            } else if let sortKeysBuf = sortKeys {
                 // 32-bit scatter: writes combined sortKeys (depth16 << 16 | idx16) + sortIndices
                 encoder.label = "LocalSort_Scatter_SIMD"
                 encoder.setComputePipelineState(scatterPipeline)
@@ -359,7 +360,7 @@ public final class LocalSortPipelineEncoder {
                 encoder.setBuffer(compactedHeader, offset: 0, index: 1)
                 encoder.setBuffer(tileCounts, offset: 0, index: 2)
                 encoder.setBuffer(tileOffsets, offset: 0, index: 3)
-                encoder.setBuffer(sortKeys, offset: 0, index: 4)
+                encoder.setBuffer(sortKeysBuf, offset: 0, index: 4)
                 encoder.setBuffer(sortIndices, offset: 0, index: 5)
                 encoder.setBytes(&tilesXU, length: MemoryLayout<UInt32>.stride, index: 6)
                 encoder.setBytes(&maxAssignmentsU, length: MemoryLayout<UInt32>.stride, index: 7)
@@ -375,12 +376,12 @@ public final class LocalSortPipelineEncoder {
             encoder.endEncoding()
         }
 
-        // === 6. PER-TILE SORT ===
-        if !skipSort, let tempK = tempSortKeys, let tempV = tempSortIndices {
+        // === 6. PER-TILE SORT (32-bit only) ===
+        if !skipSort, let sortKeysBuf = sortKeys, let tempK = tempSortKeys, let tempV = tempSortIndices {
             if let encoder = commandBuffer.makeComputeCommandEncoder() {
                 encoder.label = "LocalSort_PerTileSort"
                 encoder.setComputePipelineState(perTileSortPipeline)
-                encoder.setBuffer(sortKeys, offset: 0, index: 0)
+                encoder.setBuffer(sortKeysBuf, offset: 0, index: 0)
                 encoder.setBuffer(sortIndices, offset: 0, index: 1)
                 encoder.setBuffer(tileOffsets, offset: 0, index: 2)
                 encoder.setBuffer(tileCounts, offset: 0, index: 3)
@@ -437,9 +438,9 @@ public final class LocalSortPipelineEncoder {
             encoder.setTexture(depthTexture, index: 1)
             encoder.setBytes(&params, length: MemoryLayout<LocalSortRenderParamsSwift>.stride, index: 4)
 
-            // 8x8 threadgroup, one per tile
+            // 4×8 threadgroup for 16×16 tile (4×2 pixels per thread)
             let tgs = MTLSize(width: tilesX, height: tilesY, depth: 1)
-            let tg = MTLSize(width: 8, height: 8, depth: 1)
+            let tg = MTLSize(width: 4, height: 8, depth: 1)
             encoder.dispatchThreadgroups(tgs, threadsPerThreadgroup: tg)
             encoder.endEncoding()
         }
@@ -530,9 +531,9 @@ public final class LocalSortPipelineEncoder {
             encoder.setTexture(depthTexture, index: 2)
             encoder.setBytes(&params, length: MemoryLayout<LocalSortRenderParamsSwift>.stride, index: 3)
 
-            // 8x8 threadgroup, one per tile
+            // 4×8 threadgroup for 16×16 tile (4×2 pixels per thread)
             let tgs = MTLSize(width: tilesX, height: tilesY, depth: 1)
-            let tg = MTLSize(width: 8, height: 8, depth: 1)
+            let tg = MTLSize(width: 4, height: 8, depth: 1)
             encoder.dispatchThreadgroups(tgs, threadsPerThreadgroup: tg)
             encoder.endEncoding()
         }
@@ -604,7 +605,7 @@ public final class LocalSortPipelineEncoder {
     ) {
         let tileCount = tilesX * tilesY
 
-        var params = ProjectCompactParamsSwift(
+        var params = TileBinningParams(
             gaussianCount: UInt32(gaussianCount),
             tilesX: UInt32(tilesX),
             tilesY: UInt32(tilesY),
@@ -612,7 +613,7 @@ public final class LocalSortPipelineEncoder {
             tileHeight: UInt32(tileHeight),
             surfaceWidth: UInt32(surfaceWidth),
             surfaceHeight: UInt32(surfaceHeight),
-            maxCompacted: UInt32(maxCompacted)
+            maxCapacity: UInt32(maxCompacted)
         )
 
         var tileCountU = UInt32(tileCount)
@@ -656,7 +657,7 @@ public final class LocalSortPipelineEncoder {
             encoder.setBuffer(compactedHeader, offset: 0, index: 3)
             encoder.setBuffer(tileCounts, offset: 0, index: 4)
             encoder.setBytes(&cameraUniforms, length: MemoryLayout<CameraUniformsSwift>.stride, index: 5)
-            encoder.setBytes(&params, length: MemoryLayout<ProjectCompactParamsSwift>.stride, index: 6)
+            encoder.setBytes(&params, length: MemoryLayout<TileBinningParams>.stride, index: 6)
 
             let threads = MTLSize(width: gaussianCount, height: 1, depth: 1)
             let tg = MTLSize(width: pipeline.threadExecutionWidth, height: 1, depth: 1)
@@ -710,13 +711,13 @@ public final class LocalSortPipelineEncoder {
         }
     }
 
-    /// Encode 16-bit per-tile sort (8KB threadgroup vs 16KB for 32-bit)
+    /// Encode 16-bit per-tile sort - reads depthKeys16 directly (sequential 2-byte reads!)
     /// Output: sortedLocalIdx (ushort buffer) - sorted local indices per tile
     public func encodeSort16(
         commandBuffer: MTLCommandBuffer,
-        depthKeys16: MTLBuffer,      // ushort buffer - 16-bit depth keys
-        globalIndices: MTLBuffer,    // uint buffer - local→global mapping (read-only)
-        sortedLocalIdx: MTLBuffer,   // ushort buffer - output sorted local indices
+        depthKeys16: MTLBuffer,          // ushort buffer - 16-bit depth keys from scatter
+        globalIndices: MTLBuffer,        // uint buffer - local→global mapping (for render)
+        sortedLocalIdx: MTLBuffer,       // ushort buffer - output sorted local indices
         tileOffsets: MTLBuffer,
         tileCounts: MTLBuffer,
         tileCount: Int
@@ -726,7 +727,7 @@ public final class LocalSortPipelineEncoder {
         if let encoder = commandBuffer.makeComputeCommandEncoder() {
             encoder.label = "LocalSort_PerTileSort16"
             encoder.setComputePipelineState(sortPipeline)
-            encoder.setBuffer(depthKeys16, offset: 0, index: 0)
+            encoder.setBuffer(depthKeys16, offset: 0, index: 0)  // Sequential 2-byte reads!
             encoder.setBuffer(globalIndices, offset: 0, index: 1)
             encoder.setBuffer(sortedLocalIdx, offset: 0, index: 2)
             encoder.setBuffer(tileOffsets, offset: 0, index: 3)
@@ -785,9 +786,9 @@ public final class LocalSortPipelineEncoder {
             encoder.setTexture(depthTexture, index: 1)
             encoder.setBytes(&params, length: MemoryLayout<LocalSortRenderParamsSwift>.stride, index: 5)
 
-            // 8x8 threadgroup, one per tile
+            // 4×8 threadgroup for 16×16 tile (4×2 pixels per thread)
             let tgs = MTLSize(width: tilesX, height: tilesY, depth: 1)
-            let tg = MTLSize(width: 8, height: 8, depth: 1)
+            let tg = MTLSize(width: 4, height: 8, depth: 1)
             encoder.dispatchThreadgroups(tgs, threadsPerThreadgroup: tg)
             encoder.endEncoding()
         }

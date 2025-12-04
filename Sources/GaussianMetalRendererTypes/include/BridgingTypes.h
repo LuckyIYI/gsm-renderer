@@ -125,6 +125,8 @@ typedef struct {
     UINT32 surfaceWidth;
     UINT32 surfaceHeight;
     UINT32 maxCapacity;
+    float  alphaThreshold;      // Min alpha to contribute (default 0.004 = 1/255)
+    float  minCoverageRatio;    // Min fraction of tile pixels that benefit (default 0.0 = disabled)
 } TileBinningParams;
 
 typedef struct {
@@ -139,6 +141,8 @@ typedef struct {
     simd_float4 position_color;
     simd_int2   min_tile;
     simd_int2   max_tile;
+    UINT32      originalIdx;    // World buffer index for deterministic tie-breaking
+    UINT32      _pad0;          // Padding for alignment
 } CompactedGaussian;
 
 // =============================================================================

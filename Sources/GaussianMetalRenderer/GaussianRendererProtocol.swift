@@ -89,6 +89,16 @@ public struct BufferRenderResult: Sendable {
     }
 }
 
+// MARK: - Sort Mode
+
+/// Sort mode for LocalSortRenderer - determines buffer allocation
+public enum SortMode: Sendable {
+    /// Standard 32-bit radix sort (default, most compatible)
+    case sort32Bit
+    /// 16-bit per-tile sort with packed sortInfo (experimental, 4K/tile capacity)
+    case sort16Bit
+}
+
 // MARK: - Renderer Configuration
 
 public struct RendererConfig: Sendable {
@@ -96,17 +106,25 @@ public struct RendererConfig: Sendable {
     public let maxWidth: Int
     public let maxHeight: Int
     public let precision: RenderPrecision
+    /// Sort mode - determines which buffers are allocated (immutable after init)
+    public let sortMode: SortMode
+    /// Use textured render path (allocates gaussianRenderTexture)
+    public let useTexturedRender: Bool
 
     public init(
-        maxGaussians: Int = 2_000_000,
+        maxGaussians: Int = 6_000_000,
         maxWidth: Int = 1920,
         maxHeight: Int = 1080,
-        precision: RenderPrecision = .float16
+        precision: RenderPrecision = .float16,
+        sortMode: SortMode = .sort16Bit,
+        useTexturedRender: Bool = true
     ) {
         self.maxGaussians = maxGaussians
         self.maxWidth = maxWidth
         self.maxHeight = maxHeight
         self.precision = precision
+        self.sortMode = sortMode
+        self.useTexturedRender = useTexturedRender
     }
 }
 

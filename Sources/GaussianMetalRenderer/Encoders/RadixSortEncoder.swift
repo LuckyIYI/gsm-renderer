@@ -60,7 +60,8 @@ final class RadixSortEncoder {
             encoder.setComputePipelineState(fusePipeline)
             encoder.setBuffer(keyBuffer, offset: 0, index: 0)
             encoder.setBuffer(radixBuffers.fusedKeys, offset: 0, index: 1)
-            
+            encoder.setBuffer(header, offset: 0, index: 2)  // Pass count for bounds check
+
             let tg = MTLSize(width: fuseThreadgroupSize, height: 1, depth: 1)
             encoder.dispatchThreadgroups(
                 indirectBuffer: dispatchArgs,
@@ -71,9 +72,9 @@ final class RadixSortEncoder {
         }
         
         // Decide how many byte-wide passes we need.
-        // Use 16-bit depth quantization (2 bytes) for faster sorting - works well for gaussian splatting
-        // since relative depth order within a tile matters more than absolute precision
-        let depthBytes = 2  // 16-bit depth = 65536 levels per tile (plenty for correct ordering)
+        // Use 16-bit depth quantization (2 bytes) - sufficient for visual correctness
+        // This matches GlobalSort's approach of quantizing actual depth values
+        let depthBytes = 2  // 16-bit depth = 65536 levels (same as GlobalSort)
         var tileBytes = 1
         var remainingTiles = max(tileCount - 1, 0)
         while remainingTiles >= 256 {
@@ -124,7 +125,8 @@ final class RadixSortEncoder {
             encoder.setComputePipelineState(unpackPipeline)
             encoder.setBuffer(sourceKeys, offset: 0, index: 0)
             encoder.setBuffer(keyBuffer, offset: 0, index: 1)
-            
+            encoder.setBuffer(header, offset: 0, index: 2)  // Pass count for bounds check
+
             let tg = MTLSize(width: unpackThreadgroupSize, height: 1, depth: 1)
             encoder.dispatchThreadgroups(
                 indirectBuffer: dispatchArgs,

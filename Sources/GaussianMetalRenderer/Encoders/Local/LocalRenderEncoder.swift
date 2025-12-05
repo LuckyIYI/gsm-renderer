@@ -13,8 +13,8 @@ public final class LocalRenderEncoder {
 
     public init(library: MTLLibrary, device: MTLDevice) throws {
         // Required indirect dispatch pipelines
-        guard let clearFn = library.makeFunction(name: "LocalClearTextures"),
-              let prepareFn = library.makeFunction(name: "LocalPrepareRenderDispatch")
+        guard let clearFn = library.makeFunction(name: "localClearTextures"),
+              let prepareFn = library.makeFunction(name: "localPrepareRenderDispatch")
         else {
             fatalError("Missing required indirect render kernels")
         }

@@ -302,9 +302,9 @@ public final class GlobalSortRenderer: GaussianRenderer, @unchecked Sendable {
         }
         self.device = device
         do {
-            let currentFileURL = URL(fileURLWithPath: #filePath)
-            let moduleDir = currentFileURL.deletingLastPathComponent()
-            let metallibURL = moduleDir.appendingPathComponent("GaussianMetalRenderer.metallib")
+            guard let metallibURL = Bundle.module.url(forResource: "GaussianMetalRenderer", withExtension: "metallib") else {
+                fatalError("Failed to find GaussianMetalRenderer.metallib in bundle")
+            }
             let library = try device.makeLibrary(URL: metallibURL)
 
             self.library = library

@@ -913,7 +913,7 @@ kernel void blockScanKernel(
     uint value = (gid < count) ? input[gid] : 0u;
 
     // Use SIMD-optimized raking prefix exclusive sum
-    uint exclusive = ThreadgroupRakingPrefixExclusiveSum<SCAN_BLOCK_SIZE>(value, shared, ushort(lid));
+    uint exclusive = threadgroup_raking_prefix_exclusive_sum<SCAN_BLOCK_SIZE>(value, shared, ushort(lid));
 
     // Add block offset
     if (gid < count) {
@@ -937,7 +937,7 @@ kernel void singleBlockScanKernel(
     uint total = threadgroup_cooperative_reduce_sum<SCAN_BLOCK_SIZE>(value, shared, ushort(lid));
 
     // Compute exclusive prefix sum
-    uint exclusive = ThreadgroupRakingPrefixExclusiveSum<SCAN_BLOCK_SIZE>(value, shared, ushort(lid));
+    uint exclusive = threadgroup_raking_prefix_exclusive_sum<SCAN_BLOCK_SIZE>(value, shared, ushort(lid));
 
     // Write back results
     if (lid < blockCount) {
@@ -1405,7 +1405,7 @@ kernel void radixHistogramKernel(
     KeyType keys[GRAIN_SIZE];
     KeyType sentinelKey = (KeyType)0;
 
-    LoadBlockedLocalFromGlobal<GRAIN_SIZE>(
+    load_blocked_local_from_global<GRAIN_SIZE>(
         keys,
         &input_keys[base_id],
         local_id,
@@ -1574,8 +1574,8 @@ kernel void radixScatterKernel(
     // 1) Load keys / payloads in STRIPED fashion
     KeyType keys[GRAIN_SIZE];
     uint payloads[GRAIN_SIZE];
-    LoadStripedLocalFromGlobal<GRAIN_SIZE>(keys, &input_keys[base_id], local_id, BLOCK_SIZE, available, keySentinel);
-    LoadStripedLocalFromGlobal<GRAIN_SIZE>(payloads, &input_payload[base_id], local_id, BLOCK_SIZE, available, UINT_MAX);
+    load_striped_local_from_global<GRAIN_SIZE, BLOCK_SIZE>(keys, &input_keys[base_id], local_id, available, keySentinel);
+    load_striped_local_from_global<GRAIN_SIZE, BLOCK_SIZE>(payloads, &input_payload[base_id], local_id, available, UINT_MAX);
 
     // 2) Shared memory for bin offsets and ranking
     threadgroup uint global_bin_base[RADIX];
@@ -1604,13 +1604,13 @@ kernel void radixScatterKernel(
         ushort my_bin = ValueToKeyAtDigit(kp.key, (ushort)current_digit);
 
         // Head discontinuity + max scan to find run start
-        uchar head_flag = FlagHeadDiscontinuity<BLOCK_SIZE>(my_bin, tg_short, local_id);
+        uchar head_flag = flag_head_discontinuity<BLOCK_SIZE>(my_bin, tg_short, local_id);
         ushort run_start = ThreadgroupPrefixScan<SCAN_TYPE_INCLUSIVE>(
             head_flag ? local_id : (ushort)0, tg_short, local_id, MaxOp<ushort>());
         ushort local_offset = local_id - run_start;
 
         // Tail discontinuity for offset updates
-        uchar tail_flag = FlagTailDiscontinuity<BLOCK_SIZE>(my_bin, tg_short, local_id);
+        uchar tail_flag = flag_tail_discontinuity<BLOCK_SIZE>(my_bin, tg_short, local_id);
 
         // Check validity and scatter
         bool is_valid = (kp.payload != UINT_MAX);

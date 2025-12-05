@@ -10,9 +10,9 @@ public final class LocalPrefixScanEncoder {
     private let prefixGrainSize = 4
 
     public init(library: MTLLibrary, device: MTLDevice) throws {
-        guard let prefixFn = library.makeFunction(name: "LocalPrefixScan"),
-              let partialFn = library.makeFunction(name: "LocalScanPartialSums"),
-              let finalizeAndZeroFn = library.makeFunction(name: "LocalFinalizeScanAndZero")
+        guard let prefixFn = library.makeFunction(name: "localPrefixScan"),
+              let partialFn = library.makeFunction(name: "localScanPartialSums"),
+              let finalizeAndZeroFn = library.makeFunction(name: "localFinalizeScanAndZero")
         else {
             fatalError("Missing prefix scan kernels")
         }

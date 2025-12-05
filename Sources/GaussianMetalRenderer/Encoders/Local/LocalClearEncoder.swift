@@ -5,8 +5,8 @@ public final class LocalClearEncoder {
     private let clearPipeline: MTLComputePipelineState
 
     public init(library: MTLLibrary, device: MTLDevice) throws {
-        guard let clearFn = library.makeFunction(name: "LocalClear") else {
-            fatalError("Missing LocalClear kernel")
+        guard let clearFn = library.makeFunction(name: "localClear") else {
+            fatalError("Missing localClear kernel")
         }
         self.clearPipeline = try device.makeComputePipelineState(function: clearFn)
     }

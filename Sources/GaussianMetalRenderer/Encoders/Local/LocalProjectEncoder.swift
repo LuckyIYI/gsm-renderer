@@ -19,8 +19,8 @@ public final class LocalProjectEncoder {
 
     public init(LocalLibrary: MTLLibrary, mainLibrary: MTLLibrary, device: MTLDevice) throws {
         // Load compaction kernels (LocalCompact - just copies, no counting)
-        guard let compactFn = LocalLibrary.makeFunction(name: "LocalCompact"),
-              let writeVisibleCountFn = LocalLibrary.makeFunction(name: "LocalWriteVisibleCount")
+        guard let compactFn = LocalLibrary.makeFunction(name: "localCompact"),
+              let writeVisibleCountFn = LocalLibrary.makeFunction(name: "localWriteVisibleCount")
         else {
             fatalError("Missing compaction kernels")
         }

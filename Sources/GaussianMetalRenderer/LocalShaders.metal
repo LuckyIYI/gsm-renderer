@@ -48,7 +48,7 @@ kernel void tileBinningZeroCountsKernel(
 // KERNEL 1: CLEAR (full reset including header)
 // =============================================================================
 
-kernel void LocalClear(
+kernel void localClear(
     device atomic_uint* tileCounts [[buffer(0)]],
     device TileAssignmentHeader* header [[buffer(1)]],
     constant uint& tileCount [[buffer(2)]],
@@ -70,7 +70,7 @@ kernel void LocalClear(
 // =============================================================================
 // Clears color and depth textures before rendering (for indirect dispatch)
 
-kernel void LocalClearTextures(
+kernel void localClearTextures(
     texture2d<half, access::write> colorTex [[texture(0)]],
     texture2d<half, access::write> depthTex [[texture(1)]],
     constant uint& width [[buffer(0)]],
@@ -89,7 +89,7 @@ kernel void LocalClearTextures(
 // =============================================================================
 // Prepares indirect dispatch arguments from active tile count
 
-kernel void LocalPrepareRenderDispatch(
+kernel void localPrepareRenderDispatch(
     const device uint* activeTileCount [[buffer(0)]],
     device uint* dispatchArgs [[buffer(1)]],  // MTLDispatchThreadgroupsIndirectArguments
     uint tid [[thread_position_in_grid]]
@@ -108,7 +108,7 @@ kernel void LocalPrepareRenderDispatch(
 // Temp buffer can share memory with other buffers not used during projection.
 
 template <typename PackedWorldT, typename HarmonicsT>
-kernel void LocalProjectStore(
+kernel void localProjectStore(
     const device PackedWorldT* worldGaussians [[buffer(0)]],
     const device HarmonicsT* harmonics [[buffer(1)]],
     device CompactedGaussian* tempBuffer [[buffer(2)]],     // Temp storage at gid
@@ -232,21 +232,21 @@ kernel void LocalProjectStore(
 
 // Template instantiations for ProjectStore
 template [[host_name("LocalProjectStoreFloat")]]
-kernel void LocalProjectStore<PackedWorldGaussian, float>(
+kernel void localProjectStore<PackedWorldGaussian, float>(
     const device PackedWorldGaussian*, const device float*,
     device CompactedGaussian*, device uint*,
     constant CameraUniforms&, constant TileBinningParams&,
     const device uchar*, constant uint&, uint);
 
 template [[host_name("LocalProjectStoreHalf")]]
-kernel void LocalProjectStore<PackedWorldGaussianHalf, float>(
+kernel void localProjectStore<PackedWorldGaussianHalf, float>(
     const device PackedWorldGaussianHalf*, const device float*,
     device CompactedGaussian*, device uint*,
     constant CameraUniforms&, constant TileBinningParams&,
     const device uchar*, constant uint&, uint);
 
 template [[host_name("LocalProjectStoreHalfHalfSh")]]
-kernel void LocalProjectStore<PackedWorldGaussianHalf, half>(
+kernel void localProjectStore<PackedWorldGaussianHalf, half>(
     const device PackedWorldGaussianHalf*, const device half*,
     device CompactedGaussian*, device uint*,
     constant CameraUniforms&, constant TileBinningParams&,
@@ -258,7 +258,7 @@ kernel void LocalProjectStore<PackedWorldGaussianHalf, half>(
 // Uses prefix sum offsets to deterministically copy visible gaussians.
 // Counting eliminated - scatter atomics give us count for free.
 
-kernel void LocalCompact(
+kernel void localCompact(
     const device CompactedGaussian* tempBuffer [[buffer(0)]],
     const device uint* prefixOffsets [[buffer(1)]],  // Exclusive prefix sum
     device CompactedGaussian* compacted [[buffer(2)]],
@@ -277,7 +277,7 @@ kernel void LocalCompact(
 }
 
 // Write visible count to header
-kernel void LocalWriteVisibleCount(
+kernel void localWriteVisibleCount(
     const device uint* prefixOffsets [[buffer(0)]],
     device TileAssignmentHeader* header [[buffer(1)]],
     constant uint& gaussianCount [[buffer(2)]],
@@ -294,7 +294,7 @@ kernel void LocalWriteVisibleCount(
 #define LOCAL_SORT_PREFIX_BLOCK_SIZE 256
 #define LOCAL_SORT_PREFIX_GRAIN_SIZE 4
 
-kernel void LocalPrefixScan(
+kernel void localPrefixScan(
     const device uint* input [[buffer(0)]],
     device uint* output [[buffer(1)]],
     constant uint& count [[buffer(2)]],
@@ -348,7 +348,7 @@ kernel void LocalPrefixScan(
     }
 }
 
-kernel void LocalScanPartialSums(
+kernel void localScanPartialSums(
     device uint* partialSums [[buffer(0)]],
     constant uint& numPartials [[buffer(1)]],
     ushort localId [[thread_position_in_threadgroup]]
@@ -372,7 +372,7 @@ kernel void LocalScanPartialSums(
     }
 }
 
-kernel void LocalFinalizeScan(
+kernel void localFinalizeScan(
     device uint* output [[buffer(0)]],
     constant uint& count [[buffer(1)]],
     const device uint* partialSums [[buffer(2)]],
@@ -396,7 +396,7 @@ kernel void LocalFinalizeScan(
 // Fused finalize scan + compact active tiles
 // Note: No longer zeros counters - clear stage does this before scatter.
 // Now runs AFTER scatter, so counters contain real tile counts that sort/render need.
-kernel void LocalFinalizeScanAndZero(
+kernel void localFinalizeScanAndZero(
     device uint* output [[buffer(0)]],
     const device uint* counters [[buffer(1)]],  // Read-only now
     constant uint& count [[buffer(2)]],
@@ -434,7 +434,7 @@ kernel void LocalFinalizeScanAndZero(
 // Writes MTLDispatchThreadgroupsIndirectArguments based on visibleCount
 // Uses Metal's built-in MTLDispatchThreadgroupsIndirectArguments struct
 
-kernel void LocalPrepareScatterDispatch(
+kernel void localPrepareScatterDispatch(
     const device TileAssignmentHeader* header [[buffer(0)]],
     device MTLDispatchThreadgroupsIndirectArguments* dispatchArgs [[buffer(1)]],
     constant uint& threadgroupWidth [[buffer(2)]]
@@ -456,7 +456,7 @@ kernel void LocalPrepareScatterDispatch(
 // - Warp-level atomic batching (only lane 0 does atomic)
 // - Each thread computes its write position via popcount
 
-kernel void LocalScatterSimd(
+kernel void localScatterSimd(
     const device CompactedGaussian* compacted [[buffer(0)]],
     const device TileAssignmentHeader* header [[buffer(1)]],
     device atomic_uint* tileCounters [[buffer(2)]],
@@ -589,7 +589,7 @@ kernel void LocalScatterSimd(
 // - Deterministic via originalIdx tie-breaking
 // - 24KB threadgroup memory (vs 16KB for 32-bit)
 
-kernel void LocalPerTileSort16(
+kernel void localPerTileSort16(
     const device ushort* depthKeys16 [[buffer(0)]],    // 16-bit depth keys from scatter (sequential reads!)
     const device uint* globalIndices [[buffer(1)]],    // local idx → compacted gaussian idx (for render)
     device ushort* sortedLocalIdx [[buffer(2)]],       // output: sorted local indices
@@ -678,7 +678,7 @@ kernel void LocalPerTileSort16(
 }
 
 // Scatter kernel variant that writes 16-bit depth keys for 16-bit sort
-kernel void LocalScatterSimd16(
+kernel void localScatterSimd16(
     const device CompactedGaussian* compacted [[buffer(0)]],
     const device TileAssignmentHeader* header [[buffer(1)]],
     device atomic_uint* tileCounters [[buffer(2)]],
@@ -779,7 +779,7 @@ kernel void LocalScatterSimd16(
     }
 }
 
-kernel void LocalPerTileSort(
+kernel void localPerTileSort(
     device uint* keys [[buffer(0)]],
     device uint* values [[buffer(1)]],
     const device uint* counts [[buffer(2)]],
@@ -860,7 +860,7 @@ kernel void LocalPerTileSort(
 constant bool USE_16BIT_RENDER [[function_constant(2)]];
 
 template <bool USE_16BIT>
-kernel void LocalRenderImpl(
+kernel void localRenderImpl(
     const device CompactedGaussian* compacted [[buffer(0)]],
     const device uint* counts [[buffer(1)]],
     constant uint& maxPerTile [[buffer(2)]],
@@ -992,14 +992,14 @@ kernel void LocalRenderImpl(
 
 // Explicit instantiations
 template [[host_name("LocalRenderIndirect")]]
-kernel void LocalRenderImpl<false>(
+kernel void localRenderImpl<false>(
     const device CompactedGaussian*, const device uint*, constant uint&,
     const device void*, const device uint*, const device uint*,
     texture2d<half, access::write>, texture2d<half, access::write>,
     constant RenderParams&, uint2, uint2, uint, uint);
 
 template [[host_name("LocalRenderIndirect16")]]
-kernel void LocalRenderImpl<true>(
+kernel void localRenderImpl<true>(
     const device CompactedGaussian*, const device uint*, constant uint&,
     const device void*, const device uint*, const device uint*,
     texture2d<half, access::write>, texture2d<half, access::write>,

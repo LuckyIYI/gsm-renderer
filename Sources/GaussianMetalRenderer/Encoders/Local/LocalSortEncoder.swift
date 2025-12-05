@@ -6,13 +6,13 @@ public final class LocalSortEncoder {
     private let sort16Pipeline: MTLComputePipelineState?
 
     public init(library: MTLLibrary, device: MTLDevice) throws {
-        guard let sortFn = library.makeFunction(name: "LocalPerTileSort") else {
-            fatalError("Missing per-tile sort kernel")
+        guard let sortFn = library.makeFunction(name: "localPerTileSort") else {
+            fatalError("Missing localPerTileSort kernel")
         }
         self.perTileSortPipeline = try device.makeComputePipelineState(function: sortFn)
 
         // Optional 16-bit sort
-        if let sort16Fn = library.makeFunction(name: "LocalPerTileSort16") {
+        if let sort16Fn = library.makeFunction(name: "localPerTileSort16") {
             self.sort16Pipeline = try? device.makeComputePipelineState(function: sort16Fn)
         } else {
             self.sort16Pipeline = nil

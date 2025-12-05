@@ -1,5 +1,6 @@
 // GaussianPrefixScan.h - Shared prefix scan templates for Gaussian splatting
 // Used by both global radix sort and local sort pipelines
+// All functions use snake_case to match Metal's native SIMD style (simd_sum, simd_max, etc.)
 
 #ifndef GAUSSIAN_PREFIX_SCAN_H
 #define GAUSSIAN_PREFIX_SCAN_H
@@ -8,18 +9,11 @@
 using namespace metal;
 
 // =============================================================================
-// PREFIX SCAN CONFIGURATION
-// =============================================================================
-
-#define TILE_PREFIX_BLOCK_SIZE 256
-#define TILE_PREFIX_GRAIN_SIZE 4
-
-// =============================================================================
 // DISCONTINUITY FLAGS
 // =============================================================================
 
 template <ushort BLOCK_SIZE, typename T>
-static uchar FlagHeadDiscontinuity(const T value, threadgroup T* shared, const ushort local_id) {
+static uchar flag_head_discontinuity(const T value, threadgroup T* shared, const ushort local_id) {
     shared[local_id] = value;
     threadgroup_barrier(mem_flags::mem_threadgroup);
     uchar result = (local_id == 0) ? 1 : shared[local_id] != shared[local_id - 1];
@@ -28,7 +22,7 @@ static uchar FlagHeadDiscontinuity(const T value, threadgroup T* shared, const u
 }
 
 template <ushort BLOCK_SIZE, typename T>
-static uchar FlagTailDiscontinuity(const T value, threadgroup T* shared, const ushort local_id) {
+static uchar flag_tail_discontinuity(const T value, threadgroup T* shared, const ushort local_id) {
     shared[local_id] = value;
     threadgroup_barrier(mem_flags::mem_threadgroup);
     uchar result = (local_id == BLOCK_SIZE - 1) ? 1 : shared[local_id] != shared[local_id + 1];
@@ -41,61 +35,60 @@ static uchar FlagTailDiscontinuity(const T value, threadgroup T* shared, const u
 // =============================================================================
 
 template<ushort LENGTH, typename T>
-static void LoadStripedLocalFromGlobal(thread T (&value)[LENGTH],
-                                        const device T* input_data,
-                                        const ushort local_id,
-                                        const ushort local_size) {
+static void load_striped_local_from_global(thread T (&value)[LENGTH],
+                                           const device T* input_data,
+                                           const ushort local_id,
+                                           const ushort local_size) {
     for (ushort i = 0; i < LENGTH; i++) {
         value[i] = input_data[local_id + i * local_size];
     }
 }
 
-template<ushort LENGTH, typename T>
-static void LoadStripedLocalFromGlobal(thread T (&value)[LENGTH],
-                                        const device T* input_data,
-                                        const ushort local_id,
-                                        const ushort local_size,
-                                        const uint n,
-                                        const T substitution_value) {
+template<ushort LENGTH, ushort LOCAL_SIZE, typename T>
+static void load_striped_local_from_global(thread T (&value)[LENGTH],
+                                           const device T* input_data,
+                                           const ushort local_id,
+                                           const uint n,
+                                           const T substitution_value) {
     for (ushort i = 0; i < LENGTH; i++) {
-        value[i] = (local_id + i * local_size < n) ? input_data[local_id + i * local_size] : substitution_value;
+        value[i] = (local_id + i * LOCAL_SIZE < n) ? input_data[local_id + i * LOCAL_SIZE] : substitution_value;
     }
 }
 
 template<ushort GRAIN_SIZE, typename T>
-static void LoadBlockedLocalFromGlobal(thread T (&value)[GRAIN_SIZE],
-                                        const device T* input_data,
-                                        const ushort local_id) {
+static void load_blocked_local_from_global(thread T (&value)[GRAIN_SIZE],
+                                           const device T* input_data,
+                                           const ushort local_id) {
     for (ushort i = 0; i < GRAIN_SIZE; i++) {
         value[i] = input_data[local_id * GRAIN_SIZE + i];
     }
 }
 
 template<ushort GRAIN_SIZE, typename T>
-static void LoadBlockedLocalFromGlobal(thread T (&value)[GRAIN_SIZE],
-                                        const device T* input_data,
-                                        const ushort local_id,
-                                        const uint n,
-                                        const T substitution_value) {
+static void load_blocked_local_from_global(thread T (&value)[GRAIN_SIZE],
+                                           const device T* input_data,
+                                           const ushort local_id,
+                                           const uint n,
+                                           const T substitution_value) {
     for (ushort i = 0; i < GRAIN_SIZE; i++) {
         value[i] = (local_id * GRAIN_SIZE + i < n) ? input_data[local_id * GRAIN_SIZE + i] : substitution_value;
     }
 }
 
 template<ushort GRAIN_SIZE, typename T>
-static void StoreBlockedLocalToGlobal(device T *output_data,
-                                       thread const T (&value)[GRAIN_SIZE],
-                                       const ushort local_id) {
+static void store_blocked_local_to_global(device T *output_data,
+                                          thread const T (&value)[GRAIN_SIZE],
+                                          const ushort local_id) {
     for (ushort i = 0; i < GRAIN_SIZE; i++) {
         output_data[local_id * GRAIN_SIZE + i] = value[i];
     }
 }
 
 template<ushort GRAIN_SIZE, typename T>
-static void StoreBlockedLocalToGlobal(device T *output_data,
-                                       thread const T (&value)[GRAIN_SIZE],
-                                       const ushort local_id,
-                                       const uint n) {
+static void store_blocked_local_to_global(device T *output_data,
+                                          thread const T (&value)[GRAIN_SIZE],
+                                          const ushort local_id,
+                                          const uint n) {
     for (ushort i = 0; i < GRAIN_SIZE; i++) {
         if (local_id * GRAIN_SIZE + i < n) {
             output_data[local_id * GRAIN_SIZE + i] = value[i];
@@ -108,7 +101,7 @@ static void StoreBlockedLocalToGlobal(device T *output_data,
 // =============================================================================
 
 template<ushort LENGTH, typename T>
-static inline T ThreadPrefixInclusiveSum(thread T (&values)[LENGTH]) {
+static inline T thread_prefix_inclusive_sum(thread T (&values)[LENGTH]) {
     for (ushort i = 1; i < LENGTH; i++) {
         values[i] += values[i - 1];
     }
@@ -116,7 +109,7 @@ static inline T ThreadPrefixInclusiveSum(thread T (&values)[LENGTH]) {
 }
 
 template<ushort LENGTH, typename T>
-static inline T ThreadPrefixInclusiveSum(threadgroup T* values) {
+static inline T thread_prefix_inclusive_sum(threadgroup T* values) {
     for (ushort i = 1; i < LENGTH; i++) {
         values[i] += values[i - 1];
     }
@@ -124,8 +117,8 @@ static inline T ThreadPrefixInclusiveSum(threadgroup T* values) {
 }
 
 template<ushort LENGTH, typename T>
-static inline T ThreadPrefixExclusiveSum(thread T (&values)[LENGTH]) {
-    T inclusive_prefix = ThreadPrefixInclusiveSum<LENGTH>(values);
+static inline T thread_prefix_exclusive_sum(thread T (&values)[LENGTH]) {
+    T inclusive_prefix = thread_prefix_inclusive_sum<LENGTH>(values);
     for (ushort i = LENGTH - 1; i > 0; i--) {
         values[i] = values[i - 1];
     }
@@ -134,8 +127,8 @@ static inline T ThreadPrefixExclusiveSum(thread T (&values)[LENGTH]) {
 }
 
 template<ushort LENGTH, typename T>
-static inline T ThreadPrefixExclusiveSum(threadgroup T* values) {
-    T inclusive_prefix = ThreadPrefixInclusiveSum<LENGTH>(values);
+static inline T thread_prefix_exclusive_sum(threadgroup T* values) {
+    T inclusive_prefix = thread_prefix_inclusive_sum<LENGTH>(values);
     for (ushort i = LENGTH - 1; i > 0; i--) {
         values[i] = values[i - 1];
     }
@@ -144,14 +137,14 @@ static inline T ThreadPrefixExclusiveSum(threadgroup T* values) {
 }
 
 template<ushort LENGTH, typename T>
-static inline void ThreadUniformAdd(thread T (&values)[LENGTH], T uni) {
+static inline void thread_uniform_add(thread T (&values)[LENGTH], T uni) {
     for (ushort i = 0; i < LENGTH; i++) {
         values[i] += uni;
     }
 }
 
 template<ushort LENGTH, typename T>
-static inline void ThreadUniformAdd(threadgroup T* values, T uni) {
+static inline void thread_uniform_add(threadgroup T* values, T uni) {
     for (ushort i = 0; i < LENGTH; i++) {
         values[i] += uni;
     }
@@ -163,7 +156,7 @@ static inline void ThreadUniformAdd(threadgroup T* values, T uni) {
 
 /// Blelloch (work-efficient) prefix exclusive sum
 template<ushort BLOCK_SIZE, typename T>
-static T ThreadgroupBlellochPrefixExclusiveSum(T value, threadgroup T* sdata, const ushort lid) {
+static T threadgroup_blelloch_prefix_exclusive_sum(T value, threadgroup T* sdata, const ushort lid) {
     sdata[lid] = value;
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
@@ -209,7 +202,7 @@ static T ThreadgroupBlellochPrefixExclusiveSum(T value, threadgroup T* sdata, co
 
 /// Raking prefix exclusive sum (SIMD-optimized)
 template<ushort BLOCK_SIZE, typename T>
-static T ThreadgroupRakingPrefixExclusiveSum(T value, threadgroup T* shared, const ushort lid) {
+static T threadgroup_raking_prefix_exclusive_sum(T value, threadgroup T* shared, const ushort lid) {
     shared[lid] = value;
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
@@ -236,29 +229,27 @@ static T ThreadgroupRakingPrefixExclusiveSum(T value, threadgroup T* shared, con
     return shared[lid];
 }
 
-//------------------------------------------------------------------------------------------------//
-//  Raking threadgroup sum reduction
-template<ushort BLOCK_SIZE, typename T> static T
-threadgroup_raking_reduce_sum(T value, threadgroup T* shared, const ushort lid) {
-    // load values into shared memory
+// =============================================================================
+// THREADGROUP REDUCTIONS
+// =============================================================================
+
+/// Raking threadgroup sum reduction
+template<ushort BLOCK_SIZE, typename T>
+static T threadgroup_raking_reduce_sum(T value, threadgroup T* shared, const ushort lid) {
     shared[lid] = value;
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
-    //  only the first 32 threads form the rake
     if (lid < 32) {
-        //  reduce by thread in shared mem
         const short values_per_thread = BLOCK_SIZE / 32;
         const short first_index = lid * values_per_thread;
-        
+
         T thread_sum = shared[first_index];
-        for (short i = first_index + 1; i < first_index + values_per_thread; i++){
+        for (short i = first_index + 1; i < first_index + values_per_thread; i++) {
             thread_sum += shared[i];
         }
-        
-        //  reduce the partial sums using SIMD
+
         T total_sum = simd_sum(thread_sum);
-        
-        // broadcast result back to shared memory
+
         if (lid == 0) {
             shared[0] = total_sum;
         }
@@ -269,29 +260,23 @@ threadgroup_raking_reduce_sum(T value, threadgroup T* shared, const ushort lid) 
     return shared[0];
 }
 
-//------------------------------------------------------------------------------------------------//
-//  Raking threadgroup max reduction
-template<ushort BLOCK_SIZE, typename T> static T
-threadgroup_raking_reduce_max(T value, threadgroup T* shared, const ushort lid) {
-    // load values into shared memory
+/// Raking threadgroup max reduction
+template<ushort BLOCK_SIZE, typename T>
+static T threadgroup_raking_reduce_max(T value, threadgroup T* shared, const ushort lid) {
     shared[lid] = value;
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
-    //  only the first 32 threads form the rake
     if (lid < 32) {
-        //  reduce by thread in shared mem
         const short values_per_thread = BLOCK_SIZE / 32;
         const short first_index = lid * values_per_thread;
-        
+
         T thread_max = shared[first_index];
-        for (short i = first_index + 1; i < first_index + values_per_thread; i++){
+        for (short i = first_index + 1; i < first_index + values_per_thread; i++) {
             thread_max = max(thread_max, shared[i]);
         }
-        
-        //  reduce the partial maxes using SIMD
+
         T total_max = simd_max(thread_max);
-        
-        // broadcast result back to shared memory
+
         if (lid == 0) {
             shared[0] = total_max;
         }
@@ -302,29 +287,23 @@ threadgroup_raking_reduce_max(T value, threadgroup T* shared, const ushort lid) 
     return shared[0];
 }
 
-//------------------------------------------------------------------------------------------------//
-//  Raking threadgroup min reduction
-template<ushort BLOCK_SIZE, typename T> static T
-threadgroup_raking_reduce_min(T value, threadgroup T* shared, const ushort lid) {
-    // load values into shared memory
+/// Raking threadgroup min reduction
+template<ushort BLOCK_SIZE, typename T>
+static T threadgroup_raking_reduce_min(T value, threadgroup T* shared, const ushort lid) {
     shared[lid] = value;
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
-    //  only the first 32 threads form the rake
     if (lid < 32) {
-        //  reduce by thread in shared mem
         const short values_per_thread = BLOCK_SIZE / 32;
         const short first_index = lid * values_per_thread;
-        
+
         T thread_min = shared[first_index];
-        for (short i = first_index + 1; i < first_index + values_per_thread; i++){
+        for (short i = first_index + 1; i < first_index + values_per_thread; i++) {
             thread_min = min(thread_min, shared[i]);
         }
-        
-        //  reduce the partial mins using SIMD
+
         T total_min = simd_min(thread_min);
-        
-        // broadcast result back to shared memory
+
         if (lid == 0) {
             shared[0] = total_min;
         }
@@ -334,100 +313,82 @@ threadgroup_raking_reduce_min(T value, threadgroup T* shared, const ushort lid) 
     return shared[0];
 }
 
-//------------------------------------------------------------------------------------------------//
-//  Cooperative threadgroup sum reduction (2-level hierarchical)
-template<ushort BLOCK_SIZE, typename T> static T
-threadgroup_cooperative_reduce_sum(T value, threadgroup T* shared, const ushort lid) {
+/// Cooperative threadgroup sum reduction (2-level hierarchical)
+template<ushort BLOCK_SIZE, typename T>
+static T threadgroup_cooperative_reduce_sum(T value, threadgroup T* shared, const ushort lid) {
     const ushort simd_group_id = lid / 32;
     const ushort simd_lane_id = lid % 32;
-    
-    // Reduce within simdgroup
+
     T local_sum = simd_sum(value);
-    
-    // First thread in each simdgroup writes to shared memory
+
     if (simd_lane_id == 0) {
         shared[simd_group_id] = local_sum;
     }
-    
-    // Synchronize across the threadgroup
+
     threadgroup_barrier(mem_flags::mem_threadgroup);
-    
-    // Reduce across simdgroups
+
     T total_sum = T(0);
     const ushort num_simd_groups = (BLOCK_SIZE + 31) / 32;
     if (lid < num_simd_groups) {
         total_sum = shared[lid];
     }
     total_sum = simd_sum(total_sum);
-    
-    // Broadcast the result to all threads
+
     if (lid == 0) {
         shared[0] = total_sum;
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
-    
+
     return shared[0];
 }
 
-//------------------------------------------------------------------------------------------------//
-//  Cooperative threadgroup max reduction (2-level hierarchical)
-template<ushort BLOCK_SIZE, typename T> static T
-threadgroup_cooperative_reduce_max(T value, threadgroup T* shared, const ushort lid) {
+/// Cooperative threadgroup max reduction (2-level hierarchical)
+template<ushort BLOCK_SIZE, typename T>
+static T threadgroup_cooperative_reduce_max(T value, threadgroup T* shared, const ushort lid) {
     const ushort simd_group_id = lid / 32;
     const ushort simd_lane_id = lid % 32;
-    
-    // Reduce within simdgroup
+
     T local_max = simd_max(value);
-    
-    // First thread in each simdgroup writes to shared memory
+
     if (simd_lane_id == 0) {
         shared[simd_group_id] = local_max;
     }
-    
-    // Synchronize across the threadgroup
+
     threadgroup_barrier(mem_flags::mem_threadgroup);
-    
-    // Reduce across simdgroups
+
     T total_max = (lid < ((BLOCK_SIZE + 31) / 32)) ? shared[lid] : T(-INFINITY);
     total_max = simd_max(total_max);
-    
-    // Broadcast the result to all threads
+
     if (lid == 0) {
         shared[0] = total_max;
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
-    
+
     return shared[0];
 }
 
-//------------------------------------------------------------------------------------------------//
-//  Cooperative threadgroup min reduction (2-level hierarchical)
-template<ushort BLOCK_SIZE, typename T> static T
-threadgroup_cooperative_reduce_min(T value, threadgroup T* shared, const ushort lid) {
+/// Cooperative threadgroup min reduction (2-level hierarchical)
+template<ushort BLOCK_SIZE, typename T>
+static T threadgroup_cooperative_reduce_min(T value, threadgroup T* shared, const ushort lid) {
     const ushort simd_group_id = lid / 32;
     const ushort simd_lane_id = lid % 32;
-    
-    // Reduce within simdgroup
+
     T local_min = simd_min(value);
-    
-    // First thread in each simdgroup writes to shared memory
+
     if (simd_lane_id == 0) {
         shared[simd_group_id] = local_min;
     }
-    
-    // Synchronize across the threadgroup
+
     threadgroup_barrier(mem_flags::mem_threadgroup);
-    
-    // Reduce across simdgroups
+
     T total_min = (lid < ((BLOCK_SIZE + 31) / 32)) ? shared[lid] : T(INFINITY);
     total_min = simd_min(total_min);
-    
-    // Broadcast the result to all threads
+
     if (lid == 0) {
         shared[0] = total_min;
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
-    
+
     return shared[0];
 }
 

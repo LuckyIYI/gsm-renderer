@@ -7,8 +7,8 @@ public final class LocalScatterEncoder {
     private let scatter16Pipeline: MTLComputePipelineState?
 
     public init(library: MTLLibrary, device: MTLDevice) throws {
-        guard let prepareDispatchFn = library.makeFunction(name: "LocalPrepareScatterDispatch"),
-              let scatterFn = library.makeFunction(name: "LocalScatterSimd")
+        guard let prepareDispatchFn = library.makeFunction(name: "localPrepareScatterDispatch"),
+              let scatterFn = library.makeFunction(name: "localScatterSimd")
         else {
             fatalError("Missing scatter kernels")
         }
@@ -16,7 +16,7 @@ public final class LocalScatterEncoder {
         self.scatterPipeline = try device.makeComputePipelineState(function: scatterFn)
 
         // Optional 16-bit scatter
-        if let scatter16Fn = library.makeFunction(name: "LocalScatterSimd16") {
+        if let scatter16Fn = library.makeFunction(name: "localScatterSimd16") {
             self.scatter16Pipeline = try? device.makeComputePipelineState(function: scatter16Fn)
         } else {
             self.scatter16Pipeline = nil

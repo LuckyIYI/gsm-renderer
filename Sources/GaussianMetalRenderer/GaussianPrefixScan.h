@@ -236,4 +236,199 @@ static T ThreadgroupRakingPrefixExclusiveSum(T value, threadgroup T* shared, con
     return shared[lid];
 }
 
+//------------------------------------------------------------------------------------------------//
+//  Raking threadgroup sum reduction
+template<ushort BLOCK_SIZE, typename T> static T
+threadgroup_raking_reduce_sum(T value, threadgroup T* shared, const ushort lid) {
+    // load values into shared memory
+    shared[lid] = value;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    //  only the first 32 threads form the rake
+    if (lid < 32) {
+        //  reduce by thread in shared mem
+        const short values_per_thread = BLOCK_SIZE / 32;
+        const short first_index = lid * values_per_thread;
+        
+        T thread_sum = shared[first_index];
+        for (short i = first_index + 1; i < first_index + values_per_thread; i++){
+            thread_sum += shared[i];
+        }
+        
+        //  reduce the partial sums using SIMD
+        T total_sum = simd_sum(thread_sum);
+        
+        // broadcast result back to shared memory
+        if (lid == 0) {
+            shared[0] = total_sum;
+        }
+    }
+
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    return shared[0];
+}
+
+//------------------------------------------------------------------------------------------------//
+//  Raking threadgroup max reduction
+template<ushort BLOCK_SIZE, typename T> static T
+threadgroup_raking_reduce_max(T value, threadgroup T* shared, const ushort lid) {
+    // load values into shared memory
+    shared[lid] = value;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    //  only the first 32 threads form the rake
+    if (lid < 32) {
+        //  reduce by thread in shared mem
+        const short values_per_thread = BLOCK_SIZE / 32;
+        const short first_index = lid * values_per_thread;
+        
+        T thread_max = shared[first_index];
+        for (short i = first_index + 1; i < first_index + values_per_thread; i++){
+            thread_max = max(thread_max, shared[i]);
+        }
+        
+        //  reduce the partial maxes using SIMD
+        T total_max = simd_max(thread_max);
+        
+        // broadcast result back to shared memory
+        if (lid == 0) {
+            shared[0] = total_max;
+        }
+    }
+
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    return shared[0];
+}
+
+//------------------------------------------------------------------------------------------------//
+//  Raking threadgroup min reduction
+template<ushort BLOCK_SIZE, typename T> static T
+threadgroup_raking_reduce_min(T value, threadgroup T* shared, const ushort lid) {
+    // load values into shared memory
+    shared[lid] = value;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    //  only the first 32 threads form the rake
+    if (lid < 32) {
+        //  reduce by thread in shared mem
+        const short values_per_thread = BLOCK_SIZE / 32;
+        const short first_index = lid * values_per_thread;
+        
+        T thread_min = shared[first_index];
+        for (short i = first_index + 1; i < first_index + values_per_thread; i++){
+            thread_min = min(thread_min, shared[i]);
+        }
+        
+        //  reduce the partial mins using SIMD
+        T total_min = simd_min(thread_min);
+        
+        // broadcast result back to shared memory
+        if (lid == 0) {
+            shared[0] = total_min;
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    return shared[0];
+}
+
+//------------------------------------------------------------------------------------------------//
+//  Cooperative threadgroup sum reduction (2-level hierarchical)
+template<ushort BLOCK_SIZE, typename T> static T
+threadgroup_cooperative_reduce_sum(T value, threadgroup T* shared, const ushort lid) {
+    const ushort simd_group_id = lid / 32;
+    const ushort simd_lane_id = lid % 32;
+    
+    // Reduce within simdgroup
+    T local_sum = simd_sum(value);
+    
+    // First thread in each simdgroup writes to shared memory
+    if (simd_lane_id == 0) {
+        shared[simd_group_id] = local_sum;
+    }
+    
+    // Synchronize across the threadgroup
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    
+    // Reduce across simdgroups
+    T total_sum = T(0);
+    const ushort num_simd_groups = (BLOCK_SIZE + 31) / 32;
+    if (lid < num_simd_groups) {
+        total_sum = shared[lid];
+    }
+    total_sum = simd_sum(total_sum);
+    
+    // Broadcast the result to all threads
+    if (lid == 0) {
+        shared[0] = total_sum;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    
+    return shared[0];
+}
+
+//------------------------------------------------------------------------------------------------//
+//  Cooperative threadgroup max reduction (2-level hierarchical)
+template<ushort BLOCK_SIZE, typename T> static T
+threadgroup_cooperative_reduce_max(T value, threadgroup T* shared, const ushort lid) {
+    const ushort simd_group_id = lid / 32;
+    const ushort simd_lane_id = lid % 32;
+    
+    // Reduce within simdgroup
+    T local_max = simd_max(value);
+    
+    // First thread in each simdgroup writes to shared memory
+    if (simd_lane_id == 0) {
+        shared[simd_group_id] = local_max;
+    }
+    
+    // Synchronize across the threadgroup
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    
+    // Reduce across simdgroups
+    T total_max = (lid < ((BLOCK_SIZE + 31) / 32)) ? shared[lid] : T(-INFINITY);
+    total_max = simd_max(total_max);
+    
+    // Broadcast the result to all threads
+    if (lid == 0) {
+        shared[0] = total_max;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    
+    return shared[0];
+}
+
+//------------------------------------------------------------------------------------------------//
+//  Cooperative threadgroup min reduction (2-level hierarchical)
+template<ushort BLOCK_SIZE, typename T> static T
+threadgroup_cooperative_reduce_min(T value, threadgroup T* shared, const ushort lid) {
+    const ushort simd_group_id = lid / 32;
+    const ushort simd_lane_id = lid % 32;
+    
+    // Reduce within simdgroup
+    T local_min = simd_min(value);
+    
+    // First thread in each simdgroup writes to shared memory
+    if (simd_lane_id == 0) {
+        shared[simd_group_id] = local_min;
+    }
+    
+    // Synchronize across the threadgroup
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    
+    // Reduce across simdgroups
+    T total_min = (lid < ((BLOCK_SIZE + 31) / 32)) ? shared[lid] : T(INFINITY);
+    total_min = simd_min(total_min);
+    
+    // Broadcast the result to all threads
+    if (lid == 0) {
+        shared[0] = total_min;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    
+    return shared[0];
+}
+
 #endif // GAUSSIAN_PREFIX_SCAN_H

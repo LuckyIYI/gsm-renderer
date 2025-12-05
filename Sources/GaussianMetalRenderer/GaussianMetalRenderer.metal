@@ -470,13 +470,81 @@ kernel void resetTileBuilderStateKernel(
 // Note: tileBoundsKernel has been removed - tile bounds are now computed
 // directly in projectGaussiansFused kernel, eliminating the separate pass
 
-// Sort key generation - reads depth from packed GaussianRenderData
+// -----------------------------------------------------------------------------
+// Visible Gaussian Compaction (Deterministic Prefix-Sum Based)
+// Creates a compact list of visible gaussian indices for efficient dispatch
+// Uses prefix sum for deterministic ordering (atomic-based compaction was non-deterministic)
+// -----------------------------------------------------------------------------
+
+// Pass 1: Mark visibility - write 1 for visible, 0 for culled
+kernel void markVisibilityKernel(
+    const device int4* bounds [[buffer(0)]],       // Tile bounds from projection
+    device uint* visibilityMarks [[buffer(1)]],    // Output: 1 if visible, 0 if culled
+    constant uint& gaussianCount [[buffer(2)]],
+    uint gid [[thread_position_in_grid]]
+) {
+    if (gid >= gaussianCount) return;
+
+    // Check if gaussian is visible (valid bounds: minTX <= maxTX)
+    int4 rect = bounds[gid];
+    bool visible = (rect.x <= rect.y && rect.z <= rect.w);
+    visibilityMarks[gid] = visible ? 1u : 0u;
+}
+
+// Pass 2: After prefix sum on visibilityMarks, scatter visible indices
+// The prefix sum gives each visible gaussian a unique write position
+kernel void scatterCompactKernel(
+    const device int4* bounds [[buffer(0)]],           // Tile bounds from projection
+    const device uint* prefixSumOffsets [[buffer(1)]], // Exclusive prefix sum of visibility marks
+    device uint* visibleIndices [[buffer(2)]],         // Output: compacted visible indices
+    device uint* visibleCount [[buffer(3)]],           // Output: number of visible gaussians
+    constant uint& gaussianCount [[buffer(4)]],
+    uint gid [[thread_position_in_grid]]
+) {
+    if (gid >= gaussianCount) return;
+
+    // Check if gaussian is visible
+    int4 rect = bounds[gid];
+    bool visible = (rect.x <= rect.y && rect.z <= rect.w);
+
+    if (visible) {
+        // Write to position given by exclusive prefix sum
+        uint writePos = prefixSumOffsets[gid];
+        visibleIndices[writePos] = gid;
+    }
+
+    // Last thread writes total visible count
+    if (gid == gaussianCount - 1u) {
+        // Total = offset of last element + its visibility mark
+        *visibleCount = prefixSumOffsets[gid] + (visible ? 1u : 0u);
+    }
+}
+
+// Prepare indirect dispatch args based on visible count
+kernel void prepareIndirectDispatchKernel(
+    const device uint* visibleCount [[buffer(0)]],
+    device DispatchIndirectArgs* dispatchArgs [[buffer(1)]],
+    constant uint& threadgroupSize [[buffer(2)]],
+    uint gid [[thread_position_in_grid]]
+) {
+    if (gid != 0) return;
+
+    uint count = *visibleCount;
+    uint groups = (count + threadgroupSize - 1u) / threadgroupSize;
+
+    dispatchArgs->threadgroupsPerGridX = groups;
+    dispatchArgs->threadgroupsPerGridY = 1u;
+    dispatchArgs->threadgroupsPerGridZ = 1u;
+}
+
+// Sort key generation - outputs single 32-bit key: [tile:16][depth:16]
+// Radix sort processes LSB first, so depth (secondary) in low bits, tile (primary) in high bits
 template <typename RenderDataT>
 kernel void computeSortKeysKernel(
     const device int* tileIds [[buffer(0)]],
     const device int* tileIndices [[buffer(1)]],
     const device RenderDataT* renderData [[buffer(2)]],
-    device uint2* sortKeys [[buffer(3)]],
+    device uint* sortKeys [[buffer(3)]],
     device int* sortedIndices [[buffer(4)]],
     const device TileAssignmentHeader& header [[buffer(5)]],
     uint gid [[thread_position_in_grid]]
@@ -489,11 +557,13 @@ kernel void computeSortKeysKernel(
             uint tileId = (uint)tileIds[gid];
             float depthFloat = float(renderData[g].depth);
             half depthHalf = half(depthFloat);
-            uint depthBits = uint(as_type<ushort>(depthHalf));
-            sortKeys[gid] = uint2(tileId, depthBits);
+            // XOR with sign bit for correct IEEE 754 sorting as unsigned
+            uint depthBits = uint(as_type<ushort>(depthHalf)) ^ 0x8000u;
+            // Pack: [tile:16][depth:16] - tile in high bits for primary sort
+            sortKeys[gid] = (tileId << 16) | (depthBits & 0xFFFFu);
             sortedIndices[gid] = g;
         } else {
-            sortKeys[gid] = uint2(0xFFFFFFFFu, 0xFFFFFFFFu);
+            sortKeys[gid] = 0xFFFFFFFFu;
             sortedIndices[gid] = -1;
         }
     }
@@ -502,11 +572,11 @@ kernel void computeSortKeysKernel(
 template [[host_name("computeSortKeysKernel")]]
 kernel void computeSortKeysKernel<GaussianRenderData>(
     const device int*, const device int*, const device GaussianRenderData*,
-    device uint2*, device int*, const device TileAssignmentHeader&, uint);
+    device uint*, device int*, const device TileAssignmentHeader&, uint);
 
 
 kernel void buildHeadersFromSortedKernel(
-    const device uint2* sortedKeys [[buffer(0)]],
+    const device uint* sortedKeys [[buffer(0)]],  // 32-bit keys: [tile:16][depth:16]
     device GaussianHeader* headers [[buffer(1)]],
     const device TileAssignmentHeader* headerInfo [[buffer(2)]],
     constant uint& tileCount [[buffer(3)]],
@@ -524,11 +594,12 @@ kernel void buildHeadersFromSortedKernel(
         return;
     }
 
+    // Binary search for start of tile (tile ID is in high 16 bits)
     uint left = 0;
     uint right = total;
     while (left < right) {
         uint mid = (left + right) >> 1;
-        uint midTile = sortedKeys[mid].x;
+        uint midTile = sortedKeys[mid] >> 16;  // Extract tile from high bits
         if (midTile < tile) {
             left = mid + 1;
         } else {
@@ -537,11 +608,12 @@ kernel void buildHeadersFromSortedKernel(
     }
     uint start = left;
 
+    // Binary search for end of tile
     left = start;
     right = total;
     while (left < right) {
         uint mid = (left + right) >> 1;
-        uint midTile = sortedKeys[mid].x;
+        uint midTile = sortedKeys[mid] >> 16;  // Extract tile from high bits
         if (midTile <= tile) {
             left = mid + 1;
         } else {
@@ -794,22 +866,19 @@ kernel void encodeBitonicICB(
 }
 
 // =============================================================================
-// MARK: - Optimized Fused Coverage Scatter v2 (SIMD-based, reduced TG memory)
-// =============================================================================
-// Key optimizations:
-// 1. Reduced threadgroup memory: 128 tiles (512B) vs 2048 (8KB) = ~8x occupancy
-// 2. SIMD ballot/prefix for tile counting - no threadgroup atomics in hot loop
-// 3. Warp-cooperative global allocation - one atomic per SIMD group
-// 4. True half precision math for half variant
-// 5. Multi-pass for rare large gaussians (>128 tiles)
+// MARK: - Two-Pass Tile Assignment with Indirect Dispatch
 // =============================================================================
 
-#define FUSED_V2_TG_SIZE 64u
-#define FUSED_V2_SIMD_SIZE 32u
-#define FUSED_V2_MAX_TILES 128u  // 512 bytes - fits well in TG memory
-#define FUSED_V2_PRECISE_THRESHOLD 16u
+// Pass 0: Compact visible gaussians
+// Pass 1: Count tiles per visible gaussian (indirect dispatch)
+// Pass 2: Prefix sum on counts → offsets
+// Pass 3: Scatter tiles using precomputed offsets (indirect dispatch)
+// =============================================================================
 
-struct FusedCoverageScatterParamsV2 {
+// For large AABBs (> PRECISE_THRESHOLD tiles), use precise ellipse-tile intersection
+#define PRECISE_THRESHOLD 16u
+
+struct TileAssignParams {
     uint gaussianCount;
     uint tileWidth;
     uint tileHeight;
@@ -817,71 +886,149 @@ struct FusedCoverageScatterParamsV2 {
     uint maxAssignments;
 };
 
-// Fused coverage + scatter - reads from packed GaussianRenderData
-template <typename RenderDataT>
-kernel void fusedCoverageScatterKernelV2(
-    const device int4* bounds [[buffer(0)]],
-    device uint* coverageCounts [[buffer(1)]],
-    const device RenderDataT* renderData [[buffer(2)]],
-    constant FusedCoverageScatterParamsV2& params [[buffer(3)]],
-    device int* tileIndices [[buffer(4)]],
-    device int* tileIds [[buffer(5)]],
-    device TileAssignmentHeader* header [[buffer(6)]],
-    uint tgIdx [[thread_index_in_threadgroup]],
-    uint simdLaneId [[thread_index_in_simdgroup]],
-    uint simdGroupId [[simdgroup_index_in_threadgroup]],
-    uint groupIdx [[threadgroup_position_in_grid]]
+// -----------------------------------------------------------------------------
+// Pass 2: Prefix sum (block-level reduce + scan)
+// Uses optimized primitives from GaussianPrefixScan.h
+// -----------------------------------------------------------------------------
+#define SCAN_BLOCK_SIZE 256u
+
+// Block-level reduce: compute sum of each block using SIMD-optimized reduction
+kernel void blockReduceKernel(
+    const device uint* input [[buffer(0)]],
+    device uint* blockSums [[buffer(1)]],
+    constant uint& count [[buffer(2)]],
+    uint gid [[thread_position_in_grid]],
+    uint lid [[thread_position_in_threadgroup]],
+    uint groupId [[threadgroup_position_in_grid]]
 ) {
-    const uint gaussianIdx = groupIdx;
-    if (gaussianIdx >= params.gaussianCount) return;
+    threadgroup uint shared[SCAN_BLOCK_SIZE];
 
-    threadgroup int sharedTileIds[FUSED_V2_MAX_TILES];
-    threadgroup uint sharedCount;
-    threadgroup uint sharedGlobalOffset;
+    uint value = (gid < count) ? input[gid] : 0u;
 
-    // Load gaussian data from packed struct
-    const RenderDataT g = renderData[gaussianIdx];
-    const int4 rect = bounds[gaussianIdx];
+    // Use SIMD-optimized cooperative reduction
+    uint blockSum = threadgroup_cooperative_reduce_sum<SCAN_BLOCK_SIZE>(value, shared, ushort(lid));
+
+    if (lid == 0u) {
+        blockSums[groupId] = blockSum;
+    }
+}
+
+// Block-level exclusive scan with block sum offsets
+kernel void blockScanKernel(
+    const device uint* input [[buffer(0)]],
+    device uint* output [[buffer(1)]],
+    const device uint* blockOffsets [[buffer(2)]],
+    constant uint& count [[buffer(3)]],
+    uint gid [[thread_position_in_grid]],
+    uint lid [[thread_position_in_threadgroup]],
+    uint groupId [[threadgroup_position_in_grid]]
+) {
+    threadgroup uint shared[SCAN_BLOCK_SIZE];
+
+    uint value = (gid < count) ? input[gid] : 0u;
+
+    // Use SIMD-optimized raking prefix exclusive sum
+    uint exclusive = ThreadgroupRakingPrefixExclusiveSum<SCAN_BLOCK_SIZE>(value, shared, ushort(lid));
+
+    // Add block offset
+    if (gid < count) {
+        output[gid] = exclusive + blockOffsets[groupId];
+    }
+}
+
+// Single-block scan for block sums (assumes <= 256 blocks)
+// Also computes total and stores it at blockSums[blockCount]
+kernel void singleBlockScanKernel(
+    device uint* blockSums [[buffer(0)]],
+    constant uint& blockCount [[buffer(1)]],
+    uint lid [[thread_position_in_threadgroup]]
+) {
+    threadgroup uint shared[SCAN_BLOCK_SIZE];
+
+    // Read input value
+    uint value = (lid < blockCount) ? blockSums[lid] : 0u;
+
+    // Compute total using SIMD reduction
+    uint total = threadgroup_cooperative_reduce_sum<SCAN_BLOCK_SIZE>(value, shared, ushort(lid));
+
+    // Compute exclusive prefix sum
+    uint exclusive = ThreadgroupRakingPrefixExclusiveSum<SCAN_BLOCK_SIZE>(value, shared, ushort(lid));
+
+    // Write back results
+    if (lid < blockCount) {
+        blockSums[lid] = exclusive;
+    }
+    // Store total at blockSums[blockCount]
+    if (lid == 0u) {
+        blockSums[blockCount] = total;
+    }
+}
+
+// Write total count to header
+// Total was precomputed in singleBlockScanKernel and stored at blockSums[blockCount]
+kernel void writeTotalCountKernel(
+    const device uint* blockSums [[buffer(0)]],
+    device TileAssignmentHeader* header [[buffer(1)]],
+    constant uint& blockCount [[buffer(2)]],
+    uint tid [[thread_position_in_grid]]
+) {
+    if (tid != 0u) return;
+
+    // Total is stored at blockSums[blockCount] by singleBlockScanKernel
+    header->totalAssignments = blockSums[blockCount];
+}
+
+// -----------------------------------------------------------------------------
+// Pass 1 & 3: Indirect Tile Count/Scatter - work with compacted visible indices
+// Only processes visible gaussians via indirection through visibleIndices
+// -----------------------------------------------------------------------------
+
+template <typename RenderDataT>
+kernel void tileCountIndirectKernel(
+    const device int4* bounds [[buffer(0)]],
+    const device RenderDataT* renderData [[buffer(1)]],
+    device uint* tileCounts [[buffer(2)]],
+    const device uint* visibleIndices [[buffer(3)]],
+    constant TileAssignParams& params [[buffer(4)]],
+    uint gid [[thread_position_in_grid]]
+) {
+    if (gid >= params.gaussianCount) return;
+
+    uint originalIdx = visibleIndices[gid];
+    const int4 rect = bounds[originalIdx];
     const int minTX = rect.x;
     const int maxTX = rect.y;
     const int minTY = rect.z;
     const int maxTY = rect.w;
-    const int aabbWidth = maxTX - minTX + 1;
-    const int aabbHeight = maxTY - minTY + 1;
 
-    if (aabbWidth <= 0 || aabbHeight <= 0) {
-        if (tgIdx == 0u) {
-            coverageCounts[gaussianIdx] = 0u;
-        }
+    if (minTX > maxTX || minTY > maxTY) {
+        tileCounts[gid] = 0u;
         return;
     }
 
-    const uint aabbCount = uint(aabbWidth * aabbHeight);
+    const RenderDataT g = renderData[originalIdx];
     const float alpha = float(g.opacity);
-
     if (alpha < 1e-4f) {
-        if (tgIdx == 0u) {
-            coverageCounts[gaussianIdx] = 0u;
-        }
+        tileCounts[gid] = 0u;
         return;
     }
 
-    if (tgIdx == 0u) {
-        sharedCount = 0u;
+    const uint aabbWidth = uint(maxTX - minTX + 1);
+    const uint aabbHeight = uint(maxTY - minTY + 1);
+    const uint aabbCount = aabbWidth * aabbHeight;
+
+    if (aabbCount <= PRECISE_THRESHOLD) {
+        tileCounts[gid] = aabbCount;
+        return;
     }
-    threadgroup_barrier(mem_flags::mem_threadgroup);
 
     const float tileW = float(params.tileWidth);
     const float tileH = float(params.tileHeight);
-    const uint tilesX = params.tilesX;
-    const bool needsPrecise = (aabbCount > FUSED_V2_PRECISE_THRESHOLD);
-
     const float2 center = float2(getMean(g));
     const half4 conicH = getConic(g);
     const float3 conic = float3(float(conicH.x), float(conicH.y), float(conicH.z));
     const float qMax = computeQMax(alpha, GAUSSIAN_TAU);
 
-    // Pre-compute expanded qMax for tile-center test
     const float halfTileW = tileW * 0.5f;
     const float halfTileH = tileH * 0.5f;
     const float tileDiag = fast::sqrt(halfTileW * halfTileW + halfTileH * halfTileH);
@@ -889,108 +1036,130 @@ kernel void fusedCoverageScatterKernelV2(
     const float expand = tileDiag * fast::sqrt(maxConic);
     const float qMaxExpanded = qMax + 2.0f * expand * fast::sqrt(qMax) + expand * expand;
 
-    // Process tiles using SIMD-based approach
-    // Each thread checks one tile at a time, SIMD ballot counts hits
-    uint totalFound = 0u;
+    uint count = 0u;
+    for (int ty = minTY; ty <= maxTY; ty++) {
+        for (int tx = minTX; tx <= maxTX; tx++) {
+            const float tileCenterX = (float(tx) + 0.5f) * tileW;
+            const float tileCenterY = (float(ty) + 0.5f) * tileH;
+            const float dx = tileCenterX - center.x;
+            const float dy = tileCenterY - center.y;
+            const float q = dx * dx * conic.x + 2.0f * dx * dy * conic.y + dy * dy * conic.z;
 
-    for (uint baseIdx = 0u; baseIdx < aabbCount; baseIdx += FUSED_V2_TG_SIZE) {
-        uint idx = baseIdx + tgIdx;
-        bool intersects = false;
-        int tileId = 0;
-
-        if (idx < aabbCount) {
-            const int ty = minTY + int(idx / uint(aabbWidth));
-            const int tx = minTX + int(idx % uint(aabbWidth));
-            tileId = ty * int(tilesX) + tx;
-
-            if (!needsPrecise) {
-                intersects = true;
-            } else {
-                const float tileCenterX = (float(tx) + 0.5f) * tileW;
-                const float tileCenterY = (float(ty) + 0.5f) * tileH;
-                const float dx = tileCenterX - center.x;
-                const float dy = tileCenterY - center.y;
-                const float q = dx * dx * conic.x + 2.0f * dx * dy * conic.y + dy * dy * conic.z;
-
-                if (q <= qMax) {
-                    intersects = true;
-                } else if (q <= qMaxExpanded) {
-                    const float tileMinX = float(tx) * tileW;
-                    const float tileMinY = float(ty) * tileH;
-                    intersects = ellipseIntersectsTile(center, conic, qMax,
-                                                       tileMinX, tileMinY,
-                                                       tileMinX + tileW, tileMinY + tileH);
+            if (q <= qMax) {
+                count++;
+            } else if (q <= qMaxExpanded) {
+                const float tileMinX = float(tx) * tileW;
+                const float tileMinY = float(ty) * tileH;
+                if (ellipseIntersectsTile(center, conic, qMax,
+                                          tileMinX, tileMinY,
+                                          tileMinX + tileW, tileMinY + tileH)) {
+                    count++;
                 }
             }
         }
-
-        // SIMD ballot to count intersections efficiently
-        // This replaces threadgroup atomics in the hot loop
-        // simd_ballot returns simd_vote, cast to underlying vote_t then to uint32
-        // On Apple Silicon SIMD width is 32, so lower 32 bits are valid
-        simd_vote ballot = simd_ballot(intersects);
-        uint simdMask = uint(simd_vote::vote_t(ballot) & 0xFFFFFFFFull);
-        uint simdCount = popcount(simdMask);
-
-        // Compute prefix within SIMD group for write position
-        uint lowerMask = (1u << simdLaneId) - 1u;
-        uint simdPrefix = popcount(simdMask & lowerMask);
-
-        // First lane in each SIMD group atomically allocates space in shared buffer
-        uint simdBaseOffset = 0u;
-        if (simdLaneId == 0u && simdCount > 0u) {
-            simdBaseOffset = atomic_fetch_add_explicit(
-                (threadgroup atomic_uint*)&sharedCount, simdCount, memory_order_relaxed);
-        }
-        // Broadcast base offset to all lanes in SIMD group
-        simdBaseOffset = simd_broadcast_first(simdBaseOffset);
-
-        // Write to shared buffer (with overflow protection)
-        if (intersects) {
-            uint writePos = simdBaseOffset + simdPrefix;
-            if (writePos < FUSED_V2_MAX_TILES) {
-                sharedTileIds[writePos] = tileId;
-            }
-        }
-
-        threadgroup_barrier(mem_flags::mem_threadgroup);
     }
+    tileCounts[gid] = count;
+}
 
-    // Get final count (clamped to buffer size)
-    uint count = min(sharedCount, FUSED_V2_MAX_TILES);
+template [[host_name("tileCountIndirectKernel")]]
+kernel void tileCountIndirectKernel<GaussianRenderData>(
+    const device int4*, const device GaussianRenderData*, device uint*,
+    const device uint*, constant TileAssignParams&, uint);
 
-    // Single thread allocates global space and writes coverage count
-    if (tgIdx == 0u) {
-        coverageCounts[gaussianIdx] = count;
-        if (count > 0u) {
-            sharedGlobalOffset = atomic_fetch_add_explicit(
-                (device atomic_uint*)&header->totalAssignments, count, memory_order_relaxed);
-        } else {
-            sharedGlobalOffset = 0u;
-        }
-    }
-    threadgroup_barrier(mem_flags::mem_threadgroup);
+template <typename RenderDataT>
+kernel void tileScatterIndirectKernel(
+    const device int4* bounds [[buffer(0)]],
+    const device RenderDataT* renderData [[buffer(1)]],
+    const device uint* offsets [[buffer(2)]],
+    const device uint* visibleIndices [[buffer(3)]],
+    device int* tileIndices [[buffer(4)]],
+    device int* tileIds [[buffer(5)]],
+    constant TileAssignParams& params [[buffer(6)]],
+    uint gid [[thread_position_in_grid]]
+) {
+    if (gid >= params.gaussianCount) return;
 
-    if (count == 0u) return;
+    uint originalIdx = visibleIndices[gid];
+    const int4 rect = bounds[originalIdx];
+    const int minTX = rect.x;
+    const int maxTX = rect.y;
+    const int minTY = rect.z;
+    const int maxTY = rect.w;
 
-    // Scatter to global buffers using coalesced writes
-    const uint globalOffset = sharedGlobalOffset;
+    if (minTX > maxTX || minTY > maxTY) return;
+
+    const RenderDataT g = renderData[originalIdx];
+    const float alpha = float(g.opacity);
+    if (alpha < 1e-4f) return;
+
+    const uint aabbWidth = uint(maxTX - minTX + 1);
+    const uint aabbHeight = uint(maxTY - minTY + 1);
+    const uint aabbCount = aabbWidth * aabbHeight;
+    const uint tilesX = params.tilesX;
     const uint maxAssignments = params.maxAssignments;
 
-    for (uint i = tgIdx; i < count; i += FUSED_V2_TG_SIZE) {
-        const uint writePos = globalOffset + i;
-        if (writePos < maxAssignments) {
-            tileIds[writePos] = sharedTileIds[i];
-            tileIndices[writePos] = int(gaussianIdx);
+    uint writePos = offsets[gid];
+    const int gaussianIdx = int(originalIdx);
+
+    if (aabbCount <= PRECISE_THRESHOLD) {
+        for (int ty = minTY; ty <= maxTY; ty++) {
+            for (int tx = minTX; tx <= maxTX; tx++) {
+                if (writePos < maxAssignments) {
+                    tileIds[writePos] = ty * int(tilesX) + tx;
+                    tileIndices[writePos] = gaussianIdx;
+                    writePos++;
+                }
+            }
+        }
+        return;
+    }
+
+    const float tileW = float(params.tileWidth);
+    const float tileH = float(params.tileHeight);
+    const float2 center = float2(getMean(g));
+    const half4 conicH = getConic(g);
+    const float3 conic = float3(float(conicH.x), float(conicH.y), float(conicH.z));
+    const float qMax = computeQMax(alpha, GAUSSIAN_TAU);
+
+    const float halfTileW = tileW * 0.5f;
+    const float halfTileH = tileH * 0.5f;
+    const float tileDiag = fast::sqrt(halfTileW * halfTileW + halfTileH * halfTileH);
+    const float maxConic = max(conic.x, conic.z);
+    const float expand = tileDiag * fast::sqrt(maxConic);
+    const float qMaxExpanded = qMax + 2.0f * expand * fast::sqrt(qMax) + expand * expand;
+
+    for (int ty = minTY; ty <= maxTY; ty++) {
+        for (int tx = minTX; tx <= maxTX; tx++) {
+            const float tileCenterX = (float(tx) + 0.5f) * tileW;
+            const float tileCenterY = (float(ty) + 0.5f) * tileH;
+            const float dx = tileCenterX - center.x;
+            const float dy = tileCenterY - center.y;
+            const float q = dx * dx * conic.x + 2.0f * dx * dy * conic.y + dy * dy * conic.z;
+
+            bool shouldWrite = false;
+            if (q <= qMax) {
+                shouldWrite = true;
+            } else if (q <= qMaxExpanded) {
+                const float tileMinX = float(tx) * tileW;
+                const float tileMinY = float(ty) * tileH;
+                shouldWrite = ellipseIntersectsTile(center, conic, qMax,
+                                                    tileMinX, tileMinY,
+                                                    tileMinX + tileW, tileMinY + tileH);
+            }
+
+            if (shouldWrite && writePos < maxAssignments) {
+                tileIds[writePos] = ty * int(tilesX) + tx;
+                tileIndices[writePos] = gaussianIdx;
+                writePos++;
+            }
         }
     }
 }
 
-template [[host_name("fusedCoverageScatterKernelV2")]]
-kernel void fusedCoverageScatterKernelV2<GaussianRenderData>(
-    const device int4*, device uint*, const device GaussianRenderData*,
-    constant FusedCoverageScatterParamsV2&, device int*, device int*,
-    device TileAssignmentHeader*, uint, uint, uint, uint);
+template [[host_name("tileScatterIndirectKernel")]]
+kernel void tileScatterIndirectKernel<GaussianRenderData>(
+    const device int4*, const device GaussianRenderData*, const device uint*,
+    const device uint*, device int*, device int*, constant TileAssignParams&, uint);
 
 kernel void prepareAssignmentDispatchKernel(
     device TileAssignmentHeader* header [[buffer(0)]],
@@ -1093,7 +1262,7 @@ kernel void prepareAssignmentDispatchKernel(
 #define SCAN_TYPE_INCLUSIVE (0)
 #define SCAN_TYPE_EXCLUSIVE (1)
 
-using KeyType = ulong;
+using KeyType = uint;  // 32-bit key: [tile:16][depth:16]
 
 struct KeyPayload {
     KeyType key;
@@ -1556,38 +1725,6 @@ kernel void radixScatterKernel(
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
     }
-}
-
-kernel void fuseSortKeysKernel(
-    const device uint2* input_keys [[buffer(0)]],
-    device KeyType* output_keys [[buffer(1)]],
-    const device uint* header [[buffer(2)]],  // TileAssignmentHeader: [totalAssignments, ...]
-    uint gid [[thread_position_in_grid]]
-) {
-    uint count = header[0];  // totalAssignments
-    if (gid >= count) return;
-
-    uint2 key = input_keys[gid];
-    // Pack tileId in upper bits, 16-bit depth in lower bits
-    // Layout: [depth16 0-15, tileId 16-63] for compact radix sort passes
-    // Radix sort processes LSB first, so depth (secondary) goes low, tileId (primary) goes high
-    KeyType fused = (KeyType(key.x) << 16) | KeyType(key.y & 0xFFFFu);
-    output_keys[gid] = fused;
-}
-
-kernel void unpackSortKeysKernel(
-    const device KeyType* input_keys [[buffer(0)]],
-    device uint2* output_keys [[buffer(1)]],
-    const device uint* header [[buffer(2)]],  // TileAssignmentHeader: [totalAssignments, ...]
-    uint gid [[thread_position_in_grid]]
-) {
-    uint count = header[0];  // totalAssignments
-    if (gid >= count) return;
-
-    KeyType fused = input_keys[gid];
-    uint tile = uint(fused >> 16);
-    uint depthBits = uint(fused & 0xFFFFull);  // 16-bit depth
-    output_keys[gid] = uint2(tile, depthBits);
 }
 
 // =============================================================================

@@ -39,9 +39,8 @@ final class SortPerfTests: XCTestCase {
         let radixEncoder = try RadixSortEncoder(device: device, library: library)
         let bitonicEncoder = try BitonicSortEncoder(device: device, library: library)
 
+        // 32-bit key offsets (no fuse/unpack)
         let radixOffsets = (
-            fuse: DispatchSlot.fuseKeys.rawValue * MemoryLayout<DispatchIndirectArgsSwift>.stride,
-            unpack: DispatchSlot.unpackKeys.rawValue * MemoryLayout<DispatchIndirectArgsSwift>.stride,
             histogram: DispatchSlot.radixHistogram.rawValue * MemoryLayout<DispatchIndirectArgsSwift>.stride,
             scanBlocks: DispatchSlot.radixScanBlocks.rawValue * MemoryLayout<DispatchIndirectArgsSwift>.stride,
             exclusive: DispatchSlot.radixExclusive.rawValue * MemoryLayout<DispatchIndirectArgsSwift>.stride,
@@ -63,7 +62,8 @@ final class SortPerfTests: XCTestCase {
             let gridSize = max(1, (paddedCount + valuesPerGroup - 1) / valuesPerGroup)
             let histogramCount = gridSize * radix
 
-            let sortKeys = device.makeBuffer(length: paddedCount * MemoryLayout<SIMD2<UInt32>>.stride, options: .storageModeShared)!
+            // 32-bit keys (no fuse/unpack)
+            let sortKeys = device.makeBuffer(length: paddedCount * MemoryLayout<UInt32>.stride, options: .storageModeShared)!
             let sortIndices = device.makeBuffer(length: paddedCount * MemoryLayout<Int32>.stride, options: .storageModeShared)!
             let headerBuffer = device.makeBuffer(length: MemoryLayout<TileAssignmentHeaderSwift>.stride, options: .storageModeShared)!
 
@@ -71,8 +71,7 @@ final class SortPerfTests: XCTestCase {
                 histogram: device.makeBuffer(length: histogramCount * 4, options: .storageModePrivate)!,
                 blockSums: device.makeBuffer(length: gridSize * 4, options: .storageModePrivate)!,
                 scannedHistogram: device.makeBuffer(length: histogramCount * 4, options: .storageModePrivate)!,
-                fusedKeys: device.makeBuffer(length: paddedCount * 8, options: .storageModePrivate)!,
-                scratchKeys: device.makeBuffer(length: paddedCount * 8, options: .storageModePrivate)!,
+                scratchKeys: device.makeBuffer(length: paddedCount * 4, options: .storageModePrivate)!,
                 scratchPayload: device.makeBuffer(length: paddedCount * 4, options: .storageModePrivate)!
             )
 
@@ -81,7 +80,7 @@ final class SortPerfTests: XCTestCase {
             let expectedIdx = indices
 
             func fillInput() {
-                let keysBuf = sortKeys.contents().bindMemory(to: SIMD2<UInt32>.self, capacity: paddedCount)
+                let keysBuf = sortKeys.contents().bindMemory(to: UInt32.self, capacity: paddedCount)
                 keys.withUnsafeBufferPointer { src in
                     keysBuf.update(from: src.baseAddress!, count: keys.count)
                 }
@@ -89,7 +88,7 @@ final class SortPerfTests: XCTestCase {
                 indices.withUnsafeBufferPointer { src in
                     idxBuf.update(from: src.baseAddress!, count: indices.count)
                 }
-                let padKey = SIMD2<UInt32>(UInt32.max, UInt32.max)
+                let padKey: UInt32 = UInt32.max
                 for i in count..<paddedCount {
                     keysBuf[i] = padKey
                     idxBuf[i] = -1
@@ -162,13 +161,16 @@ final class SortPerfTests: XCTestCase {
         print("[SortPerf] \(summaries.joined(separator: " | "))")
     }
 
-    private func makeKeys(count: Int, maxTile: Int) -> ([SIMD2<UInt32>], [Int32]) {
-        var keys = [SIMD2<UInt32>](repeating: .zero, count: count)
+    // Returns 32-bit keys: [tile:16][depth:16]
+    private func makeKeys(count: Int, maxTile: Int) -> ([UInt32], [Int32]) {
+        var keys = [UInt32](repeating: 0, count: count)
         var indices = [Int32](repeating: 0, count: count)
         for i in 0..<count {
             let tile = UInt32(i / max(1, count / maxTile))
             let depth = Float(i) * 0.0001 + 0.1
-            keys[i] = SIMD2<UInt32>(tile, depth.bitPattern)
+            let halfDepth = Float16(depth)
+            let depthBits = UInt32(halfDepth.bitPattern) ^ 0x8000  // IEEE 754 sign fix
+            keys[i] = (tile << 16) | (depthBits & 0xFFFF)
             indices[i] = Int32(i)
         }
         return (keys, indices)

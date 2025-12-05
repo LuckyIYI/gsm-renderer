@@ -22,39 +22,35 @@ final class EncoderTests: XCTestCase {
 
         let count = 1024
 
-        var keys = [SIMD2<UInt32>](repeating: .zero, count: count)
+        // 32-bit keys: [tile:16][depth:16]
+        var keys = [UInt32](repeating: 0, count: count)
         var indices = [Int32](repeating: 0, count: count)
 
         // Use deterministic values with 16-bit depth (half precision)
-        // The radix sort now uses 16-bit depth quantization
         for i in 0..<count {
             let tileId = UInt32(i % 10)  // Tiles 0-9 in order
             let depth = Float(i)  // Simple increasing depth
-            // Convert to half precision (matches GPU fuseSortKeysKernel)
+            // Convert to half precision
             let halfDepth = Float16(depth)
-            let depthBits = UInt32(halfDepth.bitPattern)
-            keys[i] = SIMD2<UInt32>(tileId, depthBits)
+            let depthBits = UInt32(halfDepth.bitPattern) ^ 0x8000  // IEEE 754 sign fix
+            // Pack as [tile:16][depth:16]
+            keys[i] = (tileId << 16) | (depthBits & 0xFFFF)
             indices[i] = Int32(i)
         }
 
         struct Item {
-            let key: SIMD2<UInt32>
+            let key: UInt32
             let index: Int32
         }
 
         let items = zip(keys, indices).map { Item(key: $0, index: $1) }
-        let sortedItems = items.sorted { a, b in
-            if a.key.x != b.key.x {
-                return a.key.x < b.key.x
-            }
-            return a.key.y < b.key.y
-        }
+        let sortedItems = items.sorted { $0.key < $1.key }
         let tileCount = 10
 
-        let keyBuffer = device.makeBuffer(bytes: keys, length: count * MemoryLayout<SIMD2<UInt32>>.stride, options: .storageModeShared)!
+        let keyBuffer = device.makeBuffer(bytes: keys, length: count * MemoryLayout<UInt32>.stride, options: .storageModeShared)!
         let indicesBuffer = device.makeBuffer(bytes: indices, length: count * MemoryLayout<Int32>.stride, options: .storageModeShared)!
         let headerBuffer = device.makeBuffer(length: MemoryLayout<TileAssignmentHeaderSwift>.stride, options: .storageModeShared)!
-        
+
         let dispatchArgs = device.makeBuffer(length: 1024, options: .storageModeShared)!
 
         let maxAssignments = count * 10
@@ -84,29 +80,27 @@ final class EncoderTests: XCTestCase {
         let histBuf = device.makeBuffer(length: histogramCount * 4, options: .storageModeShared)!
         let blockSumsBuf = device.makeBuffer(length: gridSize * 4, options: .storageModeShared)!
         let scannedHistBuf = device.makeBuffer(length: histogramCount * 4, options: .storageModeShared)!
-        let fusedKeysBuf = device.makeBuffer(length: count * 8, options: .storageModeShared)!
-        let scratchKeysBuf = device.makeBuffer(length: count * 8, options: .storageModeShared)!
+        // 32-bit scratch keys (not 64-bit fused keys anymore)
+        let scratchKeysBuf = device.makeBuffer(length: count * 4, options: .storageModeShared)!
         let scratchPayloadBuf = device.makeBuffer(length: count * 4, options: .storageModeShared)!
-        
+
         let radixBuffers = RadixBufferSet(
             histogram: histBuf,
             blockSums: blockSumsBuf,
             scannedHistogram: scannedHistBuf,
-            fusedKeys: fusedKeysBuf,
             scratchKeys: scratchKeysBuf,
             scratchPayload: scratchPayloadBuf
         )
-        
+
+        // New offset tuple without fuse/unpack
         let offsets = (
-            fuse: DispatchSlot.fuseKeys.rawValue * MemoryLayout<DispatchIndirectArgsSwift>.stride,
-            unpack: DispatchSlot.unpackKeys.rawValue * MemoryLayout<DispatchIndirectArgsSwift>.stride,
             histogram: DispatchSlot.radixHistogram.rawValue * MemoryLayout<DispatchIndirectArgsSwift>.stride,
             scanBlocks: DispatchSlot.radixScanBlocks.rawValue * MemoryLayout<DispatchIndirectArgsSwift>.stride,
             exclusive: DispatchSlot.radixExclusive.rawValue * MemoryLayout<DispatchIndirectArgsSwift>.stride,
             apply: DispatchSlot.radixApply.rawValue * MemoryLayout<DispatchIndirectArgsSwift>.stride,
             scatter: DispatchSlot.radixScatter.rawValue * MemoryLayout<DispatchIndirectArgsSwift>.stride
         )
-        
+
         let commandBuffer = queue.makeCommandBuffer()!
 
         dispatchEncoder.encode(commandBuffer: commandBuffer, header: headerBuffer, dispatchArgs: dispatchArgs, maxAssignments: maxAssignments)
@@ -119,13 +113,9 @@ final class EncoderTests: XCTestCase {
 
         // Debug: Print dispatch args
         let dispatchArgsPtr = dispatchArgs.contents().bindMemory(to: DispatchIndirectArgsSwift.self, capacity: 20)
-        let fuseSlot = DispatchSlot.fuseKeys.rawValue
         let histSlot = DispatchSlot.radixHistogram.rawValue
         let scatterSlot = DispatchSlot.radixScatter.rawValue
-        NSLog("Dispatch args: fuse=(%d,%d,%d) histogram=(%d,%d,%d) scatter=(%d,%d,%d)",
-              dispatchArgsPtr[fuseSlot].threadgroupsPerGridX,
-              dispatchArgsPtr[fuseSlot].threadgroupsPerGridY,
-              dispatchArgsPtr[fuseSlot].threadgroupsPerGridZ,
+        NSLog("Dispatch args: histogram=(%d,%d,%d) scatter=(%d,%d,%d)",
               dispatchArgsPtr[histSlot].threadgroupsPerGridX,
               dispatchArgsPtr[histSlot].threadgroupsPerGridY,
               dispatchArgsPtr[histSlot].threadgroupsPerGridZ,
@@ -133,43 +123,11 @@ final class EncoderTests: XCTestCase {
               dispatchArgsPtr[scatterSlot].threadgroupsPerGridY,
               dispatchArgsPtr[scatterSlot].threadgroupsPerGridZ)
 
+        // Run the sort directly (no fuse step needed - keys already 32-bit)
         let commandBuffer2 = queue.makeCommandBuffer()!
 
-        // Only run the fuse step first to check the fused keys
-        let fuseEncoder = try RadixSortEncoder(device: device, library: library)
-
-        // Manually encode just the fuse step
-        if let enc = commandBuffer2.makeComputeCommandEncoder() {
-            enc.label = "FuseOnly"
-            guard let fuseFn = library.makeFunction(name: "fuseSortKeysKernel") else {
-                XCTFail("fuseSortKeysKernel not found")
-                return
-            }
-            let fusePipeline = try device.makeComputePipelineState(function: fuseFn)
-            enc.setComputePipelineState(fusePipeline)
-            enc.setBuffer(keyBuffer, offset: 0, index: 0)
-            enc.setBuffer(fusedKeysBuf, offset: 0, index: 1)
-            enc.dispatchThreads(MTLSize(width: count, height: 1, depth: 1),
-                               threadsPerThreadgroup: MTLSize(width: min(count, 256), height: 1, depth: 1))
-            enc.endEncoding()
-        }
-        commandBuffer2.commit()
-        commandBuffer2.waitUntilCompleted()
-
-        // Debug: Print fused keys BEFORE sort
-        let fusedBeforePtr = fusedKeysBuf.contents().bindMemory(to: UInt64.self, capacity: count)
-        var fuseCheckMsg = "Fused keys BEFORE sort:\n"
-        for i in [0, 1, 2, 10, 11, 100, 101] {
-            let fk = fusedBeforePtr[i]
-            fuseCheckMsg += "  [\(i)] fused=\(fk) tile=\(fk >> 32)\n"
-        }
-        NSLog("%@", fuseCheckMsg)
-
-        // Now run the full sort
-        let commandBuffer3 = queue.makeCommandBuffer()!
-
         encoder.encode(
-            commandBuffer: commandBuffer3,
+            commandBuffer: commandBuffer2,
             keyBuffer: keyBuffer,
             sortedIndices: indicesBuffer,
             header: headerBuffer,
@@ -179,27 +137,17 @@ final class EncoderTests: XCTestCase {
             tileCount: tileCount
         )
 
-        commandBuffer3.commit()
-        commandBuffer3.waitUntilCompleted()
-
-        // Debug: Print fused keys (after all passes)
-        let fusedKeysPtr = fusedKeysBuf.contents().bindMemory(to: UInt64.self, capacity: count)
-        let scratchKeysPtr = scratchKeysBuf.contents().bindMemory(to: UInt64.self, capacity: count)
-        var debugMsg = "First 10 fusedKeys after sort:\n"
-        for i in 0..<10 {
-            let fk = fusedKeysPtr[i]
-            let sk = scratchKeysPtr[i]
-            debugMsg += "  [\(i)] fused=\(fk) tile=\(fk >> 32) | scratch=\(sk) tile=\(sk >> 32)\n"
-        }
-        NSLog("%@", debugMsg)
+        commandBuffer2.commit()
+        commandBuffer2.waitUntilCompleted()
 
         let outIndices = indicesBuffer.contents().bindMemory(to: Int32.self, capacity: count)
-        let outKeys = keyBuffer.contents().bindMemory(to: SIMD2<UInt32>.self, capacity: count)
+        let outKeys = keyBuffer.contents().bindMemory(to: UInt32.self, capacity: count)
 
         // Debug: Print first 20 output keys as an assertion message
         var outputMsg = "First 20 GPU sorted keys:\n"
         for i in 0..<20 {
-            outputMsg += "  [\(i)] tile=\(outKeys[i].x) depth=\(outKeys[i].y) idx=\(outIndices[i])\n"
+            let key = outKeys[i]
+            outputMsg += "  [\(i)] tile=\(key >> 16) depth=\(key & 0xFFFF) idx=\(outIndices[i])\n"
         }
         NSLog("%@", outputMsg)
 
@@ -207,26 +155,24 @@ final class EncoderTests: XCTestCase {
         for i in 0..<count {
             let cpuIdx = sortedItems[i].index
             let gpuIdx = outIndices[i]
-            
+
             if cpuIdx != gpuIdx {
                 // Allow stable sort variation if keys are identical
                 let cpuKey = sortedItems[i].key
                 let gpuKey = outKeys[i]
-                
+
                 if cpuKey != gpuKey {
                      XCTFail("Mismatch at \(i): CPU Key \(cpuKey) Idx \(cpuIdx) vs GPU Key \(gpuKey) Idx \(gpuIdx)")
                      break
                 }
             }
         }
-        
+
         // Verify Keys Strictly Sorted
         for i in 0..<count-1 {
             let k1 = outKeys[i]
             let k2 = outKeys[i+1]
-            let k1Val = (UInt64(k1.x) << 32) | UInt64(k1.y)
-            let k2Val = (UInt64(k2.x) << 32) | UInt64(k2.y)
-            XCTAssertLessThanOrEqual(k1Val, k2Val, "Keys not sorted at \(i)")
+            XCTAssertLessThanOrEqual(k1, k2, "Keys not sorted at \(i)")
         }
     }
 
@@ -356,25 +302,27 @@ final class EncoderTests: XCTestCase {
     }
 
     // Test just histogram and first pass to debug
+    // Now tests 32-bit keys directly (no fuse step needed)
     func testRadixSortSinglePass() throws {
         // Simple test: 16 elements, 4 unique bins (tiles 0-3)
         let count = 16
 
-        var keys = [SIMD2<UInt32>](repeating: .zero, count: count)
+        // 32-bit keys: [tile:16][depth:16]
+        var keys = [UInt32](repeating: 0, count: count)
         var indices = [Int32](repeating: 0, count: count)
 
         // Create simple pattern: indices 0,4,8,12 have tile=0; 1,5,9,13 have tile=1; etc.
         for i in 0..<count {
             let tileId = UInt32(i % 4)
-            let depth = Float(i)
-            keys[i] = SIMD2<UInt32>(tileId, depth.bitPattern)
+            let depthBits = UInt32(i) & 0xFFFF  // Simple depth value
+            keys[i] = (tileId << 16) | depthBits
             indices[i] = Int32(i)
         }
 
         // Expected after sorting by tile: elements with tile 0 first, then tile 1, etc.
-        NSLog("Input: %@", keys.map { "(\($0.x), \($0.y))" }.joined(separator: ", "))
+        NSLog("Input: %@", keys.map { "tile=\($0 >> 16) depth=\($0 & 0xFFFF)" }.joined(separator: ", "))
 
-        let keyBuffer = device.makeBuffer(bytes: keys, length: count * MemoryLayout<SIMD2<UInt32>>.stride, options: .storageModeShared)!
+        let keyBuffer = device.makeBuffer(bytes: keys, length: count * MemoryLayout<UInt32>.stride, options: .storageModeShared)!
         let indicesBuffer = device.makeBuffer(bytes: indices, length: count * MemoryLayout<Int32>.stride, options: .storageModeShared)!
         let headerBuffer = device.makeBuffer(length: MemoryLayout<TileAssignmentHeaderSwift>.stride, options: .storageModeShared)!
 
@@ -384,11 +332,7 @@ final class EncoderTests: XCTestCase {
         while padded < count { padded <<= 1 }
         headerPtr.pointee.paddedCount = UInt32(padded)
 
-        // Fuse the keys manually for inspection
-        let fusedKeysBuf = device.makeBuffer(length: count * 8, options: .storageModeShared)!
-
-        guard let fuseFn = library.makeFunction(name: "fuseSortKeysKernel"),
-              let histFn = library.makeFunction(name: "radixHistogramKernel"),
+        guard let histFn = library.makeFunction(name: "radixHistogramKernel"),
               let scanFn = library.makeFunction(name: "radixScanBlocksKernel"),
               let exclusiveFn = library.makeFunction(name: "radixExclusiveScanKernel"),
               let applyFn = library.makeFunction(name: "radixApplyScanOffsetsKernel"),
@@ -397,7 +341,6 @@ final class EncoderTests: XCTestCase {
             return
         }
 
-        let fusePipeline = try device.makeComputePipelineState(function: fuseFn)
         let histPipeline = try device.makeComputePipelineState(function: histFn)
         let scanPipeline = try device.makeComputePipelineState(function: scanFn)
         let exclusivePipeline = try device.makeComputePipelineState(function: exclusiveFn)
@@ -412,28 +355,17 @@ final class EncoderTests: XCTestCase {
         let histBuf = device.makeBuffer(length: histogramCount * 4, options: .storageModeShared)!
         let blockSumsBuf = device.makeBuffer(length: max(gridSize, 256) * 4, options: .storageModeShared)!
         let scannedHistBuf = device.makeBuffer(length: histogramCount * 4, options: .storageModeShared)!
-        let scratchKeysBuf = device.makeBuffer(length: count * 8, options: .storageModeShared)!
+        let scratchKeysBuf = device.makeBuffer(length: count * 4, options: .storageModeShared)!
         let scratchPayloadBuf = device.makeBuffer(length: count * 4, options: .storageModeShared)!
 
         let commandBuffer = queue.makeCommandBuffer()!
 
-        // Step 1: Fuse keys
-        if let encoder = commandBuffer.makeComputeCommandEncoder() {
-            encoder.label = "Fuse"
-            encoder.setComputePipelineState(fusePipeline)
-            encoder.setBuffer(keyBuffer, offset: 0, index: 0)
-            encoder.setBuffer(fusedKeysBuf, offset: 0, index: 1)
-            encoder.dispatchThreads(MTLSize(width: count, height: 1, depth: 1),
-                                    threadsPerThreadgroup: MTLSize(width: min(count, 256), height: 1, depth: 1))
-            encoder.endEncoding()
-        }
-
-        // Step 2: One histogram pass (digit 0)
-        var digit: UInt32 = 4  // Start with byte 4 (first byte of tile)
+        // Step 1: One histogram pass (digit 2 = high byte of 32-bit key = tile bits)
+        var digit: UInt32 = 2  // Byte 2 contains tile info (key layout: [tile:16][depth:16])
         if let encoder = commandBuffer.makeComputeCommandEncoder() {
             encoder.label = "Histogram"
             encoder.setComputePipelineState(histPipeline)
-            encoder.setBuffer(fusedKeysBuf, offset: 0, index: 0)
+            encoder.setBuffer(keyBuffer, offset: 0, index: 0)
             encoder.setBuffer(histBuf, offset: 0, index: 1)
             encoder.setBytes(&digit, length: 4, index: 3)
             encoder.setBuffer(headerBuffer, offset: 0, index: 4)
@@ -442,7 +374,7 @@ final class EncoderTests: XCTestCase {
             encoder.endEncoding()
         }
 
-        // Step 3: Scan blocks
+        // Step 2: Scan blocks
         if let encoder = commandBuffer.makeComputeCommandEncoder() {
             encoder.label = "ScanBlocks"
             encoder.setComputePipelineState(scanPipeline)
@@ -454,7 +386,7 @@ final class EncoderTests: XCTestCase {
             encoder.endEncoding()
         }
 
-        // Step 4: Exclusive scan
+        // Step 3: Exclusive scan
         if let encoder = commandBuffer.makeComputeCommandEncoder() {
             encoder.label = "ExclusiveScan"
             encoder.setComputePipelineState(exclusivePipeline)
@@ -465,7 +397,7 @@ final class EncoderTests: XCTestCase {
             encoder.endEncoding()
         }
 
-        // Step 5: Apply offsets
+        // Step 4: Apply offsets
         if let encoder = commandBuffer.makeComputeCommandEncoder() {
             encoder.label = "ApplyOffsets"
             encoder.setComputePipelineState(applyPipeline)
@@ -479,12 +411,12 @@ final class EncoderTests: XCTestCase {
             encoder.endEncoding()
         }
 
-        // Step 6: Scatter
+        // Step 5: Scatter
         if let encoder = commandBuffer.makeComputeCommandEncoder() {
             encoder.label = "Scatter"
             encoder.setComputePipelineState(scatterPipeline)
             encoder.setBuffer(scratchKeysBuf, offset: 0, index: 0)      // output keys
-            encoder.setBuffer(fusedKeysBuf, offset: 0, index: 1)        // input keys
+            encoder.setBuffer(keyBuffer, offset: 0, index: 1)           // input keys (32-bit)
             encoder.setBuffer(scratchPayloadBuf, offset: 0, index: 2)   // output payload
             encoder.setBuffer(indicesBuffer, offset: 0, index: 3)       // input payload
             encoder.setBuffer(scannedHistBuf, offset: 0, index: 5)      // offsets
@@ -499,13 +431,10 @@ final class EncoderTests: XCTestCase {
         commandBuffer.waitUntilCompleted()
 
         // Print results
-        let fusedPtr = fusedKeysBuf.contents().bindMemory(to: UInt64.self, capacity: count)
         let histPtr = histBuf.contents().bindMemory(to: UInt32.self, capacity: histogramCount)
         let scannedPtr = scannedHistBuf.contents().bindMemory(to: UInt32.self, capacity: histogramCount)
-        let scratchPtr = scratchKeysBuf.contents().bindMemory(to: UInt64.self, capacity: count)
+        let scratchPtr = scratchKeysBuf.contents().bindMemory(to: UInt32.self, capacity: count)
         let scratchPayloadPtr = scratchPayloadBuf.contents().bindMemory(to: UInt32.self, capacity: count)
-
-        NSLog("Fused keys: %@", (0..<count).map { "[\($0)]=\(fusedPtr[$0]) (tile=\(fusedPtr[$0] >> 32))" }.joined(separator: ", "))
 
         // Print non-zero histogram bins
         var histMsg = "Histogram (non-zero bins): "
@@ -524,13 +453,13 @@ final class EncoderTests: XCTestCase {
         NSLog("After scatter: %@", (0..<count).map {
             let k = scratchPtr[$0]
             let p = scratchPayloadPtr[$0]
-            return "[\($0)] key=\(k) tile=\(k >> 32) idx=\(p)"
+            return "[\($0)] key=\(k) tile=\(k >> 16) idx=\(p)"
         }.joined(separator: ", "))
 
         // Verify: elements should be grouped by tile (bins 0,1,2,3)
-        var prevTile: UInt64 = 0
+        var prevTile: UInt32 = 0
         for i in 0..<count {
-            let tile = scratchPtr[i] >> 32
+            let tile = scratchPtr[i] >> 16
             XCTAssertGreaterThanOrEqual(tile, prevTile, "Tile at \(i) should be >= previous tile")
             prevTile = tile
         }
@@ -541,7 +470,8 @@ final class EncoderTests: XCTestCase {
 
         let count = 131_072
 
-        var keys = [SIMD2<UInt32>](repeating: .zero, count: count)
+        // 32-bit keys: [tile:16][depth:16]
+        var keys = [UInt32](repeating: 0, count: count)
         var indices = [Int32](repeating: 0, count: count)
 
         // Deterministic seed for reproducibility
@@ -549,32 +479,26 @@ final class EncoderTests: XCTestCase {
         for i in 0..<count {
             let tileId = UInt32(drand48() * 50) // More tiles
             let depth = Float(drand48() * 100.0 + 0.1)
-            // Convert to half precision (matches GPU fuseSortKeysKernel)
             let halfDepth = Float16(depth)
-            let depthBits = UInt32(halfDepth.bitPattern)
-            keys[i] = SIMD2<UInt32>(tileId, depthBits)
+            let depthBits = UInt32(halfDepth.bitPattern) ^ 0x8000  // IEEE 754 sign fix
+            keys[i] = (tileId << 16) | (depthBits & 0xFFFF)
             indices[i] = Int32(i)
         }
         let tileCount = 50
 
         // CPU Reference Sort
         struct Item {
-            let key: SIMD2<UInt32>
+            let key: UInt32
             let index: Int32
         }
 
         let items = zip(keys, indices).map { Item(key: $0, index: $1) }
-        let sortedItems = items.sorted { a, b in
-            if a.key.x != b.key.x {
-                return a.key.x < b.key.x
-            }
-            return a.key.y < b.key.y
-        }
-        
-        let keyBuffer = device.makeBuffer(bytes: keys, length: count * MemoryLayout<SIMD2<UInt32>>.stride, options: .storageModeShared)!
+        let sortedItems = items.sorted { $0.key < $1.key }
+
+        let keyBuffer = device.makeBuffer(bytes: keys, length: count * MemoryLayout<UInt32>.stride, options: .storageModeShared)!
         let indicesBuffer = device.makeBuffer(bytes: indices, length: count * MemoryLayout<Int32>.stride, options: .storageModeShared)!
         let headerBuffer = device.makeBuffer(length: MemoryLayout<TileAssignmentHeaderSwift>.stride, options: .storageModeShared)!
-        
+
         let dispatchArgs = device.makeBuffer(length: 4096, options: .storageModePrivate)!
         let maxAssignments = count * 10
 
@@ -599,26 +523,22 @@ final class EncoderTests: XCTestCase {
         let valuesPerGroup = 256 * 4
         let gridSize = max(1, (count + valuesPerGroup - 1) / valuesPerGroup)
         let histogramCount = gridSize * 256
-        
+
         let histBuf = device.makeBuffer(length: histogramCount * 4, options: .storageModePrivate)!
         let blockSumsBuf = device.makeBuffer(length: gridSize * 4, options: .storageModePrivate)!
         let scannedHistBuf = device.makeBuffer(length: histogramCount * 4, options: .storageModePrivate)!
-        let fusedKeysBuf = device.makeBuffer(length: count * 8, options: .storageModePrivate)!
-        let scratchKeysBuf = device.makeBuffer(length: count * 8, options: .storageModePrivate)!
+        let scratchKeysBuf = device.makeBuffer(length: count * 4, options: .storageModePrivate)!
         let scratchPayloadBuf = device.makeBuffer(length: count * 4, options: .storageModePrivate)!
-        
+
         let radixBuffers = RadixBufferSet(
             histogram: histBuf,
             blockSums: blockSumsBuf,
             scannedHistogram: scannedHistBuf,
-            fusedKeys: fusedKeysBuf,
             scratchKeys: scratchKeysBuf,
             scratchPayload: scratchPayloadBuf
         )
-        
+
         let offsets = (
-            fuse: DispatchSlot.fuseKeys.rawValue * MemoryLayout<DispatchIndirectArgsSwift>.stride,
-            unpack: DispatchSlot.unpackKeys.rawValue * MemoryLayout<DispatchIndirectArgsSwift>.stride,
             histogram: DispatchSlot.radixHistogram.rawValue * MemoryLayout<DispatchIndirectArgsSwift>.stride,
             scanBlocks: DispatchSlot.radixScanBlocks.rawValue * MemoryLayout<DispatchIndirectArgsSwift>.stride,
             exclusive: DispatchSlot.radixExclusive.rawValue * MemoryLayout<DispatchIndirectArgsSwift>.stride,
@@ -644,36 +564,34 @@ final class EncoderTests: XCTestCase {
             offsets: offsets,
             tileCount: tileCount
         )
-        
+
         commandBuffer2.commit()
         commandBuffer2.waitUntilCompleted()
-        
+
         let outIndices = indicesBuffer.contents().bindMemory(to: Int32.self, capacity: count)
-        let outKeys = keyBuffer.contents().bindMemory(to: SIMD2<UInt32>.self, capacity: count)
-        
+        let outKeys = keyBuffer.contents().bindMemory(to: UInt32.self, capacity: count)
+
         // Verify Sorted Order
         for i in 0..<count {
             let cpuIdx = sortedItems[i].index
             let gpuIdx = outIndices[i]
-            
+
             if cpuIdx != gpuIdx {
                 let cpuKey = sortedItems[i].key
                 let gpuKey = outKeys[i]
-                
+
                 if cpuKey != gpuKey {
                      XCTFail("Mismatch at \(i): CPU Key \(cpuKey) Idx \(cpuIdx) vs GPU Key \(gpuKey) Idx \(gpuIdx)")
                      break
                 }
             }
         }
-        
+
         // Verify Keys Strictly Sorted
         for i in 0..<count-1 {
             let k1 = outKeys[i]
             let k2 = outKeys[i+1]
-            let k1Val = (UInt64(k1.x) << 32) | UInt64(k1.y)
-            let k2Val = (UInt64(k2.x) << 32) | UInt64(k2.y)
-            XCTAssertLessThanOrEqual(k1Val, k2Val, "Keys not sorted at \(i)")
+            XCTAssertLessThanOrEqual(k1, k2, "Keys not sorted at \(i)")
         }
 
     }
@@ -684,8 +602,8 @@ final class EncoderTests: XCTestCase {
         var paddedCount = 1
         while paddedCount < count { paddedCount <<= 1 }
 
-        // Use max half value (0xFFFF) for sentinel keys instead of max uint32
-        var keys = [SIMD2<UInt32>](repeating: SIMD2<UInt32>(0xFFFFFFFF, 0xFFFF), count: paddedCount)
+        // Use max value for sentinel keys (32-bit key: [tile:16][depth:16])
+        var keys = [UInt32](repeating: 0xFFFFFFFF, count: paddedCount)
         var indices = [Int32](repeating: -1, count: paddedCount)
 
         // Deterministic seed for reproducibility
@@ -693,20 +611,16 @@ final class EncoderTests: XCTestCase {
         for i in 0..<count {
             let tileId = UInt32(drand48() * 50)
             let depth = Float(drand48() * 100.0 + 0.1)
-            // Convert to half precision (matches GPU fuseSortKeysKernel)
             let halfDepth = Float16(depth)
-            let depthBits = UInt32(halfDepth.bitPattern)
-            keys[i] = SIMD2<UInt32>(tileId, depthBits)
+            let depthBits = UInt32(halfDepth.bitPattern) ^ 0x8000  // IEEE 754 sign fix
+            keys[i] = (tileId << 16) | (depthBits & 0xFFFF)
             indices[i] = Int32(i)
         }
 
-        let cpuSorted = zip(keys, indices).sorted { a, b in
-            if a.0.x != b.0.x { return a.0.x < b.0.x }
-            return a.0.y < b.0.y
-        }
+        let cpuSorted = zip(keys, indices).sorted { $0.0 < $1.0 }
         let tileCount = 50
 
-        let keyBuffer = device.makeBuffer(bytes: keys, length: paddedCount * MemoryLayout<SIMD2<UInt32>>.stride, options: .storageModeShared)!
+        let keyBuffer = device.makeBuffer(bytes: keys, length: paddedCount * MemoryLayout<UInt32>.stride, options: .storageModeShared)!
         let indicesBuffer = device.makeBuffer(bytes: indices, length: paddedCount * MemoryLayout<Int32>.stride, options: .storageModeShared)!
         let headerBuffer = device.makeBuffer(length: MemoryLayout<TileAssignmentHeaderSwift>.stride, options: .storageModeShared)!
         let dispatchArgs = device.makeBuffer(length: 4096, options: .storageModePrivate)!
@@ -739,14 +653,11 @@ final class EncoderTests: XCTestCase {
             histogram: device.makeBuffer(length: histogramCount * 4, options: .storageModePrivate)!,
             blockSums: device.makeBuffer(length: gridSize * 4, options: .storageModePrivate)!,
             scannedHistogram: device.makeBuffer(length: histogramCount * 4, options: .storageModePrivate)!,
-            fusedKeys: device.makeBuffer(length: paddedCount * 8, options: .storageModePrivate)!,
-            scratchKeys: device.makeBuffer(length: paddedCount * 8, options: .storageModePrivate)!,
+            scratchKeys: device.makeBuffer(length: paddedCount * 4, options: .storageModePrivate)!,
             scratchPayload: device.makeBuffer(length: paddedCount * 4, options: .storageModePrivate)!
         )
 
         let offsets = (
-            fuse: DispatchSlot.fuseKeys.rawValue * MemoryLayout<DispatchIndirectArgsSwift>.stride,
-            unpack: DispatchSlot.unpackKeys.rawValue * MemoryLayout<DispatchIndirectArgsSwift>.stride,
             histogram: DispatchSlot.radixHistogram.rawValue * MemoryLayout<DispatchIndirectArgsSwift>.stride,
             scanBlocks: DispatchSlot.radixScanBlocks.rawValue * MemoryLayout<DispatchIndirectArgsSwift>.stride,
             exclusive: DispatchSlot.radixExclusive.rawValue * MemoryLayout<DispatchIndirectArgsSwift>.stride,
@@ -773,7 +684,7 @@ final class EncoderTests: XCTestCase {
         sortCommand.commit()
         sortCommand.waitUntilCompleted()
 
-        let gpuKeys = keyBuffer.contents().bindMemory(to: SIMD2<UInt32>.self, capacity: count)
+        let gpuKeys = keyBuffer.contents().bindMemory(to: UInt32.self, capacity: count)
         let gpuIndices = indicesBuffer.contents().bindMemory(to: Int32.self, capacity: count)
 
         for i in 0..<count {

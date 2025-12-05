@@ -20,8 +20,8 @@ public typealias BitonicParamsSwift = BitonicParams
 // DispatchSlot enum (Swift-native with static values matching C enum)
 public enum DispatchSlot: Int, CaseIterable {
     case sortKeys = 0
-    case fuseKeys = 1
-    case unpackKeys = 2
+    case unused1 = 1      // Previously fuseKeys (removed - 32-bit keys now)
+    case unused2 = 2      // Previously unpackKeys (removed - 32-bit keys now)
     case pack = 3
     case bitonicFirst = 4
     case bitonicGeneral = 5
@@ -216,9 +216,8 @@ public struct RadixBufferSet {
     public let histogram: MTLBuffer
     public let blockSums: MTLBuffer
     public let scannedHistogram: MTLBuffer
-    public let fusedKeys: MTLBuffer
-    public let scratchKeys: MTLBuffer
-    public let scratchPayload: MTLBuffer
+    public let scratchKeys: MTLBuffer      // Scratch for ping-pong during radix sort
+    public let scratchPayload: MTLBuffer   // Scratch for payload ping-pong
 }
 
 public struct RenderOutputBuffers {

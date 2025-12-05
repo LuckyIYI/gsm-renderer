@@ -107,12 +107,19 @@ final class FrameResources {
     let radixHistogram: MTLBuffer?
     let radixBlockSums: MTLBuffer?
     let radixScannedHistogram: MTLBuffer?
-    let radixFusedKeys: MTLBuffer?
     let radixKeysScratch: MTLBuffer?
     let radixPayloadScratch: MTLBuffer?
 
     // Fused Pipeline Buffers (interleaved data for cache efficiency)
     let interleavedGaussians: MTLBuffer?
+
+    // Two-pass tile assignment scratch buffer (prefix sum block sums)
+    let tileAssignBlockSums: MTLBuffer?
+
+    // Indirect dispatch buffers (for compacted visible gaussians)
+    let visibleIndices: MTLBuffer      // Compacted visible gaussian indices
+    let visibleCount: MTLBuffer        // Atomic counter for visible count
+    let tileAssignDispatchArgs: MTLBuffer  // Indirect dispatch args for tile count/scatter
 
     // Dispatch Args (Per-frame to avoid race on indirect dispatch)
     let dispatchArgs: MTLBuffer
@@ -188,10 +195,15 @@ final class FrameResources {
         self.radixHistogram = optionalBuffer("RadixHist")
         self.radixBlockSums = optionalBuffer("RadixBlockSums")
         self.radixScannedHistogram = optionalBuffer("RadixScanned")
-        self.radixFusedKeys = optionalBuffer("RadixFused")
         self.radixKeysScratch = optionalBuffer("RadixScratch")
         self.radixPayloadScratch = optionalBuffer("RadixPayload")
         self.interleavedGaussians = optionalBuffer("InterleavedGaussians")
+        self.tileAssignBlockSums = optionalBuffer("TileAssignBlockSums")
+
+        // Indirect dispatch buffers
+        self.visibleIndices = buffer("VisibleIndices")
+        self.visibleCount = buffer("VisibleCount")
+        self.tileAssignDispatchArgs = buffer("TileAssignDispatchArgs")
 
         // Output buffers (skipped in textureOnly mode to save ~20MB)
         let pixelBytes = layout.pixelCapacity
@@ -251,8 +263,8 @@ public final class GlobalSortRenderer: GaussianRenderer, @unchecked Sendable {
     // Fused pipeline encoder (for interleaved data optimization)
     let fusedPipelineEncoder: FusedPipelineEncoder
 
-    // SIMD-optimized fused coverage+scatter V2 encoder
-    let fusedCoverageScatterEncoderV2: FusedCoverageScatterEncoderV2
+    // Two-pass tile assignment encoder with compaction (Compact → Count → PrefixSum → Scatter)
+    let twoPassTileAssignEncoder: TwoPassTileAssignEncoder
 
     // Skip-based cluster culling encoder for Morton-sorted gaussians
     private var clusterCullEncoder: ClusterCullEncoder?
@@ -340,8 +352,8 @@ public final class GlobalSortRenderer: GaussianRenderer, @unchecked Sendable {
 
             let config = AssignmentDispatchConfigSwift(
                 sortThreadgroupSize: UInt32(self.sortKeyGenEncoder.threadgroupSize),
-                fuseThreadgroupSize: UInt32(self.radixSortEncoder.fuseThreadgroupSize),
-                unpackThreadgroupSize: UInt32(self.radixSortEncoder.unpackThreadgroupSize),
+                fuseThreadgroupSize: 256,   // Unused - fuse/unpack removed (32-bit keys)
+                unpackThreadgroupSize: 256, // Unused - fuse/unpack removed (32-bit keys)
                 packThreadgroupSize: UInt32(self.packEncoder.packThreadgroupSize),
                 bitonicThreadgroupSize: UInt32(self.bitonicSortEncoder.unitSize),
                 radixBlockSize: UInt32(self.radixSortEncoder.blockSize),
@@ -353,8 +365,8 @@ public final class GlobalSortRenderer: GaussianRenderer, @unchecked Sendable {
             // Fused pipeline encoder (always enabled - better performance)
             self.fusedPipelineEncoder = try FusedPipelineEncoder(device: device, library: library)
 
-            // SIMD-optimized V2 encoder for coverage+scatter
-            self.fusedCoverageScatterEncoderV2 = try FusedCoverageScatterEncoderV2(device: device, library: library)
+            // Two-pass tile assignment encoder with compaction
+            self.twoPassTileAssignEncoder = try TwoPassTileAssignEncoder(device: device, library: library)
 
             // Reset tile builder state pipeline (replaces blit for lower overhead)
             guard let resetFn = library.makeFunction(name: "resetTileBuilderStateKernel") else {
@@ -642,7 +654,8 @@ public final class GlobalSortRenderer: GaussianRenderer, @unchecked Sendable {
         add("ActiveTileIndices", tileCount * MemoryLayout<UInt32>.stride)
 
         // Sort key/index buffers (sized to paddedCapacity for sort alignment)
-        add("SortKeys", paddedCapacity * MemoryLayout<SIMD2<UInt32>>.stride)
+        // Keys are now single uint32: [tile:16][depth:16]
+        add("SortKeys", paddedCapacity * MemoryLayout<UInt32>.stride)
         add("SortedIndices", paddedCapacity * MemoryLayout<Int32>.stride)
 
         // Radix-specific buffers (only when using radix sort)
@@ -654,14 +667,27 @@ public final class GlobalSortRenderer: GaussianRenderer, @unchecked Sendable {
             add("RadixHist", histogramCapacity * MemoryLayout<UInt32>.stride)
             add("RadixBlockSums", gridCapacity * MemoryLayout<UInt32>.stride)
             add("RadixScanned", histogramCapacity * MemoryLayout<UInt32>.stride)
-            // Key/payload scratch sized to maxAssignmentCapacity (not paddedCapacity)
-            add("RadixFused", maxAssignmentCapacity * MemoryLayout<UInt64>.stride)
-            add("RadixScratch", maxAssignmentCapacity * MemoryLayout<UInt64>.stride)
+            // Scratch buffers for ping-pong during radix sort (32-bit keys now)
+            add("RadixScratch", maxAssignmentCapacity * MemoryLayout<UInt32>.stride)
             add("RadixPayload", maxAssignmentCapacity * MemoryLayout<UInt32>.stride)
         }
 
         // Fused pipeline buffers (always enabled)
         add("InterleavedGaussians", gaussianCapacity * strideForInterleaved())
+
+        // Two-pass tile assignment scratch buffer (hierarchical prefix sum block sums)
+        // Block size is 256, so numBlocks = ceil(gaussianCapacity / 256)
+        // For hierarchical scan: level1 needs numBlocks+1, level2 needs level2Blocks+1
+        let tileAssignBlockSize = 256
+        let tileAssignNumBlocks = (gaussianCapacity + tileAssignBlockSize - 1) / tileAssignBlockSize
+        let tileAssignLevel2Blocks = (tileAssignNumBlocks + tileAssignBlockSize - 1) / tileAssignBlockSize
+        let tileAssignBlockSumsSize = (tileAssignNumBlocks + 1 + tileAssignLevel2Blocks + 1) * MemoryLayout<UInt32>.stride
+        add("TileAssignBlockSums", tileAssignBlockSumsSize)
+
+        // Indirect dispatch buffers for compacted visible gaussians
+        add("VisibleIndices", gaussianCapacity * MemoryLayout<UInt32>.stride)
+        add("VisibleCount", MemoryLayout<UInt32>.stride, .storageModeShared)  // Atomic counter
+        add("TileAssignDispatchArgs", 12)  // MTLDispatchThreadgroupsIndirectArguments (3 x uint32)
 
         return FrameResourceLayout(
             limits: limits,
@@ -1039,21 +1065,33 @@ public final class GlobalSortRenderer: GaussianRenderer, @unchecked Sendable {
         // Copy bounds from projection output to frame's boundsBuffer for coverage+scatter
         // Actually, we can use projectionOutput.bounds directly!
 
-        // Fused coverage+scatter - reads mean/conic/opacity from packed GaussianRenderData
+        // Two-pass tile assignment with indirect dispatch (compacts visible gaussians first)
         // Bounds are already computed in the fused projection kernel (projectionOutput.bounds)
-        self.fusedCoverageScatterEncoderV2.encode(
+        guard let blockSumsBuffer = frame.tileAssignBlockSums else {
+            fatalError("[buildTileAssignments] tileAssignBlockSums buffer is nil")
+        }
+
+        let indirectBuffers = TwoPassTileAssignEncoder.IndirectBuffers(
+            visibleIndices: frame.visibleIndices,
+            visibleCount: frame.visibleCount,
+            indirectDispatchArgs: frame.tileAssignDispatchArgs
+        )
+
+        self.twoPassTileAssignEncoder.encode(
             commandBuffer: commandBuffer,
             gaussianCount: gaussianCount,
             tileWidth: Int(params.tileWidth),
             tileHeight: Int(params.tileHeight),
             tilesX: Int(params.tilesX),
             maxAssignments: frame.tileAssignmentMaxAssignments,
-            boundsBuffer: projectionOutput.bounds,  // Use bounds from fused projection (not frame.boundsBuffer)
+            boundsBuffer: projectionOutput.bounds,
             coverageBuffer: frame.coverageBuffer,
             renderData: projectionOutput.renderData,
             tileIndicesBuffer: frame.tileIndices,
             tileIdsBuffer: frame.tileIds,
-            tileAssignmentHeader: frame.tileAssignmentHeader
+            tileAssignmentHeader: frame.tileAssignmentHeader,
+            blockSumsBuffer: blockSumsBuffer,
+            indirectBuffers: indirectBuffers
         )
 
         return TileAssignmentBuffers(
@@ -1111,14 +1149,11 @@ public final class GlobalSortRenderer: GaussianRenderer, @unchecked Sendable {
                 histogram: frame.radixHistogram!,
                 blockSums: frame.radixBlockSums!,
                 scannedHistogram: frame.radixScannedHistogram!,
-                fusedKeys: frame.radixFusedKeys!,
                 scratchKeys: frame.radixKeysScratch!,
                 scratchPayload: frame.radixPayloadScratch!
             )
 
             let offsets = (
-                fuse: DispatchSlot.fuseKeys.rawValue * MemoryLayout<DispatchIndirectArgsSwift>.stride,
-                unpack: DispatchSlot.unpackKeys.rawValue * MemoryLayout<DispatchIndirectArgsSwift>.stride,
                 histogram: DispatchSlot.radixHistogram.rawValue * MemoryLayout<DispatchIndirectArgsSwift>.stride,
                 scanBlocks: DispatchSlot.radixScanBlocks.rawValue * MemoryLayout<DispatchIndirectArgsSwift>.stride,
                 exclusive: DispatchSlot.radixExclusive.rawValue * MemoryLayout<DispatchIndirectArgsSwift>.stride,

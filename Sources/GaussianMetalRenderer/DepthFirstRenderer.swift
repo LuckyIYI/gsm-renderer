@@ -287,8 +287,7 @@ public final class DepthFirstRenderer: GaussianRenderer, @unchecked Sendable {
             histogram: device.makeBuffer(length: radixHistSize, options: .storageModePrivate)!,
             blockSums: device.makeBuffer(length: blockSumsSize, options: .storageModePrivate)!,
             scannedHistogram: device.makeBuffer(length: radixHistSize, options: .storageModePrivate)!,
-            fusedKeys: device.makeBuffer(length: maxInstances * MemoryLayout<UInt64>.stride, options: .storageModePrivate)!,
-            scratchKeys: device.makeBuffer(length: maxInstances * MemoryLayout<UInt64>.stride, options: .storageModePrivate)!,
+            scratchKeys: device.makeBuffer(length: maxInstances * MemoryLayout<UInt32>.stride, options: .storageModePrivate)!,
             scratchPayload: device.makeBuffer(length: maxInstances * MemoryLayout<Int32>.stride, options: .storageModePrivate)!
         )
 
@@ -505,17 +504,15 @@ public final class DepthFirstRenderer: GaussianRenderer, @unchecked Sendable {
         // === 10. RADIX SORT BY TILE+DEPTH (using RadixSortEncoder) ===
         // Only 2 passes needed for tile (16-bit), depth provides ordering within tile
         let offsets = (
-            fuse: 0 * 12,
-            unpack: 1 * 12,
-            histogram: 2 * 12,
-            scanBlocks: 3 * 12,
-            exclusive: 4 * 12,
-            apply: 5 * 12,
-            scatter: 6 * 12
+            histogram: 0 * 12,
+            scanBlocks: 1 * 12,
+            exclusive: 2 * 12,
+            apply: 3 * 12,
+            scatter: 4 * 12
         )
         radixSortEncoder.encode(
             commandBuffer: commandBuffer,
-            keyBuffer: instanceSortKeys,       // SIMD2<UInt32> keys (tile, depth)
+            keyBuffer: instanceSortKeys,       // uint32 keys [tile:16][depth:16]
             sortedIndices: instanceGaussianIdx, // Int32 indices (payload)
             header: instanceHeader,             // TileAssignmentHeader with instance count
             dispatchArgs: radixSortDispatchArgs,
@@ -991,13 +988,11 @@ public final class DepthFirstRenderer: GaussianRenderer, @unchecked Sendable {
         var nTilesU = UInt32(nTiles)
         if let cb = queue.makeCommandBuffer() {
             let offsets = (
-                fuse: 0 * 12,
-                unpack: 1 * 12,
-                histogram: 2 * 12,
-                scanBlocks: 3 * 12,
-                exclusive: 4 * 12,
-                apply: 5 * 12,
-                scatter: 6 * 12
+                histogram: 0 * 12,
+                scanBlocks: 1 * 12,
+                exclusive: 2 * 12,
+                apply: 3 * 12,
+                scatter: 4 * 12
             )
             radixSortEncoder.encode(
                 commandBuffer: cb,

@@ -1,26 +1,20 @@
 import Metal
 
+/// Radix sort encoder for 32-bit keys (single uint)
+/// Key format: [tile:16][depth:16] - tile in high bits for primary sort
 final class RadixSortEncoder {
     let histogramPipeline: MTLComputePipelineState
     let scanBlocksPipeline: MTLComputePipelineState
     let exclusiveScanPipeline: MTLComputePipelineState
     let applyOffsetsPipeline: MTLComputePipelineState
     let scatterPipeline: MTLComputePipelineState
-    
-    let fusePipeline: MTLComputePipelineState
-    let unpackPipeline: MTLComputePipelineState
-    
+
     let blockSize = 256
     let grainSize = 4
     let radix = 256
-    
-    let fuseThreadgroupSize: Int
-    let unpackThreadgroupSize: Int
 
     init(device: MTLDevice, library: MTLLibrary) throws {
         guard
-            let fuseFn = library.makeFunction(name: "fuseSortKeysKernel"),
-            let unpackFn = library.makeFunction(name: "unpackSortKeysKernel"),
             let histFn = library.makeFunction(name: "radixHistogramKernel"),
             let scanFn = library.makeFunction(name: "radixScanBlocksKernel"),
             let exclusiveFn = library.makeFunction(name: "radixExclusiveScanKernel"),
@@ -29,63 +23,49 @@ final class RadixSortEncoder {
         else {
             fatalError("Radix sort functions missing from library")
         }
-        
-        self.fusePipeline = try device.makeComputePipelineState(function: fuseFn)
-        self.unpackPipeline = try device.makeComputePipelineState(function: unpackFn)
+
         self.histogramPipeline = try device.makeComputePipelineState(function: histFn)
         self.scanBlocksPipeline = try device.makeComputePipelineState(function: scanFn)
         self.exclusiveScanPipeline = try device.makeComputePipelineState(function: exclusiveFn)
         self.applyOffsetsPipeline = try device.makeComputePipelineState(function: applyFn)
         self.scatterPipeline = try device.makeComputePipelineState(function: scatterFn)
-        
-        self.fuseThreadgroupSize = max(1, min(fusePipeline.maxTotalThreadsPerThreadgroup, 256))
-        self.unpackThreadgroupSize = max(1, min(unpackPipeline.maxTotalThreadsPerThreadgroup, 256))
     }
 
+    /// Encode radix sort for 32-bit keys
+    /// - Parameters:
+    ///   - keyBuffer: Input/output 32-bit keys (uint)
+    ///   - sortedIndices: Input/output payload indices (Int32)
+    ///   - header: TileAssignmentHeader buffer
+    ///   - dispatchArgs: Indirect dispatch arguments
+    ///   - radixBuffers: Scratch buffers for radix sort
+    ///   - offsets: Dispatch offsets for histogram, scanBlocks, exclusive, apply, scatter
+    ///   - tileCount: Number of tiles (determines how many passes needed)
     func encode(
         commandBuffer: MTLCommandBuffer,
-        keyBuffer: MTLBuffer,          // Input keys (e.g. SIMD2<UInt32>)
+        keyBuffer: MTLBuffer,          // Input 32-bit keys (uint), also output
         sortedIndices: MTLBuffer,      // Input indices (Int32), also output indices
         header: MTLBuffer,
         dispatchArgs: MTLBuffer,
         radixBuffers: RadixBufferSet,
-        offsets: (fuse: Int, unpack: Int,
-                  histogram: Int, scanBlocks: Int,
+        offsets: (histogram: Int, scanBlocks: Int,
                   exclusive: Int, apply: Int, scatter: Int),
         tileCount: Int
     ) {
-        // 1. Fuse keys
-        if let encoder = commandBuffer.makeComputeCommandEncoder() {
-            encoder.label = "FuseKeys"
-            encoder.setComputePipelineState(fusePipeline)
-            encoder.setBuffer(keyBuffer, offset: 0, index: 0)
-            encoder.setBuffer(radixBuffers.fusedKeys, offset: 0, index: 1)
-            encoder.setBuffer(header, offset: 0, index: 2)  // Pass count for bounds check
-
-            let tg = MTLSize(width: fuseThreadgroupSize, height: 1, depth: 1)
-            encoder.dispatchThreadgroups(
-                indirectBuffer: dispatchArgs,
-                indirectBufferOffset: offsets.fuse,
-                threadsPerThreadgroup: tg
-            )
-            encoder.endEncoding()
-        }
-        
-        // Decide how many byte-wide passes we need.
-        // Use 16-bit depth quantization (2 bytes) - sufficient for visual correctness
-        // This matches GlobalSort's approach of quantizing actual depth values
-        let depthBytes = 2  // 16-bit depth = 65536 levels (same as GlobalSort)
+        // Determine number of passes needed for 32-bit key
+        // Key layout: [tile:16][depth:16]
+        // depth is in low 16 bits (2 bytes), tile in high 16 bits
+        let depthBytes = 2  // 16-bit depth
         var tileBytes = 1
         var remainingTiles = max(tileCount - 1, 0)
         while remainingTiles >= 256 {
             tileBytes += 1
             remainingTiles >>= 8
         }
-        // Only do as many tile bytes as actually needed - extra passes with all elements
-        // in the same bin will scramble the sorted order due to atomic racing
-        let passCount = min(8, depthBytes + tileBytes)
+        // Max 4 passes for 32-bit key
+        let passCount = min(4, depthBytes + tileBytes)
 
-        var sourceKeys = radixBuffers.fusedKeys
+        // Ping-pong between keyBuffer/scratchKeys and sortedIndices/scratchPayload
+        var sourceKeys = keyBuffer
         var destKeys = radixBuffers.scratchKeys
         var sourcePayload = sortedIndices
         var destPayload = radixBuffers.scratchPayload
@@ -107,36 +87,21 @@ final class RadixSortEncoder {
             swap(&sourcePayload, &destPayload)
         }
 
-        // If passCount is odd, the sorted payload is in scratchPayload, not sortedIndices.
-        // Copy it back to sortedIndices.
+        // If passCount is odd, sorted data is in scratch buffers - copy back
         if passCount % 2 != 0 {
             if let blit = commandBuffer.makeBlitCommandEncoder() {
-                blit.label = "CopyPayload"
+                blit.label = "CopyRadixResults"
+                blit.copy(from: radixBuffers.scratchKeys, sourceOffset: 0,
+                         to: keyBuffer, destinationOffset: 0,
+                         size: keyBuffer.length)
                 blit.copy(from: radixBuffers.scratchPayload, sourceOffset: 0,
                          to: sortedIndices, destinationOffset: 0,
                          size: sortedIndices.length)
                 blit.endEncoding()
             }
         }
-
-        // 3. Unpack keys back to original layout
-        if let encoder = commandBuffer.makeComputeCommandEncoder() {
-            encoder.label = "UnpackKeys"
-            encoder.setComputePipelineState(unpackPipeline)
-            encoder.setBuffer(sourceKeys, offset: 0, index: 0)
-            encoder.setBuffer(keyBuffer, offset: 0, index: 1)
-            encoder.setBuffer(header, offset: 0, index: 2)  // Pass count for bounds check
-
-            let tg = MTLSize(width: unpackThreadgroupSize, height: 1, depth: 1)
-            encoder.dispatchThreadgroups(
-                indirectBuffer: dispatchArgs,
-                indirectBufferOffset: offsets.unpack,
-                threadsPerThreadgroup: tg
-            )
-            encoder.endEncoding()
-        }
     }
-    
+
     private func encodeOnePass(
         commandBuffer: MTLCommandBuffer,
         digit: Int,
@@ -146,23 +111,22 @@ final class RadixSortEncoder {
         destPayload: MTLBuffer,
         dispatchArgs: MTLBuffer,
         radixBuffers: RadixBufferSet,
-        offsets: (fuse: Int, unpack: Int,
-                  histogram: Int, scanBlocks: Int,
+        offsets: (histogram: Int, scanBlocks: Int,
                   exclusive: Int, apply: Int, scatter: Int),
         header: MTLBuffer
     ) {
         var currentDigitUInt = UInt32(digit)
-        
+
         // A. Histogram
         if let encoder = commandBuffer.makeComputeCommandEncoder() {
             encoder.label = "RadixHist_\(digit)"
             encoder.setComputePipelineState(histogramPipeline)
             encoder.setBuffer(sourceKeys, offset: 0, index: 0)
             encoder.setBuffer(radixBuffers.histogram, offset: 0, index: 1)
-            
+
             encoder.setBytes(&currentDigitUInt, length: MemoryLayout<UInt32>.stride, index: 3)
             encoder.setBuffer(header, offset: 0, index: 4)
-            
+
             let tg = MTLSize(width: blockSize, height: 1, depth: 1)
             encoder.dispatchThreadgroups(
                 indirectBuffer: dispatchArgs,
@@ -171,7 +135,7 @@ final class RadixSortEncoder {
             )
             encoder.endEncoding()
         }
-        
+
         // B. Scan blocks (reduce histogram into block sums)
         if let encoder = commandBuffer.makeComputeCommandEncoder() {
             encoder.label = "RadixScanBlocks_\(digit)"
@@ -179,7 +143,7 @@ final class RadixSortEncoder {
             encoder.setBuffer(radixBuffers.histogram, offset: 0, index: 0)
             encoder.setBuffer(radixBuffers.blockSums, offset: 0, index: 1)
             encoder.setBuffer(header, offset: 0, index: 2)
-            
+
             let tg = MTLSize(width: blockSize, height: 1, depth: 1)
             encoder.dispatchThreadgroups(
                 indirectBuffer: dispatchArgs,
@@ -188,35 +152,33 @@ final class RadixSortEncoder {
             )
             encoder.endEncoding()
         }
-        
-        // C. Exclusive scan of block sums (using ThreadgroupPrefixScan helper)
+
+        // C. Exclusive scan of block sums
         if let encoder = commandBuffer.makeComputeCommandEncoder() {
             encoder.label = "RadixExclusive_\(digit)"
             encoder.setComputePipelineState(exclusiveScanPipeline)
             encoder.setBuffer(radixBuffers.blockSums, offset: 0, index: 0)
             encoder.setBuffer(header, offset: 0, index: 1)
 
-            // Allocate threadgroup memory for prefix scan
             encoder.setThreadgroupMemoryLength(blockSize * MemoryLayout<UInt32>.stride, index: 0)
 
-            // Dispatch one threadgroup with 256 threads
             let threadsPerScanGroup = MTLSize(width: blockSize, height: 1, depth: 1)
             let threadgroupsScan = MTLSize(width: 1, height: 1, depth: 1)
             encoder.dispatchThreadgroups(threadgroupsScan, threadsPerThreadgroup: threadsPerScanGroup)
             encoder.endEncoding()
         }
-        
-        // D. Apply scanned block offsets → full scanned histogram
+
+        // D. Apply scanned block offsets
         if let encoder = commandBuffer.makeComputeCommandEncoder() {
             encoder.label = "RadixApply_\(digit)"
             encoder.setComputePipelineState(applyOffsetsPipeline)
-            encoder.setBuffer(radixBuffers.histogram, offset: 0, index: 0) // hist_flat
-            encoder.setBuffer(radixBuffers.blockSums, offset: 0, index: 1) // scanned_blocks
+            encoder.setBuffer(radixBuffers.histogram, offset: 0, index: 0)
+            encoder.setBuffer(radixBuffers.blockSums, offset: 0, index: 1)
             encoder.setBuffer(radixBuffers.scannedHistogram, offset: 0, index: 2)
             encoder.setBuffer(header, offset: 0, index: 3)
-            
-            encoder.setThreadgroupMemoryLength(blockSize * MemoryLayout<UInt32>.stride, index: 0) // shared_mem
-            
+
+            encoder.setThreadgroupMemoryLength(blockSize * MemoryLayout<UInt32>.stride, index: 0)
+
             let tg = MTLSize(width: blockSize, height: 1, depth: 1)
             encoder.dispatchThreadgroups(
                 indirectBuffer: dispatchArgs,
@@ -225,20 +187,24 @@ final class RadixSortEncoder {
             )
             encoder.endEncoding()
         }
-        
+
         // E. Scatter
+        // Shader buffer order: output_keys(0), input_keys(1), output_payload(2), input_payload(3),
+        //                      offsets_flat(5), current_digit(6), header(7)
         if let encoder = commandBuffer.makeComputeCommandEncoder() {
             encoder.label = "RadixScatter_\(digit)"
             encoder.setComputePipelineState(scatterPipeline)
-            encoder.setBuffer(destKeys, offset: 0, index: 0)      // output_keys
-            encoder.setBuffer(sourceKeys, offset: 0, index: 1)    // input_keys
-            encoder.setBuffer(destPayload, offset: 0, index: 2)   // output_payload
-            encoder.setBuffer(sourcePayload, offset: 0, index: 3) // input_payload
-            
-            encoder.setBuffer(radixBuffers.scannedHistogram, offset: 0, index: 5) // offsets_flat
-            encoder.setBytes(&currentDigitUInt, length: MemoryLayout<UInt32>.stride, index: 6) // current_digit
-            encoder.setBuffer(header, offset: 0, index: 7)
-            
+            encoder.setBuffer(destKeys, offset: 0, index: 0)       // output_keys
+            encoder.setBuffer(sourceKeys, offset: 0, index: 1)     // input_keys
+            encoder.setBuffer(destPayload, offset: 0, index: 2)    // output_payload
+            encoder.setBuffer(sourcePayload, offset: 0, index: 3)  // input_payload
+            encoder.setBuffer(radixBuffers.scannedHistogram, offset: 0, index: 5)  // offsets_flat
+            encoder.setBytes(&currentDigitUInt, length: MemoryLayout<UInt32>.stride, index: 6)  // current_digit
+            encoder.setBuffer(header, offset: 0, index: 7)         // header
+
+            encoder.setThreadgroupMemoryLength(radix * MemoryLayout<UInt32>.stride, index: 0)
+            encoder.setThreadgroupMemoryLength(radix * MemoryLayout<UInt32>.stride, index: 1)
+
             let tg = MTLSize(width: blockSize, height: 1, depth: 1)
             encoder.dispatchThreadgroups(
                 indirectBuffer: dispatchArgs,

@@ -5,7 +5,6 @@ import Metal
 /// Conforms to GaussianRenderer protocol with exactly 2 render methods
 public final class LocalSortRenderer: GaussianRenderer, @unchecked Sendable {
     public let device: MTLDevice
-    private let queue: MTLCommandQueue
     private let encoder: LocalSortPipelineEncoder
 
     // Tile configuration (16×16 = 256 pixels per tile)
@@ -56,7 +55,6 @@ public final class LocalSortRenderer: GaussianRenderer, @unchecked Sendable {
 
     // Settings (non-config)
     public var flipY: Bool = false
-    public var debugPrint: Bool = false
     public var useSharedBuffers: Bool = false
 
     // Renderer configuration (immutable - determines buffer allocation)
@@ -68,7 +66,6 @@ public final class LocalSortRenderer: GaussianRenderer, @unchecked Sendable {
         guard let queue = device.makeCommandQueue() else {
             throw LocalSortError.failedToCreateQueue
         }
-        self.queue = queue
         self.encoder = try LocalSortPipelineEncoder(device: device)
     }
 
@@ -81,7 +78,6 @@ public final class LocalSortRenderer: GaussianRenderer, @unchecked Sendable {
         guard let queue = device.makeCommandQueue() else {
             throw LocalSortError.failedToCreateQueue
         }
-        self.queue = queue
         self.encoder = try LocalSortPipelineEncoder(device: device)
     }
 
@@ -200,10 +196,6 @@ public final class LocalSortRenderer: GaussianRenderer, @unchecked Sendable {
             shComponents: UInt32(shComponents),
             gaussianCount: UInt32(gaussianCount)
         )
-
-        if debugPrint {
-            print("[LocalSortRenderer] Rendering \(gaussianCount) gaussians at \(width)x\(height)")
-        }
 
         let tileCount = tilesX * tilesY
 
@@ -481,13 +473,6 @@ public final class LocalSortRenderer: GaussianRenderer, @unchecked Sendable {
             gaussianRenderTexture = device.makeTexture(descriptor: gaussianTexDesc)
         } else {
             gaussianRenderTexture = nil
-        }
-
-        if debugPrint {
-            let mode = config.sortMode == .sort16Bit ? "16-bit" : "32-bit"
-            let sortBufferMB = (maxAssignments * 4) / (1024 * 1024)  // sortIndices size
-            print("[LocalSortRenderer] Allocated \(mode) buffers: \(gaussianCount) gaussians, \(width)x\(height)")
-            print("  maxAssignments: \(tileCount) tiles × \(maxGaussiansPerTile)/tile = \(maxAssignments) (~\(sortBufferMB)MB per sort buffer)")
         }
     }
 }

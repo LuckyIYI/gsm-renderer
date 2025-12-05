@@ -69,7 +69,7 @@ struct FrameResourceLayout {
     let limits: RendererLimits
     /// Maximum tile assignments capacity (tileCount * maxPerTile, clamped by gaussianCapacity)
     let maxAssignmentCapacity: Int
-    /// Padded capacity for sort alignment (power-of-2 for bitonic, 1024-aligned for radix)
+    /// Padded capacity for radix sort alignment (1024-aligned)
     let paddedCapacity: Int
     let bufferAllocations: [(label: String, length: Int, options: MTLResourceOptions)]
     let pixelCapacity: Int
@@ -99,18 +99,18 @@ final class FrameResources {
     let activeTileIndices: MTLBuffer
     let activeTileCount: MTLBuffer
 
-    // Sort Buffers (used by both bitonic and radix)
+    // Sort Buffers
     let sortKeys: MTLBuffer
     let sortedIndices: MTLBuffer
 
-    // Radix Sort Buffers (nil when using bitonic)
+    // Radix Sort Buffers
     let radixHistogram: MTLBuffer?
     let radixBlockSums: MTLBuffer?
     let radixScannedHistogram: MTLBuffer?
     let radixKeysScratch: MTLBuffer?
     let radixPayloadScratch: MTLBuffer?
 
-    // Fused Pipeline Buffers (interleaved data for cache efficiency)
+    // Interleaved gaussian data for cache efficiency
     let interleavedGaussians: MTLBuffer?
 
     // Two-pass tile assignment scratch buffer (prefix sum block sums)
@@ -246,14 +246,11 @@ public final class GlobalSortRenderer: GaussianRenderer, @unchecked Sendable {
     private static let supportedMaxGaussians = 10_000_000
 
     public let device: MTLDevice
-    let queue: MTLCommandQueue
     let library: MTLLibrary
-    private var nextFrameCapturePath: String?
     
     // Encoders
     // Note: tileBoundsEncoder removed - tile bounds now computed in fused projection kernel
     let sortKeyGenEncoder: SortKeyGenEncoder
-    let bitonicSortEncoder: BitonicSortEncoder
     let radixSortEncoder: RadixSortEncoder
     let packEncoder: PackEncoder
     let renderEncoder: RenderEncoder
@@ -276,30 +273,10 @@ public final class GlobalSortRenderer: GaussianRenderer, @unchecked Sendable {
     private let maxInFlightFrames = 1 // Enforce single buffering initially
     private let frameLock = NSLock()
     
-    // World Buffers (Input - Shared/Transient)
-    private var worldPositionsCache: MTLBuffer?
-    private var worldScalesCache: MTLBuffer?
-    private var worldRotationsCache: MTLBuffer?
-    private var worldHarmonicsCache: MTLBuffer?
-    private var worldOpacitiesCache: MTLBuffer?
-    
-    // Gaussian input (projection stage) buffers (Shared/Transient)
-    private var gaussianMeansCache: MTLBuffer?
-    private var gaussianBoundsCache: MTLBuffer?  // int4 tile bounds (replaces radii)
+    // Gaussian projection output caches (Shared)
+    private var gaussianBoundsCache: MTLBuffer?  // int4 tile bounds
     private var gaussianMaskCache: MTLBuffer?
-    private var gaussianDepthsCache: MTLBuffer?
-    private var gaussianConicsCache: MTLBuffer?
-    private var gaussianColorsCache: MTLBuffer?
-    private var gaussianOpacitiesCache: MTLBuffer?
 
-    // Half-precision gaussian buffers cache (for half16 pipeline)
-    private var gaussianMeansHalfCache: MTLBuffer?
-    private var gaussianDepthsHalfCache: MTLBuffer?
-    private var gaussianConicsHalfCache: MTLBuffer?
-    private var gaussianColorsHalfCache: MTLBuffer?
-    private var gaussianOpacitiesHalfCache: MTLBuffer?
-
-    private let sortAlgorithm: SortAlgorithm
     private let precision: Precision
     private let effectivePrecision: Precision
     public var precisionSetting: Precision { self.effectivePrecision }
@@ -316,7 +293,6 @@ public final class GlobalSortRenderer: GaussianRenderer, @unchecked Sendable {
 
     public init(
         precision: Precision = .float32,
-        sortAlgorithm: SortAlgorithm = .radix,
         textureOnly: Bool = false,  // Skip buffer output allocation to save ~20MB
         limits: RendererLimits = RendererLimits(maxGaussians: 1_000_000, maxWidth: 2048, maxHeight: 2048)
     ) {
@@ -328,7 +304,6 @@ public final class GlobalSortRenderer: GaussianRenderer, @unchecked Sendable {
         guard let queue = device.makeCommandQueue() else {
             fatalError("Failed to create command queue")
         }
-        self.queue = queue
 
         do {
             let currentFileURL = URL(fileURLWithPath: #filePath)
@@ -341,7 +316,6 @@ public final class GlobalSortRenderer: GaussianRenderer, @unchecked Sendable {
 
             // Note: tileBoundsEncoder removed - tile bounds now computed in fused projection kernel
             self.sortKeyGenEncoder = try SortKeyGenEncoder(device: device, library: library)
-            self.bitonicSortEncoder = try BitonicSortEncoder(device: device, library: library, useIndirect: false)
             self.radixSortEncoder = try RadixSortEncoder(device: device, library: library)
             self.packEncoder = try PackEncoder(device: device, library: library)
             self.renderEncoder = try RenderEncoder(device: device, library: library)
@@ -349,17 +323,15 @@ public final class GlobalSortRenderer: GaussianRenderer, @unchecked Sendable {
 
             let config = AssignmentDispatchConfigSwift(
                 sortThreadgroupSize: UInt32(self.sortKeyGenEncoder.threadgroupSize),
-                fuseThreadgroupSize: 256,   // Unused - fuse/unpack removed (32-bit keys)
-                unpackThreadgroupSize: 256, // Unused - fuse/unpack removed (32-bit keys)
+                fuseThreadgroupSize: 256,
+                unpackThreadgroupSize: 256,
                 packThreadgroupSize: UInt32(self.packEncoder.packThreadgroupSize),
-                bitonicThreadgroupSize: UInt32(self.bitonicSortEncoder.unitSize),
+                bitonicThreadgroupSize: 256,
                 radixBlockSize: UInt32(self.radixSortEncoder.blockSize),
                 radixGrainSize: UInt32(self.radixSortEncoder.grainSize),
-                maxAssignments: 0  // Set dynamically at encode time
+                maxAssignments: 0
             )
             self.dispatchEncoder = try DispatchEncoder(device: device, library: library, config: config)
-
-            // Fused pipeline encoder (always enabled - better performance)
             self.fusedPipelineEncoder = try FusedPipelineEncoder(device: device, library: library)
 
             // Two-pass tile assignment encoder with compaction
@@ -375,14 +347,11 @@ public final class GlobalSortRenderer: GaussianRenderer, @unchecked Sendable {
             fatalError("Failed to load library or initialize encoders: \(error)")
         }
         self.precision = precision
-        self.sortAlgorithm = sortAlgorithm
         self.limits = limits
 
         // Compute layout once using max precision for safety
         self.frameLayout = GlobalSortRenderer.computeLayout(
             limits: limits,
-            sortAlgorithm: sortAlgorithm,
-            useFusedPipeline: true,  // Always enabled
             precision: Precision.float32,
             device: device,
             radixSortEncoder: self.radixSortEncoder
@@ -399,53 +368,19 @@ public final class GlobalSortRenderer: GaussianRenderer, @unchecked Sendable {
             self.frameInUse.append(false)
         }
 
-        // Preallocate shared CPU-visible caches based on precision mode
-        // float32 precision: allocate float32 gaussian caches
-        // float16 precision: allocate half gaussian caches
-        // World caches only needed for non-textureOnly mode (separate world->gaussian projection)
-        let shared: MTLResourceOptions = .storageModeShared
-        func makeShared(_ length: Int, _ label: String) -> MTLBuffer {
-            guard let buf = device.makeBuffer(length: length, options: shared) else {
-                fatalError("Failed to allocate shared buffer \(label)")
-            }
-            buf.label = label
-            return buf
-        }
-
+        // Preallocate shared CPU-visible caches for projection output
         let g = limits.maxGaussians
+        let shared: MTLResourceOptions = .storageModeShared
 
-        // World caches only needed for world->gaussian projection (not textureOnly mode)
-        if !textureOnly {
-            self.worldPositionsCache = makeShared(g * MemoryLayout<SIMD3<Float>>.stride, "WorldPositions")
-            self.worldScalesCache = makeShared(g * MemoryLayout<SIMD3<Float>>.stride, "WorldScales")
-            self.worldRotationsCache = makeShared(g * MemoryLayout<SIMD4<Float>>.stride, "WorldRotations")
-            // SH coeffs worst-case: 9 coefficients (l=2) *3 channels -> 27 floats = 108MB!
-            self.worldHarmonicsCache = makeShared(g * MemoryLayout<Float>.stride * 27, "WorldHarmonics")
-            self.worldOpacitiesCache = makeShared(g * MemoryLayout<Float>.stride, "WorldOpacities")
+        // Bounds (int4) and Mask (used for tile assignment)
+        guard let boundsCache = device.makeBuffer(length: g * MemoryLayout<SIMD4<Int32>>.stride, options: shared),
+              let maskCache = device.makeBuffer(length: g, options: shared) else {
+            fatalError("Failed to allocate projection caches")
         }
-
-        // Gaussian input caches - allocate based on precision mode
-        // encodeRenderToTextures uses float32 caches, encodeRenderToTextureHalf uses half caches
-        if precision == .float32 {
-            // Float32 gaussian caches for encodeRenderToTextures
-            self.gaussianMeansCache = makeShared(g * 8, "GaussianMeans")
-            self.gaussianDepthsCache = makeShared(g * 4, "GaussianDepths")
-            self.gaussianConicsCache = makeShared(g * 16, "GaussianConics")
-            self.gaussianColorsCache = makeShared(g * 12, "GaussianColors")
-            self.gaussianOpacitiesCache = makeShared(g * 4, "GaussianOpacities")
-        } else {
-            // Half precision caches for encodeRenderToTextureHalf
-            self.gaussianMeansHalfCache = makeShared(g * 4, "GaussianMeansHalf")
-            self.gaussianDepthsHalfCache = makeShared(g * 2, "GaussianDepthsHalf")
-            self.gaussianConicsHalfCache = makeShared(g * 8, "GaussianConicsHalf")
-            self.gaussianColorsHalfCache = makeShared(g * 6, "GaussianColorsHalf")
-            self.gaussianOpacitiesHalfCache = makeShared(g * 2, "GaussianOpacitiesHalf")
-        }
-
-        // Bounds (int4) and Mask (used for tile assignment in all modes)
-        // Note: radii no longer needed - tile bounds computed directly in fused projection
-        self.gaussianBoundsCache = makeShared(g * MemoryLayout<SIMD4<Int32>>.stride, "GaussianBounds")
-        self.gaussianMaskCache = makeShared(g, "GaussianMask")
+        boundsCache.label = "GaussianBounds"
+        maskCache.label = "GaussianMask"
+        self.gaussianBoundsCache = boundsCache
+        self.gaussianMaskCache = maskCache
     }
 
     /// Convenience initializer from RendererConfig
@@ -455,10 +390,9 @@ public final class GlobalSortRenderer: GaussianRenderer, @unchecked Sendable {
             maxWidth: config.maxWidth,
             maxHeight: config.maxHeight
         )
-        let precision: Precision = config.precision == .float16 ? .float16 : .float32
+        let precision: Precision = config.precision
         self.init(
             precision: precision,
-            sortAlgorithm: .radix,
             textureOnly: false,
             limits: limits
         )
@@ -568,14 +502,8 @@ public final class GlobalSortRenderer: GaussianRenderer, @unchecked Sendable {
 
     // MARK: - Internal Methods
 
-    func triggerCapture(path: String) {
-        self.nextFrameCapturePath = path
-    }
-
     private static func computeLayout(
         limits: RendererLimits,
-        sortAlgorithm: SortAlgorithm,
-        useFusedPipeline: Bool,
         precision: Precision,
         device: MTLDevice,
         radixSortEncoder: RadixSortEncoder
@@ -587,19 +515,9 @@ public final class GlobalSortRenderer: GaussianRenderer, @unchecked Sendable {
         let gaussianTileCapacity = gaussianCapacity * 32
         let maxAssignmentCapacity = min(tileCapacity, gaussianTileCapacity)
 
-        // paddedCapacity: aligned for sort dispatch
-        // - Radix: 1024-aligned (blockSize * grainSize)
-        // - Bitonic: power-of-2 (much larger, can be 2x maxAssignmentCapacity)
-        let paddedCapacity: Int = {
-            if sortAlgorithm == .radix {
-                let block = radixSortEncoder.blockSize * radixSortEncoder.grainSize
-                return ((maxAssignmentCapacity + block - 1) / block) * block
-            } else {
-                var value = 1
-                while value < maxAssignmentCapacity { value <<= 1 }
-                return value
-            }
-        }()
+        // paddedCapacity: 1024-aligned for radix sort (blockSize * grainSize)
+        let block = radixSortEncoder.blockSize * radixSortEncoder.grainSize
+        let paddedCapacity = ((maxAssignmentCapacity + block - 1) / block) * block
 
         let strideForPrecision: Int = (precision == .float16) ? 2 : 4
         let half2Stride = MemoryLayout<UInt16>.stride * 2
@@ -651,21 +569,19 @@ public final class GlobalSortRenderer: GaussianRenderer, @unchecked Sendable {
         add("SortKeys", paddedCapacity * MemoryLayout<UInt32>.stride)
         add("SortedIndices", paddedCapacity * MemoryLayout<Int32>.stride)
 
-        // Radix-specific buffers (only when using radix sort)
+        // Radix sort buffers
         // Note: gridCapacity is for worst-case; runtime uses ceil(totalAssignments/1024) blocks
-        if sortAlgorithm == .radix {
-            let valuesPerGroup = radixSortEncoder.blockSize * radixSortEncoder.grainSize
-            let gridCapacity = max(1, (maxAssignmentCapacity + valuesPerGroup - 1) / valuesPerGroup)
-            let histogramCapacity = gridCapacity * radixSortEncoder.radix
-            add("RadixHist", histogramCapacity * MemoryLayout<UInt32>.stride)
-            add("RadixBlockSums", gridCapacity * MemoryLayout<UInt32>.stride)
-            add("RadixScanned", histogramCapacity * MemoryLayout<UInt32>.stride)
-            // Scratch buffers for ping-pong during radix sort (32-bit keys now)
-            add("RadixScratch", maxAssignmentCapacity * MemoryLayout<UInt32>.stride)
-            add("RadixPayload", maxAssignmentCapacity * MemoryLayout<UInt32>.stride)
-        }
+        let valuesPerGroup = radixSortEncoder.blockSize * radixSortEncoder.grainSize
+        let gridCapacity = max(1, (maxAssignmentCapacity + valuesPerGroup - 1) / valuesPerGroup)
+        let histogramCapacity = gridCapacity * radixSortEncoder.radix
+        add("RadixHist", histogramCapacity * MemoryLayout<UInt32>.stride)
+        add("RadixBlockSums", gridCapacity * MemoryLayout<UInt32>.stride)
+        add("RadixScanned", histogramCapacity * MemoryLayout<UInt32>.stride)
+        // Scratch buffers for ping-pong during radix sort
+        add("RadixScratch", maxAssignmentCapacity * MemoryLayout<UInt32>.stride)
+        add("RadixPayload", maxAssignmentCapacity * MemoryLayout<UInt32>.stride)
 
-        // Fused pipeline buffers (always enabled)
+        // Interleaved gaussian data
         add("InterleavedGaussians", gaussianCapacity * strideForInterleaved())
 
         // Two-pass tile assignment scratch buffer (hierarchical prefix sum block sums)
@@ -713,19 +629,8 @@ public final class GlobalSortRenderer: GaussianRenderer, @unchecked Sendable {
             return nil
         }
 
-        if let capturePath = self.nextFrameCapturePath {
-            let descriptor = MTLCaptureDescriptor()
-            descriptor.captureObject = self.device
-            descriptor.destination = .gpuTraceDocument
-            descriptor.outputURL = URL(fileURLWithPath: capturePath)
-            let manager = MTLCaptureManager.shared()
-            try? manager.startCapture(with: descriptor)
-            self.nextFrameCapturePath = nil
-        }
-
         guard let projectionOutput = self.prepareProjectionOutput(frame: frame) else {
             self.releaseFrame(index: slotIndex)
-            if MTLCaptureManager.shared().isCapturing { MTLCaptureManager.shared().stopCapture() }
             return nil
         }
 
@@ -812,16 +717,6 @@ public final class GlobalSortRenderer: GaussianRenderer, @unchecked Sendable {
 
         guard let (frame, slotIndex) = self.acquireFrame(width: limits.maxWidth, height: limits.maxHeight) else {
             fatalError("[encodeRenderToTextures] acquireFrame failed for \(limits.maxWidth)x\(limits.maxHeight)")
-        }
-
-        if let capturePath = self.nextFrameCapturePath {
-            let descriptor = MTLCaptureDescriptor()
-            descriptor.captureObject = self.device
-            descriptor.destination = .gpuTraceDocument
-            descriptor.outputURL = URL(fileURLWithPath: capturePath)
-            let manager = MTLCaptureManager.shared()
-            try? manager.startCapture(with: descriptor)
-            self.nextFrameCapturePath = nil
         }
 
         // Prepare projection output (packed renderData + radii + mask)
@@ -1116,52 +1011,33 @@ public final class GlobalSortRenderer: GaussianRenderer, @unchecked Sendable {
             dispatchOffset: DispatchSlot.sortKeys.rawValue * MemoryLayout<DispatchIndirectArgsSwift>.stride
         )
 
-        // Sort
-        if self.sortAlgorithm == .radix {
-            let radixBuffers = RadixBufferSet(
-                histogram: frame.radixHistogram!,
-                blockSums: frame.radixBlockSums!,
-                scannedHistogram: frame.radixScannedHistogram!,
-                scratchKeys: frame.radixKeysScratch!,
-                scratchPayload: frame.radixPayloadScratch!
-            )
+        // Radix sort
+        let radixBuffers = RadixBufferSet(
+            histogram: frame.radixHistogram!,
+            blockSums: frame.radixBlockSums!,
+            scannedHistogram: frame.radixScannedHistogram!,
+            scratchKeys: frame.radixKeysScratch!,
+            scratchPayload: frame.radixPayloadScratch!
+        )
 
-            let offsets = (
-                histogram: DispatchSlot.radixHistogram.rawValue * MemoryLayout<DispatchIndirectArgsSwift>.stride,
-                scanBlocks: DispatchSlot.radixScanBlocks.rawValue * MemoryLayout<DispatchIndirectArgsSwift>.stride,
-                exclusive: DispatchSlot.radixExclusive.rawValue * MemoryLayout<DispatchIndirectArgsSwift>.stride,
-                apply: DispatchSlot.radixApply.rawValue * MemoryLayout<DispatchIndirectArgsSwift>.stride,
-                scatter: DispatchSlot.radixScatter.rawValue * MemoryLayout<DispatchIndirectArgsSwift>.stride
-            )
+        let offsets = (
+            histogram: DispatchSlot.radixHistogram.rawValue * MemoryLayout<DispatchIndirectArgsSwift>.stride,
+            scanBlocks: DispatchSlot.radixScanBlocks.rawValue * MemoryLayout<DispatchIndirectArgsSwift>.stride,
+            exclusive: DispatchSlot.radixExclusive.rawValue * MemoryLayout<DispatchIndirectArgsSwift>.stride,
+            apply: DispatchSlot.radixApply.rawValue * MemoryLayout<DispatchIndirectArgsSwift>.stride,
+            scatter: DispatchSlot.radixScatter.rawValue * MemoryLayout<DispatchIndirectArgsSwift>.stride
+        )
 
-            self.radixSortEncoder.encode(
-                commandBuffer: commandBuffer,
-                keyBuffer: sortKeysBuffer,
-                sortedIndices: sortedIndicesBuffer,
-                header: assignment.header,
-                dispatchArgs: dispatchArgs,
-                radixBuffers: radixBuffers,
-                offsets: offsets,
-                tileCount: assignment.tileCount
-            )
-        } else {
-            let paddedCount = frame.tileAssignmentPaddedCapacity
-            let offsets = (
-                first: DispatchSlot.bitonicFirst.rawValue * MemoryLayout<DispatchIndirectArgsSwift>.stride,
-                general: DispatchSlot.bitonicGeneral.rawValue * MemoryLayout<DispatchIndirectArgsSwift>.stride,
-                final: DispatchSlot.bitonicFinal.rawValue * MemoryLayout<DispatchIndirectArgsSwift>.stride
-            )
-
-            self.bitonicSortEncoder.encode(
-                commandBuffer: commandBuffer,
-                sortKeys: sortKeysBuffer,
-                sortedIndices: sortedIndicesBuffer,
-                header: assignment.header,
-                dispatchArgs: dispatchArgs,
-                offsets: offsets,
-                paddedCapacity: paddedCount
-            )
-        }
+        self.radixSortEncoder.encode(
+            commandBuffer: commandBuffer,
+            keyBuffer: sortKeysBuffer,
+            sortedIndices: sortedIndicesBuffer,
+            header: assignment.header,
+            dispatchArgs: dispatchArgs,
+            radixBuffers: radixBuffers,
+            offsets: offsets,
+            tileCount: assignment.tileCount
+        )
 
         // Build headers and active tile list (index-based render - no pack step)
         let orderedBuffers = OrderedBufferSet(
@@ -1285,27 +1161,10 @@ public final class GlobalSortRenderer: GaussianRenderer, @unchecked Sendable {
         }
     }
 
-    // MARK: - Debug/Test helpers
-
-    func makeBuffer<T>(ptr: UnsafePointer<T>, count: Int) -> MTLBuffer? {
-        self.device.makeBuffer(bytes: ptr, length: count * MemoryLayout<T>.stride, options: .storageModeShared)
-    }
-    
-    /// Choose padded assignment capacity based on sort algorithm to avoid over-allocation.
+    /// Pad assignment capacity for radix sort alignment (1024-aligned)
     private func paddedAssignmentCapacity(for totalAssignments: Int) -> Int {
         guard totalAssignments > 0 else { return 1 }
-        if self.sortAlgorithm == .radix {
-            let block = self.radixSortEncoder.blockSize * self.radixSortEncoder.grainSize
-            return ((totalAssignments + block - 1) / block) * block
-        } else {
-            return self.nextPowerOfTwo(value: totalAssignments)
-        }
-    }
-    internal func nextPowerOfTwo(value: Int) -> Int {
-        var result = 1
-        while result < value {
-            result <<= 1
-        }
-        return result
+        let block = self.radixSortEncoder.blockSize * self.radixSortEncoder.grainSize
+        return ((totalAssignments + block - 1) / block) * block
     }
 }

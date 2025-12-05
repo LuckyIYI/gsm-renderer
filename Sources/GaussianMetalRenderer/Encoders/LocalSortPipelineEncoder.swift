@@ -296,40 +296,10 @@ public final class LocalSortPipelineEncoder {
         return ptr.pointee.visibleCount
     }
 
-    /// Debug: Print first few compacted gaussians
-    public static func debugPrintCompacted(from compacted: MTLBuffer, header: MTLBuffer, count: Int = 5) {
-        let visibleCount = readVisibleCount(from: header)
-        print("[LocalSort Debug] Visible count: \(visibleCount)")
-
-        guard visibleCount > 0, compacted.storageMode == .shared else {
-            print("[LocalSort Debug] Cannot read compacted buffer (private storage or empty)")
-            return
-        }
-
-        let ptr = compacted.contents().bindMemory(to: CompactedGaussianSwift.self, capacity: Int(visibleCount))
-        for i in 0..<min(count, Int(visibleCount)) {
-            let g = ptr[i]
-            print("  [\(i)] pos=(\(g.position_color.x), \(g.position_color.y)) depth=\(g.covariance_depth.w) tiles=(\(g.min_tile.x),\(g.min_tile.y))->(\(g.max_tile.x),\(g.max_tile.y))")
-        }
-    }
-
     /// Read overflow flag from header buffer
     public static func readOverflow(from header: MTLBuffer) -> Bool {
         let ptr = header.contents().bindMemory(to: CompactedHeaderSwift.self, capacity: 1)
         return ptr.pointee.overflow != 0
-    }
-
-    /// Clear just the header buffer
-    public func encodeClearHeader(
-        commandBuffer: MTLCommandBuffer,
-        header: MTLBuffer,
-        maxCompacted: Int
-    ) {
-        if let blitEncoder = commandBuffer.makeBlitCommandEncoder() {
-            blitEncoder.label = "LocalSort_ClearHeader"
-            blitEncoder.fill(buffer: header, range: 0..<MemoryLayout<CompactedHeaderSwift>.stride, value: 0)
-            blitEncoder.endEncoding()
-        }
     }
 
     // MARK: - 16-bit Sort Experimental

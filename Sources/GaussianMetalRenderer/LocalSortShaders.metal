@@ -1,5 +1,5 @@
 // LocalSortShaders.metal - Per-tile local sort Gaussian splatting pipeline
-// Uses bitonic sort within each tile for efficient rendering
+// Uses radix sort within each tile for efficient rendering
 
 #include <metal_stdlib>
 #include <metal_atomic>
@@ -11,25 +11,8 @@ using namespace metal;
 // Function constant for optional cluster culling (index 1, matches GaussianMetalRenderer.metal)
 constant bool USE_CLUSTER_CULL [[function_constant(1)]];
 
-// SH constants and computeSHColor function now defined in GaussianShared.h
-// Math helpers (matrixFromRows, normalizeQuaternion, buildCovariance3D, projectCovariance,
-// computeConicAndRadius) now defined in GaussianHelpers.h
-// Shared structures (CameraUniforms, PackedWorldGaussian, CompactedGaussian, etc.) now in BridgingTypes.h
-
 // =============================================================================
-// STRUCT ACCESSOR HELPERS - Work with individual fields from BridgingTypes.h
-// =============================================================================
-
-// Get rotation from PackedWorldGaussian (has simd_float4 rotation)
-inline float4 getRotation(PackedWorldGaussian g) { return g.rotation; }
-
-// Get rotation from PackedWorldGaussianHalf (has individual rx,ry,rz,rw)
-inline float4 getRotation(PackedWorldGaussianHalf g) {
-    return float4(half(g.rx), half(g.ry), half(g.rz), half(g.rw));
-}
-
-// =============================================================================
-// HELPER FUNCTIONS (LocalSort-specific - shared math helpers in GaussianHelpers.h)
+// HELPER FUNCTIONS (LocalSort-specific)
 // =============================================================================
 
 // Pack half4 to float2

@@ -7,16 +7,8 @@
 using namespace metal;
 
 // =============================================================================
-// STRUCT ACCESSOR HELPERS - Work with individual fields from BridgingTypes.h
+// STRUCT ACCESSOR HELPERS - GaussianRenderData (specific to GlobalSort)
 // =============================================================================
-
-// Get rotation from PackedWorldGaussian (has simd_float4 rotation)
-inline float4 getRotation(PackedWorldGaussian g) { return g.rotation; }
-
-// Get rotation from PackedWorldGaussianHalf (has individual rx,ry,rz,rw)
-inline float4 getRotation(PackedWorldGaussianHalf g) {
-    return float4(half(g.rx), half(g.ry), half(g.rz), half(g.rw));
-}
 
 // GaussianRenderData accessors (device address space)
 inline half2 getMean(const device GaussianRenderData& g) { return half2(g.meanX, g.meanY); }

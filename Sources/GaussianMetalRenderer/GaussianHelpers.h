@@ -5,7 +5,20 @@
 #define GAUSSIAN_HELPERS_H
 
 #include <metal_stdlib>
+#include "BridgingTypes.h"
 using namespace metal;
+
+// =============================================================================
+// STRUCT ACCESSOR HELPERS
+// =============================================================================
+
+// Get rotation from PackedWorldGaussian (has simd_float4 rotation)
+inline float4 getRotation(PackedWorldGaussian g) { return g.rotation; }
+
+// Get rotation from PackedWorldGaussianHalf (has individual rx,ry,rz,rw)
+inline float4 getRotation(PackedWorldGaussianHalf g) {
+    return float4(half(g.rx), half(g.ry), half(g.rz), half(g.rw));
+}
 
 // =============================================================================
 // MATH HELPERS

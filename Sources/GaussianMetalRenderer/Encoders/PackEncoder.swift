@@ -3,7 +3,6 @@ import Metal
 final class PackEncoder {
     private let headerFromSortedPipeline: MTLComputePipelineState
     private let compactActiveTilesPipeline: MTLComputePipelineState
-    
     let packThreadgroupSize: Int
 
     init(device: MTLDevice, library: MTLLibrary) throws {
@@ -13,14 +12,10 @@ final class PackEncoder {
         else {
             fatalError("Pack functions missing")
         }
-
-
         self.headerFromSortedPipeline = try device.makeComputePipelineState(function: headerFn)
         self.compactActiveTilesPipeline = try device.makeComputePipelineState(function: compactFn)
-        
-        self.packThreadgroupSize = max(1, 256) // TODO: delete, unused
+        self.packThreadgroupSize = 256
     }
-
 
     /// Build per-tile headers and the active-tile list without packing payload buffers.
     func encodeHeadersAndActiveTiles(

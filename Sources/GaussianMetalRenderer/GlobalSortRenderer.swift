@@ -266,9 +266,6 @@ public final class GlobalSortRenderer: GaussianRenderer, @unchecked Sendable {
     // Two-pass tile assignment encoder with compaction (Compact → Count → PrefixSum → Scatter)
     let twoPassTileAssignEncoder: TwoPassTileAssignEncoder
 
-    // Skip-based cluster culling encoder for Morton-sorted gaussians
-    private var clusterCullEncoder: ClusterCullEncoder?
-
     // Reset tile builder state pipeline (replaces blit for lower overhead)
     private let resetTileBuilderStatePipeline: MTLComputePipelineState
     
@@ -804,29 +801,9 @@ public final class GlobalSortRenderer: GaussianRenderer, @unchecked Sendable {
         frameParams: FrameParams,
         mortonSorted: Bool = false
     ) -> RenderOutputTextures? {
-        // Prepare cluster visibility if Morton-sorted (optional optimization)
-        var clusterVisibility: MTLBuffer? = nil
-        var clusterSize: UInt32 = 1024
-
-        if mortonSorted {
-            // Initialize cluster cull encoder if needed
-            if clusterCullEncoder == nil {
-                clusterCullEncoder = try? ClusterCullEncoder(device: device)
-            }
-            if let cullEncoder = clusterCullEncoder {
-                let bytesPerGaussian = packedWorldBuffers.packedGaussians.length / gaussianCount
-                let inputIsHalf = bytesPerGaussian <= 24
-                clusterVisibility = cullEncoder.encodeCull(
-                    commandBuffer: commandBuffer,
-                    worldGaussians: packedWorldBuffers.packedGaussians,
-                    gaussianCount: gaussianCount,
-                    viewMatrix: cameraUniforms.viewMatrix,
-                    projectionMatrix: cameraUniforms.projectionMatrix,
-                    useHalfWorld: inputIsHalf
-                )
-                clusterSize = cullEncoder.clusterSize
-            }
-        }
+        // Cluster culling disabled (archived)
+        let clusterVisibility: MTLBuffer? = nil
+        let clusterSize: UInt32 = 1024
 
         let params = limits.buildParams(from: frameParams)
         guard self.validateLimits(gaussianCount: gaussianCount) else {

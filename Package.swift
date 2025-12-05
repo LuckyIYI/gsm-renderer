@@ -32,11 +32,7 @@ let package = Package(
                 .process("GaussianMetalRenderer.metallib"),
                 .process("GaussianMetalRenderer.metal"),
                 .process("LocalSortShaders.metallib"),
-                .process("LocalSortShaders.metal"),
-                .process("TemporalShaders.metallib"),
-                .process("TemporalShaders.metal"),
-                .process("DepthFirstShaders.metallib"),
-                .process("DepthFirstShaders.metal")
+                .process("LocalSortShaders.metal")
             ]
         ),
         .testTarget(

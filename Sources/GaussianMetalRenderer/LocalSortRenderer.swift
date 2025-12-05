@@ -7,7 +7,6 @@ public final class LocalSortRenderer: GaussianRenderer, @unchecked Sendable {
     public let device: MTLDevice
     private let queue: MTLCommandQueue
     private let encoder: LocalSortPipelineEncoder
-    private var clusterCullEncoder: ClusterCullEncoder?
 
     // Tile configuration (16×16 = 256 pixels per tile)
     private let tileWidth = 16
@@ -151,33 +150,9 @@ public final class LocalSortRenderer: GaussianRenderer, @unchecked Sendable {
     ) -> MTLTexture? {
         guard gaussianCount > 0, width > 0, height > 0 else { return nil }
 
-        // Simple skip-based cluster culling (no compaction!)
-        var clusterVisibility: MTLBuffer? = nil
-        var clusterSize: UInt32 = UInt32(CLUSTER_SIZE)
-
-        if mortonSorted {
-            if clusterCullEncoder == nil {
-                clusterCullEncoder = try? ClusterCullEncoder(device: device)
-            }
-
-            if let cullEncoder = clusterCullEncoder {
-                let bytesPerGaussian = worldGaussians.length / gaussianCount
-                let inputIsHalf = bytesPerGaussian <= 24
-
-                // Just compute visibility buffer - NO compaction
-                clusterVisibility = cullEncoder.encodeCull(
-                    commandBuffer: commandBuffer,
-                    worldGaussians: worldGaussians,
-                    gaussianCount: gaussianCount,
-                    viewMatrix: viewMatrix,
-                    projectionMatrix: projectionMatrix,
-                    useHalfWorld: inputIsHalf
-                )
-                clusterSize = cullEncoder.clusterSize
-            }
-        }
-
-        // Continue with rendering using original buffers + visibility mask
+        // Cluster culling disabled (archived)
+        let clusterVisibility: MTLBuffer? = nil
+        let clusterSize: UInt32 = UInt32(CLUSTER_SIZE)
         ensureBuffers(gaussianCount: gaussianCount, width: width, height: height)
 
         // Core buffers required for all modes

@@ -1,21 +1,21 @@
 import Metal
 
 /// Encodes scatter stage: assigns gaussians to tiles using SIMD-cooperative approach
-public final class LocalSortScatterEncoder {
+public final class LocalScatterEncoder {
     private let prepareDispatchPipeline: MTLComputePipelineState
     private let scatterPipeline: MTLComputePipelineState
     private let scatter16Pipeline: MTLComputePipelineState?
 
     public init(library: MTLLibrary, device: MTLDevice) throws {
-        guard let prepareDispatchFn = library.makeFunction(name: "localSortPrepareScatterDispatch"),
-              let scatterFn = library.makeFunction(name: "localSortScatterSimd") else {
+        guard let prepareDispatchFn = library.makeFunction(name: "LocalPrepareScatterDispatch"),
+              let scatterFn = library.makeFunction(name: "LocalScatterSimd") else {
             fatalError("Missing scatter kernels")
         }
         self.prepareDispatchPipeline = try device.makeComputePipelineState(function: prepareDispatchFn)
         self.scatterPipeline = try device.makeComputePipelineState(function: scatterFn)
 
         // Optional 16-bit scatter
-        if let scatter16Fn = library.makeFunction(name: "localSortScatterSimd16") {
+        if let scatter16Fn = library.makeFunction(name: "LocalScatterSimd16") {
             self.scatter16Pipeline = try? device.makeComputePipelineState(function: scatter16Fn)
         } else {
             self.scatter16Pipeline = nil
@@ -49,7 +49,7 @@ public final class LocalSortScatterEncoder {
 
         // Prepare indirect dispatch
         if let encoder = commandBuffer.makeComputeCommandEncoder() {
-            encoder.label = "LocalSort_PrepareScatterDispatch"
+            encoder.label = "Local_PrepareScatterDispatch"
             encoder.setComputePipelineState(prepareDispatchPipeline)
             encoder.setBuffer(compactedHeader, offset: 0, index: 0)
             encoder.setBuffer(dispatchArgsBuffer, offset: 0, index: 1)
@@ -62,7 +62,7 @@ public final class LocalSortScatterEncoder {
 
         // SIMD-cooperative scatter
         if let encoder = commandBuffer.makeComputeCommandEncoder() {
-            encoder.label = "LocalSort_Scatter_SIMD"
+            encoder.label = "Local_Scatter_SIMD"
             encoder.setComputePipelineState(scatterPipeline)
             encoder.setBuffer(compactedGaussians, offset: 0, index: 0)
             encoder.setBuffer(compactedHeader, offset: 0, index: 1)
@@ -110,7 +110,7 @@ public final class LocalSortScatterEncoder {
 
         // Prepare indirect dispatch
         if let encoder = commandBuffer.makeComputeCommandEncoder() {
-            encoder.label = "LocalSort_PrepareScatter16Dispatch"
+            encoder.label = "Local_PrepareScatter16Dispatch"
             encoder.setComputePipelineState(prepareDispatchPipeline)
             encoder.setBuffer(compactedHeader, offset: 0, index: 0)
             encoder.setBuffer(dispatchArgsBuffer, offset: 0, index: 1)
@@ -123,7 +123,7 @@ public final class LocalSortScatterEncoder {
 
         // 16-bit scatter
         if let encoder = commandBuffer.makeComputeCommandEncoder() {
-            encoder.label = "LocalSort_Scatter16_SIMD"
+            encoder.label = "Local_Scatter16_SIMD"
             encoder.setComputePipelineState(scatter16)
             encoder.setBuffer(compactedGaussians, offset: 0, index: 0)
             encoder.setBuffer(compactedHeader, offset: 0, index: 1)

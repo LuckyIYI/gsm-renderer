@@ -3,9 +3,9 @@ import Metal
 
 /// Fast Gaussian splatting renderer using per-tile local sort
 /// Conforms to GaussianRenderer protocol with exactly 2 render methods
-public final class LocalSortRenderer: GaussianRenderer, @unchecked Sendable {
+public final class LocalRenderer: GaussianRenderer, @unchecked Sendable {
     public let device: MTLDevice
-    private let encoder: LocalSortPipelineEncoder
+    private let encoder: LocalPipelineEncoder
 
     // Tile configuration (16×16 = 256 pixels per tile)
     private let tileWidth = 16
@@ -48,6 +48,11 @@ public final class LocalSortRenderer: GaussianRenderer, @unchecked Sendable {
     // Textured render buffer (only allocated when useTexturedRender == true)
     private var gaussianRenderTexture: MTLTexture?
 
+    // Indirect dispatch buffers
+    private var activeTileIndicesBuffer: MTLBuffer?
+    private var activeTileCountBuffer: MTLBuffer?
+    private var dispatchArgsBuffer: MTLBuffer?
+
     // Current allocation sizes
     private var allocatedGaussianCapacity: Int = 0
     private var allocatedWidth: Int = 0
@@ -64,21 +69,21 @@ public final class LocalSortRenderer: GaussianRenderer, @unchecked Sendable {
         self.device = device
         self.config = config
         guard let queue = device.makeCommandQueue() else {
-            throw LocalSortError.failedToCreateQueue
+            throw LocalError.failedToCreateQueue
         }
-        self.encoder = try LocalSortPipelineEncoder(device: device)
+        self.encoder = try LocalPipelineEncoder(device: device)
     }
 
     public init(config: RendererConfig = RendererConfig()) throws {
         self.config = config
         guard let device = MTLCreateSystemDefaultDevice() else {
-            throw LocalSortError.failedToCreateQueue
+            throw LocalError.failedToCreateQueue
         }
         self.device = device
         guard let queue = device.makeCommandQueue() else {
-            throw LocalSortError.failedToCreateQueue
+            throw LocalError.failedToCreateQueue
         }
-        self.encoder = try LocalSortPipelineEncoder(device: device)
+        self.encoder = try LocalPipelineEncoder(device: device)
     }
 
     // MARK: - GaussianRenderer Protocol Methods
@@ -122,7 +127,7 @@ public final class LocalSortRenderer: GaussianRenderer, @unchecked Sendable {
         whiteBackground: Bool,
         mortonSorted: Bool
     ) -> BufferRenderResult? {
-        return nil  // LocalSortRenderer only supports texture output
+        return nil  // LocalRenderer only supports texture output
     }
 
     // MARK: - Internal Render Implementation
@@ -238,6 +243,39 @@ public final class LocalSortRenderer: GaussianRenderer, @unchecked Sendable {
             depthKeys16: depthKeys16Buffer
         )
 
+        // Indirect dispatch buffers required for all render paths
+        guard let activeTileIndices = activeTileIndicesBuffer,
+              let activeTileCount = activeTileCountBuffer,
+              let dispatchArgs = dispatchArgsBuffer else {
+            return nil
+        }
+
+        // 1. Clear textures first
+        encoder.encodeClearTextures(
+            commandBuffer: commandBuffer,
+            colorTexture: colorTex,
+            depthTexture: depthTex,
+            width: width,
+            height: height,
+            whiteBackground: whiteBackground
+        )
+
+        // 2. Compact active tile indices
+        encoder.encodeCompactActiveTiles(
+            commandBuffer: commandBuffer,
+            tileCounts: tileCounts,
+            activeTileIndices: activeTileIndices,
+            activeTileCount: activeTileCount,
+            tileCount: tileCount
+        )
+
+        // 3. Prepare indirect dispatch args
+        encoder.encodePrepareRenderDispatch(
+            commandBuffer: commandBuffer,
+            activeTileCount: activeTileCount,
+            dispatchArgs: dispatchArgs
+        )
+
         // 16-bit sort path - reads depthKeys16 directly (sequential 2-byte reads!)
         if effective16BitSort, let sortedLocal16 = sortedLocalIdx16Buffer, let depth16 = depthKeys16Buffer {
             encoder.encodeSort16(
@@ -250,40 +288,16 @@ public final class LocalSortRenderer: GaussianRenderer, @unchecked Sendable {
                 tileCount: tileCount
             )
 
-            // 16-bit render (two-level indirection)
-            encoder.encodeRender16(
+            // 16-bit render via indirect dispatch (two-level indirection)
+            encoder.encodeRenderIndirect16(
                 commandBuffer: commandBuffer,
                 compactedGaussians: compacted,
                 tileOffsets: tileOffsets,
                 tileCounts: tileCounts,
                 sortedLocalIdx: sortedLocal16,
                 globalIndices: sortIndices,
-                colorTexture: colorTex,
-                depthTexture: depthTex,
-                tilesX: tilesX,
-                tilesY: tilesY,
-                width: width,
-                height: height,
-                tileWidth: tileWidth,
-                tileHeight: tileHeight,
-                whiteBackground: whiteBackground
-            )
-        } else if config.useTexturedRender, encoder.hasTexturedRender, let gaussianTex = gaussianRenderTexture {
-            // Textured render path
-            encoder.encodePackRenderTexture(
-                commandBuffer: commandBuffer,
-                compactedGaussians: compacted,
-                compactedHeader: header,
-                renderTexture: gaussianTex,
-                maxGaussians: maxCompacted
-            )
-
-            encoder.encodeRenderTextured(
-                commandBuffer: commandBuffer,
-                gaussianTexture: gaussianTex,
-                tileOffsets: tileOffsets,
-                tileCounts: tileCounts,
-                sortedIndices: sortIndices,
+                activeTileIndices: activeTileIndices,
+                dispatchArgs: dispatchArgs,
                 colorTexture: colorTex,
                 depthTexture: depthTex,
                 tilesX: tilesX,
@@ -295,13 +309,15 @@ public final class LocalSortRenderer: GaussianRenderer, @unchecked Sendable {
                 whiteBackground: whiteBackground
             )
         } else {
-            // Standard 32-bit render path
-            encoder.encodeRender(
+            // 32-bit render via indirect dispatch
+            encoder.encodeRenderIndirect(
                 commandBuffer: commandBuffer,
                 compactedGaussians: compacted,
                 tileOffsets: tileOffsets,
                 tileCounts: tileCounts,
                 sortedIndices: sortIndices,
+                activeTileIndices: activeTileIndices,
+                dispatchArgs: dispatchArgs,
                 colorTexture: colorTex,
                 depthTexture: depthTex,
                 tilesX: tilesX,
@@ -319,12 +335,12 @@ public final class LocalSortRenderer: GaussianRenderer, @unchecked Sendable {
 
     public func getVisibleCount() -> UInt32 {
         guard let header = headerBuffer else { return 0 }
-        return LocalSortPipelineEncoder.readVisibleCount(from: header)
+        return LocalPipelineEncoder.readVisibleCount(from: header)
     }
 
     public func hadOverflow() -> Bool {
         guard let header = headerBuffer else { return false }
-        return LocalSortPipelineEncoder.readOverflow(from: header)
+        return LocalPipelineEncoder.readOverflow(from: header)
     }
 
     // MARK: - Private
@@ -459,7 +475,7 @@ public final class LocalSortRenderer: GaussianRenderer, @unchecked Sendable {
 
         // Textured render texture (only if enabled)
         if config.useTexturedRender {
-            let renderTexWidth = LocalSortPipelineEncoder.renderTexWidth
+            let renderTexWidth = LocalPipelineEncoder.renderTexWidth
             let texelCount = maxCompacted * 2
             let renderTexHeight = (texelCount + renderTexWidth - 1) / renderTexWidth
             let gaussianTexDesc = MTLTextureDescriptor.texture2DDescriptor(
@@ -474,10 +490,27 @@ public final class LocalSortRenderer: GaussianRenderer, @unchecked Sendable {
         } else {
             gaussianRenderTexture = nil
         }
+
+        // === INDIRECT DISPATCH BUFFERS ===
+        // Active tile indices (max = tileCount)
+        activeTileIndicesBuffer = device.makeBuffer(
+            length: tileCount * MemoryLayout<UInt32>.stride,
+            options: priv
+        )
+        // Active tile count (single atomic uint)
+        activeTileCountBuffer = device.makeBuffer(
+            length: MemoryLayout<UInt32>.stride,
+            options: priv
+        )
+        // Dispatch args (3 uints for MTLDispatchThreadgroupsIndirectArguments)
+        dispatchArgsBuffer = device.makeBuffer(
+            length: 3 * MemoryLayout<UInt32>.stride,
+            options: priv
+        )
     }
 }
 
-public enum LocalSortError: Error {
+public enum LocalError: Error {
     case failedToCreateQueue
     case failedToCreateEncoder
 }

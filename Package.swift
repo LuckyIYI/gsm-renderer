@@ -31,8 +31,8 @@ let package = Package(
             resources: [
                 .process("GaussianMetalRenderer.metallib"),
                 .process("GaussianMetalRenderer.metal"),
-                .process("LocalSortShaders.metallib"),
-                .process("LocalSortShaders.metal")
+                .process("LocalShaders.metallib"),
+                .process("LocalShaders.metal")
             ]
         ),
         .testTarget(

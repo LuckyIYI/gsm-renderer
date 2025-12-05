@@ -91,7 +91,7 @@ public struct OrderedGaussianBuffers {
     public let activeTileCount: MTLBuffer
     public let precision: Precision
 
-    // Index-based render (like LocalSort): render reads via sortedIndices
+    // Index-based render (like Local): render reads via sortedIndices
     // renderData: AoS packed GaussianRenderData from projectGaussiansAoS
     public let renderData: MTLBuffer?
     public let sortedIndices: MTLBuffer?

@@ -228,7 +228,7 @@ final class FrameResources {
         guard let colorTex = device.makeTexture(descriptor: texDesc) else { fatalError("Failed to allocate color texture") }
         colorTex.label = "OutputColorTex"
 
-        // Depth texture uses half precision like LocalSort
+        // Depth texture uses half precision like Local
         let depthDesc = MTLTextureDescriptor.texture2DDescriptor(pixelFormat: .r16Float, width: layout.limits.maxWidth, height: layout.limits.maxHeight, mipmapped: false)
         depthDesc.usage = [.shaderWrite, .shaderRead]
         depthDesc.storageMode = .private

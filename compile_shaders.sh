@@ -26,13 +26,13 @@ xcrun -sdk $SDK metallib \
 
 echo "Done: $LIB"
 
-# LocalSort shaders (per-tile bitonic sort)
-SRC2="Sources/GaussianMetalRenderer/LocalSortShaders.metal"
-AIR2="Sources/GaussianMetalRenderer/LocalSortShaders.air"
-LIB2="Sources/GaussianMetalRenderer/LocalSortShaders.metallib"
+# Local shaders (per-tile bitonic sort)
+SRC2="Sources/GaussianMetalRenderer/LocalShaders.metal"
+AIR2="Sources/GaussianMetalRenderer/LocalShaders.air"
+LIB2="Sources/GaussianMetalRenderer/LocalShaders.metallib"
 
 echo ""
-echo "Compiling LocalSort Shaders..."
+echo "Compiling Local Shaders..."
 xcrun -sdk $SDK metal \
   $INCLUDE \
   -frecord-sources -gline-tables-only \
@@ -40,7 +40,7 @@ xcrun -sdk $SDK metal \
   -c "$SRC2" \
   -o "$AIR2"
 
-echo "Linking LocalSort Metal Library..."
+echo "Linking Local Metal Library..."
 xcrun -sdk $SDK metallib \
   "$AIR2" \
   -o "$LIB2"

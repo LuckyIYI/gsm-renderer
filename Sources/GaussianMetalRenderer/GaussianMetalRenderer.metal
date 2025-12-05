@@ -1645,11 +1645,11 @@ kernel void radixScatterKernel(
 #define RENDER_V3_PIXELS_Y 2
 
 // =============================================================================
-// Unified Index-based render (like LocalSort)
+// Unified Index-based render (like Local)
 // =============================================================================
-// - Only outputs color + depth (alpha stored in color.a, like LocalSort)
+// - Only outputs color + depth (alpha stored in color.a, like Local)
 // - Uses index-based access via sortedIndices (no Pack step needed)
-// - Half precision only (matching LocalSort)
+// - Half precision only (matching Local)
 
 kernel void globalSortRender(
     const device GaussianHeader*     headers         [[buffer(0)]],
@@ -1658,7 +1658,7 @@ kernel void globalSortRender(
     const device uint*               activeTiles     [[buffer(3)]],
     const device uint*               activeTileCount [[buffer(4)]],
     texture2d<half, access::write>   colorOut        [[texture(0)]],
-    texture2d<half, access::write>   depthOut        [[texture(1)]],  // half like LocalSort
+    texture2d<half, access::write>   depthOut        [[texture(1)]],  // half like Local
     constant RenderParams&           params          [[buffer(5)]],
     uint2                            group_id        [[threadgroup_position_in_grid]],
     uint2                            local_id        [[thread_position_in_threadgroup]]
@@ -1699,14 +1699,14 @@ kernel void globalSortRender(
     uint start = hdr.offset;
     uint count = hdr.count;
 
-    // Direct loop - using sortedIndices for indirect access (like LocalSort)
+    // Direct loop - using sortedIndices for indirect access (like Local)
     for (uint i = 0; i < count; i++) {
         // Early exit when all pixels are saturated
         half maxTrans0 = max(max(trans00, trans10), max(trans20, trans30));
         half maxTrans1 = max(max(trans01, trans11), max(trans21, trans31));
         if (max(maxTrans0, maxTrans1) < half(1.0h/255.0h)) break;
 
-        // Read via sortedIndices (like LocalSort - no Pack step)
+        // Read via sortedIndices (like Local - no Pack step)
         int gaussianIdx = sortedIndices[start + i];
         if (gaussianIdx < 0) continue;
         GaussianRenderData g = gaussians[gaussianIdx];

@@ -1,18 +1,18 @@
 import Metal
 
 /// Encodes per-tile radix sort stage
-public final class LocalSortSortEncoder {
+public final class LocalSortEncoder {
     private let perTileSortPipeline: MTLComputePipelineState
     private let sort16Pipeline: MTLComputePipelineState?
 
     public init(library: MTLLibrary, device: MTLDevice) throws {
-        guard let sortFn = library.makeFunction(name: "localSortPerTileSort") else {
+        guard let sortFn = library.makeFunction(name: "LocalPerTileSort") else {
             fatalError("Missing per-tile sort kernel")
         }
         self.perTileSortPipeline = try device.makeComputePipelineState(function: sortFn)
 
         // Optional 16-bit sort
-        if let sort16Fn = library.makeFunction(name: "localSortPerTileSort16") {
+        if let sort16Fn = library.makeFunction(name: "LocalPerTileSort16") {
             self.sort16Pipeline = try? device.makeComputePipelineState(function: sort16Fn)
         } else {
             self.sort16Pipeline = nil
@@ -34,7 +34,7 @@ public final class LocalSortSortEncoder {
         tileCount: Int
     ) {
         guard let encoder = commandBuffer.makeComputeCommandEncoder() else { return }
-        encoder.label = "LocalSort_PerTileSort"
+        encoder.label = "Local_PerTileSort"
         encoder.setComputePipelineState(perTileSortPipeline)
         encoder.setBuffer(sortKeys, offset: 0, index: 0)
         encoder.setBuffer(sortIndices, offset: 0, index: 1)
@@ -63,7 +63,7 @@ public final class LocalSortSortEncoder {
         guard let sortPipeline = sort16Pipeline else { return }
         guard let encoder = commandBuffer.makeComputeCommandEncoder() else { return }
 
-        encoder.label = "LocalSort_PerTileSort16"
+        encoder.label = "Local_PerTileSort16"
         encoder.setComputePipelineState(sortPipeline)
         encoder.setBuffer(depthKeys16, offset: 0, index: 0)
         encoder.setBuffer(globalIndices, offset: 0, index: 1)

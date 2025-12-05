@@ -1,7 +1,7 @@
 import Metal
 
 /// Encodes projection stage: ProjectStore → Visibility PrefixSum → CompactCount
-public final class LocalSortProjectEncoder {
+public final class LocalProjectEncoder {
     // Projection pipelines by (shDegree, useClusterCull)
     private var projectStoreFloatPipelines: [UInt64: MTLComputePipelineState] = [:]
     private var projectStoreHalfPipelines: [UInt64: MTLComputePipelineState] = [:]
@@ -17,10 +17,10 @@ public final class LocalSortProjectEncoder {
 
     private let prefixBlockSize = 256
 
-    public init(localSortLibrary: MTLLibrary, mainLibrary: MTLLibrary, device: MTLDevice) throws {
+    public init(LocalLibrary: MTLLibrary, mainLibrary: MTLLibrary, device: MTLDevice) throws {
         // Load compaction kernels
-        guard let compactCountFn = localSortLibrary.makeFunction(name: "localSortCompactCount"),
-              let writeVisibleCountFn = localSortLibrary.makeFunction(name: "localSortWriteVisibleCount") else {
+        guard let compactCountFn = LocalLibrary.makeFunction(name: "LocalCompactCount"),
+              let writeVisibleCountFn = LocalLibrary.makeFunction(name: "LocalWriteVisibleCount") else {
             fatalError("Missing compaction kernels")
         }
         self.compactCountPipeline = try device.makeComputePipelineState(function: compactCountFn)
@@ -47,10 +47,10 @@ public final class LocalSortProjectEncoder {
 
                 let key = Self.pipelineKey(shDegree: degree, useClusterCull: useClusterCull)
 
-                if let fn = try? localSortLibrary.makeFunction(name: "localSortProjectStoreFloat", constantValues: constantValues) {
+                if let fn = try? LocalLibrary.makeFunction(name: "LocalProjectStoreFloat", constantValues: constantValues) {
                     self.projectStoreFloatPipelines[key] = try? device.makeComputePipelineState(function: fn)
                 }
-                if let fn = try? localSortLibrary.makeFunction(name: "localSortProjectStoreHalfHalfSh", constantValues: constantValues) {
+                if let fn = try? LocalLibrary.makeFunction(name: "LocalProjectStoreHalfHalfSh", constantValues: constantValues) {
                     self.projectStoreHalfPipelines[key] = try? device.makeComputePipelineState(function: fn)
                 }
             }
@@ -101,7 +101,7 @@ public final class LocalSortProjectEncoder {
 
         // === PROJECT + STORE ===
         if let encoder = commandBuffer.makeComputeCommandEncoder() {
-            encoder.label = "LocalSort_ProjectStore"
+            encoder.label = "Local_ProjectStore"
             let pipeline = useHalfWorld
                 ? projectStoreHalfPipelines[key]!
                 : projectStoreFloatPipelines[key]!
@@ -133,7 +133,7 @@ public final class LocalSortProjectEncoder {
 
         // === WRITE VISIBLE COUNT TO HEADER ===
         if let encoder = commandBuffer.makeComputeCommandEncoder() {
-            encoder.label = "LocalSort_WriteVisibleCount"
+            encoder.label = "Local_WriteVisibleCount"
             encoder.setComputePipelineState(writeVisibleCountPipeline)
             encoder.setBuffer(visibilityMarks, offset: 0, index: 0)
             encoder.setBuffer(compactedHeader, offset: 0, index: 1)
@@ -145,7 +145,7 @@ public final class LocalSortProjectEncoder {
 
         // === COMPACT + COUNT ===
         if let encoder = commandBuffer.makeComputeCommandEncoder() {
-            encoder.label = "LocalSort_CompactCount"
+            encoder.label = "Local_CompactCount"
             encoder.setComputePipelineState(compactCountPipeline)
             encoder.setBuffer(tempProjectionBuffer, offset: 0, index: 0)
             encoder.setBuffer(visibilityMarks, offset: 0, index: 1)
@@ -173,7 +173,7 @@ public final class LocalSortProjectEncoder {
 
         // Block reduce
         if let encoder = commandBuffer.makeComputeCommandEncoder() {
-            encoder.label = "LocalSort_VisBlockReduce"
+            encoder.label = "Local_VisBlockReduce"
             encoder.setComputePipelineState(blockReducePipeline)
             encoder.setBuffer(visibilityMarks, offset: 0, index: 0)
             encoder.setBuffer(visibilityPartialSums, offset: 0, index: 1)
@@ -187,7 +187,7 @@ public final class LocalSortProjectEncoder {
         // Scan block sums
         if visBlocks <= prefixBlockSize {
             if let encoder = commandBuffer.makeComputeCommandEncoder() {
-                encoder.label = "LocalSort_VisScanBlockSums"
+                encoder.label = "Local_VisScanBlockSums"
                 encoder.setComputePipelineState(singleBlockScanPipeline)
                 encoder.setBuffer(visibilityPartialSums, offset: 0, index: 0)
                 encoder.setBytes(&visBlocksU, length: 4, index: 1)
@@ -202,7 +202,7 @@ public final class LocalSortProjectEncoder {
             var level2BlocksU = UInt32(level2Blocks)
 
             if let encoder = commandBuffer.makeComputeCommandEncoder() {
-                encoder.label = "LocalSort_VisLevel2Reduce"
+                encoder.label = "Local_VisLevel2Reduce"
                 encoder.setComputePipelineState(blockReducePipeline)
                 encoder.setBuffer(visibilityPartialSums, offset: 0, index: 0)
                 encoder.setBuffer(visibilityPartialSums, offset: level2Offset, index: 1)
@@ -213,7 +213,7 @@ public final class LocalSortProjectEncoder {
             }
 
             if let encoder = commandBuffer.makeComputeCommandEncoder() {
-                encoder.label = "LocalSort_VisLevel2Scan"
+                encoder.label = "Local_VisLevel2Scan"
                 encoder.setComputePipelineState(singleBlockScanPipeline)
                 encoder.setBuffer(visibilityPartialSums, offset: level2Offset, index: 0)
                 encoder.setBytes(&level2BlocksU, length: 4, index: 1)
@@ -223,7 +223,7 @@ public final class LocalSortProjectEncoder {
             }
 
             if let encoder = commandBuffer.makeComputeCommandEncoder() {
-                encoder.label = "LocalSort_VisLevel1Scan"
+                encoder.label = "Local_VisLevel1Scan"
                 encoder.setComputePipelineState(blockScanPipeline)
                 encoder.setBuffer(visibilityPartialSums, offset: 0, index: 0)
                 encoder.setBuffer(visibilityPartialSums, offset: 0, index: 1)
@@ -237,7 +237,7 @@ public final class LocalSortProjectEncoder {
 
         // Final scan - apply block offsets
         if let encoder = commandBuffer.makeComputeCommandEncoder() {
-            encoder.label = "LocalSort_VisFinalScan"
+            encoder.label = "Local_VisFinalScan"
             encoder.setComputePipelineState(blockScanPipeline)
             encoder.setBuffer(visibilityMarks, offset: 0, index: 0)
             encoder.setBuffer(visibilityMarks, offset: 0, index: 1)

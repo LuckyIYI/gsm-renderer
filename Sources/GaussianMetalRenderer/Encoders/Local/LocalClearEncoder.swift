@@ -1,12 +1,12 @@
 import Metal
 
 /// Encodes the clear stage - zeros tile counts and initializes header
-public final class LocalSortClearEncoder {
+public final class LocalClearEncoder {
     private let clearPipeline: MTLComputePipelineState
 
     public init(library: MTLLibrary, device: MTLDevice) throws {
-        guard let clearFn = library.makeFunction(name: "localSortClear") else {
-            fatalError("Missing localSortClear kernel")
+        guard let clearFn = library.makeFunction(name: "LocalClear") else {
+            fatalError("Missing LocalClear kernel")
         }
         self.clearPipeline = try device.makeComputePipelineState(function: clearFn)
     }
@@ -22,7 +22,7 @@ public final class LocalSortClearEncoder {
         var maxCompactedU = UInt32(maxCompacted)
 
         guard let encoder = commandBuffer.makeComputeCommandEncoder() else { return }
-        encoder.label = "LocalSort_Clear"
+        encoder.label = "Local_Clear"
         encoder.setComputePipelineState(clearPipeline)
         encoder.setBuffer(tileCounts, offset: 0, index: 0)
         encoder.setBuffer(header, offset: 0, index: 1)

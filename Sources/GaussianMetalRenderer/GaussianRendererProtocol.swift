@@ -91,7 +91,7 @@ public struct BufferRenderResult: Sendable {
 
 // MARK: - Sort Mode
 
-/// Sort mode for LocalSortRenderer - determines buffer allocation
+/// Sort mode for LocalRenderer - determines buffer allocation
 public enum SortMode: Sendable {
     /// Standard 32-bit radix sort (default, most compatible)
     case sort32Bit

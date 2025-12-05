@@ -3,31 +3,31 @@ import Metal
 /// Local sort pipeline encoder - Memory-efficient deterministic Gaussian splatting
 /// Uses two-pass projection: Visibility → PrefixSum → ProjectScatter
 /// Pipeline: Clear → ProjectVisibility → PrefixScan → ProjectScatter → TilePrefixScan → Scatter → Sort → Render
-public final class LocalSortPipelineEncoder {
+public final class LocalPipelineEncoder {
     // Device and library
     private let device: MTLDevice
-    private let localSortLibrary: MTLLibrary
+    private let LocalLibrary: MTLLibrary
 
     /// Public access to the Metal library for shared encoders
-    public var library: MTLLibrary { localSortLibrary }
+    public var library: MTLLibrary { LocalLibrary }
 
     // Per-stage encoders
-    private let clearEncoder: LocalSortClearEncoder
-    private let projectEncoder: LocalSortProjectEncoder
-    private let prefixScanEncoder: LocalSortPrefixScanEncoder
-    private let scatterEncoder: LocalSortScatterEncoder
-    private let sortEncoder: LocalSortSortEncoder
-    private let renderEncoder: LocalSortRenderEncoder
+    private let clearEncoder: LocalClearEncoder
+    private let projectEncoder: LocalProjectEncoder
+    private let prefixScanEncoder: LocalPrefixScanEncoder
+    private let scatterEncoder: LocalScatterEncoder
+    private let sortEncoder: LocalSortEncoder
+    private let renderEncoder: LocalRenderEncoder
 
     public init(device: MTLDevice) throws {
         self.device = device
 
         // Load Local sort shader library
-        guard let libraryURL = Bundle.module.url(forResource: "LocalSortShaders", withExtension: "metallib"),
+        guard let libraryURL = Bundle.module.url(forResource: "LocalShaders", withExtension: "metallib"),
               let library = try? device.makeLibrary(URL: libraryURL) else {
-            fatalError("Failed to load LocalSortShaders.metallib")
+            fatalError("Failed to load LocalShaders.metallib")
         }
-        self.localSortLibrary = library
+        self.LocalLibrary = library
 
         // Load main library for hierarchical prefix sum
         guard let mainLibraryURL = Bundle.module.url(forResource: "GaussianMetalRenderer", withExtension: "metallib"),
@@ -36,16 +36,16 @@ public final class LocalSortPipelineEncoder {
         }
 
         // Initialize per-stage encoders
-        self.clearEncoder = try LocalSortClearEncoder(library: library, device: device)
-        self.projectEncoder = try LocalSortProjectEncoder(
-            localSortLibrary: library,
+        self.clearEncoder = try LocalClearEncoder(library: library, device: device)
+        self.projectEncoder = try LocalProjectEncoder(
+            LocalLibrary: library,
             mainLibrary: mainLibrary,
             device: device
         )
-        self.prefixScanEncoder = try LocalSortPrefixScanEncoder(library: library, device: device)
-        self.scatterEncoder = try LocalSortScatterEncoder(library: library, device: device)
-        self.sortEncoder = try LocalSortSortEncoder(library: library, device: device)
-        self.renderEncoder = try LocalSortRenderEncoder(library: library, device: device)
+        self.prefixScanEncoder = try LocalPrefixScanEncoder(library: library, device: device)
+        self.scatterEncoder = try LocalScatterEncoder(library: library, device: device)
+        self.sortEncoder = try LocalSortEncoder(library: library, device: device)
+        self.renderEncoder = try LocalRenderEncoder(library: library, device: device)
     }
 
     /// Legacy init for backwards compatibility
@@ -192,102 +192,12 @@ public final class LocalSortPipelineEncoder {
         }
     }
 
-    /// Encode just the render pass (after sorting is complete)
-    public func encodeRender(
-        commandBuffer: MTLCommandBuffer,
-        compactedGaussians: MTLBuffer,
-        tileOffsets: MTLBuffer,
-        tileCounts: MTLBuffer,
-        sortedIndices: MTLBuffer,
-        colorTexture: MTLTexture,
-        depthTexture: MTLTexture,
-        tilesX: Int,
-        tilesY: Int,
-        width: Int,
-        height: Int,
-        tileWidth: Int,
-        tileHeight: Int,
-        whiteBackground: Bool = false
-    ) {
-        renderEncoder.encode(
-            commandBuffer: commandBuffer,
-            compactedGaussians: compactedGaussians,
-            tileOffsets: tileOffsets,
-            tileCounts: tileCounts,
-            sortedIndices: sortedIndices,
-            colorTexture: colorTexture,
-            depthTexture: depthTexture,
-            tilesX: tilesX,
-            tilesY: tilesY,
-            width: width,
-            height: height,
-            tileWidth: tileWidth,
-            tileHeight: tileHeight,
-            whiteBackground: whiteBackground
-        )
-    }
-
     /// Texture width for render texture (must match RENDER_TEX_WIDTH in shader)
-    public static let renderTexWidth = LocalSortRenderEncoder.renderTexWidth
-
-    /// Check if textured render is available
-    public var hasTexturedRender: Bool { renderEncoder.hasTexturedRender }
+    public static let renderTexWidth = LocalRenderEncoder.renderTexWidth
 
     /// Check if 16-bit sort is available
     public var has16BitSort: Bool {
         scatterEncoder.has16BitScatter && sortEncoder.has16BitSort && renderEncoder.has16BitRender
-    }
-
-    /// Encode the pack pass to copy gaussian data to texture
-    public func encodePackRenderTexture(
-        commandBuffer: MTLCommandBuffer,
-        compactedGaussians: MTLBuffer,
-        compactedHeader: MTLBuffer,
-        renderTexture: MTLTexture,
-        maxGaussians: Int
-    ) {
-        renderEncoder.encodePackRenderTexture(
-            commandBuffer: commandBuffer,
-            compactedGaussians: compactedGaussians,
-            compactedHeader: compactedHeader,
-            renderTexture: renderTexture,
-            maxGaussians: maxGaussians
-        )
-    }
-
-    /// Encode render pass using texture-cached gaussian data
-    public func encodeRenderTextured(
-        commandBuffer: MTLCommandBuffer,
-        gaussianTexture: MTLTexture,
-        tileOffsets: MTLBuffer,
-        tileCounts: MTLBuffer,
-        sortedIndices: MTLBuffer,
-        colorTexture: MTLTexture,
-        depthTexture: MTLTexture,
-        tilesX: Int,
-        tilesY: Int,
-        width: Int,
-        height: Int,
-        tileWidth: Int,
-        tileHeight: Int,
-        whiteBackground: Bool = false
-    ) {
-        renderEncoder.encodeTextured(
-            commandBuffer: commandBuffer,
-            gaussianTexture: gaussianTexture,
-            tileOffsets: tileOffsets,
-            tileCounts: tileCounts,
-            sortedIndices: sortedIndices,
-            colorTexture: colorTexture,
-            depthTexture: depthTexture,
-            tilesX: tilesX,
-            tilesY: tilesY,
-            width: width,
-            height: height,
-            tileWidth: tileWidth,
-            tileHeight: tileHeight,
-            whiteBackground: whiteBackground
-        )
     }
 
     /// Read visible count from header buffer (call after command buffer completes)
@@ -355,14 +265,66 @@ public final class LocalSortPipelineEncoder {
         )
     }
 
-    /// Encode 16-bit render
-    public func encodeRender16(
+    // MARK: - Indirect Dispatch Methods
+
+    /// Clear color and depth textures before indirect render
+    public func encodeClearTextures(
+        commandBuffer: MTLCommandBuffer,
+        colorTexture: MTLTexture,
+        depthTexture: MTLTexture,
+        width: Int,
+        height: Int,
+        whiteBackground: Bool
+    ) {
+        renderEncoder.encodeClearTextures(
+            commandBuffer: commandBuffer,
+            colorTexture: colorTexture,
+            depthTexture: depthTexture,
+            width: width,
+            height: height,
+            whiteBackground: whiteBackground
+        )
+    }
+
+    /// Compact active tile indices (tiles with gaussCount > 0)
+    public func encodeCompactActiveTiles(
+        commandBuffer: MTLCommandBuffer,
+        tileCounts: MTLBuffer,
+        activeTileIndices: MTLBuffer,
+        activeTileCount: MTLBuffer,
+        tileCount: Int
+    ) {
+        renderEncoder.encodeCompactActiveTiles(
+            commandBuffer: commandBuffer,
+            tileCounts: tileCounts,
+            activeTileIndices: activeTileIndices,
+            activeTileCount: activeTileCount,
+            tileCount: tileCount
+        )
+    }
+
+    /// Prepare indirect dispatch arguments
+    public func encodePrepareRenderDispatch(
+        commandBuffer: MTLCommandBuffer,
+        activeTileCount: MTLBuffer,
+        dispatchArgs: MTLBuffer
+    ) {
+        renderEncoder.encodePrepareRenderDispatch(
+            commandBuffer: commandBuffer,
+            activeTileCount: activeTileCount,
+            dispatchArgs: dispatchArgs
+        )
+    }
+
+    /// Render only active tiles using indirect dispatch
+    public func encodeRenderIndirect(
         commandBuffer: MTLCommandBuffer,
         compactedGaussians: MTLBuffer,
         tileOffsets: MTLBuffer,
         tileCounts: MTLBuffer,
-        sortedLocalIdx: MTLBuffer,
-        globalIndices: MTLBuffer,
+        sortedIndices: MTLBuffer,
+        activeTileIndices: MTLBuffer,
+        dispatchArgs: MTLBuffer,
         colorTexture: MTLTexture,
         depthTexture: MTLTexture,
         tilesX: Int,
@@ -373,13 +335,55 @@ public final class LocalSortPipelineEncoder {
         tileHeight: Int,
         whiteBackground: Bool = false
     ) {
-        renderEncoder.encode16(
+        renderEncoder.encodeIndirect(
+            commandBuffer: commandBuffer,
+            compactedGaussians: compactedGaussians,
+            tileOffsets: tileOffsets,
+            tileCounts: tileCounts,
+            sortedIndices: sortedIndices,
+            activeTileIndices: activeTileIndices,
+            dispatchArgs: dispatchArgs,
+            colorTexture: colorTexture,
+            depthTexture: depthTexture,
+            tilesX: tilesX,
+            tilesY: tilesY,
+            width: width,
+            height: height,
+            tileWidth: tileWidth,
+            tileHeight: tileHeight,
+            whiteBackground: whiteBackground
+        )
+    }
+
+    /// Render only active tiles using indirect dispatch (16-bit path)
+    public func encodeRenderIndirect16(
+        commandBuffer: MTLCommandBuffer,
+        compactedGaussians: MTLBuffer,
+        tileOffsets: MTLBuffer,
+        tileCounts: MTLBuffer,
+        sortedLocalIdx: MTLBuffer,
+        globalIndices: MTLBuffer,
+        activeTileIndices: MTLBuffer,
+        dispatchArgs: MTLBuffer,
+        colorTexture: MTLTexture,
+        depthTexture: MTLTexture,
+        tilesX: Int,
+        tilesY: Int,
+        width: Int,
+        height: Int,
+        tileWidth: Int,
+        tileHeight: Int,
+        whiteBackground: Bool = false
+    ) {
+        renderEncoder.encodeIndirect16(
             commandBuffer: commandBuffer,
             compactedGaussians: compactedGaussians,
             tileOffsets: tileOffsets,
             tileCounts: tileCounts,
             sortedLocalIdx: sortedLocalIdx,
             globalIndices: globalIndices,
+            activeTileIndices: activeTileIndices,
+            dispatchArgs: dispatchArgs,
             colorTexture: colorTexture,
             depthTexture: depthTexture,
             tilesX: tilesX,
@@ -394,7 +398,7 @@ public final class LocalSortPipelineEncoder {
 }
 
 /// Render params struct for local sort pipeline (matches Metal RenderParams - 40 bytes)
-public struct LocalSortRenderParamsSwift {
+public struct LocalRenderParamsSwift {
     public var width: UInt32
     public var height: UInt32
     public var tileWidth: UInt32

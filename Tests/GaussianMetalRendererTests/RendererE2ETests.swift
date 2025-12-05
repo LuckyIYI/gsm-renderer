@@ -3,7 +3,7 @@ import Metal
 import simd
 @testable import GaussianMetalRenderer
 
-/// End-to-end tests for GlobalSort and LocalSort renderers
+/// End-to-end tests for GlobalSort and Local renderers
 final class RendererE2ETests: XCTestCase {
 
     // MARK: - Test Data Helpers
@@ -265,9 +265,9 @@ final class RendererE2ETests: XCTestCase {
         XCTAssertEqual(cb.status, MTLCommandBufferStatus.completed)
     }
 
-    // MARK: - LocalSort Tests
+    // MARK: - Local Tests
 
-    func testLocalSortRendersCorrectly() throws {
+    func testLocalRendersCorrectly() throws {
         let width = 256
         let height = 256
         let count = 1000
@@ -275,7 +275,7 @@ final class RendererE2ETests: XCTestCase {
         let config = RendererConfig(
             maxGaussians: 10_000, maxWidth: width, maxHeight: height, precision: .float32
         )
-        let renderer = try LocalSortRenderer(config: config)
+        let renderer = try LocalRenderer(config: config)
         let device = renderer.device
 
         let (positions, scales, rotations, opacities, colors) = generateGaussians(count: count)
@@ -331,10 +331,10 @@ final class RendererE2ETests: XCTestCase {
         cb.commit()
         cb.waitUntilCompleted()
 
-        XCTAssertNotNil(result, "LocalSort should return render result")
+        XCTAssertNotNil(result, "Local should return render result")
     }
 
-    func testLocalSortAtScale() throws {
+    func testLocalAtScale() throws {
         let width = 512
         let height = 512
         let count = 50_000
@@ -342,7 +342,7 @@ final class RendererE2ETests: XCTestCase {
         let config = RendererConfig(
             maxGaussians: 100_000, maxWidth: width, maxHeight: height, precision: .float16
         )
-        let renderer = try LocalSortRenderer(config: config)
+        let renderer = try LocalRenderer(config: config)
         let device = renderer.device
 
         let (positions, scales, rotations, opacities, colors) = generateGaussians(count: count)
@@ -396,12 +396,12 @@ final class RendererE2ETests: XCTestCase {
         cb.commit()
         cb.waitUntilCompleted()
 
-        XCTAssertNotNil(result, "LocalSort at scale should return render result")
+        XCTAssertNotNil(result, "Local at scale should return render result")
     }
 
     // MARK: - Pixel Comparison Tests
 
-    func testGlobalSortVsLocalSortPixelComparison() throws {
+    func testGlobalSortVsLocalPixelComparison() throws {
         let width = 256
         let height = 256
         let count = 500
@@ -449,16 +449,16 @@ final class RendererE2ETests: XCTestCase {
             return
         }
 
-        // === Render with LocalSort ===
+        // === Render with Local ===
         let localConfig = RendererConfig(
             maxGaussians: 10_000, maxWidth: width, maxHeight: height, precision: .float32
         )
-        let localRenderer = try LocalSortRenderer(config: localConfig)
+        let localRenderer = try LocalRenderer(config: localConfig)
 
         guard let localBuffers = createPackedBuffers(device: localRenderer.device, positions: positions,
                                                       scales: scales, rotations: rotations,
                                                       opacities: opacities, colors: colors) else {
-            XCTFail("Failed to create LocalSort buffers")
+            XCTFail("Failed to create Local buffers")
             return
         }
 
@@ -488,7 +488,7 @@ final class RendererE2ETests: XCTestCase {
 
         guard let localQueue = localRenderer.device.makeCommandQueue(),
               let localCB = localQueue.makeCommandBuffer() else {
-            XCTFail("Failed to create LocalSort command buffer")
+            XCTFail("Failed to create Local command buffer")
             return
         }
 
@@ -506,12 +506,12 @@ final class RendererE2ETests: XCTestCase {
         localCB.waitUntilCompleted()
 
         guard let localColorTexture = localResult?.color else {
-            XCTFail("LocalSort didn't produce color texture")
+            XCTFail("Local didn't produce color texture")
             return
         }
 
         guard let localPixels = readPixels(texture: localColorTexture, device: localRenderer.device, queue: localQueue) else {
-            XCTFail("Failed to read LocalSort pixels")
+            XCTFail("Failed to read Local pixels")
             return
         }
 
@@ -523,7 +523,7 @@ final class RendererE2ETests: XCTestCase {
         let localNonBlack = countNonBlackPixels(localPixels)
 
         XCTAssertGreaterThan(globalNonBlack, 100, "GlobalSort should render visible gaussians")
-        XCTAssertGreaterThan(localNonBlack, 100, "LocalSort should render visible gaussians")
+        XCTAssertGreaterThan(localNonBlack, 100, "Local should render visible gaussians")
 
         // Compute similarity metrics
         var totalDiff: Int = 0
@@ -554,7 +554,7 @@ final class RendererE2ETests: XCTestCase {
         print("==============================")
 
         // Both renderers should produce similar overall output (at least 50% matching)
-        // Note: GlobalSort and LocalSort use different tile/sort approaches so exact match isn't expected
+        // Note: GlobalSort and Local use different tile/sort approaches so exact match isn't expected
         XCTAssertGreaterThan(matchPercent, 50.0,
             "Renderers should produce similar output: \(matchPercent)% matching")
 

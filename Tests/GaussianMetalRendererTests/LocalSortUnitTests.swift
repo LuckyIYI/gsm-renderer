@@ -3,8 +3,8 @@ import Metal
 import simd
 @testable import GaussianMetalRenderer
 
-/// Unit tests for LocalSort pipeline stages
-final class LocalSortUnitTests: XCTestCase {
+/// Unit tests for Local pipeline stages
+final class LocalUnitTests: XCTestCase {
 
     var device: MTLDevice!
     var library: MTLLibrary!
@@ -15,10 +15,10 @@ final class LocalSortUnitTests: XCTestCase {
         device = MTLCreateSystemDefaultDevice()!
         queue = device.makeCommandQueue()!
 
-        // Load LocalSort library
-        guard let libraryURL = Bundle.module.url(forResource: "LocalSortShaders", withExtension: "metallib"),
+        // Load Local library
+        guard let libraryURL = Bundle.module.url(forResource: "LocalShaders", withExtension: "metallib"),
               let lib = try? device.makeLibrary(URL: libraryURL) else {
-            XCTFail("Failed to load LocalSortShaders.metallib")
+            XCTFail("Failed to load LocalShaders.metallib")
             return
         }
         self.library = lib
@@ -27,7 +27,7 @@ final class LocalSortUnitTests: XCTestCase {
     // MARK: - Prefix Scan Tests
 
     func testPrefixScanCorrectness() throws {
-        let prefixScanEncoder = try LocalSortPrefixScanEncoder(library: library, device: device)
+        let prefixScanEncoder = try LocalPrefixScanEncoder(library: library, device: device)
 
         // Test with 64 tiles (4x16 grid)
         let tileCount = 64
@@ -77,7 +77,7 @@ final class LocalSortUnitTests: XCTestCase {
     }
 
     func testPrefixScanLargeScale() throws {
-        let prefixScanEncoder = try LocalSortPrefixScanEncoder(library: library, device: device)
+        let prefixScanEncoder = try LocalPrefixScanEncoder(library: library, device: device)
 
         // Test with 4096 tiles (64x64 grid)
         let tileCount = 4096
@@ -122,7 +122,7 @@ final class LocalSortUnitTests: XCTestCase {
     // MARK: - Per-Tile Sort Tests
 
     func testPerTileSortCorrectness() throws {
-        let sortEncoder = try LocalSortSortEncoder(library: library, device: device)
+        let sortEncoder = try LocalSortEncoder(library: library, device: device)
 
         // Test 4 tiles with known data
         let tileCount = 4
@@ -201,7 +201,7 @@ final class LocalSortUnitTests: XCTestCase {
     }
 
     func testPerTileSortVariableCounts() throws {
-        let sortEncoder = try LocalSortSortEncoder(library: library, device: device)
+        let sortEncoder = try LocalSortEncoder(library: library, device: device)
 
         // Test with variable tile counts
         let tileCount = 8

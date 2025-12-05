@@ -2,11 +2,11 @@ import Metal
 import GaussianMetalRendererTypes
 
 /// Encoder for fused pipeline operations using AoS (Array of Structures) data
-/// Unified with LocalSort approach: index-based render, no alpha texture, half precision
+/// Unified with Local approach: index-based render, no alpha texture, half precision
 /// NOTE: Interleave step is OBSOLETE - projection now outputs AoS directly via projectGaussiansAoS
 final class FusedPipelineEncoder {
     // Pipeline states
-    private let renderPipeline: MTLComputePipelineState  // Unified render (like LocalSort)
+    private let renderPipeline: MTLComputePipelineState  // Unified render (like Local)
     private let prepareDispatchPipeline: MTLComputePipelineState
     private let clearTexturesPipeline: MTLComputePipelineState
 
@@ -14,7 +14,7 @@ final class FusedPipelineEncoder {
     let renderThreadgroupSize: MTLSize  // 8x8 for 32x16 tiles (4x2 pixels per thread)
 
     init(device: MTLDevice, library: MTLLibrary) throws {
-        // Unified render kernel (like LocalSort)
+        // Unified render kernel (like Local)
         guard let renderFn = library.makeFunction(name: "globalSortRender") else {
             throw NSError(domain: "FusedPipelineEncoder", code: 3,
                           userInfo: [NSLocalizedDescriptionKey: "Render kernel function missing"])
@@ -37,9 +37,9 @@ final class FusedPipelineEncoder {
         self.renderThreadgroupSize = MTLSize(width: 8, height: 8, depth: 1)
     }
 
-    // MARK: - Render (unified, like LocalSort)
+    // MARK: - Render (unified, like Local)
 
-    /// Render using index-based access (like LocalSort)
+    /// Render using index-based access (like Local)
     /// No Pack step needed - reads via sortedIndices directly
     /// Only outputs color + depth (alpha in color.a channel)
     /// renderData: AoS packed GaussianRenderData from projectGaussiansAoS

@@ -1,7 +1,7 @@
 import Metal
 
 /// Encodes tile prefix scan stage: tileCounts → tileOffsets with partial sums
-public final class LocalSortPrefixScanEncoder {
+public final class LocalPrefixScanEncoder {
     private let prefixScanPipeline: MTLComputePipelineState
     private let scanPartialSumsPipeline: MTLComputePipelineState
     private let finalizeScanAndZeroPipeline: MTLComputePipelineState
@@ -10,9 +10,9 @@ public final class LocalSortPrefixScanEncoder {
     private let prefixGrainSize = 4
 
     public init(library: MTLLibrary, device: MTLDevice) throws {
-        guard let prefixFn = library.makeFunction(name: "localSortPrefixScan"),
-              let partialFn = library.makeFunction(name: "localSortScanPartialSums"),
-              let finalizeAndZeroFn = library.makeFunction(name: "localSortFinalizeScanAndZero") else {
+        guard let prefixFn = library.makeFunction(name: "LocalPrefixScan"),
+              let partialFn = library.makeFunction(name: "LocalScanPartialSums"),
+              let finalizeAndZeroFn = library.makeFunction(name: "LocalFinalizeScanAndZero") else {
             fatalError("Missing prefix scan kernels")
         }
         self.prefixScanPipeline = try device.makeComputePipelineState(function: prefixFn)
@@ -33,7 +33,7 @@ public final class LocalSortPrefixScanEncoder {
 
         // Prefix scan per block
         if let encoder = commandBuffer.makeComputeCommandEncoder() {
-            encoder.label = "LocalSort_PrefixScan"
+            encoder.label = "Local_PrefixScan"
             encoder.setComputePipelineState(prefixScanPipeline)
             encoder.setBuffer(tileCounts, offset: 0, index: 0)
             encoder.setBuffer(tileOffsets, offset: 0, index: 1)
@@ -47,7 +47,7 @@ public final class LocalSortPrefixScanEncoder {
 
         // Scan partial sums
         if let encoder = commandBuffer.makeComputeCommandEncoder() {
-            encoder.label = "LocalSort_ScanPartialSums"
+            encoder.label = "Local_ScanPartialSums"
             encoder.setComputePipelineState(scanPartialSumsPipeline)
             var numPartial = UInt32(actualGroups)
             encoder.setBuffer(partialSums, offset: 0, index: 0)
@@ -59,7 +59,7 @@ public final class LocalSortPrefixScanEncoder {
 
         // Finalize scan + zero counters (fused)
         if let encoder = commandBuffer.makeComputeCommandEncoder() {
-            encoder.label = "LocalSort_FinalizeScanAndZero"
+            encoder.label = "Local_FinalizeScanAndZero"
             encoder.setComputePipelineState(finalizeScanAndZeroPipeline)
             encoder.setBuffer(tileOffsets, offset: 0, index: 0)
             encoder.setBuffer(tileCounts, offset: 0, index: 1)

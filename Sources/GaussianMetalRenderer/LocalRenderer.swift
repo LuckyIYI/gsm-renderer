@@ -270,6 +270,9 @@ public final class LocalRenderer: GaussianRenderer, @unchecked Sendable {
             dispatchArgs: dispatchArgs
         )
 
+        // maxPerTile for fixed layout (same as SORT_MAX_SIZE in shader)
+        let maxPerTile = 2048
+
         // 16-bit sort path - reads depthKeys16 directly (sequential 2-byte reads!)
         if effective16BitSort, let sortedLocal16 = sortedLocalIdx16Buffer, let depth16 = depthKeys16Buffer {
             encoder.encodeSort16(
@@ -277,8 +280,8 @@ public final class LocalRenderer: GaussianRenderer, @unchecked Sendable {
                 depthKeys16: depth16,  // Sequential 2-byte reads - much faster than sortInfo!
                 globalIndices: sortIndices,
                 sortedLocalIdx: sortedLocal16,
-                tileOffsets: tileOffsets,
                 tileCounts: tileCounts,
+                maxPerTile: maxPerTile,
                 tileCount: tileCount
             )
 
@@ -286,8 +289,8 @@ public final class LocalRenderer: GaussianRenderer, @unchecked Sendable {
             encoder.encodeRenderIndirect16(
                 commandBuffer: commandBuffer,
                 compactedGaussians: compacted,
-                tileOffsets: tileOffsets,
                 tileCounts: tileCounts,
+                maxPerTile: maxPerTile,
                 sortedLocalIdx: sortedLocal16,
                 globalIndices: sortIndices,
                 activeTileIndices: activeTileIndices,
@@ -303,12 +306,12 @@ public final class LocalRenderer: GaussianRenderer, @unchecked Sendable {
                 whiteBackground: whiteBackground
             )
         } else {
-            // 32-bit render via indirect dispatch
+            // 32-bit render via indirect dispatch (fixed layout)
             encoder.encodeRenderIndirect(
                 commandBuffer: commandBuffer,
                 compactedGaussians: compacted,
-                tileOffsets: tileOffsets,
                 tileCounts: tileCounts,
+                maxPerTile: maxPerTile,
                 sortedIndices: sortIndices,
                 activeTileIndices: activeTileIndices,
                 dispatchArgs: dispatchArgs,

@@ -25,22 +25,21 @@ public final class LocalScatterEncoder {
     /// Check if 16-bit scatter is available
     public var has16BitScatter: Bool { scatter16Pipeline != nil }
 
-    /// Encode scatter with 32-bit keys
+    /// Encode scatter with 32-bit keys (fixed layout: tileId * maxPerTile)
     public func encode(
         commandBuffer: MTLCommandBuffer,
         compactedGaussians: MTLBuffer,
         compactedHeader: MTLBuffer,
-        tileCounts: MTLBuffer,
-        tileOffsets: MTLBuffer,
+        tileCounters: MTLBuffer,
         sortKeys: MTLBuffer,
         sortIndices: MTLBuffer,
         tilesX: Int,
-        maxAssignments: Int,
+        maxPerTile: Int,
         tileWidth: Int,
         tileHeight: Int
     ) {
         var tilesXU = UInt32(tilesX)
-        var maxAssignmentsU = UInt32(maxAssignments)
+        var maxPerTileU = UInt32(maxPerTile)
         var tileW = Int32(tileWidth)
         var tileH = Int32(tileHeight)
 
@@ -60,20 +59,19 @@ public final class LocalScatterEncoder {
             encoder.endEncoding()
         }
 
-        // SIMD-cooperative scatter
+        // SIMD-cooperative scatter (fixed layout: tileId * maxPerTile + localIdx)
         if let encoder = commandBuffer.makeComputeCommandEncoder() {
             encoder.label = "Local_Scatter_SIMD"
             encoder.setComputePipelineState(scatterPipeline)
             encoder.setBuffer(compactedGaussians, offset: 0, index: 0)
             encoder.setBuffer(compactedHeader, offset: 0, index: 1)
-            encoder.setBuffer(tileCounts, offset: 0, index: 2)
-            encoder.setBuffer(tileOffsets, offset: 0, index: 3)
-            encoder.setBuffer(sortKeys, offset: 0, index: 4)
-            encoder.setBuffer(sortIndices, offset: 0, index: 5)
-            encoder.setBytes(&tilesXU, length: MemoryLayout<UInt32>.stride, index: 6)
-            encoder.setBytes(&maxAssignmentsU, length: MemoryLayout<UInt32>.stride, index: 7)
-            encoder.setBytes(&tileW, length: MemoryLayout<Int32>.stride, index: 8)
-            encoder.setBytes(&tileH, length: MemoryLayout<Int32>.stride, index: 9)
+            encoder.setBuffer(tileCounters, offset: 0, index: 2)
+            encoder.setBuffer(sortKeys, offset: 0, index: 3)
+            encoder.setBuffer(sortIndices, offset: 0, index: 4)
+            encoder.setBytes(&tilesXU, length: MemoryLayout<UInt32>.stride, index: 5)
+            encoder.setBytes(&maxPerTileU, length: MemoryLayout<UInt32>.stride, index: 6)
+            encoder.setBytes(&tileW, length: MemoryLayout<Int32>.stride, index: 7)
+            encoder.setBytes(&tileH, length: MemoryLayout<Int32>.stride, index: 8)
 
             // 128 threads per threadgroup (4 SIMD groups = 4 gaussians)
             let tg = MTLSize(width: 128, height: 1, depth: 1)
@@ -84,24 +82,23 @@ public final class LocalScatterEncoder {
         }
     }
 
-    /// Encode scatter with 16-bit depth keys (experimental)
+    /// Encode scatter with 16-bit depth keys (fixed layout: tileId * maxPerTile)
     public func encode16(
         commandBuffer: MTLCommandBuffer,
         compactedGaussians: MTLBuffer,
         compactedHeader: MTLBuffer,
-        tileCounts: MTLBuffer,
-        tileOffsets: MTLBuffer,
+        tileCounters: MTLBuffer,
         depthKeys16: MTLBuffer,
-        sortIndices: MTLBuffer,
+        globalIndices: MTLBuffer,
         tilesX: Int,
-        maxAssignments: Int,
+        maxPerTile: Int,
         tileWidth: Int,
         tileHeight: Int
     ) {
         guard let scatter16 = scatter16Pipeline else { return }
 
         var tilesXU = UInt32(tilesX)
-        var maxAssignmentsU = UInt32(maxAssignments)
+        var maxPerTileU = UInt32(maxPerTile)
         var tileW = Int32(tileWidth)
         var tileH = Int32(tileHeight)
 
@@ -121,20 +118,19 @@ public final class LocalScatterEncoder {
             encoder.endEncoding()
         }
 
-        // 16-bit scatter
+        // 16-bit scatter (fixed layout: tileId * maxPerTile + localIdx)
         if let encoder = commandBuffer.makeComputeCommandEncoder() {
             encoder.label = "Local_Scatter16_SIMD"
             encoder.setComputePipelineState(scatter16)
             encoder.setBuffer(compactedGaussians, offset: 0, index: 0)
             encoder.setBuffer(compactedHeader, offset: 0, index: 1)
-            encoder.setBuffer(tileCounts, offset: 0, index: 2)
-            encoder.setBuffer(tileOffsets, offset: 0, index: 3)
-            encoder.setBuffer(depthKeys16, offset: 0, index: 4)
-            encoder.setBuffer(sortIndices, offset: 0, index: 5)
-            encoder.setBytes(&tilesXU, length: MemoryLayout<UInt32>.stride, index: 6)
-            encoder.setBytes(&maxAssignmentsU, length: MemoryLayout<UInt32>.stride, index: 7)
-            encoder.setBytes(&tileW, length: MemoryLayout<Int32>.stride, index: 8)
-            encoder.setBytes(&tileH, length: MemoryLayout<Int32>.stride, index: 9)
+            encoder.setBuffer(tileCounters, offset: 0, index: 2)
+            encoder.setBuffer(depthKeys16, offset: 0, index: 3)
+            encoder.setBuffer(globalIndices, offset: 0, index: 4)
+            encoder.setBytes(&tilesXU, length: MemoryLayout<UInt32>.stride, index: 5)
+            encoder.setBytes(&maxPerTileU, length: MemoryLayout<UInt32>.stride, index: 6)
+            encoder.setBytes(&tileW, length: MemoryLayout<Int32>.stride, index: 7)
+            encoder.setBytes(&tileH, length: MemoryLayout<Int32>.stride, index: 8)
 
             let tg = MTLSize(width: 128, height: 1, depth: 1)
             encoder.dispatchThreadgroups(indirectBuffer: dispatchArgsBuffer,

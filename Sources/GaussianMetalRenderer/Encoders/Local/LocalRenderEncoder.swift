@@ -100,12 +100,12 @@ public final class LocalRenderEncoder {
         encoder.endEncoding()
     }
 
-    /// Encode indirect render pass (only active tiles, 32-bit indices)
+    /// Encode indirect render pass (only active tiles, 32-bit indices, fixed layout)
     public func encodeIndirect(
         commandBuffer: MTLCommandBuffer,
         compactedGaussians: MTLBuffer,
-        tileOffsets: MTLBuffer,
         tileCounts: MTLBuffer,
+        maxPerTile: Int,
         sortedIndices: MTLBuffer,
         activeTileIndices: MTLBuffer,
         dispatchArgs: MTLBuffer,
@@ -120,6 +120,7 @@ public final class LocalRenderEncoder {
         whiteBackground: Bool = false
     ) {
         guard let encoder = commandBuffer.makeComputeCommandEncoder() else { return }
+        var maxPerTileU = UInt32(maxPerTile)
 
         var params = LocalRenderParamsSwift(
             width: UInt32(width),
@@ -128,7 +129,7 @@ public final class LocalRenderEncoder {
             tileHeight: UInt32(tileHeight),
             tilesX: UInt32(tilesX),
             tilesY: UInt32(tilesY),
-            maxPerTile: 0,
+            maxPerTile: UInt32(maxPerTile),
             whiteBackground: whiteBackground ? 1 : 0,
             activeTileCount: 0,
             gaussianCount: 0
@@ -136,13 +137,13 @@ public final class LocalRenderEncoder {
 
         encoder.label = "Local_RenderIndirect"
         encoder.setComputePipelineState(renderIndirectPipeline)
-        // Match template buffer bindings:
-        // buffer(0): compacted, buffer(1): offsets, buffer(2): counts
+        // Fixed layout buffer bindings:
+        // buffer(0): compacted, buffer(1): counts, buffer(2): maxPerTile
         // buffer(3): sortBuffer, buffer(4): globalIndices (unused), buffer(5): activeTileIndices
         // buffer(6): params
         encoder.setBuffer(compactedGaussians, offset: 0, index: 0)
-        encoder.setBuffer(tileOffsets, offset: 0, index: 1)
-        encoder.setBuffer(tileCounts, offset: 0, index: 2)
+        encoder.setBuffer(tileCounts, offset: 0, index: 1)
+        encoder.setBytes(&maxPerTileU, length: 4, index: 2)
         encoder.setBuffer(sortedIndices, offset: 0, index: 3)
         // buffer(4) unused in 32-bit path
         encoder.setBuffer(activeTileIndices, offset: 0, index: 5)
@@ -156,12 +157,12 @@ public final class LocalRenderEncoder {
         encoder.endEncoding()
     }
 
-    /// Encode indirect render pass (only active tiles, 16-bit indices)
+    /// Encode indirect render pass (only active tiles, 16-bit indices, fixed layout)
     public func encodeIndirect16(
         commandBuffer: MTLCommandBuffer,
         compactedGaussians: MTLBuffer,
-        tileOffsets: MTLBuffer,
         tileCounts: MTLBuffer,
+        maxPerTile: Int,
         sortedLocalIdx: MTLBuffer,
         globalIndices: MTLBuffer,
         activeTileIndices: MTLBuffer,
@@ -178,6 +179,7 @@ public final class LocalRenderEncoder {
     ) {
         guard let pipeline = renderIndirect16Pipeline else { return }
         guard let encoder = commandBuffer.makeComputeCommandEncoder() else { return }
+        var maxPerTileU = UInt32(maxPerTile)
 
         var params = LocalRenderParamsSwift(
             width: UInt32(width),
@@ -186,7 +188,7 @@ public final class LocalRenderEncoder {
             tileHeight: UInt32(tileHeight),
             tilesX: UInt32(tilesX),
             tilesY: UInt32(tilesY),
-            maxPerTile: 0,
+            maxPerTile: UInt32(maxPerTile),
             whiteBackground: whiteBackground ? 1 : 0,
             activeTileCount: 0,
             gaussianCount: 0
@@ -194,13 +196,13 @@ public final class LocalRenderEncoder {
 
         encoder.label = "Local_RenderIndirect16"
         encoder.setComputePipelineState(pipeline)
-        // Match template buffer bindings:
-        // buffer(0): compacted, buffer(1): offsets, buffer(2): counts
+        // Fixed layout buffer bindings:
+        // buffer(0): compacted, buffer(1): counts, buffer(2): maxPerTile
         // buffer(3): sortBuffer (ushort*), buffer(4): globalIndices, buffer(5): activeTileIndices
         // buffer(6): params
         encoder.setBuffer(compactedGaussians, offset: 0, index: 0)
-        encoder.setBuffer(tileOffsets, offset: 0, index: 1)
-        encoder.setBuffer(tileCounts, offset: 0, index: 2)
+        encoder.setBuffer(tileCounts, offset: 0, index: 1)
+        encoder.setBytes(&maxPerTileU, length: 4, index: 2)
         encoder.setBuffer(sortedLocalIdx, offset: 0, index: 3)
         encoder.setBuffer(globalIndices, offset: 0, index: 4)
         encoder.setBuffer(activeTileIndices, offset: 0, index: 5)

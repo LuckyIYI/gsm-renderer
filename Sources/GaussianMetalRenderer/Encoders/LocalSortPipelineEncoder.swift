@@ -119,7 +119,7 @@ public final class LocalPipelineEncoder {
             maxCompacted: maxCompacted
         )
 
-        // === 2. PROJECT + VISIBILITY PREFIX SUM + COMPACT COUNT ===
+        // === 2. PROJECT + VISIBILITY PREFIX SUM + COMPACT (no counting) ===
         projectEncoder.encode(
             commandBuffer: commandBuffer,
             worldGaussians: worldGaussians,
@@ -127,19 +127,51 @@ public final class LocalPipelineEncoder {
             camera: camera,
             params: params,
             gaussianCount: gaussianCount,
-            tilesX: tilesX,
             tempProjectionBuffer: tempProjectionBuffer,
             visibilityMarks: visibilityMarks,
             visibilityPartialSums: visibilityPartialSums,
             compactedGaussians: compactedGaussians,
             compactedHeader: compactedHeader,
-            tileCounts: tileCounts,
             useHalfWorld: useHalfWorld,
             clusterVisibility: clusterVisibility,
             clusterSize: clusterSize
         )
 
-        // === 3. TILE PREFIX SCAN + ACTIVE TILE COMPACTION ===
+        // maxPerTile for fixed layout (same as SORT_MAX_SIZE in shader)
+        let maxPerTile = 2048
+
+        // === 3. SCATTER (fixed layout: tileId * maxPerTile, atomics give counts) ===
+        let effective16Bit = use16BitSort && scatterEncoder.has16BitScatter && depthKeys16 != nil
+        if effective16Bit, let depth16 = depthKeys16 {
+            scatterEncoder.encode16(
+                commandBuffer: commandBuffer,
+                compactedGaussians: compactedGaussians,
+                compactedHeader: compactedHeader,
+                tileCounters: tileCounts,
+                depthKeys16: depth16,
+                globalIndices: sortIndices,
+                tilesX: tilesX,
+                maxPerTile: maxPerTile,
+                tileWidth: tileWidth,
+                tileHeight: tileHeight
+            )
+        } else if let sortKeysBuf = sortKeys {
+            scatterEncoder.encode(
+                commandBuffer: commandBuffer,
+                compactedGaussians: compactedGaussians,
+                compactedHeader: compactedHeader,
+                tileCounters: tileCounts,
+                sortKeys: sortKeysBuf,
+                sortIndices: sortIndices,
+                tilesX: tilesX,
+                maxPerTile: maxPerTile,
+                tileWidth: tileWidth,
+                tileHeight: tileHeight
+            )
+        }
+
+        // === 4. TILE PREFIX SCAN + ACTIVE TILE COMPACTION ===
+        // (Now AFTER scatter - reads tile counts populated by scatter atomics)
         prefixScanEncoder.encode(
             commandBuffer: commandBuffer,
             tileCounts: tileCounts,
@@ -150,48 +182,14 @@ public final class LocalPipelineEncoder {
             activeTileCount: activeTileCount
         )
 
-        // === 4. SCATTER ===
-        let effective16Bit = use16BitSort && scatterEncoder.has16BitScatter && depthKeys16 != nil
-        if effective16Bit, let depth16 = depthKeys16 {
-            scatterEncoder.encode16(
-                commandBuffer: commandBuffer,
-                compactedGaussians: compactedGaussians,
-                compactedHeader: compactedHeader,
-                tileCounts: tileCounts,
-                tileOffsets: tileOffsets,
-                depthKeys16: depth16,
-                sortIndices: sortIndices,
-                tilesX: tilesX,
-                maxAssignments: maxAssignments,
-                tileWidth: tileWidth,
-                tileHeight: tileHeight
-            )
-        } else if let sortKeysBuf = sortKeys {
-            scatterEncoder.encode(
-                commandBuffer: commandBuffer,
-                compactedGaussians: compactedGaussians,
-                compactedHeader: compactedHeader,
-                tileCounts: tileCounts,
-                tileOffsets: tileOffsets,
-                sortKeys: sortKeysBuf,
-                sortIndices: sortIndices,
-                tilesX: tilesX,
-                maxAssignments: maxAssignments,
-                tileWidth: tileWidth,
-                tileHeight: tileHeight
-            )
-        }
-
-        // === 5. PER-TILE SORT ===
-        if !skipSort, let sortKeysBuf = sortKeys, let tempK = tempSortKeys, let tempV = tempSortIndices {
+        // === 5. PER-TILE SORT (fixed layout: tileId * maxPerTile) ===
+        if !skipSort, let sortKeysBuf = sortKeys {
             sortEncoder.encode(
                 commandBuffer: commandBuffer,
                 sortKeys: sortKeysBuf,
                 sortIndices: sortIndices,
-                tileOffsets: tileOffsets,
                 tileCounts: tileCounts,
-                tempSortKeys: tempK,
-                tempSortIndices: tempV,
+                maxPerTile: maxPerTile,
                 tileCount: tileCount
             )
         }
@@ -219,44 +217,41 @@ public final class LocalPipelineEncoder {
 
     // MARK: - 16-bit Sort Experimental
 
-    /// Encode 16-bit scatter
+    /// Encode 16-bit scatter (fixed layout: tileId * maxPerTile)
     public func encodeScatter16(
         commandBuffer: MTLCommandBuffer,
         compactedGaussians: MTLBuffer,
         compactedHeader: MTLBuffer,
-        tileCounts: MTLBuffer,
-        tileOffsets: MTLBuffer,
+        tileCounters: MTLBuffer,
         depthKeys16: MTLBuffer,
         globalIndices: MTLBuffer,
         tilesX: Int,
-        maxAssignments: Int,
+        maxPerTile: Int,
         tileWidth: Int,
-        tileHeight: Int,
-        dispatchArgsBuffer: MTLBuffer
+        tileHeight: Int
     ) {
         scatterEncoder.encode16(
             commandBuffer: commandBuffer,
             compactedGaussians: compactedGaussians,
             compactedHeader: compactedHeader,
-            tileCounts: tileCounts,
-            tileOffsets: tileOffsets,
+            tileCounters: tileCounters,
             depthKeys16: depthKeys16,
-            sortIndices: globalIndices,
+            globalIndices: globalIndices,
             tilesX: tilesX,
-            maxAssignments: maxAssignments,
+            maxPerTile: maxPerTile,
             tileWidth: tileWidth,
             tileHeight: tileHeight
         )
     }
 
-    /// Encode 16-bit per-tile sort
+    /// Encode 16-bit per-tile sort (fixed layout: tileId * maxPerTile)
     public func encodeSort16(
         commandBuffer: MTLCommandBuffer,
         depthKeys16: MTLBuffer,
         globalIndices: MTLBuffer,
         sortedLocalIdx: MTLBuffer,
-        tileOffsets: MTLBuffer,
         tileCounts: MTLBuffer,
+        maxPerTile: Int,
         tileCount: Int
     ) {
         sortEncoder.encode16(
@@ -264,8 +259,8 @@ public final class LocalPipelineEncoder {
             depthKeys16: depthKeys16,
             globalIndices: globalIndices,
             sortedLocalIdx: sortedLocalIdx,
-            tileOffsets: tileOffsets,
             tileCounts: tileCounts,
+            maxPerTile: maxPerTile,
             tileCount: tileCount
         )
     }
@@ -304,12 +299,12 @@ public final class LocalPipelineEncoder {
         )
     }
 
-    /// Render only active tiles using indirect dispatch
+    /// Render only active tiles using indirect dispatch (fixed layout)
     public func encodeRenderIndirect(
         commandBuffer: MTLCommandBuffer,
         compactedGaussians: MTLBuffer,
-        tileOffsets: MTLBuffer,
         tileCounts: MTLBuffer,
+        maxPerTile: Int,
         sortedIndices: MTLBuffer,
         activeTileIndices: MTLBuffer,
         dispatchArgs: MTLBuffer,
@@ -326,8 +321,8 @@ public final class LocalPipelineEncoder {
         renderEncoder.encodeIndirect(
             commandBuffer: commandBuffer,
             compactedGaussians: compactedGaussians,
-            tileOffsets: tileOffsets,
             tileCounts: tileCounts,
+            maxPerTile: maxPerTile,
             sortedIndices: sortedIndices,
             activeTileIndices: activeTileIndices,
             dispatchArgs: dispatchArgs,
@@ -343,12 +338,12 @@ public final class LocalPipelineEncoder {
         )
     }
 
-    /// Render only active tiles using indirect dispatch (16-bit path)
+    /// Render only active tiles using indirect dispatch (16-bit path, fixed layout)
     public func encodeRenderIndirect16(
         commandBuffer: MTLCommandBuffer,
         compactedGaussians: MTLBuffer,
-        tileOffsets: MTLBuffer,
         tileCounts: MTLBuffer,
+        maxPerTile: Int,
         sortedLocalIdx: MTLBuffer,
         globalIndices: MTLBuffer,
         activeTileIndices: MTLBuffer,
@@ -366,8 +361,8 @@ public final class LocalPipelineEncoder {
         renderEncoder.encodeIndirect16(
             commandBuffer: commandBuffer,
             compactedGaussians: compactedGaussians,
-            tileOffsets: tileOffsets,
             tileCounts: tileCounts,
+            maxPerTile: maxPerTile,
             sortedLocalIdx: sortedLocalIdx,
             globalIndices: globalIndices,
             activeTileIndices: activeTileIndices,

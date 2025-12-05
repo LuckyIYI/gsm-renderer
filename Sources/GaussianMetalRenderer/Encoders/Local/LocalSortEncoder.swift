@@ -22,26 +22,24 @@ public final class LocalSortEncoder {
     /// Check if 16-bit sort is available
     public var has16BitSort: Bool { sort16Pipeline != nil }
 
-    /// Encode 32-bit per-tile radix sort
+    /// Encode 32-bit per-tile bitonic sort (fixed layout: tileId * maxPerTile)
     public func encode(
         commandBuffer: MTLCommandBuffer,
         sortKeys: MTLBuffer,
         sortIndices: MTLBuffer,
-        tileOffsets: MTLBuffer,
         tileCounts: MTLBuffer,
-        tempSortKeys: MTLBuffer,
-        tempSortIndices: MTLBuffer,
+        maxPerTile: Int,
         tileCount: Int
     ) {
         guard let encoder = commandBuffer.makeComputeCommandEncoder() else { return }
+        var maxPerTileU = UInt32(maxPerTile)
+
         encoder.label = "Local_PerTileSort"
         encoder.setComputePipelineState(perTileSortPipeline)
         encoder.setBuffer(sortKeys, offset: 0, index: 0)
         encoder.setBuffer(sortIndices, offset: 0, index: 1)
-        encoder.setBuffer(tileOffsets, offset: 0, index: 2)
-        encoder.setBuffer(tileCounts, offset: 0, index: 3)
-        encoder.setBuffer(tempSortKeys, offset: 0, index: 4)
-        encoder.setBuffer(tempSortIndices, offset: 0, index: 5)
+        encoder.setBuffer(tileCounts, offset: 0, index: 2)
+        encoder.setBytes(&maxPerTileU, length: 4, index: 3)
 
         // One threadgroup per tile
         let tgs = MTLSize(width: tileCount, height: 1, depth: 1)
@@ -50,26 +48,27 @@ public final class LocalSortEncoder {
         encoder.endEncoding()
     }
 
-    /// Encode 16-bit per-tile sort (experimental - 50% less threadgroup memory)
+    /// Encode 16-bit per-tile sort (fixed layout: tileId * maxPerTile)
     public func encode16(
         commandBuffer: MTLCommandBuffer,
         depthKeys16: MTLBuffer,
         globalIndices: MTLBuffer,
         sortedLocalIdx: MTLBuffer,
-        tileOffsets: MTLBuffer,
         tileCounts: MTLBuffer,
+        maxPerTile: Int,
         tileCount: Int
     ) {
         guard let sortPipeline = sort16Pipeline else { return }
         guard let encoder = commandBuffer.makeComputeCommandEncoder() else { return }
+        var maxPerTileU = UInt32(maxPerTile)
 
         encoder.label = "Local_PerTileSort16"
         encoder.setComputePipelineState(sortPipeline)
         encoder.setBuffer(depthKeys16, offset: 0, index: 0)
         encoder.setBuffer(globalIndices, offset: 0, index: 1)
         encoder.setBuffer(sortedLocalIdx, offset: 0, index: 2)
-        encoder.setBuffer(tileOffsets, offset: 0, index: 3)
-        encoder.setBuffer(tileCounts, offset: 0, index: 4)
+        encoder.setBuffer(tileCounts, offset: 0, index: 3)
+        encoder.setBytes(&maxPerTileU, length: 4, index: 4)
 
         // One threadgroup per tile
         let tgs = MTLSize(width: tileCount, height: 1, depth: 1)

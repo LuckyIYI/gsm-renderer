@@ -138,17 +138,12 @@ final class LocalUnitTests: XCTestCase {
         let totalAssignments = tileCount * maxPerTile
 
         // Generate sort keys: [depth:32] for each tile
+        // Data layout: tile i's data at i * maxPerTile
         var sortKeys = [UInt32](repeating: 0, count: totalAssignments)
         var sortIndices = [Int32](repeating: 0, count: totalAssignments)
         var tileCounts = [UInt32](repeating: UInt32(maxPerTile), count: tileCount)
-        var tileOffsets = [UInt32](repeating: 0, count: tileCount)
 
-        // Set up offsets
-        for i in 0..<tileCount {
-            tileOffsets[i] = UInt32(i * maxPerTile)
-        }
-
-        // Fill each tile with random depths
+        // Fill each tile with random depths (fixed layout: tile * maxPerTile)
         srand48(42)
         for tile in 0..<tileCount {
             let offset = tile * maxPerTile
@@ -173,20 +168,15 @@ final class LocalUnitTests: XCTestCase {
         // GPU buffers
         let sortKeysBuffer = device.makeBuffer(bytes: sortKeys, length: totalAssignments * 4, options: .storageModeShared)!
         let sortIndicesBuffer = device.makeBuffer(bytes: sortIndices, length: totalAssignments * 4, options: .storageModeShared)!
-        let tileOffsetsBuffer = device.makeBuffer(bytes: tileOffsets, length: tileCount * 4, options: .storageModeShared)!
         let tileCountsBuffer = device.makeBuffer(bytes: tileCounts, length: tileCount * 4, options: .storageModeShared)!
-        let tempSortKeys = device.makeBuffer(length: totalAssignments * 4, options: .storageModeShared)!
-        let tempSortIndices = device.makeBuffer(length: totalAssignments * 4, options: .storageModeShared)!
 
         let cb = queue.makeCommandBuffer()!
         sortEncoder.encode(
             commandBuffer: cb,
             sortKeys: sortKeysBuffer,
             sortIndices: sortIndicesBuffer,
-            tileOffsets: tileOffsetsBuffer,
             tileCounts: tileCountsBuffer,
-            tempSortKeys: tempSortKeys,
-            tempSortIndices: tempSortIndices,
+            maxPerTile: maxPerTile,
             tileCount: tileCount
         )
         cb.commit()
@@ -211,55 +201,47 @@ final class LocalUnitTests: XCTestCase {
     func testPerTileSortVariableCounts() throws {
         let sortEncoder = try LocalSortEncoder(library: library, device: device)
 
-        // Test with variable tile counts
+        // Test with variable tile counts (fixed layout: maxPerTile per tile)
         let tileCount = 8
+        let maxPerTile = 128  // Fixed layout - each tile gets maxPerTile slots
         var tileCounts: [UInt32] = [10, 50, 5, 100, 25, 0, 75, 30]
-        let maxAssignments = Int(tileCounts.reduce(0, +))
+        let totalSize = tileCount * maxPerTile
 
-        // Compute offsets
-        var tileOffsets = [UInt32](repeating: 0, count: tileCount)
-        var offset: UInt32 = 0
-        for i in 0..<tileCount {
-            tileOffsets[i] = offset
-            offset += tileCounts[i]
-        }
-
-        // Generate data
-        var sortKeys = [UInt32](repeating: 0, count: maxAssignments)
-        var sortIndices = [Int32](repeating: 0, count: maxAssignments)
+        // Generate data using fixed layout
+        var sortKeys = [UInt32](repeating: 0xFFFFFFFF, count: totalSize)
+        var sortIndices = [Int32](repeating: 0, count: totalSize)
 
         srand48(123)
-        for i in 0..<maxAssignments {
-            sortKeys[i] = UInt32(drand48() * 65535.0)
-            sortIndices[i] = Int32(i)
+        for tile in 0..<tileCount {
+            let offset = tile * maxPerTile
+            let count = Int(tileCounts[tile])
+            for j in 0..<count {
+                sortKeys[offset + j] = UInt32(drand48() * 65535.0)
+                sortIndices[offset + j] = Int32(offset + j)
+            }
         }
 
         // GPU buffers
-        let sortKeysBuffer = device.makeBuffer(bytes: sortKeys, length: maxAssignments * 4, options: .storageModeShared)!
-        let sortIndicesBuffer = device.makeBuffer(bytes: sortIndices, length: maxAssignments * 4, options: .storageModeShared)!
-        let tileOffsetsBuffer = device.makeBuffer(bytes: tileOffsets, length: tileCount * 4, options: .storageModeShared)!
+        let sortKeysBuffer = device.makeBuffer(bytes: sortKeys, length: totalSize * 4, options: .storageModeShared)!
+        let sortIndicesBuffer = device.makeBuffer(bytes: sortIndices, length: totalSize * 4, options: .storageModeShared)!
         let tileCountsBuffer = device.makeBuffer(bytes: tileCounts, length: tileCount * 4, options: .storageModeShared)!
-        let tempSortKeys = device.makeBuffer(length: maxAssignments * 4, options: .storageModeShared)!
-        let tempSortIndices = device.makeBuffer(length: maxAssignments * 4, options: .storageModeShared)!
 
         let cb = queue.makeCommandBuffer()!
         sortEncoder.encode(
             commandBuffer: cb,
             sortKeys: sortKeysBuffer,
             sortIndices: sortIndicesBuffer,
-            tileOffsets: tileOffsetsBuffer,
             tileCounts: tileCountsBuffer,
-            tempSortKeys: tempSortKeys,
-            tempSortIndices: tempSortIndices,
+            maxPerTile: maxPerTile,
             tileCount: tileCount
         )
         cb.commit()
         cb.waitUntilCompleted()
 
         // Verify each tile is sorted
-        let gpuKeys = sortKeysBuffer.contents().bindMemory(to: UInt32.self, capacity: maxAssignments)
+        let gpuKeys = sortKeysBuffer.contents().bindMemory(to: UInt32.self, capacity: totalSize)
         for tile in 0..<tileCount {
-            let tileOffset = Int(tileOffsets[tile])
+            let tileOffset = tile * maxPerTile  // Fixed layout
             let count = Int(tileCounts[tile])
             guard count > 1 else { continue }
             for j in 0..<(count - 1) {

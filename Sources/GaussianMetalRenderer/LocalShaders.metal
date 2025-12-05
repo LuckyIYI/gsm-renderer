@@ -6,6 +6,7 @@
 #include "BridgingTypes.h"
 #include "GaussianShared.h"
 #include "GaussianHelpers.h"
+#include "GaussianPrefixScan.h"
 using namespace metal;
 
 // Function constant for optional cluster culling (index 1, matches GaussianMetalRenderer.metal)
@@ -27,71 +28,7 @@ inline half4 LocalUnpackHalf4(float2 v) {
     return half4(as_type<half2>(u.x), as_type<half2>(u.y));
 }
 
-// =============================================================================
-// FLASHGS-STYLE ELLIPSE-TILE INTERSECTION
-// =============================================================================
-// Exact port of FlashGS intersection test
-// power = ln2 * (8 + log2(opacity)) = ln(256 * opacity)
-// Threshold w = 2 * power in the quadratic form: conic.x*dx^2 + 2*conic.y*dx*dy + conic.z*dy^2 <= w
-
-// Segment-ellipse intersection (FlashGS exact)
-inline bool LocalSegmentIntersectEllipse(float a, float b, float c, float d, float l, float r) {
-    float delta = b * b - 4.0f * a * c;
-    float t1 = (l - d) * (2.0f * a) + b;
-    float t2 = (r - d) * (2.0f * a) + b;
-    return delta >= 0.0f && (t1 <= 0.0f || t1 * t1 <= delta) && (t2 >= 0.0f || t2 * t2 <= delta);
-}
-
-// Block-ellipse intersection (FlashGS exact)
-// Tests closest vertical and horizontal edges
-inline bool LocalBlockIntersectEllipse(int2 pix_min, int2 pix_max, float2 center, float3 conic, float power) {
-    float w = 2.0f * power;
-    float dx, dy;
-    float a, b, c;
-
-    // Check closest vertical edge
-    if (center.x * 2.0f < float(pix_min.x + pix_max.x)) {
-        dx = center.x - float(pix_min.x);
-    } else {
-        dx = center.x - float(pix_max.x);
-    }
-    a = conic.z;
-    b = -2.0f * conic.y * dx;
-    c = conic.x * dx * dx - w;
-
-    if (LocalSegmentIntersectEllipse(a, b, c, center.y, float(pix_min.y), float(pix_max.y))) {
-        return true;
-    }
-
-    // Check closest horizontal edge
-    if (center.y * 2.0f < float(pix_min.y + pix_max.y)) {
-        dy = center.y - float(pix_min.y);
-    } else {
-        dy = center.y - float(pix_max.y);
-    }
-    a = conic.x;
-    b = -2.0f * conic.y * dy;
-    c = conic.z * dy * dy - w;
-
-    if (LocalSegmentIntersectEllipse(a, b, c, center.x, float(pix_min.x), float(pix_max.x))) {
-        return true;
-    }
-
-    return false;
-}
-
-// Block contains center (FlashGS exact)
-inline bool LocalBlockContainsCenter(int2 pix_min, int2 pix_max, float2 center) {
-    return center.x >= float(pix_min.x) && center.x <= float(pix_max.x) &&
-           center.y >= float(pix_min.y) && center.y <= float(pix_max.y);
-}
-
-// Compute power from opacity (FlashGS exact)
-// power = ln2 * 8 + ln2 * log2(opacity) = ln(256 * opacity)
-constant float LN2 = 0.693147180559945f;
-inline float LocalComputePower(float opacity) {
-    return LN2 * 8.0f + LN2 * log2(max(opacity, 1e-6f));
-}
+// Ellipse intersection is now in GaussianShared.h - use gaussianIntersectsTile()
 
 // =============================================================================
 // KERNEL: ZERO TILE COUNTS (simple version for external use)
@@ -316,17 +253,16 @@ kernel void LocalProjectStore<PackedWorldGaussianHalf, half>(
     const device uchar*, constant uint&, uint);
 
 // =============================================================================
-// KERNEL 2b: COMPACT + COUNT (copies visible from temp to compacted)
+// KERNEL 2b: COMPACT (copies visible from temp to compacted, NO counting)
 // =============================================================================
 // Uses prefix sum offsets to deterministically copy visible gaussians.
+// Counting eliminated - scatter atomics give us count for free.
 
-kernel void LocalCompactCount(
+kernel void LocalCompact(
     const device CompactedGaussian* tempBuffer [[buffer(0)]],
     const device uint* prefixOffsets [[buffer(1)]],  // Exclusive prefix sum
     device CompactedGaussian* compacted [[buffer(2)]],
-    device atomic_uint* tileCounts [[buffer(3)]],
-    constant uint& gaussianCount [[buffer(4)]],
-    constant uint& tilesX [[buffer(5)]],
+    constant uint& gaussianCount [[buffer(3)]],
     uint gid [[thread_position_in_grid]]
 ) {
     if (gid >= gaussianCount) return;
@@ -336,18 +272,8 @@ kernel void LocalCompactCount(
     uint nextOffset = prefixOffsets[gid + 1];
     if (nextOffset <= myOffset) return;  // Not visible
 
-    // Copy from temp to compacted
+    // Copy from temp to compacted (deterministic index from prefix sum)
     compacted[myOffset] = tempBuffer[gid];
-
-    // Count tiles
-    int2 minTile = tempBuffer[gid].min_tile;
-    int2 maxTile = tempBuffer[gid].max_tile;
-    for (int ty = minTile.y; ty < maxTile.y; ++ty) {
-        for (int tx = minTile.x; tx < maxTile.x; ++tx) {
-            uint tileId = uint(ty * int(tilesX) + tx);
-            atomic_fetch_add_explicit(&tileCounts[tileId], 1u, memory_order_relaxed);
-        }
-    }
 }
 
 // Write visible count to header
@@ -467,10 +393,12 @@ kernel void LocalFinalizeScan(
     }
 }
 
-// Fused finalize scan + zero counters + compact active tiles (one dispatch instead of three)
+// Fused finalize scan + compact active tiles
+// Note: No longer zeros counters - clear stage does this before scatter.
+// Now runs AFTER scatter, so counters contain real tile counts that sort/render need.
 kernel void LocalFinalizeScanAndZero(
     device uint* output [[buffer(0)]],
-    device atomic_uint* counters [[buffer(1)]],
+    const device uint* counters [[buffer(1)]],  // Read-only now
     constant uint& count [[buffer(2)]],
     const device uint* partialSums [[buffer(3)]],
     device uint* activeTileIndices [[buffer(4)]],
@@ -485,18 +413,17 @@ kernel void LocalFinalizeScanAndZero(
     for (ushort i = 0; i < LOCAL_SORT_PREFIX_GRAIN_SIZE; ++i) {
         uint idx = globalOffset + localId * LOCAL_SORT_PREFIX_GRAIN_SIZE + i;
         if (idx < count) {
-            // Finalize scan (add block sum)
+            // Finalize scan (add block sum) - vestigial but harmless
             if (groupId > 0) {
                 output[idx] += blockSum;
             }
-            // Read count before zeroing - if > 0, this tile is active
-            uint tileCount = atomic_load_explicit(&counters[idx], memory_order_relaxed);
+            // Read count - if > 0, this tile is active
+            uint tileCount = counters[idx];
             if (tileCount > 0) {
                 uint slot = atomic_fetch_add_explicit(activeTileCount, 1u, memory_order_relaxed);
                 activeTileIndices[slot] = idx;
             }
-            // Zero the counter for scatter
-            atomic_store_explicit(&counters[idx], 0u, memory_order_relaxed);
+            // No zeroing - counters needed by sort/render
         }
     }
 }
@@ -533,13 +460,12 @@ kernel void LocalScatterSimd(
     const device CompactedGaussian* compacted [[buffer(0)]],
     const device TileAssignmentHeader* header [[buffer(1)]],
     device atomic_uint* tileCounters [[buffer(2)]],
-    const device uint* offsets [[buffer(3)]],
-    device uint* sortKeys [[buffer(4)]],
-    device uint* sortIndices [[buffer(5)]],
-    constant uint& tilesX [[buffer(6)]],
-    constant uint& maxCapacity [[buffer(7)]],
-    constant int& tileWidth [[buffer(8)]],
-    constant int& tileHeight [[buffer(9)]],
+    device uint* sortKeys [[buffer(3)]],
+    device uint* sortIndices [[buffer(4)]],
+    constant uint& tilesX [[buffer(5)]],
+    constant uint& maxPerTile [[buffer(6)]],
+    constant int& tileWidth [[buffer(7)]],
+    constant int& tileHeight [[buffer(8)]],
     uint gid [[thread_position_in_grid]],
     uint simd_lane [[thread_index_in_simdgroup]],
     uint simd_group_id [[simdgroup_index_in_threadgroup]],
@@ -571,7 +497,7 @@ kernel void LocalScatterSimd(
         center = g.position_color.xy;
         half4 colorOp = LocalUnpackHalf4(g.position_color.zw);
         opacity = float(colorOp.w);
-        power = LocalComputePower(opacity);
+        power = gaussianComputePower(opacity);
         // 32-bit stable key: (depth16 << 16) | originalIdx for deterministic tie-breaking
         // Use originalIdx (world buffer index) instead of compactedIdx to ensure determinism
         uint depth16 = ((as_type<uint>(g.covariance_depth.w) ^ 0x80000000u) >> 16u) & 0xFFFFu;
@@ -612,21 +538,21 @@ kernel void LocalScatterSimd(
         int2 pix_min = int2(tx * tileWidth, ty * tileHeight);
         int2 pix_max = int2(pix_min.x + tileWidth - 1, pix_min.y + tileHeight - 1);
 
-        // FlashGS intersection test 
-        bool valid = LocalBlockContainsCenter(pix_min, pix_max, center) ||
-                     LocalBlockIntersectEllipse(pix_min, pix_max, center, conic, power);
+        // Shared ellipse intersection test (from GaussianShared.h)
+        bool valid = gaussianIntersectsTile(pix_min, pix_max, center, conic, power);
 
         // SIMD early-out: skip iteration if no lanes are valid
         simd_vote ballot = simd_ballot(valid);
         if (simd_vote::vote_t(ballot) == 0) continue;
 
         // Valid lanes write to their tiles (parallel atomics across SIMD)
+        // Fixed layout: tileId * maxPerTile + localIdx (no prefix sum needed)
         if (valid) {
             uint tileId = uint(ty) * tilesX + uint(tx);
             uint localIdx = atomic_fetch_add_explicit(&tileCounters[tileId], 1u, memory_order_relaxed);
-            uint writePos = offsets[tileId] + localIdx;
 
-            if (writePos < maxCapacity) {
+            if (localIdx < maxPerTile) {
+                uint writePos = tileId * maxPerTile + localIdx;
                 sortKeys[writePos] = depthKey;
                 sortIndices[writePos] = gaussianIdx;
             }
@@ -667,15 +593,16 @@ kernel void LocalPerTileSort16(
     const device ushort* depthKeys16 [[buffer(0)]],    // 16-bit depth keys from scatter (sequential reads!)
     const device uint* globalIndices [[buffer(1)]],    // local idx → compacted gaussian idx (for render)
     device ushort* sortedLocalIdx [[buffer(2)]],       // output: sorted local indices
-    const device uint* offsets [[buffer(3)]],
-    const device uint* counts [[buffer(4)]],
+    const device uint* counts [[buffer(3)]],
+    constant uint& maxPerTile [[buffer(4)]],
     uint tileId [[threadgroup_position_in_grid]],
     ushort localId [[thread_position_in_threadgroup]],
     ushort tgSize [[threads_per_threadgroup]],
     ushort simd_lane [[thread_index_in_simdgroup]],
     ushort simd_id [[simdgroup_index_in_threadgroup]]
 ) {
-    uint start = offsets[tileId];
+    // Fixed layout: each tile's data at tileId * maxPerTile
+    uint start = tileId * maxPerTile;
     uint count = counts[tileId];
 
     if (count <= 1) {
@@ -755,14 +682,12 @@ kernel void LocalScatterSimd16(
     const device CompactedGaussian* compacted [[buffer(0)]],
     const device TileAssignmentHeader* header [[buffer(1)]],
     device atomic_uint* tileCounters [[buffer(2)]],
-    const device uint* offsets [[buffer(3)]],
-    device ushort* depthKeys16 [[buffer(4)]],      // 16-bit depth keys - used directly by sort16
-    device uint* globalIndices [[buffer(5)]],       // local → global mapping for render
-    constant uint& tilesX [[buffer(6)]],
-    constant uint& maxCapacity [[buffer(7)]],
-    constant int& tileWidth [[buffer(8)]],
-    constant int& tileHeight [[buffer(9)]],
-    // buffer(10) removed - sortInfo no longer needed
+    device ushort* depthKeys16 [[buffer(3)]],      // 16-bit depth keys - used directly by sort16
+    device uint* globalIndices [[buffer(4)]],       // local → global mapping for render
+    constant uint& tilesX [[buffer(5)]],
+    constant uint& maxPerTile [[buffer(6)]],
+    constant int& tileWidth [[buffer(7)]],
+    constant int& tileHeight [[buffer(8)]],
     uint gid [[thread_position_in_grid]],
     uint simd_lane [[thread_index_in_simdgroup]],
     uint simd_group_id [[simdgroup_index_in_threadgroup]],
@@ -793,7 +718,7 @@ kernel void LocalScatterSimd16(
         center = g.position_color.xy;
         half4 colorOp = LocalUnpackHalf4(g.position_color.zw);
         opacity16 = float(colorOp.w);
-        power = LocalComputePower(opacity16);
+        power = gaussianComputePower(opacity16);
         // Full depth bits for sort
         depthBits = as_type<uint>(g.covariance_depth.w);
         originalIdx = g.originalIdx;
@@ -834,18 +759,19 @@ kernel void LocalScatterSimd16(
         int2 pix_min = int2(tx * tileWidth, ty * tileHeight);
         int2 pix_max = int2(pix_min.x + tileWidth - 1, pix_min.y + tileHeight - 1);
 
-        bool valid = LocalBlockContainsCenter(pix_min, pix_max, center) ||
-                     LocalBlockIntersectEllipse(pix_min, pix_max, center, conic, power);
+        // Shared ellipse intersection test (from GaussianShared.h)
+        bool valid = gaussianIntersectsTile(pix_min, pix_max, center, conic, power);
 
         simd_vote ballot = simd_ballot(valid);
         if (simd_vote::vote_t(ballot) == 0) continue;
 
+        // Fixed layout: tileId * maxPerTile + localIdx
         if (valid) {
             uint tileId = uint(ty) * tilesX + uint(tx);
             uint localIdx = atomic_fetch_add_explicit(&tileCounters[tileId], 1u, memory_order_relaxed);
-            uint writePos = offsets[tileId] + localIdx;
 
-            if (writePos < maxCapacity) {
+            if (localIdx < maxPerTile) {
+                uint writePos = tileId * maxPerTile + localIdx;
                 depthKeys16[writePos] = depth16;
                 globalIndices[writePos] = gaussianIdx;
             }
@@ -856,15 +782,14 @@ kernel void LocalScatterSimd16(
 kernel void LocalPerTileSort(
     device uint* keys [[buffer(0)]],
     device uint* values [[buffer(1)]],
-    const device uint* offsets [[buffer(2)]],
-    const device uint* counts [[buffer(3)]],
-    device uint* tempKeys [[buffer(4)]],
-    device uint* tempValues [[buffer(5)]],
+    const device uint* counts [[buffer(2)]],
+    constant uint& maxPerTile [[buffer(3)]],
     uint tileId [[threadgroup_position_in_grid]],
     ushort localId [[thread_position_in_threadgroup]],
     ushort tgSize [[threads_per_threadgroup]]
 ) {
-    uint start = offsets[tileId];
+    // Fixed layout: each tile's data starts at tileId * maxPerTile
+    uint start = tileId * maxPerTile;
     uint count = counts[tileId];
 
     if (count <= 1) return;
@@ -937,8 +862,8 @@ constant bool USE_16BIT_RENDER [[function_constant(2)]];
 template <bool USE_16BIT>
 kernel void LocalRenderImpl(
     const device CompactedGaussian* compacted [[buffer(0)]],
-    const device uint* offsets [[buffer(1)]],
-    const device uint* counts [[buffer(2)]],
+    const device uint* counts [[buffer(1)]],
+    constant uint& maxPerTile [[buffer(2)]],
     // 32-bit: sortedIndices, 16-bit: sortedLocalIdx
     const device void* sortBuffer [[buffer(3)]],
     // 16-bit only: globalIndices (unused in 32-bit path)
@@ -963,7 +888,8 @@ kernel void LocalRenderImpl(
     if (localIdx == 0) {
         tileId = activeTileIndices[groupIdx];
         tileGaussianCount = counts[tileId];
-        tileDataOffset = offsets[tileId];
+        // Fixed layout: each tile's data at tileId * maxPerTile
+        tileDataOffset = tileId * maxPerTile;
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
@@ -1067,14 +993,14 @@ kernel void LocalRenderImpl(
 // Explicit instantiations
 template [[host_name("LocalRenderIndirect")]]
 kernel void LocalRenderImpl<false>(
-    const device CompactedGaussian*, const device uint*, const device uint*,
+    const device CompactedGaussian*, const device uint*, constant uint&,
     const device void*, const device uint*, const device uint*,
     texture2d<half, access::write>, texture2d<half, access::write>,
     constant RenderParams&, uint2, uint2, uint, uint);
 
 template [[host_name("LocalRenderIndirect16")]]
 kernel void LocalRenderImpl<true>(
-    const device CompactedGaussian*, const device uint*, const device uint*,
+    const device CompactedGaussian*, const device uint*, constant uint&,
     const device void*, const device uint*, const device uint*,
     texture2d<half, access::write>, texture2d<half, access::write>,
     constant RenderParams&, uint2, uint2, uint, uint);

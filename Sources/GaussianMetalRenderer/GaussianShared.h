@@ -132,4 +132,98 @@ inline float3 computeSHColor(
     return color;
 }
 
+// =============================================================================
+// SHARED ELLIPSE-TILE INTERSECTION (used by both Local and Global pipelines)
+// =============================================================================
+// FlashGS-style intersection: exact ellipse-tile test
+// power = ln2 * (8 + log2(opacity)) = ln(256 * opacity)
+// Threshold w = 2 * power in quadratic form: conic.x*dx^2 + 2*conic.y*dx*dy + conic.z*dy^2 <= w
+
+constant float GAUSSIAN_LN2 = 0.693147180559945f;
+
+/// Compute power threshold from opacity (FlashGS exact)
+inline float gaussianComputePower(float opacity) {
+    return GAUSSIAN_LN2 * 8.0f + GAUSSIAN_LN2 * log2(max(opacity, 1e-6f));
+}
+
+/// Segment-ellipse intersection helper (FlashGS exact)
+inline bool gaussianSegmentIntersectEllipse(float a, float b, float c, float d, float l, float r) {
+    float delta = b * b - 4.0f * a * c;
+    float t1 = (l - d) * (2.0f * a) + b;
+    float t2 = (r - d) * (2.0f * a) + b;
+    return delta >= 0.0f && (t1 <= 0.0f || t1 * t1 <= delta) && (t2 >= 0.0f || t2 * t2 <= delta);
+}
+
+/// Check if tile contains gaussian center
+inline bool gaussianTileContainsCenter(int2 pix_min, int2 pix_max, float2 center) {
+    return center.x >= float(pix_min.x) && center.x <= float(pix_max.x) &&
+           center.y >= float(pix_min.y) && center.y <= float(pix_max.y);
+}
+
+/// Full ellipse-tile intersection test (FlashGS exact)
+/// Tests closest vertical and horizontal edges
+inline bool gaussianTileIntersectsEllipse(int2 pix_min, int2 pix_max, float2 center, float3 conic, float power) {
+    float w = 2.0f * power;
+    float dx, dy;
+    float a, b, c;
+
+    // Check closest vertical edge
+    if (center.x * 2.0f < float(pix_min.x + pix_max.x)) {
+        dx = center.x - float(pix_min.x);
+    } else {
+        dx = center.x - float(pix_max.x);
+    }
+    a = conic.z;
+    b = -2.0f * conic.y * dx;
+    c = conic.x * dx * dx - w;
+
+    if (gaussianSegmentIntersectEllipse(a, b, c, center.y, float(pix_min.y), float(pix_max.y))) {
+        return true;
+    }
+
+    // Check closest horizontal edge
+    if (center.y * 2.0f < float(pix_min.y + pix_max.y)) {
+        dy = center.y - float(pix_min.y);
+    } else {
+        dy = center.y - float(pix_max.y);
+    }
+    a = conic.x;
+    b = -2.0f * conic.y * dy;
+    c = conic.z * dy * dy - w;
+
+    if (gaussianSegmentIntersectEllipse(a, b, c, center.x, float(pix_min.x), float(pix_max.x))) {
+        return true;
+    }
+
+    return false;
+}
+
+/// Combined intersection test: center containment OR ellipse intersection
+inline bool gaussianIntersectsTile(int2 pix_min, int2 pix_max, float2 center, float3 conic, float power) {
+    return gaussianTileContainsCenter(pix_min, pix_max, center) ||
+           gaussianTileIntersectsEllipse(pix_min, pix_max, center, conic, power);
+}
+
+// =============================================================================
+// AABB-TILE INTERSECTION (simpler, faster, less precise)
+// =============================================================================
+// Use when ellipse precision isn't needed or for early-out culling
+
+/// Check if gaussian AABB intersects tile (simple box overlap)
+inline bool gaussianAABBIntersectsTile(int2 tileMin, int2 tileMax, int2 gaussianMinTile, int2 gaussianMaxTile, int tileX, int tileY) {
+    return tileX >= gaussianMinTile.x && tileX < gaussianMaxTile.x &&
+           tileY >= gaussianMinTile.y && tileY < gaussianMaxTile.y;
+}
+
+/// Check if pixel-space AABB intersects tile
+inline bool gaussianPixelAABBIntersectsTile(int2 pix_min, int2 pix_max, float2 center, float radius) {
+    float gaussianMinX = center.x - radius;
+    float gaussianMaxX = center.x + radius;
+    float gaussianMinY = center.y - radius;
+    float gaussianMaxY = center.y + radius;
+
+    return gaussianMaxX >= float(pix_min.x) && gaussianMinX <= float(pix_max.x) &&
+           gaussianMaxY >= float(pix_min.y) && gaussianMinY <= float(pix_max.y);
+}
+
 #endif // GAUSSIAN_SHARED_H

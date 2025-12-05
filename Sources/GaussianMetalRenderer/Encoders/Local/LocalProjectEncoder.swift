@@ -6,8 +6,8 @@ public final class LocalProjectEncoder {
     private var projectStoreFloatPipelines: [UInt64: MTLComputePipelineState] = [:]
     private var projectStoreHalfPipelines: [UInt64: MTLComputePipelineState] = [:]
 
-    // Compaction
-    private let compactCountPipeline: MTLComputePipelineState
+    // Compaction (no counting - scatter atomics give count for free)
+    private let compactPipeline: MTLComputePipelineState
     private let writeVisibleCountPipeline: MTLComputePipelineState
 
     // Hierarchical prefix sum
@@ -18,12 +18,12 @@ public final class LocalProjectEncoder {
     private let prefixBlockSize = 256
 
     public init(LocalLibrary: MTLLibrary, mainLibrary: MTLLibrary, device: MTLDevice) throws {
-        // Load compaction kernels
-        guard let compactCountFn = LocalLibrary.makeFunction(name: "LocalCompactCount"),
+        // Load compaction kernels (LocalCompact - just copies, no counting)
+        guard let compactFn = LocalLibrary.makeFunction(name: "LocalCompact"),
               let writeVisibleCountFn = LocalLibrary.makeFunction(name: "LocalWriteVisibleCount") else {
             fatalError("Missing compaction kernels")
         }
-        self.compactCountPipeline = try device.makeComputePipelineState(function: compactCountFn)
+        self.compactPipeline = try device.makeComputePipelineState(function: compactFn)
         self.writeVisibleCountPipeline = try device.makeComputePipelineState(function: writeVisibleCountFn)
 
         // Load hierarchical prefix sum from main library
@@ -77,14 +77,12 @@ public final class LocalProjectEncoder {
         camera: CameraUniformsSwift,
         params: TileBinningParams,
         gaussianCount: Int,
-        tilesX: Int,
         // Output
         tempProjectionBuffer: MTLBuffer,
         visibilityMarks: MTLBuffer,
         visibilityPartialSums: MTLBuffer,
         compactedGaussians: MTLBuffer,
         compactedHeader: MTLBuffer,
-        tileCounts: MTLBuffer,
         // Options
         useHalfWorld: Bool,
         clusterVisibility: MTLBuffer?,
@@ -93,7 +91,6 @@ public final class LocalProjectEncoder {
         var cameraUniforms = camera
         var binParams = params
         var gaussianCountU = UInt32(gaussianCount)
-        var tilesXU = UInt32(tilesX)
 
         let shDegree = Self.shDegree(from: camera.shComponents)
         let useClusterCull = clusterVisibility != nil
@@ -143,18 +140,16 @@ public final class LocalProjectEncoder {
             encoder.endEncoding()
         }
 
-        // === COMPACT + COUNT ===
+        // === COMPACT (no counting - scatter atomics give count for free) ===
         if let encoder = commandBuffer.makeComputeCommandEncoder() {
-            encoder.label = "Local_CompactCount"
-            encoder.setComputePipelineState(compactCountPipeline)
+            encoder.label = "Local_Compact"
+            encoder.setComputePipelineState(compactPipeline)
             encoder.setBuffer(tempProjectionBuffer, offset: 0, index: 0)
-            encoder.setBuffer(visibilityMarks, offset: 0, index: 1)
+            encoder.setBuffer(visibilityMarks, offset: 0, index: 1)  // prefix sum offsets
             encoder.setBuffer(compactedGaussians, offset: 0, index: 2)
-            encoder.setBuffer(tileCounts, offset: 0, index: 3)
-            encoder.setBytes(&gaussianCountU, length: 4, index: 4)
-            encoder.setBytes(&tilesXU, length: 4, index: 5)
+            encoder.setBytes(&gaussianCountU, length: 4, index: 3)
             let threads = MTLSize(width: gaussianCount, height: 1, depth: 1)
-            let tg = MTLSize(width: compactCountPipeline.threadExecutionWidth, height: 1, depth: 1)
+            let tg = MTLSize(width: compactPipeline.threadExecutionWidth, height: 1, depth: 1)
             encoder.dispatchThreads(threads, threadsPerThreadgroup: tg)
             encoder.endEncoding()
         }

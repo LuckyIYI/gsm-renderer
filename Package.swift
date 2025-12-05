@@ -7,7 +7,7 @@ let package = Package(
     name: "GaussianMetalRenderer",
     platforms: [
         .macOS(.v15),
-        .iOS(.v18)
+        .iOS(.v18),
     ],
     products: [
         .library(
@@ -28,11 +28,15 @@ let package = Package(
             name: "GaussianMetalRenderer",
             dependencies: ["GaussianMetalRendererTypes"],
             path: "Sources/GaussianMetalRenderer",
+            exclude: [
+                "GaussianMetalRenderer.air",
+                "LocalShaders.air",
+            ],
             resources: [
                 .process("GaussianMetalRenderer.metallib"),
                 .process("GaussianMetalRenderer.metal"),
                 .process("LocalShaders.metallib"),
-                .process("LocalShaders.metal")
+                .process("LocalShaders.metal"),
             ]
         ),
         .testTarget(

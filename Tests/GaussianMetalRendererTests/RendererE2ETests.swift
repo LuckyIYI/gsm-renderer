@@ -1,11 +1,10 @@
-import XCTest
+@testable import GaussianMetalRenderer
 import Metal
 import simd
-@testable import GaussianMetalRenderer
+import XCTest
 
 /// End-to-end tests for GlobalSort and Local renderers
 final class RendererE2ETests: XCTestCase {
-
     // MARK: - Test Data Helpers
 
     func generateGaussians(count: Int, seed: Int = 42) -> (
@@ -22,7 +21,7 @@ final class RendererE2ETests: XCTestCase {
         var colors: [SIMD3<Float>] = []
 
         srand48(seed)
-        for i in 0..<count {
+        for i in 0 ..< count {
             let gridSize = Int(sqrt(Double(count))) + 1
             let x = Float(i % gridSize) / Float(gridSize) * 4 - 2
             let y = Float(i / gridSize) / Float(gridSize) * 4 - 2
@@ -45,10 +44,11 @@ final class RendererE2ETests: XCTestCase {
     }
 
     func createPackedBuffers(device: MTLDevice, positions: [SIMD3<Float>], scales: [SIMD3<Float>],
-                             rotations: [SIMD4<Float>], opacities: [Float], colors: [SIMD3<Float>]) -> PackedWorldBuffers? {
+                             rotations: [SIMD4<Float>], opacities: [Float], colors: [SIMD3<Float>]) -> PackedWorldBuffers?
+    {
         let count = positions.count
         var packed: [PackedWorldGaussian] = []
-        for i in 0..<count {
+        for i in 0 ..< count {
             packed.append(PackedWorldGaussian(
                 position: positions[i], scale: scales[i], rotation: rotations[i], opacity: opacities[i]
             ))
@@ -62,7 +62,8 @@ final class RendererE2ETests: XCTestCase {
         }
 
         guard let packedBuf = device.makeBuffer(bytes: &packed, length: count * MemoryLayout<PackedWorldGaussian>.stride, options: .storageModeShared),
-              let harmonicsBuf = device.makeBuffer(bytes: &harmonics, length: count * 3 * 4, options: .storageModeShared) else {
+              let harmonicsBuf = device.makeBuffer(bytes: &harmonics, length: count * 3 * 4, options: .storageModeShared)
+        else {
             return nil
         }
 
@@ -114,7 +115,8 @@ final class RendererE2ETests: XCTestCase {
 
         // Use blit encoder to copy texture to buffer
         guard let cb = queue.makeCommandBuffer(),
-              let blit = cb.makeBlitCommandEncoder() else {
+              let blit = cb.makeBlitCommandEncoder()
+        else {
             return nil
         }
 
@@ -156,22 +158,24 @@ final class RendererE2ETests: XCTestCase {
 
         let renderer = GlobalSortRenderer(
             precision: .float32,
-            limits: RendererLimits(maxGaussians: 10_000, maxWidth: width, maxHeight: height)
+            limits: RendererLimits(maxGaussians: 10000, maxWidth: width, maxHeight: height)
         )
 
-        let (positions, scales, rotations, opacities, colors) = generateGaussians(count: count)
+        let (positions, scales, rotations, opacities, colors) = self.generateGaussians(count: count)
         guard let buffers = createPackedBuffers(device: renderer.device, positions: positions,
-                                                 scales: scales, rotations: rotations,
-                                                 opacities: opacities, colors: colors) else {
+                                                scales: scales, rotations: rotations,
+                                                opacities: opacities, colors: colors)
+        else {
             XCTFail("Failed to create buffers")
             return
         }
 
-        let camera = createCamera(width: Float(width), height: Float(height), gaussianCount: count)
+        let camera = self.createCamera(width: Float(width), height: Float(height), gaussianCount: count)
         let frameParams = FrameParams(gaussianCount: count, whiteBackground: false)
 
         guard let queue = renderer.device.makeCommandQueue(),
-              let cb = queue.makeCommandBuffer() else {
+              let cb = queue.makeCommandBuffer()
+        else {
             XCTFail("Failed to create command buffer")
             return
         }
@@ -191,7 +195,7 @@ final class RendererE2ETests: XCTestCase {
     func testGlobalSortAtScale() throws {
         let width = 512
         let height = 512
-        let count = 50_000
+        let count = 50000
 
         let renderer = GlobalSortRenderer(
             precision: .float16,
@@ -199,19 +203,21 @@ final class RendererE2ETests: XCTestCase {
             limits: RendererLimits(maxGaussians: 100_000, maxWidth: width, maxHeight: height)
         )
 
-        let (positions, scales, rotations, opacities, colors) = generateGaussians(count: count)
+        let (positions, scales, rotations, opacities, colors) = self.generateGaussians(count: count)
         guard let buffers = createPackedBuffers(device: renderer.device, positions: positions,
-                                                 scales: scales, rotations: rotations,
-                                                 opacities: opacities, colors: colors) else {
+                                                scales: scales, rotations: rotations,
+                                                opacities: opacities, colors: colors)
+        else {
             XCTFail("Failed to create buffers")
             return
         }
 
-        let camera = createCamera(width: Float(width), height: Float(height), gaussianCount: count)
+        let camera = self.createCamera(width: Float(width), height: Float(height), gaussianCount: count)
         let frameParams = FrameParams(gaussianCount: count, whiteBackground: false)
 
         guard let queue = renderer.device.makeCommandQueue(),
-              let cb = queue.makeCommandBuffer() else {
+              let cb = queue.makeCommandBuffer()
+        else {
             XCTFail("Failed to create command buffer")
             return
         }
@@ -234,22 +240,24 @@ final class RendererE2ETests: XCTestCase {
 
         let renderer = GlobalSortRenderer(
             precision: .float16,
-            limits: RendererLimits(maxGaussians: 10_000, maxWidth: width, maxHeight: height)
+            limits: RendererLimits(maxGaussians: 10000, maxWidth: width, maxHeight: height)
         )
 
-        let (positions, scales, rotations, opacities, colors) = generateGaussians(count: count)
+        let (positions, scales, rotations, opacities, colors) = self.generateGaussians(count: count)
         guard let buffers = createPackedBuffers(device: renderer.device, positions: positions,
-                                                 scales: scales, rotations: rotations,
-                                                 opacities: opacities, colors: colors) else {
+                                                scales: scales, rotations: rotations,
+                                                opacities: opacities, colors: colors)
+        else {
             XCTFail("Failed to create buffers")
             return
         }
 
-        let camera = createCamera(width: Float(width), height: Float(height), gaussianCount: count)
+        let camera = self.createCamera(width: Float(width), height: Float(height), gaussianCount: count)
         let frameParams = FrameParams(gaussianCount: count, whiteBackground: true)
 
         guard let queue = renderer.device.makeCommandQueue(),
-              let cb = queue.makeCommandBuffer() else {
+              let cb = queue.makeCommandBuffer()
+        else {
             XCTFail("Failed to create command buffer")
             return
         }
@@ -273,15 +281,16 @@ final class RendererE2ETests: XCTestCase {
         let count = 1000
 
         let config = RendererConfig(
-            maxGaussians: 10_000, maxWidth: width, maxHeight: height, precision: .float32
+            maxGaussians: 10000, maxWidth: width, maxHeight: height, precision: .float32
         )
         let renderer = try LocalRenderer(config: config)
         let device = renderer.device
 
-        let (positions, scales, rotations, opacities, colors) = generateGaussians(count: count)
+        let (positions, scales, rotations, opacities, colors) = self.generateGaussians(count: count)
         guard let buffers = createPackedBuffers(device: device, positions: positions,
-                                                 scales: scales, rotations: rotations,
-                                                 opacities: opacities, colors: colors) else {
+                                                scales: scales, rotations: rotations,
+                                                opacities: opacities, colors: colors)
+        else {
             XCTFail("Failed to create buffers")
             return
         }
@@ -313,7 +322,8 @@ final class RendererE2ETests: XCTestCase {
 
         // Create command buffer from device
         guard let queue = device.makeCommandQueue(),
-              let cb = queue.makeCommandBuffer() else {
+              let cb = queue.makeCommandBuffer()
+        else {
             XCTFail("Failed to create command buffer")
             return
         }
@@ -337,7 +347,7 @@ final class RendererE2ETests: XCTestCase {
     func testLocalAtScale() throws {
         let width = 512
         let height = 512
-        let count = 50_000
+        let count = 50000
 
         let config = RendererConfig(
             maxGaussians: 100_000, maxWidth: width, maxHeight: height, precision: .float16
@@ -345,10 +355,11 @@ final class RendererE2ETests: XCTestCase {
         let renderer = try LocalRenderer(config: config)
         let device = renderer.device
 
-        let (positions, scales, rotations, opacities, colors) = generateGaussians(count: count)
+        let (positions, scales, rotations, opacities, colors) = self.generateGaussians(count: count)
         guard let buffers = createPackedBuffers(device: device, positions: positions,
-                                                 scales: scales, rotations: rotations,
-                                                 opacities: opacities, colors: colors) else {
+                                                scales: scales, rotations: rotations,
+                                                opacities: opacities, colors: colors)
+        else {
             XCTFail("Failed to create buffers")
             return
         }
@@ -378,7 +389,8 @@ final class RendererE2ETests: XCTestCase {
         )
 
         guard let queue = device.makeCommandQueue(),
-              let cb = queue.makeCommandBuffer() else {
+              let cb = queue.makeCommandBuffer()
+        else {
             XCTFail("Failed to create command buffer")
             return
         }
@@ -407,26 +419,28 @@ final class RendererE2ETests: XCTestCase {
         let count = 500
 
         // Generate same gaussians for both renderers
-        let (positions, scales, rotations, opacities, colors) = generateGaussians(count: count, seed: 999)
+        let (positions, scales, rotations, opacities, colors) = self.generateGaussians(count: count, seed: 999)
 
         // === Render with GlobalSort ===
         let globalRenderer = GlobalSortRenderer(
             precision: .float32,
-            limits: RendererLimits(maxGaussians: 10_000, maxWidth: width, maxHeight: height)
+            limits: RendererLimits(maxGaussians: 10000, maxWidth: width, maxHeight: height)
         )
 
         guard let globalBuffers = createPackedBuffers(device: globalRenderer.device, positions: positions,
-                                                       scales: scales, rotations: rotations,
-                                                       opacities: opacities, colors: colors) else {
+                                                      scales: scales, rotations: rotations,
+                                                      opacities: opacities, colors: colors)
+        else {
             XCTFail("Failed to create GlobalSort buffers")
             return
         }
 
-        let globalCamera = createCamera(width: Float(width), height: Float(height), gaussianCount: count)
+        let globalCamera = self.createCamera(width: Float(width), height: Float(height), gaussianCount: count)
         let frameParams = FrameParams(gaussianCount: count, whiteBackground: false)
 
         guard let globalQueue = globalRenderer.device.makeCommandQueue(),
-              let globalCB = globalQueue.makeCommandBuffer() else {
+              let globalCB = globalQueue.makeCommandBuffer()
+        else {
             XCTFail("Failed to create GlobalSort command buffer")
             return
         }
@@ -451,13 +465,14 @@ final class RendererE2ETests: XCTestCase {
 
         // === Render with Local ===
         let localConfig = RendererConfig(
-            maxGaussians: 10_000, maxWidth: width, maxHeight: height, precision: .float32
+            maxGaussians: 10000, maxWidth: width, maxHeight: height, precision: .float32
         )
         let localRenderer = try LocalRenderer(config: localConfig)
 
         guard let localBuffers = createPackedBuffers(device: localRenderer.device, positions: positions,
-                                                      scales: scales, rotations: rotations,
-                                                      opacities: opacities, colors: colors) else {
+                                                     scales: scales, rotations: rotations,
+                                                     opacities: opacities, colors: colors)
+        else {
             XCTFail("Failed to create Local buffers")
             return
         }
@@ -487,7 +502,8 @@ final class RendererE2ETests: XCTestCase {
         )
 
         guard let localQueue = localRenderer.device.makeCommandQueue(),
-              let localCB = localQueue.makeCommandBuffer() else {
+              let localCB = localQueue.makeCommandBuffer()
+        else {
             XCTFail("Failed to create Local command buffer")
             return
         }
@@ -519,16 +535,16 @@ final class RendererE2ETests: XCTestCase {
         XCTAssertEqual(globalPixels.count, localPixels.count, "Pixel count mismatch")
 
         // Verify both renderers produced visible output
-        let globalNonBlack = countNonBlackPixels(globalPixels)
-        let localNonBlack = countNonBlackPixels(localPixels)
+        let globalNonBlack = self.countNonBlackPixels(globalPixels)
+        let localNonBlack = self.countNonBlackPixels(localPixels)
 
         XCTAssertGreaterThan(globalNonBlack, 100, "GlobalSort should render visible gaussians")
         XCTAssertGreaterThan(localNonBlack, 100, "Local should render visible gaussians")
 
         // Compute similarity metrics
-        var totalDiff: Int = 0
+        var totalDiff = 0
         var matchingPixels = 0
-        let tolerance: Int = 20  // Allow differences due to different sorting approaches
+        let tolerance = 20 // Allow differences due to different sorting approaches
 
         for i in stride(from: 0, to: globalPixels.count, by: 4) {
             let rDiff = abs(Int(globalPixels[i]) - Int(localPixels[i]))
@@ -556,7 +572,7 @@ final class RendererE2ETests: XCTestCase {
         // Both renderers should produce similar overall output (at least 50% matching)
         // Note: GlobalSort and Local use different tile/sort approaches so exact match isn't expected
         XCTAssertGreaterThan(matchPercent, 50.0,
-            "Renderers should produce similar output: \(matchPercent)% matching")
+                             "Renderers should produce similar output: \(matchPercent)% matching")
 
         // Verify both have similar coverage (non-black pixel count within 50%)
         let coverageDiff = abs(globalNonBlack - localNonBlack)
@@ -564,7 +580,7 @@ final class RendererE2ETests: XCTestCase {
         let coverageRatio = avgCoverage > 0 ? Double(coverageDiff) / Double(avgCoverage) : 0.0
 
         XCTAssertLessThan(coverageRatio, 0.5,
-            "Coverage should be similar: global=\(globalNonBlack), local=\(localNonBlack)")
+                          "Coverage should be similar: global=\(globalNonBlack), local=\(localNonBlack)")
     }
 
     // MARK: - Performance Test Helpers
@@ -579,7 +595,8 @@ final class RendererE2ETests: XCTestCase {
         let verbose: Bool
 
         init(width: Int = 512, height: Int = 512, count: Int, precision: RenderPrecision = .float32,
-             warmupFrames: Int = 3, measureFrames: Int = 10, verbose: Bool = false) {
+             warmupFrames: Int = 3, measureFrames: Int = 10, verbose: Bool = false)
+        {
             self.width = width
             self.height = height
             self.count = count
@@ -592,10 +609,10 @@ final class RendererE2ETests: XCTestCase {
 
     struct PerfResult {
         let times: [Double]
-        var avg: Double { times.reduce(0, +) / Double(times.count) }
-        var min: Double { times.min() ?? 0 }
-        var max: Double { times.max() ?? 0 }
-        var fps: Double { 1000.0 / avg }
+        var avg: Double { self.times.reduce(0, +) / Double(self.times.count) }
+        var min: Double { self.times.min() ?? 0 }
+        var max: Double { self.times.max() ?? 0 }
+        var fps: Double { 1000.0 / self.avg }
     }
 
     func createCameraParams(width: Int, height: Int) -> CameraParams {
@@ -627,7 +644,7 @@ final class RendererE2ETests: XCTestCase {
         guard let queue = renderer.device.makeCommandQueue() else { return nil }
 
         // Warmup
-        for _ in 0..<config.warmupFrames {
+        for _ in 0 ..< config.warmupFrames {
             guard let cb = queue.makeCommandBuffer() else { continue }
             _ = renderer.render(
                 toTexture: cb, input: input, camera: camera,
@@ -640,7 +657,7 @@ final class RendererE2ETests: XCTestCase {
 
         // Measure
         var times: [Double] = []
-        for i in 0..<config.measureFrames {
+        for i in 0 ..< config.measureFrames {
             guard let cb = queue.makeCommandBuffer() else { continue }
             let start = CFAbsoluteTimeGetCurrent()
             _ = renderer.render(
@@ -660,9 +677,9 @@ final class RendererE2ETests: XCTestCase {
         return PerfResult(times: times)
     }
 
-    func runPerfComparison(config: PerfConfig, label: String) throws -> (global: PerfResult, local: PerfResult)? {
-        let (positions, scales, rotations, opacities, colors) = generateGaussians(count: config.count, seed: 42)
-        let camera = createCameraParams(width: config.width, height: config.height)
+    func runPerfComparison(config: PerfConfig, label _: String) throws -> (global: PerfResult, local: PerfResult)? {
+        let (positions, scales, rotations, opacities, colors) = self.generateGaussians(count: config.count, seed: 42)
+        let camera = self.createCameraParams(width: config.width, height: config.height)
 
         // GlobalSort
         let globalRenderer = GlobalSortRenderer(
@@ -732,9 +749,9 @@ final class RendererE2ETests: XCTestCase {
     /// End-to-end performance comparison between GlobalSort and Local renderers
     func testPerformanceComparison() throws {
         let testCases: [(count: Int, name: String)] = [
-            (10_000, "10K"),
-            (50_000, "50K"),
-            (100_000, "100K")
+            (10000, "10K"),
+            (50000, "50K"),
+            (100_000, "100K"),
         ]
 
         print("\n=== Renderer Performance Comparison ===")
@@ -748,7 +765,7 @@ final class RendererE2ETests: XCTestCase {
                 XCTFail("Failed to run comparison for \(testCase.name)")
                 return
             }
-            printComparisonResult(label: "\(testCase.name) Gaussians", global: global, local: local)
+            self.printComparisonResult(label: "\(testCase.name) Gaussians", global: global, local: local)
         }
 
         print("========================================\n")
@@ -770,7 +787,7 @@ final class RendererE2ETests: XCTestCase {
             return
         }
 
-        printComparisonResult(label: "2M Gaussians", global: global, local: local, showMinMax: false)
+        self.printComparisonResult(label: "2M Gaussians", global: global, local: local, showMinMax: false)
         print("=====================================\n")
     }
 
@@ -786,7 +803,7 @@ final class RendererE2ETests: XCTestCase {
         }
 
         print("")
-        printComparisonResult(label: "100K Gaussians", global: global, local: local)
+        self.printComparisonResult(label: "100K Gaussians", global: global, local: local)
         print("=====================================\n")
     }
 }

@@ -1,5 +1,5 @@
-import Metal
 import GaussianMetalRendererTypes
+import Metal
 
 final class TileBoundsEncoder {
     private let pipeline: MTLComputePipelineState
@@ -34,14 +34,14 @@ final class TileBoundsEncoder {
             gaussianCount: UInt32(gaussianCount)
         )
 
-        encoder.setComputePipelineState(pipeline)
+        encoder.setComputePipelineState(self.pipeline)
         encoder.setBuffer(renderData, offset: 0, index: 0)
         encoder.setBuffer(radii, offset: 0, index: 1)
         encoder.setBuffer(mask, offset: 0, index: 2)
         encoder.setBuffer(boundsBuffer, offset: 0, index: 3)
         encoder.setBytes(&paramsStruct, length: MemoryLayout<TileBoundsParamsSwift>.stride, index: 4)
 
-        let tgWidth = pipeline.threadExecutionWidth
+        let tgWidth = self.pipeline.threadExecutionWidth
         let threads = MTLSize(width: gaussianCount, height: 1, depth: 1)
         let tg = MTLSize(width: tgWidth, height: 1, depth: 1)
         encoder.dispatchThreads(threads, threadsPerThreadgroup: tg)

@@ -9,7 +9,7 @@ public final class LocalPipelineEncoder {
     private let LocalLibrary: MTLLibrary
 
     /// Public access to the Metal library for shared encoders
-    public var library: MTLLibrary { LocalLibrary }
+    public var library: MTLLibrary { self.LocalLibrary }
 
     // Per-stage encoders
     private let clearEncoder: LocalClearEncoder
@@ -24,14 +24,16 @@ public final class LocalPipelineEncoder {
 
         // Load Local sort shader library
         guard let libraryURL = Bundle.module.url(forResource: "LocalShaders", withExtension: "metallib"),
-              let library = try? device.makeLibrary(URL: libraryURL) else {
+              let library = try? device.makeLibrary(URL: libraryURL)
+        else {
             fatalError("Failed to load LocalShaders.metallib")
         }
         self.LocalLibrary = library
 
         // Load main library for hierarchical prefix sum
         guard let mainLibraryURL = Bundle.module.url(forResource: "GaussianMetalRenderer", withExtension: "metallib"),
-              let mainLibrary = try? device.makeLibrary(URL: mainLibraryURL) else {
+              let mainLibrary = try? device.makeLibrary(URL: mainLibraryURL)
+        else {
             fatalError("Failed to load GaussianMetalRenderer.metallib")
         }
 
@@ -49,7 +51,7 @@ public final class LocalPipelineEncoder {
     }
 
     /// Legacy init for backwards compatibility
-    public convenience init(device: MTLDevice, library: MTLLibrary) throws {
+    public convenience init(device: MTLDevice, library _: MTLLibrary) throws {
         try self.init(device: device)
     }
 
@@ -78,7 +80,7 @@ public final class LocalPipelineEncoder {
         sortKeys: MTLBuffer?,
         sortIndices: MTLBuffer,
         maxCompacted: Int,
-        maxAssignments: Int,
+        maxAssignments _: Int,
         // Temp buffer for single-pass projection
         tempProjectionBuffer: MTLBuffer,
         // Visibility prefix sum buffers
@@ -90,8 +92,8 @@ public final class LocalPipelineEncoder {
         // Options
         useHalfWorld: Bool = false,
         skipSort: Bool = false,
-        tempSortKeys: MTLBuffer? = nil,
-        tempSortIndices: MTLBuffer? = nil,
+        tempSortKeys _: MTLBuffer? = nil,
+        tempSortIndices _: MTLBuffer? = nil,
         clusterVisibility: MTLBuffer? = nil,
         clusterSize: UInt32 = 1024,
         use16BitSort: Bool = false,
@@ -111,7 +113,7 @@ public final class LocalPipelineEncoder {
         )
 
         // === 1. CLEAR ===
-        clearEncoder.encode(
+        self.clearEncoder.encode(
             commandBuffer: commandBuffer,
             tileCounts: tileCounts,
             header: compactedHeader,
@@ -120,7 +122,7 @@ public final class LocalPipelineEncoder {
         )
 
         // === 2. PROJECT + VISIBILITY PREFIX SUM + COMPACT (no counting) ===
-        projectEncoder.encode(
+        self.projectEncoder.encode(
             commandBuffer: commandBuffer,
             worldGaussians: worldGaussians,
             harmonics: harmonics,
@@ -141,9 +143,9 @@ public final class LocalPipelineEncoder {
         let maxPerTile = 2048
 
         // === 3. SCATTER (fixed layout: tileId * maxPerTile, atomics give counts) ===
-        let effective16Bit = use16BitSort && scatterEncoder.has16BitScatter && depthKeys16 != nil
+        let effective16Bit = use16BitSort && self.scatterEncoder.has16BitScatter && depthKeys16 != nil
         if effective16Bit, let depth16 = depthKeys16 {
-            scatterEncoder.encode16(
+            self.scatterEncoder.encode16(
                 commandBuffer: commandBuffer,
                 compactedGaussians: compactedGaussians,
                 compactedHeader: compactedHeader,
@@ -156,7 +158,7 @@ public final class LocalPipelineEncoder {
                 tileHeight: tileHeight
             )
         } else if let sortKeysBuf = sortKeys {
-            scatterEncoder.encode(
+            self.scatterEncoder.encode(
                 commandBuffer: commandBuffer,
                 compactedGaussians: compactedGaussians,
                 compactedHeader: compactedHeader,
@@ -172,7 +174,7 @@ public final class LocalPipelineEncoder {
 
         // === 4. TILE PREFIX SCAN + ACTIVE TILE COMPACTION ===
         // (Now AFTER scatter - reads tile counts populated by scatter atomics)
-        prefixScanEncoder.encode(
+        self.prefixScanEncoder.encode(
             commandBuffer: commandBuffer,
             tileCounts: tileCounts,
             tileOffsets: tileOffsets,
@@ -184,7 +186,7 @@ public final class LocalPipelineEncoder {
 
         // === 5. PER-TILE SORT (fixed layout: tileId * maxPerTile) ===
         if !skipSort, let sortKeysBuf = sortKeys {
-            sortEncoder.encode(
+            self.sortEncoder.encode(
                 commandBuffer: commandBuffer,
                 sortKeys: sortKeysBuf,
                 sortIndices: sortIndices,
@@ -200,7 +202,7 @@ public final class LocalPipelineEncoder {
 
     /// Check if 16-bit sort is available
     public var has16BitSort: Bool {
-        scatterEncoder.has16BitScatter && sortEncoder.has16BitSort && renderEncoder.has16BitRender
+        self.scatterEncoder.has16BitScatter && self.sortEncoder.has16BitSort && self.renderEncoder.has16BitRender
     }
 
     /// Read visible count from header buffer (call after command buffer completes)
@@ -230,7 +232,7 @@ public final class LocalPipelineEncoder {
         tileWidth: Int,
         tileHeight: Int
     ) {
-        scatterEncoder.encode16(
+        self.scatterEncoder.encode16(
             commandBuffer: commandBuffer,
             compactedGaussians: compactedGaussians,
             compactedHeader: compactedHeader,
@@ -254,7 +256,7 @@ public final class LocalPipelineEncoder {
         maxPerTile: Int,
         tileCount: Int
     ) {
-        sortEncoder.encode16(
+        self.sortEncoder.encode16(
             commandBuffer: commandBuffer,
             depthKeys16: depthKeys16,
             globalIndices: globalIndices,
@@ -276,7 +278,7 @@ public final class LocalPipelineEncoder {
         height: Int,
         whiteBackground: Bool
     ) {
-        renderEncoder.encodeClearTextures(
+        self.renderEncoder.encodeClearTextures(
             commandBuffer: commandBuffer,
             colorTexture: colorTexture,
             depthTexture: depthTexture,
@@ -292,7 +294,7 @@ public final class LocalPipelineEncoder {
         activeTileCount: MTLBuffer,
         dispatchArgs: MTLBuffer
     ) {
-        renderEncoder.encodePrepareRenderDispatch(
+        self.renderEncoder.encodePrepareRenderDispatch(
             commandBuffer: commandBuffer,
             activeTileCount: activeTileCount,
             dispatchArgs: dispatchArgs
@@ -318,7 +320,7 @@ public final class LocalPipelineEncoder {
         tileHeight: Int,
         whiteBackground: Bool = false
     ) {
-        renderEncoder.encodeIndirect(
+        self.renderEncoder.encodeIndirect(
             commandBuffer: commandBuffer,
             compactedGaussians: compactedGaussians,
             tileCounts: tileCounts,
@@ -358,7 +360,7 @@ public final class LocalPipelineEncoder {
         tileHeight: Int,
         whiteBackground: Bool = false
     ) {
-        renderEncoder.encodeIndirect16(
+        self.renderEncoder.encodeIndirect16(
             commandBuffer: commandBuffer,
             compactedGaussians: compactedGaussians,
             tileCounts: tileCounts,

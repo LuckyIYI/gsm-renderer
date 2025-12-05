@@ -1,5 +1,5 @@
-import Metal
 import GaussianMetalRendererTypes
+import Metal
 
 /// Encoder for buffer-based rendering (for Python/MLX readback)
 /// Texture-based rendering uses FusedPipelineEncoder instead
@@ -38,7 +38,7 @@ final class RenderEncoder {
     ) {
         self.prepareDispatch(commandBuffer: commandBuffer, activeTileCount: orderedBuffers.activeTileCount, dispatchArgs: dispatchArgs)
         self.clearTargets(commandBuffer: commandBuffer, outputBuffers: outputBuffers, params: params)
-        
+
         if let encoder = commandBuffer.makeComputeCommandEncoder() {
             encoder.label = "RenderTiles"
             if precision == .float16, let halfPipe = self.renderPipelineHalf {
@@ -52,17 +52,17 @@ final class RenderEncoder {
             encoder.setBuffer(orderedBuffers.colors, offset: 0, index: 3)
             encoder.setBuffer(orderedBuffers.opacities, offset: 0, index: 4)
             encoder.setBuffer(orderedBuffers.depths, offset: 0, index: 5)
-            
+
             encoder.setBuffer(outputBuffers.colorOutGPU, offset: 0, index: 6)
             encoder.setBuffer(outputBuffers.depthOutGPU, offset: 0, index: 7)
             encoder.setBuffer(outputBuffers.alphaOutGPU, offset: 0, index: 8)
-            
+
             var p = params
             encoder.setBytes(&p, length: MemoryLayout<RenderParams>.stride, index: 9)
-            
+
             encoder.setBuffer(orderedBuffers.activeTileIndices, offset: 0, index: 10)
             encoder.setBuffer(orderedBuffers.activeTileCount, offset: 0, index: 11)
-            
+
             let w = Int(params.tileWidth)
             let h = Int(params.tileHeight)
             let tg = MTLSize(width: w, height: h, depth: 1)
@@ -74,14 +74,14 @@ final class RenderEncoder {
             encoder.endEncoding()
         }
     }
-    
+
     private func prepareDispatch(commandBuffer: MTLCommandBuffer, activeTileCount: MTLBuffer, dispatchArgs: MTLBuffer) {
         if let encoder = commandBuffer.makeComputeCommandEncoder() {
             encoder.label = "PrepareRenderDispatch"
             encoder.setComputePipelineState(self.prepareDispatchPipeline)
             encoder.setBuffer(activeTileCount, offset: 0, index: 0)
             encoder.setBuffer(dispatchArgs, offset: 0, index: 1)
-            
+
             // Params unused by kernel but required by signature?
             // Kernel signature: (uint* activeCount, DispatchIndirectArgs* dispatchArgs, RenderDispatchParams params)
             // Just pass dummy params
@@ -99,16 +99,16 @@ final class RenderEncoder {
             // The kernel: `if (count > params.tileCount) count = params.tileCount;`
             // So I should pass a large enough number if I don't know it, or fix the signature.
             // I will fix the signature to take `tileCount`.
-            dispatchParams.tileCount = 1000000 // Large enough
-            
+            dispatchParams.tileCount = 1_000_000 // Large enough
+
             encoder.setBytes(&dispatchParams, length: MemoryLayout<RenderDispatchParamsSwift>.stride, index: 2)
-            
+
             let threads = MTLSize(width: 1, height: 1, depth: 1)
             encoder.dispatchThreads(threads, threadsPerThreadgroup: threads)
             encoder.endEncoding()
         }
     }
-    
+
     private func clearTargets(commandBuffer: MTLCommandBuffer, outputBuffers: RenderOutputBuffers, params: RenderParams) {
         if let encoder = commandBuffer.makeComputeCommandEncoder() {
             encoder.label = "ClearTargets"
@@ -116,18 +116,17 @@ final class RenderEncoder {
             encoder.setBuffer(outputBuffers.colorOutGPU, offset: 0, index: 0)
             encoder.setBuffer(outputBuffers.depthOutGPU, offset: 0, index: 1)
             encoder.setBuffer(outputBuffers.alphaOutGPU, offset: 0, index: 2)
-            
+
             var clearParams = ClearParamsSwift(
                 pixelCount: params.width * params.height,
                 whiteBackground: params.whiteBackground
             )
             encoder.setBytes(&clearParams, length: MemoryLayout<ClearParamsSwift>.stride, index: 3)
-            
+
             let threads = MTLSize(width: Int(clearParams.pixelCount), height: 1, depth: 1)
             let tg = MTLSize(width: self.clearPipeline.threadExecutionWidth, height: 1, depth: 1)
             encoder.dispatchThreads(threads, threadsPerThreadgroup: tg)
             encoder.endEncoding()
         }
     }
-    
 }

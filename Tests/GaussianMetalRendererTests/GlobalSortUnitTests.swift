@@ -1,11 +1,10 @@
-import XCTest
+@testable import GaussianMetalRenderer
 import Metal
 import simd
-@testable import GaussianMetalRenderer
+import XCTest
 
 /// Unit tests for GlobalSort pipeline stages
 final class GlobalSortUnitTests: XCTestCase {
-
     var device: MTLDevice!
     var library: MTLLibrary!
     var queue: MTLCommandQueue!
@@ -15,7 +14,7 @@ final class GlobalSortUnitTests: XCTestCase {
         let renderer = GlobalSortRenderer(limits: RendererLimits(maxGaussians: 100_000, maxWidth: 512, maxHeight: 512))
         self.device = renderer.device
         self.library = renderer.library
-        self.queue = device.makeCommandQueue()!
+        self.queue = self.device.makeCommandQueue()!
     }
 
     // MARK: - Radix Sort Tests
@@ -29,7 +28,7 @@ final class GlobalSortUnitTests: XCTestCase {
         var indices = [Int32](repeating: 0, count: count)
 
         srand48(42)
-        for i in 0..<count {
+        for i in 0 ..< count {
             let tileId = UInt32(drand48() * 10)
             let depth = Float(drand48() * 100.0)
             let halfDepth = Float16(depth)
@@ -42,10 +41,10 @@ final class GlobalSortUnitTests: XCTestCase {
         let cpuSorted = zip(keys, indices).sorted { $0.0 < $1.0 }
 
         // GPU sort
-        let keyBuffer = device.makeBuffer(bytes: keys, length: count * 4, options: .storageModeShared)!
-        let indicesBuffer = device.makeBuffer(bytes: indices, length: count * 4, options: .storageModeShared)!
-        let headerBuffer = device.makeBuffer(length: MemoryLayout<TileAssignmentHeaderSwift>.stride, options: .storageModeShared)!
-        let dispatchArgs = device.makeBuffer(length: 4096, options: .storageModeShared)!
+        let keyBuffer = self.device.makeBuffer(bytes: keys, length: count * 4, options: .storageModeShared)!
+        let indicesBuffer = self.device.makeBuffer(bytes: indices, length: count * 4, options: .storageModeShared)!
+        let headerBuffer = self.device.makeBuffer(length: MemoryLayout<TileAssignmentHeaderSwift>.stride, options: .storageModeShared)!
+        let dispatchArgs = self.device.makeBuffer(length: 4096, options: .storageModeShared)!
 
         let headerPtr = headerBuffer.contents().bindMemory(to: TileAssignmentHeaderSwift.self, capacity: 1)
         headerPtr.pointee.totalAssignments = UInt32(count)
@@ -63,10 +62,10 @@ final class GlobalSortUnitTests: XCTestCase {
         let histogramCount = gridSize * 256
         let radixBuffers = RadixBufferSet(
             histogram: device.makeBuffer(length: histogramCount * 4, options: .storageModeShared)!,
-            blockSums: device.makeBuffer(length: gridSize * 4, options: .storageModeShared)!,
-            scannedHistogram: device.makeBuffer(length: histogramCount * 4, options: .storageModeShared)!,
-            scratchKeys: device.makeBuffer(length: count * 4, options: .storageModeShared)!,
-            scratchPayload: device.makeBuffer(length: count * 4, options: .storageModeShared)!
+            blockSums: self.device.makeBuffer(length: gridSize * 4, options: .storageModeShared)!,
+            scannedHistogram: self.device.makeBuffer(length: histogramCount * 4, options: .storageModeShared)!,
+            scratchKeys: self.device.makeBuffer(length: count * 4, options: .storageModeShared)!,
+            scratchPayload: self.device.makeBuffer(length: count * 4, options: .storageModeShared)!
         )
 
         let offsets = (
@@ -78,13 +77,13 @@ final class GlobalSortUnitTests: XCTestCase {
         )
 
         // Dispatch setup
-        let cb1 = queue.makeCommandBuffer()!
+        let cb1 = self.queue.makeCommandBuffer()!
         dispatchEncoder.encode(commandBuffer: cb1, header: headerBuffer, dispatchArgs: dispatchArgs, maxAssignments: count * 10)
         cb1.commit()
         cb1.waitUntilCompleted()
 
         // Sort
-        let cb2 = queue.makeCommandBuffer()!
+        let cb2 = self.queue.makeCommandBuffer()!
         encoder.encode(
             commandBuffer: cb2, keyBuffer: keyBuffer, sortedIndices: indicesBuffer,
             header: headerBuffer, dispatchArgs: dispatchArgs, radixBuffers: radixBuffers,
@@ -95,24 +94,24 @@ final class GlobalSortUnitTests: XCTestCase {
 
         // Verify
         let gpuKeys = keyBuffer.contents().bindMemory(to: UInt32.self, capacity: count)
-        for i in 0..<count-1 {
-            XCTAssertLessThanOrEqual(gpuKeys[i], gpuKeys[i+1], "Keys not sorted at \(i)")
+        for i in 0 ..< count - 1 {
+            XCTAssertLessThanOrEqual(gpuKeys[i], gpuKeys[i + 1], "Keys not sorted at \(i)")
         }
 
-        for i in 0..<count {
+        for i in 0 ..< count {
             XCTAssertEqual(gpuKeys[i], cpuSorted[i].0, "Key mismatch at \(i)")
         }
     }
 
     func testRadixSortLargeScale() throws {
         let encoder = try RadixSortEncoder(device: device, library: library)
-        let count = 50_000
+        let count = 50000
 
         var keys = [UInt32](repeating: 0, count: count)
         var indices = [Int32](repeating: 0, count: count)
 
         srand48(123)
-        for i in 0..<count {
+        for i in 0 ..< count {
             let tileId = UInt32(drand48() * 100)
             let depth = Float(drand48() * 100.0)
             let halfDepth = Float16(depth)
@@ -121,10 +120,10 @@ final class GlobalSortUnitTests: XCTestCase {
             indices[i] = Int32(i)
         }
 
-        let keyBuffer = device.makeBuffer(bytes: keys, length: count * 4, options: .storageModeShared)!
-        let indicesBuffer = device.makeBuffer(bytes: indices, length: count * 4, options: .storageModeShared)!
-        let headerBuffer = device.makeBuffer(length: MemoryLayout<TileAssignmentHeaderSwift>.stride, options: .storageModeShared)!
-        let dispatchArgs = device.makeBuffer(length: 4096, options: .storageModePrivate)!
+        let keyBuffer = self.device.makeBuffer(bytes: keys, length: count * 4, options: .storageModeShared)!
+        let indicesBuffer = self.device.makeBuffer(bytes: indices, length: count * 4, options: .storageModeShared)!
+        let headerBuffer = self.device.makeBuffer(length: MemoryLayout<TileAssignmentHeaderSwift>.stride, options: .storageModeShared)!
+        let dispatchArgs = self.device.makeBuffer(length: 4096, options: .storageModePrivate)!
 
         let headerPtr = headerBuffer.contents().bindMemory(to: TileAssignmentHeaderSwift.self, capacity: 1)
         headerPtr.pointee.totalAssignments = UInt32(count)
@@ -142,10 +141,10 @@ final class GlobalSortUnitTests: XCTestCase {
         let histogramCount = gridSize * 256
         let radixBuffers = RadixBufferSet(
             histogram: device.makeBuffer(length: histogramCount * 4, options: .storageModePrivate)!,
-            blockSums: device.makeBuffer(length: gridSize * 4, options: .storageModePrivate)!,
-            scannedHistogram: device.makeBuffer(length: histogramCount * 4, options: .storageModePrivate)!,
-            scratchKeys: device.makeBuffer(length: count * 4, options: .storageModePrivate)!,
-            scratchPayload: device.makeBuffer(length: count * 4, options: .storageModePrivate)!
+            blockSums: self.device.makeBuffer(length: gridSize * 4, options: .storageModePrivate)!,
+            scannedHistogram: self.device.makeBuffer(length: histogramCount * 4, options: .storageModePrivate)!,
+            scratchKeys: self.device.makeBuffer(length: count * 4, options: .storageModePrivate)!,
+            scratchPayload: self.device.makeBuffer(length: count * 4, options: .storageModePrivate)!
         )
 
         let offsets = (
@@ -156,12 +155,12 @@ final class GlobalSortUnitTests: XCTestCase {
             scatter: DispatchSlot.radixScatter.rawValue * MemoryLayout<DispatchIndirectArgsSwift>.stride
         )
 
-        let cb1 = queue.makeCommandBuffer()!
+        let cb1 = self.queue.makeCommandBuffer()!
         dispatchEncoder.encode(commandBuffer: cb1, header: headerBuffer, dispatchArgs: dispatchArgs, maxAssignments: count * 10)
         cb1.commit()
         cb1.waitUntilCompleted()
 
-        let cb2 = queue.makeCommandBuffer()!
+        let cb2 = self.queue.makeCommandBuffer()!
         encoder.encode(
             commandBuffer: cb2, keyBuffer: keyBuffer, sortedIndices: indicesBuffer,
             header: headerBuffer, dispatchArgs: dispatchArgs, radixBuffers: radixBuffers,
@@ -172,8 +171,8 @@ final class GlobalSortUnitTests: XCTestCase {
 
         // Verify sorted
         let gpuKeys = keyBuffer.contents().bindMemory(to: UInt32.self, capacity: count)
-        for i in 0..<count-1 {
-            XCTAssertLessThanOrEqual(gpuKeys[i], gpuKeys[i+1], "Keys not sorted at \(i)")
+        for i in 0 ..< count - 1 {
+            XCTAssertLessThanOrEqual(gpuKeys[i], gpuKeys[i + 1], "Keys not sorted at \(i)")
         }
     }
 }

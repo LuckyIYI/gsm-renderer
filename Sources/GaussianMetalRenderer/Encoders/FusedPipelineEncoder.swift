@@ -1,17 +1,17 @@
-import Metal
 import GaussianMetalRendererTypes
+import Metal
 
 /// Encoder for fused pipeline operations using AoS (Array of Structures) data
 /// Unified with Local approach: index-based render, no alpha texture, half precision
 /// NOTE: Interleave step is OBSOLETE - projection now outputs AoS directly via projectGaussiansAoS
 final class FusedPipelineEncoder {
     // Pipeline states
-    private let renderPipeline: MTLComputePipelineState  // Unified render (like Local)
+    private let renderPipeline: MTLComputePipelineState // Unified render (like Local)
     private let prepareDispatchPipeline: MTLComputePipelineState
     private let clearTexturesPipeline: MTLComputePipelineState
 
     // Threadgroup sizes
-    let renderThreadgroupSize: MTLSize  // 8x8 for 32x16 tiles (4x2 pixels per thread)
+    let renderThreadgroupSize: MTLSize // 8x8 for 32x16 tiles (4x2 pixels per thread)
 
     init(device: MTLDevice, library: MTLLibrary) throws {
         // Unified render kernel (like Local)
@@ -46,7 +46,7 @@ final class FusedPipelineEncoder {
     func encodeRender(
         commandBuffer: MTLCommandBuffer,
         headers: MTLBuffer,
-        renderData: MTLBuffer,  // GaussianRenderData from AoS projection
+        renderData: MTLBuffer, // GaussianRenderData from AoS projection
         sortedIndices: MTLBuffer,
         activeTileIndices: MTLBuffer,
         activeTileCount: MTLBuffer,
@@ -59,7 +59,7 @@ final class FusedPipelineEncoder {
         guard let encoder = commandBuffer.makeComputeCommandEncoder() else { return }
 
         encoder.label = "GlobalSortRender"
-        encoder.setComputePipelineState(renderPipeline)
+        encoder.setComputePipelineState(self.renderPipeline)
 
         encoder.setBuffer(headers, offset: 0, index: 0)
         encoder.setBuffer(renderData, offset: 0, index: 1)
@@ -77,7 +77,7 @@ final class FusedPipelineEncoder {
         encoder.dispatchThreadgroups(
             indirectBuffer: dispatchArgs,
             indirectBufferOffset: dispatchOffset,
-            threadsPerThreadgroup: renderThreadgroupSize
+            threadsPerThreadgroup: self.renderThreadgroupSize
         )
 
         encoder.endEncoding()
@@ -90,7 +90,7 @@ final class FusedPipelineEncoder {
     func encodeCompleteRender(
         commandBuffer: MTLCommandBuffer,
         orderedBuffers: OrderedGaussianBuffers,
-        renderData: MTLBuffer,  // GaussianRenderData from AoS projection
+        renderData: MTLBuffer, // GaussianRenderData from AoS projection
         sortedIndices: MTLBuffer,
         colorTexture: MTLTexture,
         depthTexture: MTLTexture,
@@ -99,14 +99,14 @@ final class FusedPipelineEncoder {
         dispatchOffset: Int
     ) {
         // 1. Prepare dispatch args from active tile count
-        prepareDispatch(
+        self.prepareDispatch(
             commandBuffer: commandBuffer,
             activeTileCount: orderedBuffers.activeTileCount,
             dispatchArgs: dispatchArgs
         )
 
         // 2. Clear output textures
-        clearTextures(
+        self.clearTextures(
             commandBuffer: commandBuffer,
             colorTexture: colorTexture,
             depthTexture: depthTexture,
@@ -114,7 +114,7 @@ final class FusedPipelineEncoder {
         )
 
         // 3. Render
-        encodeRender(
+        self.encodeRender(
             commandBuffer: commandBuffer,
             headers: orderedBuffers.headers,
             renderData: renderData,
@@ -138,12 +138,12 @@ final class FusedPipelineEncoder {
     ) {
         guard let encoder = commandBuffer.makeComputeCommandEncoder() else { return }
         encoder.label = "PrepareRenderDispatch"
-        encoder.setComputePipelineState(prepareDispatchPipeline)
+        encoder.setComputePipelineState(self.prepareDispatchPipeline)
         encoder.setBuffer(activeTileCount, offset: 0, index: 0)
         encoder.setBuffer(dispatchArgs, offset: 0, index: 1)
 
         var dispatchParams = RenderDispatchParamsSwift(
-            tileCount: 1000000, // Large enough to not clamp
+            tileCount: 1_000_000, // Large enough to not clamp
             totalAssignments: 0,
             gaussianCount: 0
         )
@@ -162,7 +162,7 @@ final class FusedPipelineEncoder {
     ) {
         guard let encoder = commandBuffer.makeComputeCommandEncoder() else { return }
         encoder.label = "ClearTextures"
-        encoder.setComputePipelineState(clearTexturesPipeline)
+        encoder.setComputePipelineState(self.clearTexturesPipeline)
         encoder.setTexture(colorTexture, index: 0)
         encoder.setTexture(depthTexture, index: 1)
 

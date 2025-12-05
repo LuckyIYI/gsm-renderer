@@ -12,7 +12,8 @@ public final class LocalPrefixScanEncoder {
     public init(library: MTLLibrary, device: MTLDevice) throws {
         guard let prefixFn = library.makeFunction(name: "LocalPrefixScan"),
               let partialFn = library.makeFunction(name: "LocalScanPartialSums"),
-              let finalizeAndZeroFn = library.makeFunction(name: "LocalFinalizeScanAndZero") else {
+              let finalizeAndZeroFn = library.makeFunction(name: "LocalFinalizeScanAndZero")
+        else {
             fatalError("Missing prefix scan kernels")
         }
         self.prefixScanPipeline = try device.makeComputePipelineState(function: prefixFn)
@@ -29,14 +30,14 @@ public final class LocalPrefixScanEncoder {
         activeTileIndices: MTLBuffer,
         activeTileCount: MTLBuffer
     ) {
-        let elementsPerGroup = prefixBlockSize * prefixGrainSize
+        let elementsPerGroup = self.prefixBlockSize * self.prefixGrainSize
         let actualGroups = max(1, (tileCount + elementsPerGroup - 1) / elementsPerGroup)
         var tileCountU = UInt32(tileCount)
 
         // Prefix scan per block
         if let encoder = commandBuffer.makeComputeCommandEncoder() {
             encoder.label = "Local_PrefixScan"
-            encoder.setComputePipelineState(prefixScanPipeline)
+            encoder.setComputePipelineState(self.prefixScanPipeline)
             encoder.setBuffer(tileCounts, offset: 0, index: 0)
             encoder.setBuffer(tileOffsets, offset: 0, index: 1)
             encoder.setBytes(&tileCountU, length: MemoryLayout<UInt32>.stride, index: 2)
@@ -50,7 +51,7 @@ public final class LocalPrefixScanEncoder {
         // Scan partial sums
         if let encoder = commandBuffer.makeComputeCommandEncoder() {
             encoder.label = "Local_ScanPartialSums"
-            encoder.setComputePipelineState(scanPartialSumsPipeline)
+            encoder.setComputePipelineState(self.scanPartialSumsPipeline)
             var numPartial = UInt32(actualGroups)
             encoder.setBuffer(partialSums, offset: 0, index: 0)
             encoder.setBytes(&numPartial, length: MemoryLayout<UInt32>.stride, index: 1)
@@ -62,14 +63,14 @@ public final class LocalPrefixScanEncoder {
         // Clear activeTileCount before finalize pass
         if let blitEncoder = commandBuffer.makeBlitCommandEncoder() {
             blitEncoder.label = "Local_ClearActiveTileCount"
-            blitEncoder.fill(buffer: activeTileCount, range: 0..<MemoryLayout<UInt32>.stride, value: 0)
+            blitEncoder.fill(buffer: activeTileCount, range: 0 ..< MemoryLayout<UInt32>.stride, value: 0)
             blitEncoder.endEncoding()
         }
 
         // Finalize scan + zero counters + compact active tiles (fused)
         if let encoder = commandBuffer.makeComputeCommandEncoder() {
             encoder.label = "Local_FinalizeScanAndZero"
-            encoder.setComputePipelineState(finalizeScanAndZeroPipeline)
+            encoder.setComputePipelineState(self.finalizeScanAndZeroPipeline)
             encoder.setBuffer(tileOffsets, offset: 0, index: 0)
             encoder.setBuffer(tileCounts, offset: 0, index: 1)
             encoder.setBytes(&tileCountU, length: MemoryLayout<UInt32>.stride, index: 2)

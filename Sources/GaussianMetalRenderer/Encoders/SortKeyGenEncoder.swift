@@ -9,7 +9,7 @@ final class SortKeyGenEncoder {
             fatalError("computeSortKeysKernel not found")
         }
         self.pipeline = try device.makeComputePipelineState(function: function)
-        self.threadgroupSize = max(1, min(pipeline.maxTotalThreadsPerThreadgroup, 256))
+        self.threadgroupSize = max(1, min(self.pipeline.maxTotalThreadsPerThreadgroup, 256))
     }
 
     /// Reads depth from packed GaussianRenderData
@@ -27,7 +27,7 @@ final class SortKeyGenEncoder {
         guard let encoder = commandBuffer.makeComputeCommandEncoder() else { return }
         encoder.label = "SortKeys"
 
-        encoder.setComputePipelineState(pipeline)
+        encoder.setComputePipelineState(self.pipeline)
         encoder.setBuffer(tileIds, offset: 0, index: 0)
         encoder.setBuffer(tileIndices, offset: 0, index: 1)
         encoder.setBuffer(renderData, offset: 0, index: 2)

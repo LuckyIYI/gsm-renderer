@@ -1,5 +1,5 @@
-import simd
 @preconcurrency import Metal
+import simd
 
 // MARK: - Precision
 
@@ -13,8 +13,8 @@ public enum RenderPrecision: Sendable {
 /// Unified input for Gaussian splatting renderers
 /// Contains packed world-space gaussian data and spherical harmonics
 public struct GaussianInput: Sendable {
-    public let gaussians: MTLBuffer    // PackedWorldGaussian (48 bytes) or PackedWorldGaussianHalf (24 bytes)
-    public let harmonics: MTLBuffer    // Spherical harmonics coefficients
+    public let gaussians: MTLBuffer // PackedWorldGaussian (48 bytes) or PackedWorldGaussianHalf (24 bytes)
+    public let harmonics: MTLBuffer // Spherical harmonics coefficients
     public let gaussianCount: Int
     public let shComponents: Int
 
@@ -78,9 +78,9 @@ public struct TextureRenderResult: Sendable {
 
 /// Result from rendering to buffers (CPU-readable output)
 public struct BufferRenderResult: Sendable {
-    public let color: MTLBuffer   // RGB float32, stride 12 bytes per pixel
-    public let depth: MTLBuffer   // Float32, stride 4 bytes per pixel
-    public let alpha: MTLBuffer   // Float32, stride 4 bytes per pixel
+    public let color: MTLBuffer // RGB float32, stride 12 bytes per pixel
+    public let depth: MTLBuffer // Float32, stride 4 bytes per pixel
+    public let alpha: MTLBuffer // Float32, stride 4 bytes per pixel
 
     public init(color: MTLBuffer, depth: MTLBuffer, alpha: MTLBuffer) {
         self.color = color
@@ -171,8 +171,8 @@ public extension GaussianRenderer {
         height: Int,
         whiteBackground: Bool
     ) -> TextureRenderResult? {
-        render(toTexture: commandBuffer, input: input, camera: camera,
-               width: width, height: height, whiteBackground: whiteBackground, mortonSorted: false)
+        self.render(toTexture: commandBuffer, input: input, camera: camera,
+                    width: width, height: height, whiteBackground: whiteBackground, mortonSorted: false)
     }
 
     func render(
@@ -183,8 +183,8 @@ public extension GaussianRenderer {
         height: Int,
         whiteBackground: Bool
     ) -> BufferRenderResult? {
-        render(toBuffer: commandBuffer, input: input, camera: camera,
-               width: width, height: height, whiteBackground: whiteBackground, mortonSorted: false)
+        self.render(toBuffer: commandBuffer, input: input, camera: camera,
+                    width: width, height: height, whiteBackground: whiteBackground, mortonSorted: false)
     }
 }
 

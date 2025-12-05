@@ -1,6 +1,6 @@
 import Foundation
-import simd
 @_exported import GaussianMetalRendererTypes
+import simd
 
 // =============================================================================
 // TYPE ALIASES FOR API COMPATIBILITY
@@ -18,8 +18,8 @@ public typealias CompactedGaussianSwift = CompactedGaussian
 // CONVENIENCE EXTENSIONS
 // =============================================================================
 
-extension PackedWorldGaussian {
-    public init(position: SIMD3<Float>, scale: SIMD3<Float>, rotation: SIMD4<Float>, opacity: Float) {
+public extension PackedWorldGaussian {
+    init(position: SIMD3<Float>, scale: SIMD3<Float>, rotation: SIMD4<Float>, opacity: Float) {
         self.init()
         self.px = position.x
         self.py = position.y
@@ -32,19 +32,19 @@ extension PackedWorldGaussian {
         self.rotation = rotation
     }
 
-    public var position: SIMD3<Float> {
+    var position: SIMD3<Float> {
         get { SIMD3(px, py, pz) }
         set { px = newValue.x; py = newValue.y; pz = newValue.z }
     }
 
-    public var scale: SIMD3<Float> {
+    var scale: SIMD3<Float> {
         get { SIMD3(sx, sy, sz) }
         set { sx = newValue.x; sy = newValue.y; sz = newValue.z }
     }
 }
 
-extension CameraUniforms {
-    public init(
+public extension CameraUniforms {
+    init(
         viewMatrix: simd_float4x4,
         projectionMatrix: simd_float4x4,
         cameraCenter: SIMD3<Float>,
@@ -78,8 +78,8 @@ extension CameraUniforms {
     }
 }
 
-extension RenderParams {
-    public init(
+public extension RenderParams {
+    init(
         width: UInt32,
         height: UInt32,
         tileWidth: UInt32,
@@ -105,8 +105,8 @@ extension RenderParams {
     }
 }
 
-extension TileAssignmentHeader {
-    public init(visibleCount: UInt32 = 0, maxCapacity: UInt32 = 0, paddedCount: UInt32 = 0, overflow: UInt32 = 0) {
+public extension TileAssignmentHeader {
+    init(visibleCount: UInt32 = 0, maxCapacity: UInt32 = 0, paddedCount: UInt32 = 0, overflow: UInt32 = 0) {
         self.init()
         self.totalAssignments = visibleCount
         self.maxCapacity = maxCapacity
@@ -114,14 +114,14 @@ extension TileAssignmentHeader {
         self.overflow = overflow
     }
 
-    public var visibleCount: UInt32 {
+    var visibleCount: UInt32 {
         get { totalAssignments }
         set { totalAssignments = newValue }
     }
 }
 
-extension TileBinningParams {
-    public init(
+public extension TileBinningParams {
+    init(
         gaussianCount: UInt32,
         tilesX: UInt32,
         tilesY: UInt32,
@@ -192,18 +192,18 @@ public struct PackedWorldGaussianHalf {
     }
 
     public var position: SIMD3<Float> {
-        get { SIMD3(Float(px), Float(py), Float(pz)) }
-        set { px = Float16(newValue.x); py = Float16(newValue.y); pz = Float16(newValue.z) }
+        get { SIMD3(Float(self.px), Float(self.py), Float(self.pz)) }
+        set { self.px = Float16(newValue.x); self.py = Float16(newValue.y); self.pz = Float16(newValue.z) }
     }
 
     public var scale: SIMD3<Float> {
-        get { SIMD3(Float(sx), Float(sy), Float(sz)) }
-        set { sx = Float16(newValue.x); sy = Float16(newValue.y); sz = Float16(newValue.z) }
+        get { SIMD3(Float(self.sx), Float(self.sy), Float(self.sz)) }
+        set { self.sx = Float16(newValue.x); self.sy = Float16(newValue.y); self.sz = Float16(newValue.z) }
     }
 
     public var rotation: SIMD4<Float> {
-        get { SIMD4(Float(rx), Float(ry), Float(rz), Float(rw)) }
-        set { rx = Float16(newValue.x); ry = Float16(newValue.y); rz = Float16(newValue.z); rw = Float16(newValue.w) }
+        get { SIMD4(Float(self.rx), Float(self.ry), Float(self.rz), Float(self.rw)) }
+        set { self.rx = Float16(newValue.x); self.ry = Float16(newValue.y); self.rz = Float16(newValue.z); self.rw = Float16(newValue.w) }
     }
 }
 
@@ -224,9 +224,9 @@ public struct GaussianRenderDataSwift {
     public var _pad: UInt16
     public var _structPad: UInt32
 
-    public var mean: SIMD2<Float> { SIMD2(Float(meanX), Float(meanY)) }
-    public var conic: SIMD4<Float> { SIMD4(Float(conicA), Float(conicB), Float(conicC), Float(conicD)) }
-    public var color: SIMD3<Float> { SIMD3(Float(colorR), Float(colorG), Float(colorB)) }
+    public var mean: SIMD2<Float> { SIMD2(Float(self.meanX), Float(self.meanY)) }
+    public var conic: SIMD4<Float> { SIMD4(Float(self.conicA), Float(self.conicB), Float(self.conicC), Float(self.conicD)) }
+    public var color: SIMD3<Float> { SIMD3(Float(self.colorR), Float(self.colorG), Float(self.colorB)) }
 }
 
 // ProjectCompactParamsSwift removed - use TileBinningParams from C header instead

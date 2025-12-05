@@ -14,7 +14,8 @@ public final class LocalRenderEncoder {
     public init(library: MTLLibrary, device: MTLDevice) throws {
         // Required indirect dispatch pipelines
         guard let clearFn = library.makeFunction(name: "LocalClearTextures"),
-              let prepareFn = library.makeFunction(name: "LocalPrepareRenderDispatch") else {
+              let prepareFn = library.makeFunction(name: "LocalPrepareRenderDispatch")
+        else {
             fatalError("Missing required indirect render kernels")
         }
         self.clearTexturesPipeline = try device.makeComputePipelineState(function: clearFn)
@@ -22,7 +23,7 @@ public final class LocalRenderEncoder {
 
         // Create function constant values for 32-bit render (USE_16BIT_RENDER = false)
         let constantValues32 = MTLFunctionConstantValues()
-        var use16Bit: Bool = false
+        var use16Bit = false
         constantValues32.setConstantValue(&use16Bit, type: .bool, index: 2)
 
         guard let renderIndFn = try? library.makeFunction(name: "LocalRenderIndirect", constantValues: constantValues32) else {
@@ -32,7 +33,7 @@ public final class LocalRenderEncoder {
 
         // Create function constant values for 16-bit render (USE_16BIT_RENDER = true)
         let constantValues16 = MTLFunctionConstantValues()
-        var use16BitTrue: Bool = true
+        var use16BitTrue = true
         constantValues16.setConstantValue(&use16BitTrue, type: .bool, index: 2)
 
         if let renderInd16Fn = try? library.makeFunction(name: "LocalRenderIndirect16", constantValues: constantValues16) {
@@ -43,7 +44,7 @@ public final class LocalRenderEncoder {
     }
 
     /// Check if 16-bit render is available
-    public var has16BitRender: Bool { renderIndirect16Pipeline != nil }
+    public var has16BitRender: Bool { self.renderIndirect16Pipeline != nil }
 
     // MARK: - Indirect Dispatch Methods
 
@@ -63,7 +64,7 @@ public final class LocalRenderEncoder {
         var bg: UInt32 = whiteBackground ? 1 : 0
 
         encoder.label = "Local_ClearTextures"
-        encoder.setComputePipelineState(clearTexturesPipeline)
+        encoder.setComputePipelineState(self.clearTexturesPipeline)
         encoder.setTexture(colorTexture, index: 0)
         encoder.setTexture(depthTexture, index: 1)
         encoder.setBytes(&w, length: MemoryLayout<UInt32>.stride, index: 0)
@@ -89,7 +90,7 @@ public final class LocalRenderEncoder {
         guard let encoder = commandBuffer.makeComputeCommandEncoder() else { return }
 
         encoder.label = "Local_PrepareRenderDispatch"
-        encoder.setComputePipelineState(prepareRenderDispatchPipeline)
+        encoder.setComputePipelineState(self.prepareRenderDispatchPipeline)
         encoder.setBuffer(activeTileCount, offset: 0, index: 0)
         encoder.setBuffer(dispatchArgs, offset: 0, index: 1)
 
@@ -136,7 +137,7 @@ public final class LocalRenderEncoder {
         )
 
         encoder.label = "Local_RenderIndirect"
-        encoder.setComputePipelineState(renderIndirectPipeline)
+        encoder.setComputePipelineState(self.renderIndirectPipeline)
         // Fixed layout buffer bindings:
         // buffer(0): compacted, buffer(1): counts, buffer(2): maxPerTile
         // buffer(3): sortBuffer, buffer(4): globalIndices (unused), buffer(5): activeTileIndices

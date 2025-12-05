@@ -24,7 +24,7 @@ final class BitonicSortEncoder {
     init(device: MTLDevice, library: MTLLibrary, useIndirect: Bool = true) throws {
         self.device = device
         self.useIndirect = useIndirect
-        
+
         guard
             let firstFn = library.makeFunction(name: "bitonicSortFirstPass"),
             let generalFn = library.makeFunction(name: "bitonicSortGeneralPass"),
@@ -33,7 +33,7 @@ final class BitonicSortEncoder {
         else {
             fatalError("Bitonic sort functions missing")
         }
-        
+
         func makePipeline(_ fn: MTLFunction) throws -> MTLComputePipelineState {
             if useIndirect {
                 let desc = MTLComputePipelineDescriptor()
@@ -44,11 +44,11 @@ final class BitonicSortEncoder {
                 return try device.makeComputePipelineState(function: fn)
             }
         }
-        
+
         self.firstPassPipeline = try makePipeline(firstFn)
         self.generalPassPipeline = try makePipeline(generalFn)
         self.finalPassPipeline = try makePipeline(finalFn)
-        
+
         if useIndirect {
             self.icbFillPipeline = try makePipeline(icbFillFn)
             self.icbArgEncoder = icbFillFn.makeArgumentEncoder(bufferIndex: 0)
@@ -56,11 +56,11 @@ final class BitonicSortEncoder {
             self.icbFillPipeline = nil
             self.icbArgEncoder = nil
         }
-        
+
         let bitonicMax = min(firstPassPipeline.maxTotalThreadsPerThreadgroup, 512)
         self.unitSize = BitonicSortEncoder.largestPowerOfTwo(lessThanOrEqualTo: bitonicMax)
     }
-    
+
     static func largestPowerOfTwo(lessThanOrEqualTo value: Int) -> Int {
         var v = value
         v |= v >> 1
@@ -70,11 +70,11 @@ final class BitonicSortEncoder {
         v |= v >> 16
         return (v + 1) >> 1
     }
-    
+
     private func log2PowerOfTwo(_ value: Int) -> Int {
-        return Int.bitWidth - value.leadingZeroBitCount - 1
+        Int.bitWidth - value.leadingZeroBitCount - 1
     }
-    
+
     private func maxPassCount(for paddedCapacity: Int) -> Int {
         let m = self.log2PowerOfTwo(paddedCapacity)
         let u = self.log2PowerOfTwo(self.unitSize)
@@ -82,12 +82,13 @@ final class BitonicSortEncoder {
         // total = 1(first) + g finals + g*(g-1)/2 generals
         return 1 + g + (g * (g - 1)) / 2
     }
-    
+
     private func buildScheduleForCapacity(_ paddedCapacity: Int) {
         guard let icb = self.icb,
               let passTypeBuffer = self.passTypeBuffer,
               let firstParamsBuffer = self.firstParamsBuffer,
-              let generalParamsBuffer = self.generalParamsBuffer else {
+              let generalParamsBuffer = self.generalParamsBuffer
+        else {
             return
         }
 
@@ -95,12 +96,12 @@ final class BitonicSortEncoder {
         let passTypes = passTypeBuffer.contents().bindMemory(to: UInt32.self, capacity: maxCommands)
 
         func writeFirstParam(_ slot: Int, value: UInt32) {
-            let raw = firstParamsBuffer.contents().advanced(by: slot * firstParamStride)
+            let raw = firstParamsBuffer.contents().advanced(by: slot * self.firstParamStride)
             raw.storeBytes(of: value, as: UInt32.self)
         }
 
         func writeGeneralParam(_ slot: Int, value: SIMD2<UInt32>) {
-            let raw = generalParamsBuffer.contents().advanced(by: slot * generalParamStride)
+            let raw = generalParamsBuffer.contents().advanced(by: slot * self.generalParamStride)
             raw.storeBytes(of: value, as: SIMD2<UInt32>.self)
         }
 
@@ -109,7 +110,7 @@ final class BitonicSortEncoder {
         if slot < maxCommands {
             let cmd = icb.indirectComputeCommandAt(slot)
             cmd.setComputePipelineState(self.firstPassPipeline)
-            cmd.setKernelBuffer(firstParamsBuffer, offset: slot * firstParamStride, at: 3)
+            cmd.setKernelBuffer(firstParamsBuffer, offset: slot * self.firstParamStride, at: 3)
             cmd.setThreadgroupMemoryLength(self.unitSize * 16, index: 0)
             cmd.setThreadgroupMemoryLength(self.unitSize * 8, index: 1)
             cmd.setBarrier()
@@ -119,14 +120,14 @@ final class BitonicSortEncoder {
         }
 
         var k = self.unitSize << 1
-        while k <= paddedCapacity && slot < maxCommands {
+        while k <= paddedCapacity, slot < maxCommands {
             var j = k >> 1
-            while j > 0 && slot < maxCommands {
+            while j > 0, slot < maxCommands {
                 let params = SIMD2<UInt32>(UInt32(k), UInt32(j))
                 if self.unitSize < j {
                     let cmd = icb.indirectComputeCommandAt(slot)
                     cmd.setComputePipelineState(self.generalPassPipeline)
-                    cmd.setKernelBuffer(generalParamsBuffer, offset: slot * generalParamStride, at: 3)
+                    cmd.setKernelBuffer(generalParamsBuffer, offset: slot * self.generalParamStride, at: 3)
                     cmd.setBarrier()
                     writeGeneralParam(slot, value: params)
                     passTypes[slot] = 1
@@ -135,7 +136,7 @@ final class BitonicSortEncoder {
                 } else {
                     let cmd = icb.indirectComputeCommandAt(slot)
                     cmd.setComputePipelineState(self.finalPassPipeline)
-                    cmd.setKernelBuffer(generalParamsBuffer, offset: slot * generalParamStride, at: 3)
+                    cmd.setKernelBuffer(generalParamsBuffer, offset: slot * self.generalParamStride, at: 3)
                     cmd.setThreadgroupMemoryLength((self.unitSize * MemoryLayout<SIMD2<UInt32>>.stride) << 1, index: 0)
                     cmd.setThreadgroupMemoryLength((self.unitSize * MemoryLayout<Int32>.stride) << 1, index: 1)
                     cmd.setBarrier()
@@ -154,7 +155,7 @@ final class BitonicSortEncoder {
             slot += 1
         }
     }
-    
+
     private func ensureICB(maxPaddedCapacity: Int) {
         guard self.useIndirect else { return }
         if let _ = self.icb, maxPaddedCapacity <= self.icbMaxPadded {
@@ -181,11 +182,11 @@ final class BitonicSortEncoder {
 
         self.icb = icb
         self.icbMaxCommands = commandCount
-        self.icbMaxPadded   = maxPaddedCapacity
+        self.icbMaxPadded = maxPaddedCapacity
 
         // Argument buffer for the ICB container
         guard let encoder = self.icbArgEncoder else { return }
-        let argBuffer = device.makeBuffer(
+        let argBuffer = self.device.makeBuffer(
             length: encoder.encodedLength,
             options: .storageModeShared
         )!
@@ -193,14 +194,15 @@ final class BitonicSortEncoder {
         encoder.setIndirectCommandBuffer(icb, index: 0)
         self.icbArgBuffer = argBuffer
 
-        let firstBytes = commandCount * firstParamStride
-        let generalBytes = commandCount * generalParamStride
-        self.firstParamsBuffer = device.makeBuffer(length: firstBytes, options: .storageModeShared)
-        self.generalParamsBuffer = device.makeBuffer(length: generalBytes, options: .storageModeShared)
-        self.passTypeBuffer = device.makeBuffer(length: commandCount * MemoryLayout<UInt32>.stride, options: .storageModeShared)
+        let firstBytes = commandCount * self.firstParamStride
+        let generalBytes = commandCount * self.generalParamStride
+        self.firstParamsBuffer = self.device.makeBuffer(length: firstBytes, options: .storageModeShared)
+        self.generalParamsBuffer = self.device.makeBuffer(length: generalBytes, options: .storageModeShared)
+        self.passTypeBuffer = self.device.makeBuffer(length: commandCount * MemoryLayout<UInt32>.stride, options: .storageModeShared)
 
         self.buildScheduleForCapacity(maxPaddedCapacity)
     }
+
     func encode(
         commandBuffer: MTLCommandBuffer,
         sortKeys: MTLBuffer,
@@ -211,8 +213,8 @@ final class BitonicSortEncoder {
         paddedCapacity: Int,
         debugParams: MTLBuffer? = nil
     ) {
-        if useIndirect {
-            encodeIndirect(
+        if self.useIndirect {
+            self.encodeIndirect(
                 commandBuffer: commandBuffer,
                 sortKeys: sortKeys,
                 sortedIndices: sortedIndices,
@@ -223,7 +225,7 @@ final class BitonicSortEncoder {
                 debugParams: debugParams
             )
         } else {
-            encodeDirect(
+            self.encodeDirect(
                 commandBuffer: commandBuffer,
                 sortKeys: sortKeys,
                 sortedIndices: sortedIndices,
@@ -243,7 +245,7 @@ final class BitonicSortEncoder {
         dispatchArgs: MTLBuffer,
         offsets: (first: Int, general: Int, final: Int),
         paddedCapacity: Int,
-        debugParams: MTLBuffer? = nil
+        debugParams _: MTLBuffer? = nil
     ) {
         guard paddedCapacity > 1 else { return }
         self.ensureICB(maxPaddedCapacity: paddedCapacity)
@@ -255,7 +257,7 @@ final class BitonicSortEncoder {
         let commandsToRun = self.icbMaxCommands
 
         // Bind per-pass buffers for this frame (small loop, no k/j math on CPU).
-        for slot in 0..<commandsToRun {
+        for slot in 0 ..< commandsToRun {
             let cmd = icb.indirectComputeCommandAt(slot)
             cmd.setKernelBuffer(sortKeys, offset: 0, at: 0)
             cmd.setKernelBuffer(sortedIndices, offset: 0, at: 1)
@@ -266,28 +268,28 @@ final class BitonicSortEncoder {
         if let enc = commandBuffer.makeComputeCommandEncoder() {
             enc.label = "BitonicICBFill"
             enc.setComputePipelineState(fillPipeline)
-            enc.setBuffer(icbArgBuffer,    offset: 0, index: 0)
-            enc.setBuffer(header,          offset: 0, index: 1)
-            enc.setBuffer(dispatchArgs,    offset: 0, index: 2)
-            enc.setBuffer(passTypeBuffer,  offset: 0, index: 3)
+            enc.setBuffer(icbArgBuffer, offset: 0, index: 0)
+            enc.setBuffer(header, offset: 0, index: 1)
+            enc.setBuffer(dispatchArgs, offset: 0, index: 2)
+            enc.setBuffer(passTypeBuffer, offset: 0, index: 3)
             if let firstParams = self.firstParamsBuffer {
                 enc.setBuffer(firstParams, offset: 0, index: 9)
                 enc.useResource(firstParams, usage: .write)
             }
-            var u  = UInt32(self.unitSize)
+            var u = UInt32(self.unitSize)
             var first = UInt32(offsets.first)
-            var gen   = UInt32(offsets.general)
-            var fin   = UInt32(offsets.final)
+            var gen = UInt32(offsets.general)
+            var fin = UInt32(offsets.final)
             var maxCmds = UInt32(commandsToRun)
-            enc.setBytes(&u,       length: 4, index: 4)
+            enc.setBytes(&u, length: 4, index: 4)
             enc.setBytes(&maxCmds, length: 4, index: 5)
-            enc.setBytes(&first,   length: 4, index: 6)
-            enc.setBytes(&gen,     length: 4, index: 7)
-            enc.setBytes(&fin,     length: 4, index: 8)
+            enc.setBytes(&first, length: 4, index: 6)
+            enc.setBytes(&gen, length: 4, index: 7)
+            enc.setBytes(&fin, length: 4, index: 8)
 
-            enc.useResource(icb,          usage: .write)
+            enc.useResource(icb, usage: .write)
             enc.useResource(dispatchArgs, usage: .read)
-            enc.useResource(header,       usage: .read)
+            enc.useResource(header, usage: .read)
             enc.useResource(passTypeBuffer, usage: .read)
 
             let one = MTLSize(width: 1, height: 1, depth: 1)
@@ -298,7 +300,7 @@ final class BitonicSortEncoder {
         // Optional optimize
         if let blit = commandBuffer.makeBlitCommandEncoder() {
             blit.label = "BitonicICBOptimize"
-            blit.optimizeIndirectCommandBuffer(icb, range: 0..<commandsToRun)
+            blit.optimizeIndirectCommandBuffer(icb, range: 0 ..< commandsToRun)
             blit.endEncoding()
         }
 
@@ -307,16 +309,15 @@ final class BitonicSortEncoder {
             exec.label = "BitonicICBExecute"
             if let firstParams = self.firstParamsBuffer { exec.useResource(firstParams, usage: .read) }
             if let generalParams = self.generalParamsBuffer { exec.useResource(generalParams, usage: .read) }
-            exec.useResource(sortKeys,      usage: [.read, .write])
+            exec.useResource(sortKeys, usage: [.read, .write])
             exec.useResource(sortedIndices, usage: [.read, .write])
-            exec.useResource(header,        usage: .read)
-            exec.useResource(dispatchArgs,  usage: .read)
-            exec.useResource(icb,           usage: .read)
-            exec.executeCommandsInBuffer(icb, range: 0..<commandsToRun)
+            exec.useResource(header, usage: .read)
+            exec.useResource(dispatchArgs, usage: .read)
+            exec.useResource(icb, usage: .read)
+            exec.executeCommandsInBuffer(icb, range: 0 ..< commandsToRun)
             exec.endEncoding()
         }
     }
-
 
     func encodeDirect(
         commandBuffer: MTLCommandBuffer,
@@ -330,7 +331,7 @@ final class BitonicSortEncoder {
         guard paddedCapacity > 1 else { return }
         let gridSize = paddedCapacity / 2
         guard gridSize > 0 else { return }
-        
+
         // First Pass
         if let encoder = commandBuffer.makeComputeCommandEncoder() {
             encoder.label = "BitonicFirst"
@@ -338,13 +339,13 @@ final class BitonicSortEncoder {
             encoder.setBuffer(sortKeys, offset: 0, index: 0)
             encoder.setBuffer(sortedIndices, offset: 0, index: 1)
             encoder.setBuffer(header, offset: 0, index: 2)
-            
+
             var logicalUnitSize = UInt32(min(self.unitSize, paddedCapacity / 2))
             encoder.setBytes(&logicalUnitSize, length: 4, index: 3)
-            
+
             encoder.setThreadgroupMemoryLength(self.unitSize * 16, index: 0)
             encoder.setThreadgroupMemoryLength(self.unitSize * 8, index: 1)
-            
+
             let tg = MTLSize(width: self.unitSize, height: 1, depth: 1)
             encoder.dispatchThreadgroups(
                 indirectBuffer: dispatchArgs,
@@ -353,7 +354,7 @@ final class BitonicSortEncoder {
             )
             encoder.endEncoding()
         }
-        
+
         // Subsequent Passes
         var k = UInt32(self.unitSize << 1)
         while k <= UInt32(paddedCapacity) {
@@ -389,7 +390,7 @@ final class BitonicSortEncoder {
                         encoder.setBuffer(sortedIndices, offset: 0, index: 1)
                         encoder.setBuffer(header, offset: 0, index: 2)
                         encoder.setBytes(&p, length: MemoryLayout<SIMD2<UInt32>>.stride, index: 3)
-                        
+
                         encoder.setThreadgroupMemoryLength(
                             (self.unitSize * MemoryLayout<SIMD2<UInt32>>.stride) << 1,
                             index: 0
@@ -398,7 +399,7 @@ final class BitonicSortEncoder {
                             (self.unitSize * MemoryLayout<Int32>.stride) << 1,
                             index: 1
                         )
-                        
+
                         let tg = MTLSize(width: self.unitSize, height: 1, depth: 1)
                         encoder.dispatchThreadgroups(
                             indirectBuffer: dispatchArgs,
@@ -415,6 +416,6 @@ final class BitonicSortEncoder {
     }
 
     // Debug helpers
-    var debugFirstParamsBuffer: MTLBuffer? { firstParamsBuffer }
-    var debugGeneralParamsBuffer: MTLBuffer? { generalParamsBuffer }
+    var debugFirstParamsBuffer: MTLBuffer? { self.firstParamsBuffer }
+    var debugGeneralParamsBuffer: MTLBuffer? { self.generalParamsBuffer }
 }

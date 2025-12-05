@@ -24,9 +24,9 @@ final class TwoPassTileAssignEncoder {
 
     /// Buffers required for indirect dispatch
     struct IndirectBuffers {
-        let visibleIndices: MTLBuffer     // Compacted visible gaussian indices [maxGaussians]
-        let visibleCount: MTLBuffer       // Visible count (4 bytes)
-        let indirectDispatchArgs: MTLBuffer  // Dispatch args (12 bytes)
+        let visibleIndices: MTLBuffer // Compacted visible gaussian indices [maxGaussians]
+        let visibleCount: MTLBuffer // Visible count (4 bytes)
+        let indirectDispatchArgs: MTLBuffer // Dispatch args (12 bytes)
     }
 
     init(device: MTLDevice, library: MTLLibrary) throws {
@@ -60,7 +60,7 @@ final class TwoPassTileAssignEncoder {
         self.blockScanPipeline = try device.makeComputePipelineState(function: blockScanFn)
         self.writeTotalPipeline = try device.makeComputePipelineState(function: writeTotalFn)
 
-        self.threadgroupSize = min(countPipeline.maxTotalThreadsPerThreadgroup, 256)
+        self.threadgroupSize = min(self.countPipeline.maxTotalThreadsPerThreadgroup, 256)
     }
 
     /// Encode hierarchical prefix sum on a buffer
@@ -72,29 +72,29 @@ final class TwoPassTileAssignEncoder {
         count: Int,
         labelPrefix: String
     ) -> UInt32 {
-        let numBlocks = (count + blockSize - 1) / blockSize
+        let numBlocks = (count + self.blockSize - 1) / self.blockSize
         var countU32 = UInt32(count)
         var numBlocksU32 = UInt32(numBlocks)
 
         // Block-level reduce (dataBuffer → blockSums)
         if let encoder = commandBuffer.makeComputeCommandEncoder() {
             encoder.label = "\(labelPrefix)BlockReduce"
-            encoder.setComputePipelineState(blockReducePipeline)
+            encoder.setComputePipelineState(self.blockReducePipeline)
             encoder.setBuffer(dataBuffer, offset: 0, index: 0)
             encoder.setBuffer(blockSumsBuffer, offset: 0, index: 1)
             encoder.setBytes(&countU32, length: 4, index: 2)
 
-            let threads = MTLSize(width: numBlocks * blockSize, height: 1, depth: 1)
+            let threads = MTLSize(width: numBlocks * self.blockSize, height: 1, depth: 1)
             let tg = MTLSize(width: blockSize, height: 1, depth: 1)
             encoder.dispatchThreads(threads, threadsPerThreadgroup: tg)
             encoder.endEncoding()
         }
 
-        if numBlocks <= blockSize {
+        if numBlocks <= self.blockSize {
             // Single-level scan: blockSums fits in one threadgroup
             if let encoder = commandBuffer.makeComputeCommandEncoder() {
                 encoder.label = "\(labelPrefix)SingleBlockScan"
-                encoder.setComputePipelineState(singleBlockScanPipeline)
+                encoder.setComputePipelineState(self.singleBlockScanPipeline)
                 encoder.setBuffer(blockSumsBuffer, offset: 0, index: 0)
                 encoder.setBytes(&numBlocksU32, length: 4, index: 1)
 
@@ -104,7 +104,7 @@ final class TwoPassTileAssignEncoder {
             }
         } else {
             // Two-level scan for numBlocks > 256
-            let level2Blocks = (numBlocks + blockSize - 1) / blockSize
+            let level2Blocks = (numBlocks + self.blockSize - 1) / self.blockSize
             let level2Offset = (numBlocks + 1) * MemoryLayout<UInt32>.stride
 
             var numBlocksL2 = UInt32(numBlocks)
@@ -113,12 +113,12 @@ final class TwoPassTileAssignEncoder {
             // Reduce blockSums → level2Sums
             if let encoder = commandBuffer.makeComputeCommandEncoder() {
                 encoder.label = "\(labelPrefix)Level2Reduce"
-                encoder.setComputePipelineState(blockReducePipeline)
+                encoder.setComputePipelineState(self.blockReducePipeline)
                 encoder.setBuffer(blockSumsBuffer, offset: 0, index: 0)
                 encoder.setBuffer(blockSumsBuffer, offset: level2Offset, index: 1)
                 encoder.setBytes(&numBlocksL2, length: 4, index: 2)
 
-                let threads = MTLSize(width: level2Blocks * blockSize, height: 1, depth: 1)
+                let threads = MTLSize(width: level2Blocks * self.blockSize, height: 1, depth: 1)
                 let tg = MTLSize(width: blockSize, height: 1, depth: 1)
                 encoder.dispatchThreads(threads, threadsPerThreadgroup: tg)
                 encoder.endEncoding()
@@ -127,7 +127,7 @@ final class TwoPassTileAssignEncoder {
             // Single-block scan of level2Sums
             if let encoder = commandBuffer.makeComputeCommandEncoder() {
                 encoder.label = "\(labelPrefix)Level2Scan"
-                encoder.setComputePipelineState(singleBlockScanPipeline)
+                encoder.setComputePipelineState(self.singleBlockScanPipeline)
                 encoder.setBuffer(blockSumsBuffer, offset: level2Offset, index: 0)
                 encoder.setBytes(&level2BlocksU32, length: 4, index: 1)
 
@@ -139,13 +139,13 @@ final class TwoPassTileAssignEncoder {
             // Block scan of blockSums using level2Sums as offsets
             if let encoder = commandBuffer.makeComputeCommandEncoder() {
                 encoder.label = "\(labelPrefix)Level1Scan"
-                encoder.setComputePipelineState(blockScanPipeline)
+                encoder.setComputePipelineState(self.blockScanPipeline)
                 encoder.setBuffer(blockSumsBuffer, offset: 0, index: 0)
                 encoder.setBuffer(blockSumsBuffer, offset: 0, index: 1)
                 encoder.setBuffer(blockSumsBuffer, offset: level2Offset, index: 2)
                 encoder.setBytes(&numBlocksU32, length: 4, index: 3)
 
-                let threads = MTLSize(width: level2Blocks * blockSize, height: 1, depth: 1)
+                let threads = MTLSize(width: level2Blocks * self.blockSize, height: 1, depth: 1)
                 let tg = MTLSize(width: blockSize, height: 1, depth: 1)
                 encoder.dispatchThreads(threads, threadsPerThreadgroup: tg)
                 encoder.endEncoding()
@@ -157,13 +157,13 @@ final class TwoPassTileAssignEncoder {
         // Block-level scan with offsets
         if let encoder = commandBuffer.makeComputeCommandEncoder() {
             encoder.label = "\(labelPrefix)BlockScan"
-            encoder.setComputePipelineState(blockScanPipeline)
+            encoder.setComputePipelineState(self.blockScanPipeline)
             encoder.setBuffer(dataBuffer, offset: 0, index: 0)
             encoder.setBuffer(dataBuffer, offset: 0, index: 1)
             encoder.setBuffer(blockSumsBuffer, offset: 0, index: 2)
             encoder.setBytes(&countU32, length: 4, index: 3)
 
-            let threads = MTLSize(width: numBlocks * blockSize, height: 1, depth: 1)
+            let threads = MTLSize(width: numBlocks * self.blockSize, height: 1, depth: 1)
             let tg = MTLSize(width: blockSize, height: 1, depth: 1)
             encoder.dispatchThreads(threads, threadsPerThreadgroup: tg)
             encoder.endEncoding()
@@ -183,7 +183,7 @@ final class TwoPassTileAssignEncoder {
         tilesX: Int,
         maxAssignments: Int,
         boundsBuffer: MTLBuffer,
-        coverageBuffer: MTLBuffer,  // Used for visibility marks, then tile counts
+        coverageBuffer: MTLBuffer, // Used for visibility marks, then tile counts
         renderData: MTLBuffer,
         tileIndicesBuffer: MTLBuffer,
         tileIdsBuffer: MTLBuffer,
@@ -198,7 +198,7 @@ final class TwoPassTileAssignEncoder {
         // 0a. Mark visibility: write 1/0 to coverageBuffer
         if let encoder = commandBuffer.makeComputeCommandEncoder() {
             encoder.label = "MarkVisibility"
-            encoder.setComputePipelineState(markVisibilityPipeline)
+            encoder.setComputePipelineState(self.markVisibilityPipeline)
             encoder.setBuffer(boundsBuffer, offset: 0, index: 0)
             encoder.setBuffer(coverageBuffer, offset: 0, index: 1)
             var count = UInt32(gaussianCount)
@@ -211,7 +211,7 @@ final class TwoPassTileAssignEncoder {
         }
 
         // 0b. Prefix sum on visibility marks → exclusive offsets in coverageBuffer
-        _ = encodePrefixSum(
+        _ = self.encodePrefixSum(
             commandBuffer: commandBuffer,
             dataBuffer: coverageBuffer,
             blockSumsBuffer: blockSumsBuffer,
@@ -222,7 +222,7 @@ final class TwoPassTileAssignEncoder {
         // 0c. Scatter visible indices using prefix sum offsets
         if let encoder = commandBuffer.makeComputeCommandEncoder() {
             encoder.label = "ScatterCompact"
-            encoder.setComputePipelineState(scatterCompactPipeline)
+            encoder.setComputePipelineState(self.scatterCompactPipeline)
             encoder.setBuffer(boundsBuffer, offset: 0, index: 0)
             encoder.setBuffer(coverageBuffer, offset: 0, index: 1)
             encoder.setBuffer(indirectBuffers.visibleIndices, offset: 0, index: 2)
@@ -239,7 +239,7 @@ final class TwoPassTileAssignEncoder {
         // 0d. Prepare indirect dispatch args based on visible count
         if let encoder = commandBuffer.makeComputeCommandEncoder() {
             encoder.label = "PrepareIndirectDispatch"
-            encoder.setComputePipelineState(prepareIndirectPipeline)
+            encoder.setComputePipelineState(self.prepareIndirectPipeline)
             encoder.setBuffer(indirectBuffers.visibleCount, offset: 0, index: 0)
             encoder.setBuffer(indirectBuffers.indirectDispatchArgs, offset: 0, index: 1)
             var tgSize = UInt32(threadgroupSize)
@@ -258,7 +258,7 @@ final class TwoPassTileAssignEncoder {
         if let blit = commandBuffer.makeBlitCommandEncoder() {
             blit.label = "ClearCoverage"
             let coverageSize = gaussianCount * MemoryLayout<UInt32>.stride
-            blit.fill(buffer: coverageBuffer, range: 0..<coverageSize, value: 0)
+            blit.fill(buffer: coverageBuffer, range: 0 ..< coverageSize, value: 0)
             blit.endEncoding()
         }
 
@@ -272,7 +272,7 @@ final class TwoPassTileAssignEncoder {
 
         if let encoder = commandBuffer.makeComputeCommandEncoder() {
             encoder.label = "TileCountIndirect"
-            encoder.setComputePipelineState(countPipeline)
+            encoder.setComputePipelineState(self.countPipeline)
             encoder.setBuffer(boundsBuffer, offset: 0, index: 0)
             encoder.setBuffer(renderData, offset: 0, index: 1)
             encoder.setBuffer(coverageBuffer, offset: 0, index: 2)
@@ -289,7 +289,7 @@ final class TwoPassTileAssignEncoder {
         // =================================================================
         // Pass 2: Hierarchical Prefix Sum for tile offsets
         // =================================================================
-        let numBlocksU32 = encodePrefixSum(
+        let numBlocksU32 = self.encodePrefixSum(
             commandBuffer: commandBuffer,
             dataBuffer: coverageBuffer,
             blockSumsBuffer: blockSumsBuffer,
@@ -300,7 +300,7 @@ final class TwoPassTileAssignEncoder {
         // Write total count to header
         if let encoder = commandBuffer.makeComputeCommandEncoder() {
             encoder.label = "WriteTotalCount"
-            encoder.setComputePipelineState(writeTotalPipeline)
+            encoder.setComputePipelineState(self.writeTotalPipeline)
             encoder.setBuffer(blockSumsBuffer, offset: 0, index: 0)
             encoder.setBuffer(tileAssignmentHeader, offset: 0, index: 1)
             var numBlocksVar = numBlocksU32
@@ -316,7 +316,7 @@ final class TwoPassTileAssignEncoder {
         // =================================================================
         if let encoder = commandBuffer.makeComputeCommandEncoder() {
             encoder.label = "TileScatterIndirect"
-            encoder.setComputePipelineState(scatterPipeline)
+            encoder.setComputePipelineState(self.scatterPipeline)
             encoder.setBuffer(boundsBuffer, offset: 0, index: 0)
             encoder.setBuffer(renderData, offset: 0, index: 1)
             encoder.setBuffer(coverageBuffer, offset: 0, index: 2)

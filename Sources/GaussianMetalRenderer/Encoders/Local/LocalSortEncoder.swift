@@ -20,7 +20,7 @@ public final class LocalSortEncoder {
     }
 
     /// Check if 16-bit sort is available
-    public var has16BitSort: Bool { sort16Pipeline != nil }
+    public var has16BitSort: Bool { self.sort16Pipeline != nil }
 
     /// Encode 32-bit per-tile bitonic sort (fixed layout: tileId * maxPerTile)
     public func encode(
@@ -35,7 +35,7 @@ public final class LocalSortEncoder {
         var maxPerTileU = UInt32(maxPerTile)
 
         encoder.label = "Local_PerTileSort"
-        encoder.setComputePipelineState(perTileSortPipeline)
+        encoder.setComputePipelineState(self.perTileSortPipeline)
         encoder.setBuffer(sortKeys, offset: 0, index: 0)
         encoder.setBuffer(sortIndices, offset: 0, index: 1)
         encoder.setBuffer(tileCounts, offset: 0, index: 2)

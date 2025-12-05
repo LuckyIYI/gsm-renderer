@@ -23,7 +23,7 @@ public final class LocalClearEncoder {
 
         guard let encoder = commandBuffer.makeComputeCommandEncoder() else { return }
         encoder.label = "Local_Clear"
-        encoder.setComputePipelineState(clearPipeline)
+        encoder.setComputePipelineState(self.clearPipeline)
         encoder.setBuffer(tileCounts, offset: 0, index: 0)
         encoder.setBuffer(header, offset: 0, index: 1)
         encoder.setBytes(&tileCountU, length: 4, index: 2)

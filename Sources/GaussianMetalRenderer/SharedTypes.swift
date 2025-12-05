@@ -1,9 +1,10 @@
 import Foundation
-import simd
-import Metal
 import GaussianMetalRendererTypes
+import Metal
+import simd
 
 // MARK: - Type Aliases from BridgingTypes.h
+
 // All types are defined in BridgingTypes.h and imported via GaussianMetalRendererTypes.
 // Swift-side typealiases for API compatibility:
 
@@ -106,8 +107,8 @@ public struct RadixBufferSet {
     public let histogram: MTLBuffer
     public let blockSums: MTLBuffer
     public let scannedHistogram: MTLBuffer
-    public let scratchKeys: MTLBuffer      // Scratch for ping-pong during radix sort
-    public let scratchPayload: MTLBuffer   // Scratch for payload ping-pong
+    public let scratchKeys: MTLBuffer // Scratch for ping-pong during radix sort
+    public let scratchPayload: MTLBuffer // Scratch for payload ping-pong
 }
 
 public struct RenderOutputBuffers {

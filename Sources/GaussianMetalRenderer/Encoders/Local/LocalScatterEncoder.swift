@@ -8,7 +8,8 @@ public final class LocalScatterEncoder {
 
     public init(library: MTLLibrary, device: MTLDevice) throws {
         guard let prepareDispatchFn = library.makeFunction(name: "LocalPrepareScatterDispatch"),
-              let scatterFn = library.makeFunction(name: "LocalScatterSimd") else {
+              let scatterFn = library.makeFunction(name: "LocalScatterSimd")
+        else {
             fatalError("Missing scatter kernels")
         }
         self.prepareDispatchPipeline = try device.makeComputePipelineState(function: prepareDispatchFn)
@@ -23,7 +24,7 @@ public final class LocalScatterEncoder {
     }
 
     /// Check if 16-bit scatter is available
-    public var has16BitScatter: Bool { scatter16Pipeline != nil }
+    public var has16BitScatter: Bool { self.scatter16Pipeline != nil }
 
     /// Encode scatter with 32-bit keys (fixed layout: tileId * maxPerTile)
     public func encode(
@@ -49,10 +50,10 @@ public final class LocalScatterEncoder {
         // Prepare indirect dispatch
         if let encoder = commandBuffer.makeComputeCommandEncoder() {
             encoder.label = "Local_PrepareScatterDispatch"
-            encoder.setComputePipelineState(prepareDispatchPipeline)
+            encoder.setComputePipelineState(self.prepareDispatchPipeline)
             encoder.setBuffer(compactedHeader, offset: 0, index: 0)
             encoder.setBuffer(dispatchArgsBuffer, offset: 0, index: 1)
-            var tgWidth = UInt32(4)  // 4 gaussians per threadgroup (4 SIMD groups)
+            var tgWidth = UInt32(4) // 4 gaussians per threadgroup (4 SIMD groups)
             encoder.setBytes(&tgWidth, length: MemoryLayout<UInt32>.stride, index: 2)
             encoder.dispatchThreads(MTLSize(width: 1, height: 1, depth: 1),
                                     threadsPerThreadgroup: MTLSize(width: 1, height: 1, depth: 1))
@@ -62,7 +63,7 @@ public final class LocalScatterEncoder {
         // SIMD-cooperative scatter (fixed layout: tileId * maxPerTile + localIdx)
         if let encoder = commandBuffer.makeComputeCommandEncoder() {
             encoder.label = "Local_Scatter_SIMD"
-            encoder.setComputePipelineState(scatterPipeline)
+            encoder.setComputePipelineState(self.scatterPipeline)
             encoder.setBuffer(compactedGaussians, offset: 0, index: 0)
             encoder.setBuffer(compactedHeader, offset: 0, index: 1)
             encoder.setBuffer(tileCounters, offset: 0, index: 2)
@@ -108,7 +109,7 @@ public final class LocalScatterEncoder {
         // Prepare indirect dispatch
         if let encoder = commandBuffer.makeComputeCommandEncoder() {
             encoder.label = "Local_PrepareScatter16Dispatch"
-            encoder.setComputePipelineState(prepareDispatchPipeline)
+            encoder.setComputePipelineState(self.prepareDispatchPipeline)
             encoder.setBuffer(compactedHeader, offset: 0, index: 0)
             encoder.setBuffer(dispatchArgsBuffer, offset: 0, index: 1)
             var tgWidth = UInt32(4)

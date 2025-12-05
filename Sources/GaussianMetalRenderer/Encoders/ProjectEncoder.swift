@@ -2,8 +2,8 @@ import Metal
 
 /// Packed world gaussian buffers - single interleaved buffer for optimal memory access
 public struct PackedWorldBuffers {
-    public let packedGaussians: MTLBuffer  // PackedWorldGaussian or PackedWorldGaussianHalf array
-    public let harmonics: MTLBuffer         // Separate buffer for variable-size SH data (float or half)
+    public let packedGaussians: MTLBuffer // PackedWorldGaussian or PackedWorldGaussianHalf array
+    public let harmonics: MTLBuffer // Separate buffer for variable-size SH data (float or half)
 
     public init(packedGaussians: MTLBuffer, harmonics: MTLBuffer) {
         self.packedGaussians = packedGaussians
@@ -14,9 +14,9 @@ public struct PackedWorldBuffers {
 /// Output buffer set for fused projection (packed render data + bounds + mask)
 /// Note: radii buffer is no longer needed - tile bounds computed directly in projection
 public struct ProjectionOutput {
-    public let renderData: MTLBuffer   // GaussianRenderData array (packed)
-    public let bounds: MTLBuffer       // int4 array (tile bounds, replaces radii)
-    public let mask: MTLBuffer         // uchar array (for culling)
+    public let renderData: MTLBuffer // GaussianRenderData array (packed)
+    public let bounds: MTLBuffer // int4 array (tile bounds, replaces radii)
+    public let mask: MTLBuffer // uchar array (for culling)
 
     public init(renderData: MTLBuffer, bounds: MTLBuffer, mask: MTLBuffer) {
         self.renderData = renderData
@@ -45,16 +45,16 @@ final class ProjectEncoder {
     /// Map shComponents count to SH degree (0-3)
     private static func shDegree(from shComponents: UInt32) -> UInt32 {
         switch shComponents {
-        case 0, 1: return 0     // DC only
-        case 2...4: return 1    // Degree 1 (4 coeffs)
-        case 5...9: return 2    // Degree 2 (9 coeffs)
-        default: return 3       // Degree 3 (16 coeffs)
+        case 0, 1: 0 // DC only
+        case 2 ... 4: 1 // Degree 1 (4 coeffs)
+        case 5 ... 9: 2 // Degree 2 (9 coeffs)
+        default: 3 // Degree 3 (16 coeffs)
         }
     }
 
     init(device: MTLDevice, library: MTLLibrary) throws {
         // Create fused projection pipelines for each SH degree, with and without cluster culling
-        for degree: UInt32 in 0...3 {
+        for degree: UInt32 in 0 ... 3 {
             // Without cluster culling (USE_CLUSTER_CULL=false)
             let noCullConstants = MTLFunctionConstantValues()
             var shDegree = degree
@@ -83,7 +83,7 @@ final class ProjectEncoder {
             }
         }
 
-        guard floatPipelines[0] != nil else {
+        guard self.floatPipelines[0] != nil else {
             fatalError("Failed to create fused projection pipeline")
         }
     }
@@ -118,18 +118,17 @@ final class ProjectEncoder {
         let useClusterCull = clusterVisibility != nil
 
         // Select pipeline based on precision and culling mode
-        let pipeline: MTLComputePipelineState
-        if useClusterCull {
+        let pipeline: MTLComputePipelineState = if useClusterCull {
             if useHalfWorld {
-                pipeline = halfCullPipelines[shDegree] ?? halfCullPipelines[0] ?? floatCullPipelines[0]!
+                self.halfCullPipelines[shDegree] ?? self.halfCullPipelines[0] ?? self.floatCullPipelines[0]!
             } else {
-                pipeline = floatCullPipelines[shDegree] ?? floatCullPipelines[0]!
+                self.floatCullPipelines[shDegree] ?? self.floatCullPipelines[0]!
             }
         } else {
             if useHalfWorld {
-                pipeline = halfPipelines[shDegree] ?? halfPipelines[0] ?? floatPipelines[0]!
+                self.halfPipelines[shDegree] ?? self.halfPipelines[0] ?? self.floatPipelines[0]!
             } else {
-                pipeline = floatPipelines[shDegree] ?? floatPipelines[0]!
+                self.floatPipelines[shDegree] ?? self.floatPipelines[0]!
             }
         }
 
@@ -141,7 +140,7 @@ final class ProjectEncoder {
 
         // Output buffers
         encoder.setBuffer(output.renderData, offset: 0, index: 2)
-        encoder.setBuffer(output.bounds, offset: 0, index: 3)  // int4 tile bounds (replaces radii)
+        encoder.setBuffer(output.bounds, offset: 0, index: 3) // int4 tile bounds (replaces radii)
         encoder.setBuffer(output.mask, offset: 0, index: 4)
 
         var cam = cameraUniforms

@@ -566,4 +566,227 @@ final class RendererE2ETests: XCTestCase {
         XCTAssertLessThan(coverageRatio, 0.5,
             "Coverage should be similar: global=\(globalNonBlack), local=\(localNonBlack)")
     }
+
+    // MARK: - Performance Test Helpers
+
+    struct PerfConfig {
+        let width: Int
+        let height: Int
+        let count: Int
+        let precision: RenderPrecision
+        let warmupFrames: Int
+        let measureFrames: Int
+        let verbose: Bool
+
+        init(width: Int = 512, height: Int = 512, count: Int, precision: RenderPrecision = .float32,
+             warmupFrames: Int = 3, measureFrames: Int = 10, verbose: Bool = false) {
+            self.width = width
+            self.height = height
+            self.count = count
+            self.precision = precision
+            self.warmupFrames = warmupFrames
+            self.measureFrames = measureFrames
+            self.verbose = verbose
+        }
+    }
+
+    struct PerfResult {
+        let times: [Double]
+        var avg: Double { times.reduce(0, +) / Double(times.count) }
+        var min: Double { times.min() ?? 0 }
+        var max: Double { times.max() ?? 0 }
+        var fps: Double { 1000.0 / avg }
+    }
+
+    func createCameraParams(width: Int, height: Int) -> CameraParams {
+        let aspect = Float(width) / Float(height)
+        let fov: Float = 60.0 * .pi / 180.0
+        let f = 1.0 / tan(fov / 2.0)
+        var projMatrix = matrix_identity_float4x4
+        projMatrix.columns.0 = SIMD4(f / aspect, 0, 0, 0)
+        projMatrix.columns.1 = SIMD4(0, f, 0, 0)
+        projMatrix.columns.2 = SIMD4(0, 0, -1.002, -1)
+        projMatrix.columns.3 = SIMD4(0, 0, -0.2, 0)
+
+        return CameraParams(
+            viewMatrix: matrix_identity_float4x4,
+            projectionMatrix: projMatrix,
+            position: SIMD3<Float>(0, 0, 0),
+            focalX: Float(width) * f / (2 * aspect),
+            focalY: Float(height) * f / 2
+        )
+    }
+
+    func measureRenderer(
+        _ renderer: GaussianRenderer,
+        input: GaussianInput,
+        camera: CameraParams,
+        config: PerfConfig,
+        label: String
+    ) -> PerfResult? {
+        guard let queue = renderer.device.makeCommandQueue() else { return nil }
+
+        // Warmup
+        for _ in 0..<config.warmupFrames {
+            guard let cb = queue.makeCommandBuffer() else { continue }
+            _ = renderer.render(
+                toTexture: cb, input: input, camera: camera,
+                width: config.width, height: config.height,
+                whiteBackground: false, mortonSorted: false
+            )
+            cb.commit()
+            cb.waitUntilCompleted()
+        }
+
+        // Measure
+        var times: [Double] = []
+        for i in 0..<config.measureFrames {
+            guard let cb = queue.makeCommandBuffer() else { continue }
+            let start = CFAbsoluteTimeGetCurrent()
+            _ = renderer.render(
+                toTexture: cb, input: input, camera: camera,
+                width: config.width, height: config.height,
+                whiteBackground: false, mortonSorted: false
+            )
+            cb.commit()
+            cb.waitUntilCompleted()
+            let elapsed = (CFAbsoluteTimeGetCurrent() - start) * 1000.0
+            times.append(elapsed)
+            if config.verbose {
+                print("  \(label) run \(i + 1): \(String(format: "%.2f", elapsed))ms")
+            }
+        }
+
+        return PerfResult(times: times)
+    }
+
+    func runPerfComparison(config: PerfConfig, label: String) throws -> (global: PerfResult, local: PerfResult)? {
+        let (positions, scales, rotations, opacities, colors) = generateGaussians(count: config.count, seed: 42)
+        let camera = createCameraParams(width: config.width, height: config.height)
+
+        // GlobalSort
+        let globalRenderer = GlobalSortRenderer(
+            precision: config.precision,
+            textureOnly: true,
+            limits: RendererLimits(maxGaussians: config.count + 1000, maxWidth: config.width, maxHeight: config.height)
+        )
+
+        guard let globalBuffers = createPackedBuffers(
+            device: globalRenderer.device, positions: positions, scales: scales,
+            rotations: rotations, opacities: opacities, colors: colors
+        ) else { return nil }
+
+        let globalInput = GaussianInput(
+            gaussians: globalBuffers.packedGaussians,
+            harmonics: globalBuffers.harmonics,
+            gaussianCount: config.count,
+            shComponents: 0
+        )
+
+        guard let globalResult = measureRenderer(globalRenderer, input: globalInput, camera: camera, config: config, label: "GlobalSort") else {
+            return nil
+        }
+
+        // Local
+        let localConfig = RendererConfig(
+            maxGaussians: config.count + 1000, maxWidth: config.width, maxHeight: config.height, precision: config.precision
+        )
+        let localRenderer = try LocalRenderer(config: localConfig)
+
+        guard let localBuffers = createPackedBuffers(
+            device: localRenderer.device, positions: positions, scales: scales,
+            rotations: rotations, opacities: opacities, colors: colors
+        ) else { return nil }
+
+        let localInput = GaussianInput(
+            gaussians: localBuffers.packedGaussians,
+            harmonics: localBuffers.harmonics,
+            gaussianCount: config.count,
+            shComponents: 0
+        )
+
+        guard let localResult = measureRenderer(localRenderer, input: localInput, camera: camera, config: config, label: "Local") else {
+            return nil
+        }
+
+        return (globalResult, localResult)
+    }
+
+    func printComparisonResult(label: String, global: PerfResult, local: PerfResult, showMinMax: Bool = true) {
+        let faster = global.avg < local.avg ? "GlobalSort" : "Local"
+        let speedup = global.avg < local.avg ? local.avg / global.avg : global.avg / local.avg
+
+        print("[\(label)]")
+        if showMinMax {
+            print("  GlobalSort: \(String(format: "%.2f", global.avg))ms avg (min: \(String(format: "%.2f", global.min)), max: \(String(format: "%.2f", global.max)))")
+            print("  Local:      \(String(format: "%.2f", local.avg))ms avg (min: \(String(format: "%.2f", local.min)), max: \(String(format: "%.2f", local.max)))")
+        } else {
+            print("  GlobalSort: \(String(format: "%.2f", global.avg))ms (\(String(format: "%.1f", global.fps)) FPS)")
+            print("  Local:      \(String(format: "%.2f", local.avg))ms (\(String(format: "%.1f", local.fps)) FPS)")
+        }
+        print("  Winner:     \(faster) (\(String(format: "%.2f", speedup))x faster)\n")
+    }
+
+    // MARK: - Performance Tests
+
+    /// End-to-end performance comparison between GlobalSort and Local renderers
+    func testPerformanceComparison() throws {
+        let testCases: [(count: Int, name: String)] = [
+            (10_000, "10K"),
+            (50_000, "50K"),
+            (100_000, "100K")
+        ]
+
+        print("\n=== Renderer Performance Comparison ===")
+        print("Resolution: 512x512")
+        print("API: render(toTexture:...) for both renderers")
+        print("Warmup: 3 frames, Measured: 10 frames each\n")
+
+        for testCase in testCases {
+            let config = PerfConfig(count: testCase.count)
+            guard let (global, local) = try runPerfComparison(config: config, label: testCase.name) else {
+                XCTFail("Failed to run comparison for \(testCase.name)")
+                return
+            }
+            printComparisonResult(label: "\(testCase.name) Gaussians", global: global, local: local)
+        }
+
+        print("========================================\n")
+    }
+
+    /// Focused performance test for 2M gaussians (larger scale)
+    func testPerformance2M() throws {
+        let config = PerfConfig(
+            width: 1024, height: 1024, count: 2_000_000,
+            precision: .float16, warmupFrames: 2, measureFrames: 5, verbose: true
+        )
+
+        print("\n=== 2M Gaussian Performance Test ===")
+        print("Resolution: \(config.width)x\(config.height), Count: \(config.count)")
+        print("API: render(toTexture:...) for both renderers\n")
+
+        guard let (global, local) = try runPerfComparison(config: config, label: "2M") else {
+            XCTFail("Failed to run 2M comparison")
+            return
+        }
+
+        printComparisonResult(label: "2M Gaussians", global: global, local: local, showMinMax: false)
+        print("=====================================\n")
+    }
+
+    /// Compare performance at 100K with detailed per-run output
+    func testComparePerformanceWithLocalSort() throws {
+        let config = PerfConfig(count: 100_000, verbose: true)
+
+        print("\n=== Renderer Performance (100K) ===")
+
+        guard let (global, local) = try runPerfComparison(config: config, label: "100K") else {
+            XCTFail("Failed to run 100K comparison")
+            return
+        }
+
+        print("")
+        printComparisonResult(label: "100K Gaussians", global: global, local: local)
+        print("=====================================\n")
+    }
 }

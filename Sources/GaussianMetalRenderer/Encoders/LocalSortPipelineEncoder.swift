@@ -1,51 +1,61 @@
 import Metal
 
-/// Local sort pipeline encoder
-/// Uses dedicated LocalSortShaders.metallib for clean, optimized implementation
-/// Pipeline: Clear → Project+Compact+Count → PrefixScan → Scatter → PerTileSort → Render
+/// Local sort pipeline encoder - Memory-efficient deterministic Gaussian splatting
+/// Uses two-pass projection: Visibility → PrefixSum → ProjectScatter
+/// Pipeline: Clear → ProjectVisibility → PrefixScan → ProjectScatter → TilePrefixScan → Scatter → Sort → Render
 public final class LocalSortPipelineEncoder {
-    // Device and library for creating function constant variants
+    // Device and library
     private let device: MTLDevice
     private let localSortLibrary: MTLLibrary
 
     /// Public access to the Metal library for shared encoders (e.g., ClusterCullEncoder)
     public var library: MTLLibrary { localSortLibrary }
 
-    // Pipeline states from LocalSortShaders.metallib
+    // Core pipelines
     private let clearPipeline: MTLComputePipelineState
-    private let projectCompactCountPipeline: MTLComputePipelineState
-    private let projectCompactCountHalfPipeline: MTLComputePipelineState?
+    private let writeVisibleCountPipeline: MTLComputePipelineState
 
-    // SH degree-specific pipelines (function constants for unrolled loops)
-    // Key: (SH degree, USE_CLUSTER_CULL) - 8 variants per precision
-    private var projectFloatPipelines: [UInt64: MTLComputePipelineState] = [:]  // Float world
-    private var projectHalfPipelines: [UInt64: MTLComputePipelineState] = [:]   // Half world
+    // Efficient projection pipelines (temp buffer approach - single projection pass)
+    // Key: (SH degree, USE_CLUSTER_CULL)
+    private var projectStoreFloatPipelines: [UInt64: MTLComputePipelineState] = [:]
+    private var projectStoreHalfPipelines: [UInt64: MTLComputePipelineState] = [:]
+    private let compactCountPipeline: MTLComputePipelineState
+    private let prepareCompactDispatchPipeline: MTLComputePipelineState
 
-    /// Create pipeline key from SH degree and cluster cull flag
-    private static func pipelineKey(shDegree: UInt32, useClusterCull: Bool) -> UInt64 {
-        return UInt64(shDegree) | (useClusterCull ? 0x100 : 0)
-    }
+    // Hierarchical prefix sum pipelines
+    private let blockReducePipeline: MTLComputePipelineState
+    private let singleBlockScanPipeline: MTLComputePipelineState
+    private let blockScanPipeline: MTLComputePipelineState
+
+    // Tile prefix scan pipelines
     private let prefixScanPipeline: MTLComputePipelineState
     private let scanPartialSumsPipeline: MTLComputePipelineState
     private let finalizeScanPipeline: MTLComputePipelineState
     private let finalizeScanAndZeroPipeline: MTLComputePipelineState
+
+    // Scatter and sort pipelines
     private let prepareScatterDispatchPipeline: MTLComputePipelineState
     private let scatterPipeline: MTLComputePipelineState
     private let perTileSortPipeline: MTLComputePipelineState
     private let renderPipeline: MTLComputePipelineState
     private let zeroPipeline: MTLComputePipelineState
 
-    // 16-bit sort experimental pipelines (optional - for reduced threadgroup memory)
+    // 16-bit sort experimental pipelines (optional)
     private let scatter16Pipeline: MTLComputePipelineState?
     private let sort16Pipeline: MTLComputePipelineState?
     private let render16Pipeline: MTLComputePipelineState?
 
-    // Texture-cached render (optional - for TLB optimization)
+    // Texture-cached render (optional)
     private let packRenderTexturePipeline: MTLComputePipelineState?
     private let renderTexturedPipeline: MTLComputePipelineState?
 
     private let prefixBlockSize = 256
     private let prefixGrainSize = 4
+
+    /// Create pipeline key from SH degree and cluster cull flag
+    private static func pipelineKey(shDegree: UInt32, useClusterCull: Bool) -> UInt64 {
+        return UInt64(shDegree) | (useClusterCull ? 0x100 : 0)
+    }
 
     /// Map shComponents count to SH degree (0-3)
     private static func shDegree(from shComponents: UInt32) -> UInt32 {
@@ -67,16 +77,17 @@ public final class LocalSortPipelineEncoder {
         }
         self.localSortLibrary = library
 
-        // Load all kernel functions
-        // Default function constant values (degree 3 = 16 SH coeffs, no cluster cull)
+        // Default function constants
         let defaultConstants = MTLFunctionConstantValues()
         var defaultDegree: UInt32 = 3
         var defaultCull: Bool = false
-        defaultConstants.setConstantValue(&defaultDegree, type: .uint, index: 0)  // SH_DEGREE
-        defaultConstants.setConstantValue(&defaultCull, type: .bool, index: 1)    // USE_CLUSTER_CULL
+        defaultConstants.setConstantValue(&defaultDegree, type: .uint, index: 0)
+        defaultConstants.setConstantValue(&defaultCull, type: .bool, index: 1)
 
+        // Load core kernels
         guard let clearFn = library.makeFunction(name: "localSortClear"),
-              let projectFn = try? library.makeFunction(name: "localSortProjectCompactCountFloat", constantValues: defaultConstants),
+              let writeVisibleCountFn = library.makeFunction(name: "localSortWriteVisibleCount"),
+              let compactCountFn = library.makeFunction(name: "localSortCompactCount"),
               let prefixFn = library.makeFunction(name: "localSortPrefixScan"),
               let partialFn = library.makeFunction(name: "localSortScanPartialSums"),
               let finalizeFn = library.makeFunction(name: "localSortFinalizeScan"),
@@ -84,52 +95,63 @@ public final class LocalSortPipelineEncoder {
               let prepareDispatchFn = library.makeFunction(name: "localSortPrepareScatterDispatch"),
               let scatterFn = library.makeFunction(name: "localSortScatterSimd"),
               let sortFn = library.makeFunction(name: "localSortPerTileSort"),
-              let renderFn = library.makeFunction(name: "localSortRender") else {
+              let renderFn = library.makeFunction(name: "localSortRender"),
+              let zeroFn = library.makeFunction(name: "tileBinningZeroCountsKernel") else {
             fatalError("Missing required kernel functions in LocalSortShaders")
         }
 
         self.clearPipeline = try device.makeComputePipelineState(function: clearFn)
-        self.projectCompactCountPipeline = try device.makeComputePipelineState(function: projectFn)
+        self.writeVisibleCountPipeline = try device.makeComputePipelineState(function: writeVisibleCountFn)
+        self.compactCountPipeline = try device.makeComputePipelineState(function: compactCountFn)
         self.prefixScanPipeline = try device.makeComputePipelineState(function: prefixFn)
         self.scanPartialSumsPipeline = try device.makeComputePipelineState(function: partialFn)
         self.finalizeScanPipeline = try device.makeComputePipelineState(function: finalizeFn)
         self.finalizeScanAndZeroPipeline = try device.makeComputePipelineState(function: finalizeAndZeroFn)
         self.prepareScatterDispatchPipeline = try device.makeComputePipelineState(function: prepareDispatchFn)
+        self.prepareCompactDispatchPipeline = try device.makeComputePipelineState(function: prepareDispatchFn)  // Reuse same kernel with different args
         self.scatterPipeline = try device.makeComputePipelineState(function: scatterFn)
         self.perTileSortPipeline = try device.makeComputePipelineState(function: sortFn)
         self.renderPipeline = try device.makeComputePipelineState(function: renderFn)
+        self.zeroPipeline = try device.makeComputePipelineState(function: zeroFn)
 
-        // Half precision project kernel (half world + half harmonics for bandwidth)
-        if let projectHalfFn = try? library.makeFunction(name: "localSortProjectCompactCountHalfHalfSh", constantValues: defaultConstants) {
-            self.projectCompactCountHalfPipeline = try? device.makeComputePipelineState(function: projectHalfFn)
-        } else {
-            self.projectCompactCountHalfPipeline = nil
-        }
-
-        // Create all pipeline variants: SH degree (0-3) x cluster cull (true/false) x precision (float/half)
+        // Create projection+store pipeline variants: SH degree (0-3) x cluster cull (true/false)
         for degree: UInt32 in 0...3 {
             for useClusterCull in [false, true] {
                 let constantValues = MTLFunctionConstantValues()
                 var shDegree = degree
                 var cullEnabled = useClusterCull
-                constantValues.setConstantValue(&shDegree, type: .uint, index: 0)      // SH_DEGREE
-                constantValues.setConstantValue(&cullEnabled, type: .bool, index: 1)   // USE_CLUSTER_CULL
+                constantValues.setConstantValue(&shDegree, type: .uint, index: 0)
+                constantValues.setConstantValue(&cullEnabled, type: .bool, index: 1)
 
                 let key = Self.pipelineKey(shDegree: degree, useClusterCull: useClusterCull)
 
-                // Float world pipeline
-                if let fn = try? library.makeFunction(name: "localSortProjectCompactCountFloat", constantValues: constantValues) {
-                    self.projectFloatPipelines[key] = try? device.makeComputePipelineState(function: fn)
+                // ProjectStore - Float world, Float harmonics
+                if let fn = try? library.makeFunction(name: "localSortProjectStoreFloat", constantValues: constantValues) {
+                    self.projectStoreFloatPipelines[key] = try? device.makeComputePipelineState(function: fn)
                 }
 
-                // Half world pipeline
-                if let fn = try? library.makeFunction(name: "localSortProjectCompactCountHalfHalfSh", constantValues: constantValues) {
-                    self.projectHalfPipelines[key] = try? device.makeComputePipelineState(function: fn)
+                // ProjectStore - Half world, Half harmonics
+                if let fn = try? library.makeFunction(name: "localSortProjectStoreHalfHalfSh", constantValues: constantValues) {
+                    self.projectStoreHalfPipelines[key] = try? device.makeComputePipelineState(function: fn)
                 }
             }
         }
 
-        // Texture-cached render pipelines (optional, for TLB optimization)
+        // Load hierarchical prefix sum pipelines from main library
+        guard let mainLibraryURL = Bundle.module.url(forResource: "GaussianMetalRenderer", withExtension: "metallib"),
+              let mainLibrary = try? device.makeLibrary(URL: mainLibraryURL) else {
+            fatalError("Failed to load GaussianMetalRenderer.metallib")
+        }
+        guard let reduceFn = mainLibrary.makeFunction(name: "blockReduceKernel"),
+              let singleScanFn = mainLibrary.makeFunction(name: "singleBlockScanKernel"),
+              let blockScanFn = mainLibrary.makeFunction(name: "blockScanKernel") else {
+            fatalError("Missing hierarchical prefix sum kernels in GaussianMetalRenderer")
+        }
+        self.blockReducePipeline = try device.makeComputePipelineState(function: reduceFn)
+        self.singleBlockScanPipeline = try device.makeComputePipelineState(function: singleScanFn)
+        self.blockScanPipeline = try device.makeComputePipelineState(function: blockScanFn)
+
+        // Optional: Texture-cached render pipelines
         if let packFn = library.makeFunction(name: "localSortPackRenderTexture"),
            let renderTexFn = library.makeFunction(name: "localSortRenderTextured") {
             self.packRenderTexturePipeline = try? device.makeComputePipelineState(function: packFn)
@@ -139,7 +161,7 @@ public final class LocalSortPipelineEncoder {
             self.renderTexturedPipeline = nil
         }
 
-        // 16-bit sort experimental pipelines (optional - 50% less threadgroup memory)
+        // Optional: 16-bit sort pipelines
         if let scatter16Fn = library.makeFunction(name: "localSortScatterSimd16"),
            let sort16Fn = library.makeFunction(name: "localSortPerTileSort16"),
            let render16Fn = library.makeFunction(name: "localSortRender16") {
@@ -151,20 +173,16 @@ public final class LocalSortPipelineEncoder {
             self.sort16Pipeline = nil
             self.render16Pipeline = nil
         }
-
-        // Zero kernel - from local sort library
-        guard let zeroFn = library.makeFunction(name: "tileBinningZeroCountsKernel") else {
-            fatalError("Missing tileBinningZeroCountsKernel in LocalSortShaders")
-        }
-        self.zeroPipeline = try device.makeComputePipelineState(function: zeroFn)
     }
 
-    /// Legacy init for backwards compatibility with existing tests
+    /// Legacy init for backwards compatibility
     public convenience init(device: MTLDevice, library: MTLLibrary) throws {
         try self.init(device: device)
     }
 
-    /// Encode the full Local sort pipeline (steps 1-5: Clear → Project → Scan → Scatter → Sort)
+    /// Encode the full Local sort pipeline
+    /// Efficient temp buffer approach: ProjectStore → PrefixSum → CompactCount → Scatter → Sort
+    /// Temp buffer can alias with other buffers not used during projection
     public func encode(
         commandBuffer: MTLCommandBuffer,
         // Input
@@ -179,28 +197,30 @@ public final class LocalSortPipelineEncoder {
         tileHeight: Int,
         surfaceWidth: Int,
         surfaceHeight: Int,
-        // Output buffers (caller provides)
+        // Output buffers
         compactedGaussians: MTLBuffer,
         compactedHeader: MTLBuffer,
         tileCounts: MTLBuffer,
         tileOffsets: MTLBuffer,
         partialSums: MTLBuffer,
-        sortKeys: MTLBuffer?,           // Only needed for 32-bit sort mode
+        sortKeys: MTLBuffer?,
         sortIndices: MTLBuffer,
         maxCompacted: Int,
         maxAssignments: Int,
-        // Optional
+        // Temp buffer for single-pass projection (can alias with sortKeys/sortIndices)
+        tempProjectionBuffer: MTLBuffer,   // [gaussianCount] CompactedGaussian
+        // Visibility prefix sum buffers
+        visibilityMarks: MTLBuffer,        // [gaussianCount + 1] for prefix sum
+        visibilityPartialSums: MTLBuffer,  // For hierarchical scan
+        // Options
         useHalfWorld: Bool = false,
         skipSort: Bool = false,
-        // For 32-bit sort
         tempSortKeys: MTLBuffer? = nil,
         tempSortIndices: MTLBuffer? = nil,
-        // Skip-based cluster culling (no compaction)
         clusterVisibility: MTLBuffer? = nil,
         clusterSize: UInt32 = 1024,
-        // 16-bit sort (experimental)
         use16BitSort: Bool = false,
-        depthKeys16: MTLBuffer? = nil   // Required when use16BitSort=true (ushort buffer)
+        depthKeys16: MTLBuffer? = nil
     ) {
         let tileCount = tilesX * tilesY
         let elementsPerGroup = prefixBlockSize * prefixGrainSize
@@ -221,7 +241,12 @@ public final class LocalSortPipelineEncoder {
         var maxCompactedU = UInt32(maxCompacted)
         var tilesXU = UInt32(tilesX)
         var maxAssignmentsU = UInt32(maxAssignments)
+        var gaussianCountU = UInt32(gaussianCount)
         var cameraUniforms = camera
+
+        let shDegree = Self.shDegree(from: camera.shComponents)
+        let useClusterCull = clusterVisibility != nil
+        let key = Self.pipelineKey(shDegree: shDegree, useClusterCull: useClusterCull)
 
         // === 1. CLEAR ===
         if let encoder = commandBuffer.makeComputeCommandEncoder() {
@@ -229,49 +254,147 @@ public final class LocalSortPipelineEncoder {
             encoder.setComputePipelineState(clearPipeline)
             encoder.setBuffer(tileCounts, offset: 0, index: 0)
             encoder.setBuffer(compactedHeader, offset: 0, index: 1)
-            encoder.setBytes(&tileCountU, length: MemoryLayout<UInt32>.stride, index: 2)
-            encoder.setBytes(&maxCompactedU, length: MemoryLayout<UInt32>.stride, index: 3)
-
+            encoder.setBytes(&tileCountU, length: 4, index: 2)
+            encoder.setBytes(&maxCompactedU, length: 4, index: 3)
             let threads = MTLSize(width: max(tileCount, 1), height: 1, depth: 1)
             let tg = MTLSize(width: clearPipeline.threadExecutionWidth, height: 1, depth: 1)
             encoder.dispatchThreads(threads, threadsPerThreadgroup: tg)
             encoder.endEncoding()
         }
 
-        // === 2. PROJECT + COMPACT + COUNT ===
+        // === 2a. PROJECT + STORE (single pass - stores full data to temp buffer) ===
+        // Projects all gaussians, writes full CompactedGaussian to tempBuffer[gid], marks visibility
         if let encoder = commandBuffer.makeComputeCommandEncoder() {
-            encoder.label = clusterVisibility != nil ? "LocalSort_ProjectCompactCount_Cull" : "LocalSort_ProjectCompactCount"
-
-            // Select pipeline - unified kernel with function constants for SH degree and cluster cull
-            let shDegree = Self.shDegree(from: camera.shComponents)
-            let useClusterCull = clusterVisibility != nil
-            let key = Self.pipelineKey(shDegree: shDegree, useClusterCull: useClusterCull)
-
-            let pipeline: MTLComputePipelineState
-            if useHalfWorld {
-                pipeline = projectHalfPipelines[key] ?? projectCompactCountHalfPipeline ?? projectCompactCountPipeline
-            } else {
-                pipeline = projectFloatPipelines[key] ?? projectCompactCountPipeline
-            }
+            encoder.label = "LocalSort_ProjectStore"
+            let pipeline = useHalfWorld
+                ? projectStoreHalfPipelines[key]!
+                : projectStoreFloatPipelines[key]!
             encoder.setComputePipelineState(pipeline)
-
             encoder.setBuffer(worldGaussians, offset: 0, index: 0)
             encoder.setBuffer(harmonics, offset: 0, index: 1)
-            encoder.setBuffer(compactedGaussians, offset: 0, index: 2)
-            encoder.setBuffer(compactedHeader, offset: 0, index: 3)
-            encoder.setBuffer(tileCounts, offset: 0, index: 4)
-            encoder.setBytes(&cameraUniforms, length: MemoryLayout<CameraUniformsSwift>.stride, index: 5)
-            encoder.setBytes(&params, length: MemoryLayout<TileBinningParams>.stride, index: 6)
+            encoder.setBuffer(tempProjectionBuffer, offset: 0, index: 2)
+            encoder.setBuffer(visibilityMarks, offset: 0, index: 3)
+            encoder.setBytes(&cameraUniforms, length: MemoryLayout<CameraUniformsSwift>.stride, index: 4)
+            encoder.setBytes(&params, length: MemoryLayout<TileBinningParams>.stride, index: 5)
+            if let clusterVis = clusterVisibility {
+                encoder.setBuffer(clusterVis, offset: 0, index: 6)
+                var cs = clusterSize
+                encoder.setBytes(&cs, length: 4, index: 7)
+            }
+            let threads = MTLSize(width: gaussianCount, height: 1, depth: 1)
+            let tg = MTLSize(width: pipeline.threadExecutionWidth, height: 1, depth: 1)
+            encoder.dispatchThreads(threads, threadsPerThreadgroup: tg)
+            encoder.endEncoding()
+        }
 
-            // Add cluster visibility buffer for skip-based culling
-            if let visibilityBuffer = clusterVisibility {
-                encoder.setBuffer(visibilityBuffer, offset: 0, index: 7)
-                var clusterSizeVar = clusterSize
-                encoder.setBytes(&clusterSizeVar, length: MemoryLayout<UInt32>.stride, index: 8)
+        // === 2b. HIERARCHICAL PREFIX SUM ON VISIBILITY ===
+        let visScanCount = gaussianCount + 1
+        let visBlocks = (visScanCount + prefixBlockSize - 1) / prefixBlockSize
+        var visScanCountU = UInt32(visScanCount)
+        var visBlocksU = UInt32(visBlocks)
+
+        // Block reduce
+        if let encoder = commandBuffer.makeComputeCommandEncoder() {
+            encoder.label = "LocalSort_VisBlockReduce"
+            encoder.setComputePipelineState(blockReducePipeline)
+            encoder.setBuffer(visibilityMarks, offset: 0, index: 0)
+            encoder.setBuffer(visibilityPartialSums, offset: 0, index: 1)
+            encoder.setBytes(&visScanCountU, length: 4, index: 2)
+            let threads = MTLSize(width: visBlocks * prefixBlockSize, height: 1, depth: 1)
+            let tg = MTLSize(width: prefixBlockSize, height: 1, depth: 1)
+            encoder.dispatchThreads(threads, threadsPerThreadgroup: tg)
+            encoder.endEncoding()
+        }
+
+        // Scan block sums
+        if visBlocks <= prefixBlockSize {
+            if let encoder = commandBuffer.makeComputeCommandEncoder() {
+                encoder.label = "LocalSort_VisScanBlockSums"
+                encoder.setComputePipelineState(singleBlockScanPipeline)
+                encoder.setBuffer(visibilityPartialSums, offset: 0, index: 0)
+                encoder.setBytes(&visBlocksU, length: 4, index: 1)
+                encoder.dispatchThreadgroups(MTLSize(width: 1, height: 1, depth: 1),
+                                             threadsPerThreadgroup: MTLSize(width: prefixBlockSize, height: 1, depth: 1))
+                encoder.endEncoding()
+            }
+        } else {
+            // Two-level hierarchical scan
+            let level2Blocks = (visBlocks + prefixBlockSize - 1) / prefixBlockSize
+            let level2Offset = (visBlocks + 1) * 4
+            var level2BlocksU = UInt32(level2Blocks)
+
+            if let encoder = commandBuffer.makeComputeCommandEncoder() {
+                encoder.label = "LocalSort_VisLevel2Reduce"
+                encoder.setComputePipelineState(blockReducePipeline)
+                encoder.setBuffer(visibilityPartialSums, offset: 0, index: 0)
+                encoder.setBuffer(visibilityPartialSums, offset: level2Offset, index: 1)
+                encoder.setBytes(&visBlocksU, length: 4, index: 2)
+                let threads = MTLSize(width: level2Blocks * prefixBlockSize, height: 1, depth: 1)
+                encoder.dispatchThreads(threads, threadsPerThreadgroup: MTLSize(width: prefixBlockSize, height: 1, depth: 1))
+                encoder.endEncoding()
             }
 
-            let tg = MTLSize(width: pipeline.threadExecutionWidth, height: 1, depth: 1)
+            if let encoder = commandBuffer.makeComputeCommandEncoder() {
+                encoder.label = "LocalSort_VisLevel2Scan"
+                encoder.setComputePipelineState(singleBlockScanPipeline)
+                encoder.setBuffer(visibilityPartialSums, offset: level2Offset, index: 0)
+                encoder.setBytes(&level2BlocksU, length: 4, index: 1)
+                encoder.dispatchThreadgroups(MTLSize(width: 1, height: 1, depth: 1),
+                                             threadsPerThreadgroup: MTLSize(width: prefixBlockSize, height: 1, depth: 1))
+                encoder.endEncoding()
+            }
+
+            if let encoder = commandBuffer.makeComputeCommandEncoder() {
+                encoder.label = "LocalSort_VisLevel1Scan"
+                encoder.setComputePipelineState(blockScanPipeline)
+                encoder.setBuffer(visibilityPartialSums, offset: 0, index: 0)
+                encoder.setBuffer(visibilityPartialSums, offset: 0, index: 1)
+                encoder.setBuffer(visibilityPartialSums, offset: level2Offset, index: 2)
+                encoder.setBytes(&visBlocksU, length: 4, index: 3)
+                let threads = MTLSize(width: level2Blocks * prefixBlockSize, height: 1, depth: 1)
+                encoder.dispatchThreads(threads, threadsPerThreadgroup: MTLSize(width: prefixBlockSize, height: 1, depth: 1))
+                encoder.endEncoding()
+            }
+        }
+
+        // Final scan - apply block offsets
+        if let encoder = commandBuffer.makeComputeCommandEncoder() {
+            encoder.label = "LocalSort_VisFinalScan"
+            encoder.setComputePipelineState(blockScanPipeline)
+            encoder.setBuffer(visibilityMarks, offset: 0, index: 0)
+            encoder.setBuffer(visibilityMarks, offset: 0, index: 1)
+            encoder.setBuffer(visibilityPartialSums, offset: 0, index: 2)
+            encoder.setBytes(&visScanCountU, length: 4, index: 3)
+            let threads = MTLSize(width: visBlocks * prefixBlockSize, height: 1, depth: 1)
+            encoder.dispatchThreads(threads, threadsPerThreadgroup: MTLSize(width: prefixBlockSize, height: 1, depth: 1))
+            encoder.endEncoding()
+        }
+
+        // === 2c. WRITE VISIBLE COUNT TO HEADER ===
+        if let encoder = commandBuffer.makeComputeCommandEncoder() {
+            encoder.label = "LocalSort_WriteVisibleCount"
+            encoder.setComputePipelineState(writeVisibleCountPipeline)
+            encoder.setBuffer(visibilityMarks, offset: 0, index: 0)
+            encoder.setBuffer(compactedHeader, offset: 0, index: 1)
+            encoder.setBytes(&gaussianCountU, length: 4, index: 2)
+            encoder.dispatchThreads(MTLSize(width: 1, height: 1, depth: 1),
+                                    threadsPerThreadgroup: MTLSize(width: 1, height: 1, depth: 1))
+            encoder.endEncoding()
+        }
+
+        // === 2d. COMPACT + COUNT (copies visible from temp to compacted, counts tiles) ===
+        // Uses prefix sum offsets for deterministic output ordering
+        if let encoder = commandBuffer.makeComputeCommandEncoder() {
+            encoder.label = "LocalSort_CompactCount"
+            encoder.setComputePipelineState(compactCountPipeline)
+            encoder.setBuffer(tempProjectionBuffer, offset: 0, index: 0)
+            encoder.setBuffer(visibilityMarks, offset: 0, index: 1)  // Prefix sum offsets
+            encoder.setBuffer(compactedGaussians, offset: 0, index: 2)
+            encoder.setBuffer(tileCounts, offset: 0, index: 3)
+            encoder.setBytes(&gaussianCountU, length: 4, index: 4)
+            encoder.setBytes(&tilesXU, length: 4, index: 5)
             let threads = MTLSize(width: gaussianCount, height: 1, depth: 1)
+            let tg = MTLSize(width: compactCountPipeline.threadExecutionWidth, height: 1, depth: 1)
             encoder.dispatchThreads(threads, threadsPerThreadgroup: tg)
             encoder.endEncoding()
         }
@@ -579,90 +702,6 @@ public final class LocalSortPipelineEncoder {
             blitEncoder.label = "LocalSort_ClearHeader"
             blitEncoder.fill(buffer: header, range: 0..<MemoryLayout<CompactedHeaderSwift>.stride, value: 0)
             blitEncoder.endEncoding()
-        }
-    }
-
-    // MARK: - Project + Compact Only
-
-    /// Encode just project + compact (for temporal mode which skips prefix scan)
-    public func encodeProjectCompact(
-        commandBuffer: MTLCommandBuffer,
-        worldGaussians: MTLBuffer,
-        harmonics: MTLBuffer,
-        camera: CameraUniformsSwift,
-        gaussianCount: Int,
-        tilesX: Int,
-        tilesY: Int,
-        tileWidth: Int,
-        tileHeight: Int,
-        surfaceWidth: Int,
-        surfaceHeight: Int,
-        compactedGaussians: MTLBuffer,
-        compactedHeader: MTLBuffer,
-        tileCounts: MTLBuffer,
-        maxCompacted: Int,
-        useHalfWorld: Bool = false
-    ) {
-        let tileCount = tilesX * tilesY
-
-        var params = TileBinningParams(
-            gaussianCount: UInt32(gaussianCount),
-            tilesX: UInt32(tilesX),
-            tilesY: UInt32(tilesY),
-            tileWidth: UInt32(tileWidth),
-            tileHeight: UInt32(tileHeight),
-            surfaceWidth: UInt32(surfaceWidth),
-            surfaceHeight: UInt32(surfaceHeight),
-            maxCapacity: UInt32(maxCompacted)
-        )
-
-        var tileCountU = UInt32(tileCount)
-        var maxCompactedU = UInt32(maxCompacted)
-        var cameraUniforms = camera
-
-        // === 1. CLEAR ===
-        if let encoder = commandBuffer.makeComputeCommandEncoder() {
-            encoder.label = "LocalSort_Clear"
-            encoder.setComputePipelineState(clearPipeline)
-            encoder.setBuffer(tileCounts, offset: 0, index: 0)
-            encoder.setBuffer(compactedHeader, offset: 0, index: 1)
-            encoder.setBytes(&tileCountU, length: MemoryLayout<UInt32>.stride, index: 2)
-            encoder.setBytes(&maxCompactedU, length: MemoryLayout<UInt32>.stride, index: 3)
-
-            let threads = MTLSize(width: max(tileCount, 1), height: 1, depth: 1)
-            let tg = MTLSize(width: clearPipeline.threadExecutionWidth, height: 1, depth: 1)
-            encoder.dispatchThreads(threads, threadsPerThreadgroup: tg)
-            encoder.endEncoding()
-        }
-
-        // === 2. PROJECT + COMPACT + COUNT ===
-        if let encoder = commandBuffer.makeComputeCommandEncoder() {
-            encoder.label = "LocalSort_ProjectCompactCount"
-
-            // Select pipeline with SH function constant (no cluster cull in this method)
-            let shDegree = Self.shDegree(from: camera.shComponents)
-            let key = Self.pipelineKey(shDegree: shDegree, useClusterCull: false)
-
-            let pipeline: MTLComputePipelineState
-            if useHalfWorld {
-                pipeline = projectHalfPipelines[key] ?? projectCompactCountHalfPipeline ?? projectCompactCountPipeline
-            } else {
-                pipeline = projectFloatPipelines[key] ?? projectCompactCountPipeline
-            }
-            encoder.setComputePipelineState(pipeline)
-
-            encoder.setBuffer(worldGaussians, offset: 0, index: 0)
-            encoder.setBuffer(harmonics, offset: 0, index: 1)
-            encoder.setBuffer(compactedGaussians, offset: 0, index: 2)
-            encoder.setBuffer(compactedHeader, offset: 0, index: 3)
-            encoder.setBuffer(tileCounts, offset: 0, index: 4)
-            encoder.setBytes(&cameraUniforms, length: MemoryLayout<CameraUniformsSwift>.stride, index: 5)
-            encoder.setBytes(&params, length: MemoryLayout<TileBinningParams>.stride, index: 6)
-
-            let threads = MTLSize(width: gaussianCount, height: 1, depth: 1)
-            let tg = MTLSize(width: pipeline.threadExecutionWidth, height: 1, depth: 1)
-            encoder.dispatchThreads(threads, threadsPerThreadgroup: tg)
-            encoder.endEncoding()
         }
     }
 

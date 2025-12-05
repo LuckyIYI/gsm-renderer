@@ -3,6 +3,35 @@ import Metal
 import simd
 @testable import GaussianMetalRenderer
 
+/// Helper struct for projection buffers (temp buffer + visibility prefix-sum)
+fileprivate struct ProjBuffersHelper {
+    let tempProjection: MTLBuffer  // [gaussianCount] CompactedGaussian
+    let visibilityMarks: MTLBuffer       // [gaussianCount + 1]
+    let visibilityPartialSums: MTLBuffer // For hierarchical scan
+
+    static func create(device: MTLDevice, gaussianCount: Int) -> ProjBuffersHelper? {
+        let blockSize = 256
+        let visBlocks = (gaussianCount + 1 + blockSize - 1) / blockSize
+        let level2Blocks = (visBlocks + blockSize - 1) / blockSize
+        let totalPartialSums = (visBlocks + 1) + (level2Blocks + 1)
+
+        guard let tempProjection = device.makeBuffer(
+            length: gaussianCount * MemoryLayout<CompactedGaussianSwift>.stride,
+            options: .storageModeShared
+        ),
+        let marks = device.makeBuffer(
+            length: (gaussianCount + 1) * MemoryLayout<UInt32>.stride,
+            options: .storageModeShared
+        ),
+        let partialSums = device.makeBuffer(
+            length: totalPartialSums * MemoryLayout<UInt32>.stride,
+            options: .storageModeShared
+        ) else { return nil }
+
+        return ProjBuffersHelper(tempProjection: tempProjection, visibilityMarks: marks, visibilityPartialSums: partialSums)
+    }
+}
+
 /// Unit tests for each Local kernel in isolation
 final class LocalSortKernelUnitTests: XCTestCase {
     private let tileWidth = 32
@@ -106,6 +135,7 @@ final class LocalSortKernelUnitTests: XCTestCase {
             length: maxCompacted * 16 * MemoryLayout<UInt32>.stride,
             options: .storageModeShared
         )!
+        let projBuffers = ProjBuffersHelper.create(device: device, gaussianCount: gaussianCount)!
 
         encoder.encode(
             commandBuffer: cb,
@@ -128,6 +158,9 @@ final class LocalSortKernelUnitTests: XCTestCase {
             sortIndices: sortIndicesBuffer,
             maxCompacted: maxCompacted,
             maxAssignments: maxCompacted * 16,
+            tempProjectionBuffer: projBuffers.tempProjection,
+            visibilityMarks: projBuffers.visibilityMarks,
+            visibilityPartialSums: projBuffers.visibilityPartialSums,
             skipSort: true  // Skip sort for this test
         )
 
@@ -241,6 +274,7 @@ final class LocalSortKernelUnitTests: XCTestCase {
         let partialSumsBuffer = device.makeBuffer(length: 1024 * MemoryLayout<UInt32>.stride, options: .storageModeShared)!
         let sortKeysBuffer = device.makeBuffer(length: maxAssignments * MemoryLayout<UInt32>.stride, options: .storageModeShared)!
         let sortIndicesBuffer = device.makeBuffer(length: maxAssignments * MemoryLayout<UInt32>.stride, options: .storageModeShared)!
+        let projBuffers2 = ProjBuffersHelper.create(device: device, gaussianCount: gaussianCount)!
 
         let camera = createTestCamera()
 
@@ -270,6 +304,9 @@ final class LocalSortKernelUnitTests: XCTestCase {
             sortIndices: sortIndicesBuffer,
             maxCompacted: maxCompacted,
             maxAssignments: maxAssignments,
+            tempProjectionBuffer: projBuffers2.tempProjection,
+            visibilityMarks: projBuffers2.visibilityMarks,
+            visibilityPartialSums: projBuffers2.visibilityPartialSums,
             skipSort: true
         )
 
@@ -355,6 +392,7 @@ final class LocalSortKernelUnitTests: XCTestCase {
         let sortIndicesBuffer = device.makeBuffer(length: maxAssignments * MemoryLayout<UInt32>.stride, options: .storageModeShared)!
         let tempSortKeys = device.makeBuffer(length: maxAssignments * MemoryLayout<UInt32>.stride, options: .storageModePrivate)!
         let tempSortIndices = device.makeBuffer(length: maxAssignments * MemoryLayout<UInt32>.stride, options: .storageModePrivate)!
+        let projBuffers = ProjBuffersHelper.create(device: device, gaussianCount: gaussianCount)!
 
         // Output textures
         let colorDesc = MTLTextureDescriptor.texture2DDescriptor(pixelFormat: .rgba16Float, width: imageWidth, height: imageHeight, mipmapped: false)
@@ -416,6 +454,9 @@ final class LocalSortKernelUnitTests: XCTestCase {
             sortIndices: sortIndicesBuffer,
             maxCompacted: maxCompacted,
             maxAssignments: maxAssignments,
+            tempProjectionBuffer: projBuffers.tempProjection,
+            visibilityMarks: projBuffers.visibilityMarks,
+            visibilityPartialSums: projBuffers.visibilityPartialSums,
             skipSort: false,
             tempSortKeys: tempSortKeys,
             tempSortIndices: tempSortIndices

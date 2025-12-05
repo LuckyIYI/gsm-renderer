@@ -3,6 +3,38 @@ import Metal
 import simd
 @testable import GaussianMetalRenderer
 
+/// Helper struct for projection buffers (temp buffer + visibility prefix-sum)
+struct ProjectionBuffers {
+    let tempProjection: MTLBuffer  // [gaussianCount] CompactedGaussian
+    let visibilityMarks: MTLBuffer       // [gaussianCount + 1]
+    let visibilityPartialSums: MTLBuffer // For hierarchical scan
+
+    static func create(device: MTLDevice, gaussianCount: Int) -> ProjectionBuffers? {
+        let blockSize = 256
+        let visBlocks = (gaussianCount + 1 + blockSize - 1) / blockSize
+        let level2Blocks = (visBlocks + blockSize - 1) / blockSize
+        let totalPartialSums = (visBlocks + 1) + (level2Blocks + 1)
+
+        guard let tempProjection = device.makeBuffer(
+            length: gaussianCount * MemoryLayout<CompactedGaussianSwift>.stride,
+            options: .storageModeShared
+        ),
+        let marks = device.makeBuffer(
+            length: (gaussianCount + 1) * MemoryLayout<UInt32>.stride,
+            options: .storageModeShared
+        ),
+        let partialSums = device.makeBuffer(
+            length: totalPartialSums * MemoryLayout<UInt32>.stride,
+            options: .storageModeShared
+        ) else { return nil }
+
+        return ProjectionBuffers(tempProjection: tempProjection, visibilityMarks: marks, visibilityPartialSums: partialSums)
+    }
+}
+
+/// Legacy alias for backwards compatibility
+typealias VisibilityBuffers = ProjectionBuffers
+
 /// Tests for the Local-style pipeline (fused project + compact + count + scatter)
 final class LocalSortPipelineTests: XCTestCase {
     private let tileWidth = 32
@@ -64,6 +96,7 @@ final class LocalSortPipelineTests: XCTestCase {
             length: maxAssignments * MemoryLayout<UInt32>.stride,
             options: .storageModeShared
         )!
+        let visBuffers = VisibilityBuffers.create(device: device, gaussianCount: gaussianCount)!
 
         // Populate test data - gaussians in front of camera
         populateTestData(
@@ -101,7 +134,10 @@ final class LocalSortPipelineTests: XCTestCase {
             sortKeys: sortKeysBuffer,
             sortIndices: sortIndicesBuffer,
             maxCompacted: maxCompacted,
-            maxAssignments: maxAssignments
+            maxAssignments: maxAssignments,
+            tempProjectionBuffer: visBuffers.tempProjection,
+            visibilityMarks: visBuffers.visibilityMarks,
+            visibilityPartialSums: visBuffers.visibilityPartialSums
         )
 
         cb.commit()
@@ -201,6 +237,7 @@ final class LocalSortPipelineTests: XCTestCase {
             length: maxAssignments * MemoryLayout<UInt32>.stride,
             options: .storageModePrivate
         )!
+        let projBuffers = ProjectionBuffers.create(device: device, gaussianCount: gaussianCount)!
 
         // Create output textures
         let colorDesc = MTLTextureDescriptor.texture2DDescriptor(
@@ -260,6 +297,9 @@ final class LocalSortPipelineTests: XCTestCase {
             sortIndices: sortIndicesBuffer,
             maxCompacted: maxCompacted,
             maxAssignments: maxAssignments,
+            tempProjectionBuffer: projBuffers.tempProjection,
+            visibilityMarks: projBuffers.visibilityMarks,
+            visibilityPartialSums: projBuffers.visibilityPartialSums,
             useHalfWorld: false,
             skipSort: false,
             tempSortKeys: tempSortKeys,
@@ -413,6 +453,7 @@ final class LocalSortPipelineTests: XCTestCase {
                 length: maxAssignments * MemoryLayout<UInt32>.stride,
                 options: .storageModePrivate
             )!
+            let projBuffers = ProjectionBuffers.create(device: device, gaussianCount: gaussianCount)!
 
             populateTestData(
                 worldBuffer: worldBuffer,
@@ -446,6 +487,9 @@ final class LocalSortPipelineTests: XCTestCase {
                         sortIndices: sortIndicesBuffer,
                         maxCompacted: maxCompacted,
                         maxAssignments: maxAssignments,
+                        tempProjectionBuffer: projBuffers.tempProjection,
+                        visibilityMarks: projBuffers.visibilityMarks,
+                        visibilityPartialSums: projBuffers.visibilityPartialSums,
                         useHalfWorld: false,
                         skipSort: false,
                         tempSortKeys: tempSortKeys,
@@ -497,6 +541,9 @@ final class LocalSortPipelineTests: XCTestCase {
                     sortIndices: sortIndicesBuffer,
                     maxCompacted: maxCompacted,
                     maxAssignments: maxAssignments,
+                    tempProjectionBuffer: projBuffers.tempProjection,
+                    visibilityMarks: projBuffers.visibilityMarks,
+                    visibilityPartialSums: projBuffers.visibilityPartialSums,
                     useHalfWorld: false,
                     skipSort: false,
                     tempSortKeys: tempSortKeys,
@@ -610,6 +657,7 @@ final class LocalSortPipelineTests: XCTestCase {
             length: maxAssignments * MemoryLayout<UInt32>.stride,
             options: .storageModePrivate
         )!
+        let projBuffers = ProjectionBuffers.create(device: device, gaussianCount: gaussianCount)!
 
         let colorDesc = MTLTextureDescriptor.texture2DDescriptor(
             pixelFormat: .rgba16Float,
@@ -658,6 +706,9 @@ final class LocalSortPipelineTests: XCTestCase {
                     sortIndices: sortIndicesBuffer,
                     maxCompacted: maxCompacted,
                     maxAssignments: maxAssignments,
+                    tempProjectionBuffer: projBuffers.tempProjection,
+                    visibilityMarks: projBuffers.visibilityMarks,
+                    visibilityPartialSums: projBuffers.visibilityPartialSums,
                     useHalfWorld: false,
                     skipSort: false,
                     tempSortKeys: tempSortKeys,
@@ -693,6 +744,9 @@ final class LocalSortPipelineTests: XCTestCase {
                 sortIndices: sortIndicesBuffer,
                 maxCompacted: maxCompacted,
                 maxAssignments: maxAssignments,
+                tempProjectionBuffer: projBuffers.tempProjection,
+                visibilityMarks: projBuffers.visibilityMarks,
+                visibilityPartialSums: projBuffers.visibilityPartialSums,
                 useHalfWorld: false,
                 skipSort: true  // No sort
             )
@@ -727,6 +781,9 @@ final class LocalSortPipelineTests: XCTestCase {
                 sortIndices: sortIndicesBuffer,
                 maxCompacted: maxCompacted,
                 maxAssignments: maxAssignments,
+                tempProjectionBuffer: projBuffers.tempProjection,
+                visibilityMarks: projBuffers.visibilityMarks,
+                visibilityPartialSums: projBuffers.visibilityPartialSums,
                 useHalfWorld: false,
                 skipSort: false,
                 tempSortKeys: tempSortKeys,
@@ -865,6 +922,7 @@ final class LocalSortPipelineTests: XCTestCase {
             length: maxAssignments * MemoryLayout<UInt32>.stride,
             options: .storageModePrivate
         )!
+        let projBuffers = ProjectionBuffers.create(device: device, gaussianCount: gaussianCount)!
 
         let colorDesc = MTLTextureDescriptor.texture2DDescriptor(
             pixelFormat: .rgba16Float, width: imageWidth, height: imageHeight, mipmapped: false)
@@ -924,6 +982,9 @@ final class LocalSortPipelineTests: XCTestCase {
                     sortIndices: sortIndicesBuffer,
                     maxCompacted: maxCompacted,
                     maxAssignments: maxAssignments,
+                    tempProjectionBuffer: projBuffers.tempProjection,
+                    visibilityMarks: projBuffers.visibilityMarks,
+                    visibilityPartialSums: projBuffers.visibilityPartialSums,
                     skipSort: false,
                     tempSortKeys: tempSortKeys,
                     tempSortIndices: tempSortIndices
@@ -955,6 +1016,9 @@ final class LocalSortPipelineTests: XCTestCase {
                 sortIndices: sortIndicesBuffer,
                 maxCompacted: maxCompacted,
                 maxAssignments: maxAssignments,
+                tempProjectionBuffer: projBuffers.tempProjection,
+                visibilityMarks: projBuffers.visibilityMarks,
+                visibilityPartialSums: projBuffers.visibilityPartialSums,
                 skipSort: true
             )
             cb.commit()
@@ -985,6 +1049,9 @@ final class LocalSortPipelineTests: XCTestCase {
                 sortIndices: sortIndicesBuffer,
                 maxCompacted: maxCompacted,
                 maxAssignments: maxAssignments,
+                tempProjectionBuffer: projBuffers.tempProjection,
+                visibilityMarks: projBuffers.visibilityMarks,
+                visibilityPartialSums: projBuffers.visibilityPartialSums,
                 skipSort: false,
                 tempSortKeys: tempSortKeys,
                 tempSortIndices: tempSortIndices
@@ -1122,6 +1189,7 @@ final class LocalSortPipelineTests: XCTestCase {
             length: maxAssignments * MemoryLayout<UInt32>.stride,
             options: .storageModePrivate
         )!
+        let projBuffers = ProjectionBuffers.create(device: device, gaussianCount: gaussianCount)!
 
         // Output textures
         let colorDesc = MTLTextureDescriptor.texture2DDescriptor(
@@ -1192,6 +1260,9 @@ final class LocalSortPipelineTests: XCTestCase {
                     sortIndices: sortIndicesBuffer,
                     maxCompacted: maxCompacted,
                     maxAssignments: maxAssignments,
+                    tempProjectionBuffer: projBuffers.tempProjection,
+                    visibilityMarks: projBuffers.visibilityMarks,
+                    visibilityPartialSums: projBuffers.visibilityPartialSums,
                     skipSort: false,
                     tempSortKeys: tempSortKeys,
                     tempSortIndices: tempSortIndices
@@ -1244,6 +1315,9 @@ final class LocalSortPipelineTests: XCTestCase {
                 sortIndices: sortIndicesBuffer,
                 maxCompacted: maxCompacted,
                 maxAssignments: maxAssignments,
+                tempProjectionBuffer: projBuffers.tempProjection,
+                visibilityMarks: projBuffers.visibilityMarks,
+                visibilityPartialSums: projBuffers.visibilityPartialSums,
                 skipSort: false,
                 tempSortKeys: tempSortKeys,
                 tempSortIndices: tempSortIndices
@@ -1360,6 +1434,7 @@ final class LocalSortPipelineTests: XCTestCase {
                 length: maxAssignments * MemoryLayout<UInt32>.stride,
                 options: .storageModePrivate
             )!
+            let projBuffers = ProjectionBuffers.create(device: device, gaussianCount: gaussianCount)!
 
             populateTestData(
                 worldBuffer: worldBuffer,
@@ -1392,7 +1467,10 @@ final class LocalSortPipelineTests: XCTestCase {
                         sortKeys: sortKeysBuffer,
                         sortIndices: sortIndicesBuffer,
                         maxCompacted: maxCompacted,
-                        maxAssignments: maxAssignments
+                        maxAssignments: maxAssignments,
+                        tempProjectionBuffer: projBuffers.tempProjection,
+                        visibilityMarks: projBuffers.visibilityMarks,
+                        visibilityPartialSums: projBuffers.visibilityPartialSums
                     )
                     cb.commit()
                     cb.waitUntilCompleted()
@@ -1423,7 +1501,10 @@ final class LocalSortPipelineTests: XCTestCase {
                     sortKeys: sortKeysBuffer,
                     sortIndices: sortIndicesBuffer,
                     maxCompacted: maxCompacted,
-                    maxAssignments: maxAssignments
+                    maxAssignments: maxAssignments,
+                    tempProjectionBuffer: projBuffers.tempProjection,
+                    visibilityMarks: projBuffers.visibilityMarks,
+                    visibilityPartialSums: projBuffers.visibilityPartialSums
                 )
                 cb.commit()
                 cb.waitUntilCompleted()
@@ -1831,6 +1912,7 @@ final class LocalSortPipelineTests: XCTestCase {
             length: maxAssignments * MemoryLayout<UInt32>.stride,
             options: .storageModePrivate
         )!
+        let projBuffers = ProjectionBuffers.create(device: device, gaussianCount: gaussianCount)!
 
         populateTestData(worldBuffer: worldBuffer, harmonicsBuffer: harmonicsBuffer, count: gaussianCount)
         let camera = createTestCamera()
@@ -1862,6 +1944,9 @@ final class LocalSortPipelineTests: XCTestCase {
             sortIndices: sortIndicesBuffer,
             maxCompacted: maxCompacted,
             maxAssignments: maxAssignments,
+            tempProjectionBuffer: projBuffers.tempProjection,
+            visibilityMarks: projBuffers.visibilityMarks,
+            visibilityPartialSums: projBuffers.visibilityPartialSums,
             skipSort: true  // Skip sort, we just want the scatter distribution
         )
 
@@ -2040,6 +2125,26 @@ final class LocalSortPipelineTests: XCTestCase {
                 options: .storageModeShared
             )!
 
+            // Temp projection buffer (efficient single-pass projection)
+            let tempProjectionBuffer = device.makeBuffer(
+                length: maxCompacted * MemoryLayout<CompactedGaussianSwift>.stride,
+                options: .storageModeShared
+            )!
+
+            // Visibility prefix sum buffers
+            let visibilityMarksBuffer = device.makeBuffer(
+                length: (gaussianCount + 1) * MemoryLayout<UInt32>.stride,
+                options: .storageModeShared
+            )!
+            let blockSize = 256
+            let visBlocks = (gaussianCount + 1 + blockSize - 1) / blockSize
+            let level2Blocks = (visBlocks + blockSize - 1) / blockSize
+            let totalPartialSums = (visBlocks + 1) + (level2Blocks + 1)
+            let visibilityPartialSumsBuffer = device.makeBuffer(
+                length: totalPartialSums * MemoryLayout<UInt32>.stride,
+                options: .storageModeShared
+            )!
+
             guard let cb = queue.makeCommandBuffer() else { continue }
 
             encoder.encode(
@@ -2063,6 +2168,9 @@ final class LocalSortPipelineTests: XCTestCase {
                 sortIndices: sortIndicesBuffer,
                 maxCompacted: maxCompacted,
                 maxAssignments: maxAssignments,
+                tempProjectionBuffer: tempProjectionBuffer,
+                visibilityMarks: visibilityMarksBuffer,
+                visibilityPartialSums: visibilityPartialSumsBuffer,
                 skipSort: true  // Skip sort to isolate compaction
             )
 
@@ -2201,6 +2309,7 @@ final class LocalSortPipelineTests: XCTestCase {
                 length: maxAssignments * MemoryLayout<UInt32>.stride,
                 options: .storageModeShared
             )!
+            let projBuffers = ProjectionBuffers.create(device: device, gaussianCount: gaussianCount)!
 
             guard let cb = queue.makeCommandBuffer() else { continue }
 
@@ -2225,6 +2334,9 @@ final class LocalSortPipelineTests: XCTestCase {
                 sortIndices: sortIndicesBuffer,
                 maxCompacted: maxCompacted,
                 maxAssignments: maxAssignments,
+                tempProjectionBuffer: projBuffers.tempProjection,
+                visibilityMarks: projBuffers.visibilityMarks,
+                visibilityPartialSums: projBuffers.visibilityPartialSums,
                 skipSort: true  // Skip sort to see scatter output
             )
 

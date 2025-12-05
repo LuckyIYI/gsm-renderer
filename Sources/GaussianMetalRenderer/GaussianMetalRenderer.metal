@@ -118,7 +118,7 @@ kernel void projectGaussiansFused(
     // If opacity is too low, no pixel will get meaningful contribution
     // Threshold ~1/255 = 0.004 (below visible quantization level)
     // ==========================================================================
-    if (opacity < 0.004f) {
+    if (opacity < 0.005f) {
         outMask[gid] = 0;
         outBounds[gid] = int4(0, -1, 0, -1);
         return;
@@ -1017,48 +1017,9 @@ kernel void tileCountIndirectKernel(
     const uint aabbHeight = uint(maxTY - minTY + 1);
     const uint aabbCount = aabbWidth * aabbHeight;
 
-    if (aabbCount <= PRECISE_THRESHOLD) {
-        tileCounts[gid] = aabbCount;
-        return;
-    }
-
-    const float tileW = float(params.tileWidth);
-    const float tileH = float(params.tileHeight);
-    const float2 center = float2(getMean(g));
-    const half4 conicH = getConic(g);
-    const float3 conic = float3(float(conicH.x), float(conicH.y), float(conicH.z));
-    const float qMax = computeQMax(alpha, GAUSSIAN_TAU);
-
-    const float halfTileW = tileW * 0.5f;
-    const float halfTileH = tileH * 0.5f;
-    const float tileDiag = fast::sqrt(halfTileW * halfTileW + halfTileH * halfTileH);
-    const float maxConic = max(conic.x, conic.z);
-    const float expand = tileDiag * fast::sqrt(maxConic);
-    const float qMaxExpanded = qMax + 2.0f * expand * fast::sqrt(qMax) + expand * expand;
-
-    uint count = 0u;
-    for (int ty = minTY; ty <= maxTY; ty++) {
-        for (int tx = minTX; tx <= maxTX; tx++) {
-            const float tileCenterX = (float(tx) + 0.5f) * tileW;
-            const float tileCenterY = (float(ty) + 0.5f) * tileH;
-            const float dx = tileCenterX - center.x;
-            const float dy = tileCenterY - center.y;
-            const float q = dx * dx * conic.x + 2.0f * dx * dy * conic.y + dy * dy * conic.z;
-
-            if (q <= qMax) {
-                count++;
-            } else if (q <= qMaxExpanded) {
-                const float tileMinX = float(tx) * tileW;
-                const float tileMinY = float(ty) * tileH;
-                if (ellipseIntersectsTile(center, conic, qMax,
-                                          tileMinX, tileMinY,
-                                          tileMinX + tileW, tileMinY + tileH)) {
-                    count++;
-                }
-            }
-        }
-    }
-    tileCounts[gid] = count;
+    // Use AABB directly - ellipse check disabled for simplicity
+    // (Ellipse check was duplicating work between count and scatter)
+    tileCounts[gid] = aabbCount;
 }
 
 template [[host_name("tileCountIndirectKernel")]]
@@ -1092,62 +1053,17 @@ kernel void tileScatterIndirectKernel(
     const float alpha = float(g.opacity);
     if (alpha < 1e-4f) return;
 
-    const uint aabbWidth = uint(maxTX - minTX + 1);
-    const uint aabbHeight = uint(maxTY - minTY + 1);
-    const uint aabbCount = aabbWidth * aabbHeight;
     const uint tilesX = params.tilesX;
     const uint maxAssignments = params.maxAssignments;
 
     uint writePos = offsets[gid];
     const int gaussianIdx = int(originalIdx);
 
-    if (aabbCount <= PRECISE_THRESHOLD) {
-        for (int ty = minTY; ty <= maxTY; ty++) {
-            for (int tx = minTX; tx <= maxTX; tx++) {
-                if (writePos < maxAssignments) {
-                    tileIds[writePos] = ty * int(tilesX) + tx;
-                    tileIndices[writePos] = gaussianIdx;
-                    writePos++;
-                }
-            }
-        }
-        return;
-    }
-
-    const float tileW = float(params.tileWidth);
-    const float tileH = float(params.tileHeight);
-    const float2 center = float2(getMean(g));
-    const half4 conicH = getConic(g);
-    const float3 conic = float3(float(conicH.x), float(conicH.y), float(conicH.z));
-    const float qMax = computeQMax(alpha, GAUSSIAN_TAU);
-
-    const float halfTileW = tileW * 0.5f;
-    const float halfTileH = tileH * 0.5f;
-    const float tileDiag = fast::sqrt(halfTileW * halfTileW + halfTileH * halfTileH);
-    const float maxConic = max(conic.x, conic.z);
-    const float expand = tileDiag * fast::sqrt(maxConic);
-    const float qMaxExpanded = qMax + 2.0f * expand * fast::sqrt(qMax) + expand * expand;
-
+    // Use AABB directly - ellipse check disabled for simplicity
+    // (Ellipse check was duplicating work between count and scatter)
     for (int ty = minTY; ty <= maxTY; ty++) {
         for (int tx = minTX; tx <= maxTX; tx++) {
-            const float tileCenterX = (float(tx) + 0.5f) * tileW;
-            const float tileCenterY = (float(ty) + 0.5f) * tileH;
-            const float dx = tileCenterX - center.x;
-            const float dy = tileCenterY - center.y;
-            const float q = dx * dx * conic.x + 2.0f * dx * dy * conic.y + dy * dy * conic.z;
-
-            bool shouldWrite = false;
-            if (q <= qMax) {
-                shouldWrite = true;
-            } else if (q <= qMaxExpanded) {
-                const float tileMinX = float(tx) * tileW;
-                const float tileMinY = float(ty) * tileH;
-                shouldWrite = ellipseIntersectsTile(center, conic, qMax,
-                                                    tileMinX, tileMinY,
-                                                    tileMinX + tileW, tileMinY + tileH);
-            }
-
-            if (shouldWrite && writePos < maxAssignments) {
+            if (writePos < maxAssignments) {
                 tileIds[writePos] = ty * int(tilesX) + tx;
                 tileIndices[writePos] = gaussianIdx;
                 writePos++;

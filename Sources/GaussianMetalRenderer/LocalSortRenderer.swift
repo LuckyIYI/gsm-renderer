@@ -39,6 +39,14 @@ public final class LocalSortRenderer: GaussianRenderer, @unchecked Sendable {
     private var sortedLocalIdx16Buffer: MTLBuffer?  // ushort buffer for sorted local indices
     // sortInfoBuffer removed - sort reads depthKeys16 directly
 
+    // Temp buffer for efficient single-pass projection
+    // Can be aliased with other buffers not used during projection phase
+    private var tempProjectionBuffer: MTLBuffer?         // [gaussianCount] CompactedGaussian
+
+    // Deterministic compaction buffers
+    private var visibilityMarksBuffer: MTLBuffer?        // Visibility marks for prefix sum [gaussianCount+1]
+    private var visibilityPartialSumsBuffer: MTLBuffer?  // Partial sums for hierarchical scan
+
     // Textured render buffer (only allocated when useTexturedRender == true)
     private var gaussianRenderTexture: MTLTexture?
 
@@ -179,6 +187,9 @@ public final class LocalSortRenderer: GaussianRenderer, @unchecked Sendable {
               let tileOffsets = tileOffsetsBuffer,
               let partialSums = partialSumsBuffer,
               let sortIndices = sortIndicesBuffer,
+              let tempProjection = tempProjectionBuffer,
+              let visibilityMarks = visibilityMarksBuffer,
+              let visibilityPartialSums = visibilityPartialSumsBuffer,
               let colorTex = colorTexture,
               let depthTex = depthTexture else {
             return nil
@@ -225,8 +236,7 @@ public final class LocalSortRenderer: GaussianRenderer, @unchecked Sendable {
         let effective16BitSort = config.sortMode == .sort16Bit && encoder.has16BitSort &&
             sortedLocalIdx16Buffer != nil && depthKeys16Buffer != nil
 
-        // Standard pipeline with optional cluster visibility
-        // For 16-bit sort, we use 16-bit scatter and skip 32-bit sort
+        // Efficient single-pass projection pipeline with optional cluster visibility
         encoder.encode(
             commandBuffer: commandBuffer,
             worldGaussians: worldGaussians,
@@ -248,8 +258,11 @@ public final class LocalSortRenderer: GaussianRenderer, @unchecked Sendable {
             sortIndices: sortIndices,
             maxCompacted: maxCompacted,
             maxAssignments: maxAssignments,
+            tempProjectionBuffer: tempProjection,
+            visibilityMarks: visibilityMarks,
+            visibilityPartialSums: visibilityPartialSums,
             useHalfWorld: useHalfWorld,
-            skipSort: effective16BitSort,  // Skip 32-bit sort if using 16-bit
+            skipSort: effective16BitSort,
             tempSortKeys: effective16BitSort ? nil : tempSortKeys,
             tempSortIndices: effective16BitSort ? nil : tempSortIndices,
             clusterVisibility: clusterVisibility,
@@ -394,6 +407,29 @@ public final class LocalSortRenderer: GaussianRenderer, @unchecked Sendable {
         )
         sortIndicesBuffer = device.makeBuffer(
             length: maxAssignments * MemoryLayout<UInt32>.stride,
+            options: priv
+        )
+
+        // === TEMP PROJECTION BUFFER (efficient single-pass projection) ===
+        // Stores full CompactedGaussian at original gaussian index during projection
+        tempProjectionBuffer = device.makeBuffer(
+            length: maxCompacted * MemoryLayout<CompactedGaussianSwift>.stride,
+            options: priv
+        )
+
+        // === VISIBILITY PREFIX SUM BUFFERS ===
+        // Visibility marks: gaussianCount+1 elements for prefix sum (total at end)
+        visibilityMarksBuffer = device.makeBuffer(
+            length: (gaussianCount + 1) * MemoryLayout<UInt32>.stride,
+            options: priv
+        )
+        // Partial sums for hierarchical scan (supports up to 16M gaussians)
+        let blockSize = 256
+        let visBlocks = (gaussianCount + 1 + blockSize - 1) / blockSize
+        let level2Blocks = (visBlocks + blockSize - 1) / blockSize
+        let totalPartialSums = (visBlocks + 1) + (level2Blocks + 1)
+        visibilityPartialSumsBuffer = device.makeBuffer(
+            length: totalPartialSums * MemoryLayout<UInt32>.stride,
             options: priv
         )
 

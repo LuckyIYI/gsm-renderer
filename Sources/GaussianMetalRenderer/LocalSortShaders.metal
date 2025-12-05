@@ -146,76 +146,72 @@ kernel void localSortClear(
 }
 
 // =============================================================================
-// KERNEL 2: FUSED PROJECT + COMPACT + COUNT
+// KERNEL 2a: PROJECT + STORE (efficient temp buffer approach)
 // =============================================================================
-// Templated on world gaussian type and harmonics type for maximum flexibility
-// Optional cluster culling via USE_CLUSTER_CULL function constant
+// Projects all gaussians, stores full results to temp buffer, marks visibility.
+// Temp buffer can share memory with other buffers not used during projection.
 
 template <typename PackedWorldT, typename HarmonicsT>
-kernel void localSortProjectCompactCount(
+kernel void localSortProjectStore(
     const device PackedWorldT* worldGaussians [[buffer(0)]],
     const device HarmonicsT* harmonics [[buffer(1)]],
-    device CompactedGaussian* compacted [[buffer(2)]],
-    device TileAssignmentHeader* header [[buffer(3)]],
-    device atomic_uint* tileCounts [[buffer(4)]],
-    constant CameraUniforms& camera [[buffer(5)]],
-    constant TileBinningParams& params [[buffer(6)]],
-    // Optional cluster culling buffers (only bound when USE_CLUSTER_CULL is true)
-    const device uchar* clusterVisible [[buffer(7), function_constant(USE_CLUSTER_CULL)]],
-    constant uint& clusterSize [[buffer(8), function_constant(USE_CLUSTER_CULL)]],
+    device CompactedGaussian* tempBuffer [[buffer(2)]],     // Temp storage at gid
+    device uint* visibilityMarks [[buffer(3)]],             // 1 if visible, 0 if culled
+    constant CameraUniforms& camera [[buffer(4)]],
+    constant TileBinningParams& params [[buffer(5)]],
+    const device uchar* clusterVisible [[buffer(6), function_constant(USE_CLUSTER_CULL)]],
+    constant uint& clusterSize [[buffer(7), function_constant(USE_CLUSTER_CULL)]],
     uint gid [[thread_position_in_grid]]
 ) {
     if (gid >= params.gaussianCount) return;
 
-    // Skip-based cluster culling (only when enabled via function constant)
+    // Cluster culling
     if (USE_CLUSTER_CULL) {
         uint clusterId = gid / clusterSize;
-        if (clusterVisible[clusterId] == 0) return;
+        if (clusterVisible[clusterId] == 0) {
+            visibilityMarks[gid] = 0u;
+            return;
+        }
     }
 
-    // Load
     PackedWorldT g = worldGaussians[gid];
 
-    // Early cull: skip tiny gaussians (scale < 0.001)
+    // Early cull: tiny gaussians
     float3 scale = float3(g.sx, g.sy, g.sz);
     float maxScale = max(scale.x, max(scale.y, scale.z));
-    if (maxScale < 0.0005f) return;  // Skip near-invisible gaussians
+    if (maxScale < 0.0005f) {
+        visibilityMarks[gid] = 0u;
+        return;
+    }
 
     float3 pos = float3(g.px, g.py, g.pz);
     float4 viewPos = camera.viewMatrix * float4(pos, 1.0f);
 
-    // Cull: behind camera - match original pipeline EXACTLY
-    // safeDepthComponent: keeps sign, just handles near-zero values
     float depth = viewPos.z;
-    float absDepth = fabs(depth);
-    if (absDepth < 1e-4f) {
-        depth = (depth >= 0) ? 1e-4f : -1e-4f;
+    if (fabs(depth) < 1e-4f) depth = (depth >= 0) ? 1e-4f : -1e-4f;
+
+    if (depth <= camera.nearPlane) {
+        visibilityMarks[gid] = 0u;
+        return;
     }
 
-    if (depth <= camera.nearPlane) return;
     float opacity = float(g.opacity);
+    if (opacity < 0.004f) {
+        visibilityMarks[gid] = 0u;
+        return;
+    }
 
-    // Cull: low opacity - match original pipeline
-    if (opacity < 1e-4f) return;
-
-    // ==========================================================================
-    // OPACITY CONTRIBUTION FILTER - Skip gaussians that can't contribute meaningfully
-    // Even at gaussian center (power=0), alpha = opacity * exp(0) = opacity
-    // If opacity is too low, no pixel will get meaningful contribution
-    // Threshold ~1/255 = 0.004 (below visible quantization level)
-    // ==========================================================================
-    if (opacity < 0.004f) return;
-
-    // Project - match original pipeline convention exactly
     float4 clip = camera.projectionMatrix * viewPos;
-    if (fabs(clip.w) < 1e-6f) return;
+    if (fabs(clip.w) < 1e-6f) {
+        visibilityMarks[gid] = 0u;
+        return;
+    }
 
     float ndcX = clip.x / clip.w;
     float ndcY = clip.y / clip.w;
     float px = ((ndcX + 1.0f) * camera.width - 1.0f) * 0.5f;
     float py = ((ndcY + 1.0f) * camera.height - 1.0f) * 0.5f;
 
-    // Covariance (scale already loaded in early cull) - using shared functions from GaussianHelpers.h
     float4 quat = normalizeQuaternion(getRotation(g));
     float3x3 cov3d = buildCovariance3D(scale, quat);
 
@@ -228,24 +224,23 @@ kernel void localSortProjectCompactCount(
                                         camera.focalX, camera.focalY,
                                         camera.width, camera.height);
 
-    // Compute conic and radius using shared function
     float4 conic4;
     float radius;
     computeConicAndRadius(cov2d, conic4, radius);
     float3 conic = conic4.xyz;
 
-    if (radius < 0.5f) return;
+    if (radius < 0.5f) {
+        visibilityMarks[gid] = 0u;
+        return;
+    }
 
-    // ==========================================================================
-    // TOTAL INK FILTER - Skip gaussians with negligible total contribution
-    // Total integrated alpha = opacity × 2π / √det  (the gaussian's "total ink")
-    // If total ink is too small, the gaussian can't meaningfully contribute anywhere
-    // ==========================================================================
     float det = conic.x * conic.z - conic.y * conic.y;
     float totalInk = opacity * 6.283185f / sqrt(max(det, 1e-6f));
-    if (totalInk < 3.0f) return;  // Less than 1 unit of alpha total
+    if (totalInk < 3.0f) {
+        visibilityMarks[gid] = 0u;
+        return;
+    }
 
-    // 1. Clamp pixel coords to screen bounds first
     float maxW = float(params.surfaceWidth - 1);
     float maxH = float(params.surfaceHeight - 1);
     float xmin = clamp(px - radius, 0.0f, maxW);
@@ -253,87 +248,99 @@ kernel void localSortProjectCompactCount(
     float ymin = clamp(py - radius, 0.0f, maxH);
     float ymax = clamp(py + radius, 0.0f, maxH);
 
-    // 2. Compute tile bounds (EXCLUSIVE max - matches scatter_simd interpretation)
     int tileW = int(params.tileWidth);
     int tileH = int(params.tileHeight);
-    int2 minTile = int2(
-        max(0, int(floor(xmin / float(tileW)))),
-        max(0, int(floor(ymin / float(tileH))))
-    );
-    int2 maxTile = int2(
-        min(int(params.tilesX), int(ceil(xmax / float(tileW)))),
-        min(int(params.tilesY), int(ceil(ymax / float(tileH))))
-    );
+    int2 minTile = int2(max(0, int(floor(xmin / float(tileW)))),
+                        max(0, int(floor(ymin / float(tileH)))));
+    int2 maxTile = int2(min(int(params.tilesX), int(ceil(xmax / float(tileW)))),
+                        min(int(params.tilesY), int(ceil(ymax / float(tileH)))));
 
-    // Cull: zero coverage
-    if (minTile.x >= maxTile.x || minTile.y >= maxTile.y) return;
-
-    // Count per tile (AABB - simple and reliable)
-    for (int ty = minTile.y; ty < maxTile.y; ++ty) {
-        for (int tx = minTile.x; tx < maxTile.x; ++tx) {
-            uint tileId = uint(ty * int(params.tilesX) + tx);
-            atomic_fetch_add_explicit(&tileCounts[tileId], 1u, memory_order_relaxed);
-        }
-    }
-
-    // Compute color (SH) - uses function constant for compile-time optimization
-    float3 color = computeSHColor(harmonics, gid, pos, camera.cameraCenter, camera.shComponents);
-    color = max(color + 0.5f, float3(0.0f));
-
-    // Compact: write visible gaussian
-    uint idx = atomic_fetch_add_explicit((device atomic_uint*)&header->totalAssignments, 1u, memory_order_relaxed);
-    if (idx >= params.maxCapacity) {
-        header->overflow = 1u;
+    if (minTile.x >= maxTile.x || minTile.y >= maxTile.y) {
+        visibilityMarks[gid] = 0u;
         return;
     }
 
-    compacted[idx].covariance_depth = float4(conic, depth);
-    // Use the computed color from harmonics (debug line removed)
-    compacted[idx].position_color = float4(px, py, localSortPackHalf4(half4(half3(color), half(opacity))));
-    compacted[idx].min_tile = minTile;
-    compacted[idx].max_tile = maxTile;
-    compacted[idx].originalIdx = gid;  // Store world buffer index for deterministic sorting
+    // Compute color
+    float3 color = computeSHColor(harmonics, gid, pos, camera.cameraCenter, camera.shComponents);
+    color = max(color + 0.5f, float3(0.0f));
+
+    // Store to temp buffer at original index
+    tempBuffer[gid].covariance_depth = float4(conic, depth);
+    tempBuffer[gid].position_color = float4(px, py, localSortPackHalf4(half4(half3(color), half(opacity))));
+    tempBuffer[gid].min_tile = minTile;
+    tempBuffer[gid].max_tile = maxTile;
+    tempBuffer[gid].originalIdx = gid;
+
+    visibilityMarks[gid] = 1u;
 }
 
-// Instantiate all combinations: World(float/half) x Harmonics(float/half)
-// Note: clusterVisible and clusterSize are optional via function_constant(USE_CLUSTER_CULL)
-// When USE_CLUSTER_CULL=false, those parameters are not bound
-
-// Float world, float harmonics
-template [[host_name("localSortProjectCompactCountFloat")]]
-kernel void localSortProjectCompactCount<PackedWorldGaussian, float>(
+// Template instantiations for ProjectStore
+template [[host_name("localSortProjectStoreFloat")]]
+kernel void localSortProjectStore<PackedWorldGaussian, float>(
     const device PackedWorldGaussian*, const device float*,
-    device CompactedGaussian*, device TileAssignmentHeader*,
-    device atomic_uint*, constant CameraUniforms&,
-    constant TileBinningParams&,
+    device CompactedGaussian*, device uint*,
+    constant CameraUniforms&, constant TileBinningParams&,
     const device uchar*, constant uint&, uint);
 
-// Half world, float harmonics
-template [[host_name("localSortProjectCompactCountHalf")]]
-kernel void localSortProjectCompactCount<PackedWorldGaussianHalf, float>(
+template [[host_name("localSortProjectStoreHalf")]]
+kernel void localSortProjectStore<PackedWorldGaussianHalf, float>(
     const device PackedWorldGaussianHalf*, const device float*,
-    device CompactedGaussian*, device TileAssignmentHeader*,
-    device atomic_uint*, constant CameraUniforms&,
-    constant TileBinningParams&,
+    device CompactedGaussian*, device uint*,
+    constant CameraUniforms&, constant TileBinningParams&,
     const device uchar*, constant uint&, uint);
 
-// Float world, half harmonics
-template [[host_name("localSortProjectCompactCountFloatHalfSh")]]
-kernel void localSortProjectCompactCount<PackedWorldGaussian, half>(
-    const device PackedWorldGaussian*, const device half*,
-    device CompactedGaussian*, device TileAssignmentHeader*,
-    device atomic_uint*, constant CameraUniforms&,
-    constant TileBinningParams&,
-    const device uchar*, constant uint&, uint);
-
-// Half world, half harmonics (full half precision pipeline)
-template [[host_name("localSortProjectCompactCountHalfHalfSh")]]
-kernel void localSortProjectCompactCount<PackedWorldGaussianHalf, half>(
+template [[host_name("localSortProjectStoreHalfHalfSh")]]
+kernel void localSortProjectStore<PackedWorldGaussianHalf, half>(
     const device PackedWorldGaussianHalf*, const device half*,
-    device CompactedGaussian*, device TileAssignmentHeader*,
-    device atomic_uint*, constant CameraUniforms&,
-    constant TileBinningParams&,
+    device CompactedGaussian*, device uint*,
+    constant CameraUniforms&, constant TileBinningParams&,
     const device uchar*, constant uint&, uint);
+
+// =============================================================================
+// KERNEL 2b: COMPACT + COUNT (copies visible from temp to compacted)
+// =============================================================================
+// Uses prefix sum offsets to deterministically copy visible gaussians.
+
+kernel void localSortCompactCount(
+    const device CompactedGaussian* tempBuffer [[buffer(0)]],
+    const device uint* prefixOffsets [[buffer(1)]],  // Exclusive prefix sum
+    device CompactedGaussian* compacted [[buffer(2)]],
+    device atomic_uint* tileCounts [[buffer(3)]],
+    constant uint& gaussianCount [[buffer(4)]],
+    constant uint& tilesX [[buffer(5)]],
+    uint gid [[thread_position_in_grid]]
+) {
+    if (gid >= gaussianCount) return;
+
+    // Check visibility via prefix sum
+    uint myOffset = prefixOffsets[gid];
+    uint nextOffset = prefixOffsets[gid + 1];
+    if (nextOffset <= myOffset) return;  // Not visible
+
+    // Copy from temp to compacted
+    compacted[myOffset] = tempBuffer[gid];
+
+    // Count tiles
+    int2 minTile = tempBuffer[gid].min_tile;
+    int2 maxTile = tempBuffer[gid].max_tile;
+    for (int ty = minTile.y; ty < maxTile.y; ++ty) {
+        for (int tx = minTile.x; tx < maxTile.x; ++tx) {
+            uint tileId = uint(ty * int(tilesX) + tx);
+            atomic_fetch_add_explicit(&tileCounts[tileId], 1u, memory_order_relaxed);
+        }
+    }
+}
+
+// Write visible count to header
+kernel void localSortWriteVisibleCount(
+    const device uint* prefixOffsets [[buffer(0)]],
+    device TileAssignmentHeader* header [[buffer(1)]],
+    constant uint& gaussianCount [[buffer(2)]],
+    uint gid [[thread_position_in_grid]]
+) {
+    if (gid != 0) return;
+    header->totalAssignments = prefixOffsets[gaussianCount];
+}
 
 // =============================================================================
 // KERNEL 3: PREFIX SCAN (reuse from main file or inline simple version)

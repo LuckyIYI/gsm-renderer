@@ -54,10 +54,10 @@ inline float3 computeSHColor(
     float3 cameraCenter,
     uint shComponents  // runtime fallback if function constant not set
 ) {
-    // DC only - no direction needed
+    // DC only - no direction needed, but still need SH_C0 coefficient
     if (SH_DEGREE_0 || shComponents == 0) {
         uint base = gid * 3u;
-        return float3(harmonics[base], harmonics[base + 1], harmonics[base + 2]);
+        return float3(harmonics[base], harmonics[base + 1], harmonics[base + 2]) * SH_C0;
     }
 
     // Compute view direction

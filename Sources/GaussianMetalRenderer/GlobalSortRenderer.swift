@@ -586,12 +586,8 @@ public final class GlobalSortRenderer: GaussianRenderer, @unchecked Sendable {
         let gaussianCapacity = limits.maxGaussians
         let tileCount = limits.maxTileCount
 
-        // maxAssignmentCapacity: worst-case tile assignments we must support
-        // Each assignment is a (gaussian, tile) pair where gaussian overlaps tile
-        // Bound 1: tileCount * maxPerTile (per-tile limit)
-        // Bound 2: gaussianCapacity * tilesPerGaussian (each gaussian spans limited tiles)
         let tileCapacity = tileCount * limits.maxPerTile
-        let gaussianTileCapacity = gaussianCapacity * 8  // each gaussian spans ~8 tiles max
+        let gaussianTileCapacity = gaussianCapacity * 32
         let maxAssignmentCapacity = min(tileCapacity, gaussianTileCapacity)
 
         // paddedCapacity: aligned for sort dispatch

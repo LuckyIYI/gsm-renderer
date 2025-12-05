@@ -84,6 +84,9 @@ public final class LocalPipelineEncoder {
         // Visibility prefix sum buffers
         visibilityMarks: MTLBuffer,
         visibilityPartialSums: MTLBuffer,
+        // Active tile buffers (populated during prefix scan)
+        activeTileIndices: MTLBuffer,
+        activeTileCount: MTLBuffer,
         // Options
         useHalfWorld: Bool = false,
         skipSort: Bool = false,
@@ -136,13 +139,15 @@ public final class LocalPipelineEncoder {
             clusterSize: clusterSize
         )
 
-        // === 3. TILE PREFIX SCAN ===
+        // === 3. TILE PREFIX SCAN + ACTIVE TILE COMPACTION ===
         prefixScanEncoder.encode(
             commandBuffer: commandBuffer,
             tileCounts: tileCounts,
             tileOffsets: tileOffsets,
             partialSums: partialSums,
-            tileCount: tileCount
+            tileCount: tileCount,
+            activeTileIndices: activeTileIndices,
+            activeTileCount: activeTileCount
         )
 
         // === 4. SCATTER ===
@@ -283,23 +288,6 @@ public final class LocalPipelineEncoder {
             width: width,
             height: height,
             whiteBackground: whiteBackground
-        )
-    }
-
-    /// Compact active tile indices (tiles with gaussCount > 0)
-    public func encodeCompactActiveTiles(
-        commandBuffer: MTLCommandBuffer,
-        tileCounts: MTLBuffer,
-        activeTileIndices: MTLBuffer,
-        activeTileCount: MTLBuffer,
-        tileCount: Int
-    ) {
-        renderEncoder.encodeCompactActiveTiles(
-            commandBuffer: commandBuffer,
-            tileCounts: tileCounts,
-            activeTileIndices: activeTileIndices,
-            activeTileCount: activeTileCount,
-            tileCount: tileCount
         )
     }
 

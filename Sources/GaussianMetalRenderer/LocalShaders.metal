@@ -148,26 +148,7 @@ kernel void LocalClearTextures(
 }
 
 // =============================================================================
-// KERNEL 1c: COMPACT ACTIVE TILES
-// =============================================================================
-// After prefix scan, compacts non-empty tile indices for indirect dispatch
-
-kernel void LocalCompactActiveTiles(
-    const device uint* tileCounts [[buffer(0)]],
-    device uint* activeTileIndices [[buffer(1)]],
-    device atomic_uint* activeTileCount [[buffer(2)]],
-    constant uint& tileCount [[buffer(3)]],
-    uint gid [[thread_position_in_grid]]
-) {
-    if (gid >= tileCount) return;
-    if (tileCounts[gid] > 0) {
-        uint idx = atomic_fetch_add_explicit(activeTileCount, 1u, memory_order_relaxed);
-        activeTileIndices[idx] = gid;
-    }
-}
-
-// =============================================================================
-// KERNEL 1d: PREPARE RENDER DISPATCH
+// KERNEL 1c: PREPARE RENDER DISPATCH
 // =============================================================================
 // Prepares indirect dispatch arguments from active tile count
 
@@ -486,12 +467,14 @@ kernel void LocalFinalizeScan(
     }
 }
 
-// Fused finalize scan + zero counters (one dispatch instead of two)
+// Fused finalize scan + zero counters + compact active tiles (one dispatch instead of three)
 kernel void LocalFinalizeScanAndZero(
     device uint* output [[buffer(0)]],
     device atomic_uint* counters [[buffer(1)]],
     constant uint& count [[buffer(2)]],
     const device uint* partialSums [[buffer(3)]],
+    device uint* activeTileIndices [[buffer(4)]],
+    device atomic_uint* activeTileCount [[buffer(5)]],
     uint groupId [[threadgroup_position_in_grid]],
     ushort localId [[thread_position_in_threadgroup]]
 ) {
@@ -505,6 +488,12 @@ kernel void LocalFinalizeScanAndZero(
             // Finalize scan (add block sum)
             if (groupId > 0) {
                 output[idx] += blockSum;
+            }
+            // Read count before zeroing - if > 0, this tile is active
+            uint tileCount = atomic_load_explicit(&counters[idx], memory_order_relaxed);
+            if (tileCount > 0) {
+                uint slot = atomic_fetch_add_explicit(activeTileCount, 1u, memory_order_relaxed);
+                activeTileIndices[slot] = idx;
             }
             // Zero the counter for scatter
             atomic_store_explicit(&counters[idx], 0u, memory_order_relaxed);

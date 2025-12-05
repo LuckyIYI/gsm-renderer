@@ -4,7 +4,6 @@ import Metal
 public final class LocalRenderEncoder {
     // Indirect dispatch pipelines
     private let clearTexturesPipeline: MTLComputePipelineState
-    private let compactActiveTilesPipeline: MTLComputePipelineState
     private let prepareRenderDispatchPipeline: MTLComputePipelineState
     private let renderIndirectPipeline: MTLComputePipelineState
     private let renderIndirect16Pipeline: MTLComputePipelineState?
@@ -15,12 +14,10 @@ public final class LocalRenderEncoder {
     public init(library: MTLLibrary, device: MTLDevice) throws {
         // Required indirect dispatch pipelines
         guard let clearFn = library.makeFunction(name: "LocalClearTextures"),
-              let compactFn = library.makeFunction(name: "LocalCompactActiveTiles"),
               let prepareFn = library.makeFunction(name: "LocalPrepareRenderDispatch") else {
             fatalError("Missing required indirect render kernels")
         }
         self.clearTexturesPipeline = try device.makeComputePipelineState(function: clearFn)
-        self.compactActiveTilesPipeline = try device.makeComputePipelineState(function: compactFn)
         self.prepareRenderDispatchPipeline = try device.makeComputePipelineState(function: prepareFn)
 
         // Create function constant values for 32-bit render (USE_16BIT_RENDER = false)
@@ -80,40 +77,6 @@ public final class LocalRenderEncoder {
             depth: 1
         )
         encoder.dispatchThreadgroups(gridSize, threadsPerThreadgroup: threadgroupSize)
-        encoder.endEncoding()
-    }
-
-    /// Compact active tile indices (tiles with gaussCount > 0)
-    public func encodeCompactActiveTiles(
-        commandBuffer: MTLCommandBuffer,
-        tileCounts: MTLBuffer,
-        activeTileIndices: MTLBuffer,
-        activeTileCount: MTLBuffer,
-        tileCount: Int
-    ) {
-        // Clear activeTileCount to 0 before atomic adds
-        guard let blitEncoder = commandBuffer.makeBlitCommandEncoder() else { return }
-        blitEncoder.label = "Local_ClearActiveTileCount"
-        blitEncoder.fill(buffer: activeTileCount, range: 0..<MemoryLayout<UInt32>.stride, value: 0)
-        blitEncoder.endEncoding()
-
-        guard let encoder = commandBuffer.makeComputeCommandEncoder() else { return }
-
-        var tc = UInt32(tileCount)
-
-        encoder.label = "Local_CompactActiveTiles"
-        encoder.setComputePipelineState(compactActiveTilesPipeline)
-        encoder.setBuffer(tileCounts, offset: 0, index: 0)
-        encoder.setBuffer(activeTileIndices, offset: 0, index: 1)
-        encoder.setBuffer(activeTileCount, offset: 0, index: 2)
-        encoder.setBytes(&tc, length: MemoryLayout<UInt32>.stride, index: 3)
-
-        let threadsPerGroup = 256
-        let groups = (tileCount + threadsPerGroup - 1) / threadsPerGroup
-        encoder.dispatchThreadgroups(
-            MTLSize(width: groups, height: 1, depth: 1),
-            threadsPerThreadgroup: MTLSize(width: threadsPerGroup, height: 1, depth: 1)
-        )
         encoder.endEncoding()
     }
 

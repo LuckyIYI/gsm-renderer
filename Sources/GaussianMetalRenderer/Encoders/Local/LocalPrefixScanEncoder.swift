@@ -25,7 +25,9 @@ public final class LocalPrefixScanEncoder {
         tileCounts: MTLBuffer,
         tileOffsets: MTLBuffer,
         partialSums: MTLBuffer,
-        tileCount: Int
+        tileCount: Int,
+        activeTileIndices: MTLBuffer,
+        activeTileCount: MTLBuffer
     ) {
         let elementsPerGroup = prefixBlockSize * prefixGrainSize
         let actualGroups = max(1, (tileCount + elementsPerGroup - 1) / elementsPerGroup)
@@ -57,7 +59,14 @@ public final class LocalPrefixScanEncoder {
             encoder.endEncoding()
         }
 
-        // Finalize scan + zero counters (fused)
+        // Clear activeTileCount before finalize pass
+        if let blitEncoder = commandBuffer.makeBlitCommandEncoder() {
+            blitEncoder.label = "Local_ClearActiveTileCount"
+            blitEncoder.fill(buffer: activeTileCount, range: 0..<MemoryLayout<UInt32>.stride, value: 0)
+            blitEncoder.endEncoding()
+        }
+
+        // Finalize scan + zero counters + compact active tiles (fused)
         if let encoder = commandBuffer.makeComputeCommandEncoder() {
             encoder.label = "Local_FinalizeScanAndZero"
             encoder.setComputePipelineState(finalizeScanAndZeroPipeline)
@@ -65,6 +74,8 @@ public final class LocalPrefixScanEncoder {
             encoder.setBuffer(tileCounts, offset: 0, index: 1)
             encoder.setBytes(&tileCountU, length: MemoryLayout<UInt32>.stride, index: 2)
             encoder.setBuffer(partialSums, offset: 0, index: 3)
+            encoder.setBuffer(activeTileIndices, offset: 0, index: 4)
+            encoder.setBuffer(activeTileCount, offset: 0, index: 5)
             let tg = MTLSize(width: prefixBlockSize, height: 1, depth: 1)
             let tgs = MTLSize(width: actualGroups, height: 1, depth: 1)
             encoder.dispatchThreadgroups(tgs, threadsPerThreadgroup: tg)

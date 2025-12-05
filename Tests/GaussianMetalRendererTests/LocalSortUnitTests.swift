@@ -51,6 +51,8 @@ final class LocalUnitTests: XCTestCase {
         let tileCountsBuffer = device.makeBuffer(bytes: tileCounts, length: tileCount * 4, options: .storageModeShared)!
         let tileOffsetsBuffer = device.makeBuffer(length: tileCount * 4, options: .storageModeShared)!
         let partialSumsBuffer = device.makeBuffer(length: 1024 * 4, options: .storageModeShared)!
+        let activeTileIndicesBuffer = device.makeBuffer(length: tileCount * 4, options: .storageModeShared)!
+        let activeTileCountBuffer = device.makeBuffer(length: 4, options: .storageModeShared)!
 
         // Encode
         let cb = queue.makeCommandBuffer()!
@@ -59,7 +61,9 @@ final class LocalUnitTests: XCTestCase {
             tileCounts: tileCountsBuffer,
             tileOffsets: tileOffsetsBuffer,
             partialSums: partialSumsBuffer,
-            tileCount: tileCount
+            tileCount: tileCount,
+            activeTileIndices: activeTileIndicesBuffer,
+            activeTileCount: activeTileCountBuffer
         )
         cb.commit()
         cb.waitUntilCompleted()
@@ -100,6 +104,8 @@ final class LocalUnitTests: XCTestCase {
         let tileCountsBuffer = device.makeBuffer(bytes: tileCounts, length: tileCount * 4, options: .storageModeShared)!
         let tileOffsetsBuffer = device.makeBuffer(length: tileCount * 4, options: .storageModeShared)!
         let partialSumsBuffer = device.makeBuffer(length: 4096 * 4, options: .storageModeShared)!
+        let activeTileIndicesBuffer = device.makeBuffer(length: tileCount * 4, options: .storageModeShared)!
+        let activeTileCountBuffer = device.makeBuffer(length: 4, options: .storageModeShared)!
 
         let cb = queue.makeCommandBuffer()!
         prefixScanEncoder.encode(
@@ -107,7 +113,9 @@ final class LocalUnitTests: XCTestCase {
             tileCounts: tileCountsBuffer,
             tileOffsets: tileOffsetsBuffer,
             partialSums: partialSumsBuffer,
-            tileCount: tileCount
+            tileCount: tileCount,
+            activeTileIndices: activeTileIndicesBuffer,
+            activeTileCount: activeTileCountBuffer
         )
         cb.commit()
         cb.waitUntilCompleted()

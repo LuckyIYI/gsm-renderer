@@ -204,11 +204,19 @@ public final class LocalRenderer: GaussianRenderer, @unchecked Sendable {
 
         let tileCount = tilesX * tilesY
 
+        // Indirect dispatch buffers required for all render paths
+        guard let activeTileIndices = activeTileIndicesBuffer,
+              let activeTileCount = activeTileCountBuffer,
+              let dispatchArgs = dispatchArgsBuffer else {
+            return nil
+        }
+
         // Check if 16-bit sort is available and enabled (based on config, not runtime flag)
         let effective16BitSort = config.sortMode == .sort16Bit && encoder.has16BitSort &&
             sortedLocalIdx16Buffer != nil && depthKeys16Buffer != nil
 
         // Efficient single-pass projection pipeline with optional cluster visibility
+        // Also computes active tile list during prefix scan (fused)
         encoder.encode(
             commandBuffer: commandBuffer,
             worldGaussians: worldGaussians,
@@ -233,6 +241,8 @@ public final class LocalRenderer: GaussianRenderer, @unchecked Sendable {
             tempProjectionBuffer: tempProjection,
             visibilityMarks: visibilityMarks,
             visibilityPartialSums: visibilityPartialSums,
+            activeTileIndices: activeTileIndices,
+            activeTileCount: activeTileCount,
             useHalfWorld: useHalfWorld,
             skipSort: effective16BitSort,
             tempSortKeys: effective16BitSort ? nil : tempSortKeys,
@@ -243,14 +253,7 @@ public final class LocalRenderer: GaussianRenderer, @unchecked Sendable {
             depthKeys16: depthKeys16Buffer
         )
 
-        // Indirect dispatch buffers required for all render paths
-        guard let activeTileIndices = activeTileIndicesBuffer,
-              let activeTileCount = activeTileCountBuffer,
-              let dispatchArgs = dispatchArgsBuffer else {
-            return nil
-        }
-
-        // 1. Clear textures first
+        // 1. Clear textures
         encoder.encodeClearTextures(
             commandBuffer: commandBuffer,
             colorTexture: colorTex,
@@ -260,16 +263,7 @@ public final class LocalRenderer: GaussianRenderer, @unchecked Sendable {
             whiteBackground: whiteBackground
         )
 
-        // 2. Compact active tile indices
-        encoder.encodeCompactActiveTiles(
-            commandBuffer: commandBuffer,
-            tileCounts: tileCounts,
-            activeTileIndices: activeTileIndices,
-            activeTileCount: activeTileCount,
-            tileCount: tileCount
-        )
-
-        // 3. Prepare indirect dispatch args
+        // 2. Prepare indirect dispatch args (active tiles already computed in prefix scan)
         encoder.encodePrepareRenderDispatch(
             commandBuffer: commandBuffer,
             activeTileCount: activeTileCount,

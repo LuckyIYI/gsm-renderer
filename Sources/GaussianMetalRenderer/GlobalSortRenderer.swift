@@ -401,7 +401,6 @@ public final class GlobalSortRenderer: GaussianRenderer, @unchecked Sendable {
     // MARK: - GaussianRenderer Protocol Methods
 
     /// Render to GPU textures (protocol method)
-    /// - Parameter mortonSorted: If true, enables cluster-level culling optimization for Morton-sorted gaussians
     public func render(
         toTexture commandBuffer: MTLCommandBuffer,
         input: GaussianInput,
@@ -441,15 +440,13 @@ public final class GlobalSortRenderer: GaussianRenderer, @unchecked Sendable {
             gaussianCount: input.gaussianCount,
             packedWorldBuffers: packedWorld,
             cameraUniforms: cameraUniforms,
-            frameParams: frameParams,
-            mortonSorted: mortonSorted
+            frameParams: frameParams
         ) else { return nil }
 
         return TextureRenderResult(color: output.color, depth: output.depth, alpha: nil)
     }
 
     /// Render to CPU-readable buffers (protocol method)
-    /// - Parameter mortonSorted: If true, enables cluster-level culling optimization for Morton-sorted gaussians
     public func render(
         toBuffer commandBuffer: MTLCommandBuffer,
         input: GaussianInput,
@@ -697,19 +694,13 @@ public final class GlobalSortRenderer: GaussianRenderer, @unchecked Sendable {
     }
     
     /// Render to textures using packed GaussianRenderData pipeline
-    /// - Parameter mortonSorted: If true, enables cluster-level culling optimization for Morton-sorted gaussians
     func encodeRenderToTextures(
         commandBuffer: MTLCommandBuffer,
         gaussianCount: Int,
         packedWorldBuffers: PackedWorldBuffers,
         cameraUniforms: CameraUniformsSwift,
-        frameParams: FrameParams,
-        mortonSorted: Bool = false
+        frameParams: FrameParams
     ) -> RenderOutputTextures? {
-        // Cluster culling disabled (archived)
-        let clusterVisibility: MTLBuffer? = nil
-        let clusterSize: UInt32 = 1024
-
         let params = limits.buildParams(from: frameParams)
         guard self.validateLimits(gaussianCount: gaussianCount) else {
             fatalError("[encodeRenderToTextures] validateLimits failed")
@@ -725,7 +716,6 @@ public final class GlobalSortRenderer: GaussianRenderer, @unchecked Sendable {
         }
 
         // Fused projection + tile bounds (single pass)
-        // (with optional cluster culling when mortonSorted=true)
         self.projectEncoder.encode(
             commandBuffer: commandBuffer,
             gaussianCount: gaussianCount,
@@ -736,8 +726,6 @@ public final class GlobalSortRenderer: GaussianRenderer, @unchecked Sendable {
             tileHeight: params.tileHeight,
             tilesX: params.tilesX,
             tilesY: UInt32(limits.tilesY),
-            clusterVisibility: clusterVisibility,
-            clusterSize: clusterSize,
             useHalfWorld: effectivePrecision == .float16
         )
 

@@ -567,11 +567,14 @@ kernel void computeSortKeysKernel<GaussianRenderData>(
     device uint*, device int*, const device TileAssignmentHeader&, uint);
 
 
+// Fused: build headers + compact active tiles in one pass
 kernel void buildHeadersFromSortedKernel(
     const device uint* sortedKeys [[buffer(0)]],  // 32-bit keys: [tile:16][depth:16]
     device GaussianHeader* headers [[buffer(1)]],
     const device TileAssignmentHeader* headerInfo [[buffer(2)]],
     constant uint& tileCount [[buffer(3)]],
+    device uint* activeTiles [[buffer(4)]],
+    device atomic_uint* activeCount [[buffer(5)]],
     uint tile [[thread_position_in_grid]]
 ) {
     if (tile >= tileCount) {
@@ -618,19 +621,9 @@ kernel void buildHeadersFromSortedKernel(
     header.offset = start;
     header.count = end > start ? (end - start) : 0u;
     headers[tile] = header;
-}
 
-kernel void compactActiveTilesKernel(
-    const device GaussianHeader* headers [[buffer(0)]],
-    device uint* activeTiles [[buffer(1)]],
-    device atomic_uint* activeCount [[buffer(2)]],
-    constant uint& tileCount [[buffer(3)]],
-    uint tile [[thread_position_in_grid]]
-) {
-    if (tile >= tileCount) {
-        return;
-    }
-    if (headers[tile].count > 0u) {
+    // Compact active tiles (fused - no separate pass needed)
+    if (header.count > 0u) {
         uint index = atomic_fetch_add_explicit(activeCount, 1u, memory_order_relaxed);
         activeTiles[index] = tile;
     }

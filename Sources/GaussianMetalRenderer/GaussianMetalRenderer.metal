@@ -650,206 +650,6 @@ kernel void prepareRenderDispatchKernel(
     dispatchArgs[DispatchSlotRenderTiles].threadgroupsPerGridZ = 1u;
 }
 
-///////////////////////////////////////////////////////////////////////////////
-//  Fast bitonic sort (shared-memory first/final pass)
-///////////////////////////////////////////////////////////////////////////////
-
-static constexpr int genLeftIndex(const uint position, const uint blockSize) {
-    const uint blockMask = blockSize - 1;
-    const uint no = position & blockMask;
-    return ((position & ~blockMask) << 1) | no;
-}
-
-static inline bool bitonicKeyLess(uint2 left, uint2 right) {
-    return (left.x < right.x) || ((left.x == right.x) && (left.y < right.y));
-}
-
-static void bitonicSwap(bool reverse, threadgroup uint2& keyL, threadgroup int& valL, threadgroup uint2& keyR, threadgroup
-   int& valR) {
-    bool lt = bitonicKeyLess(keyL, keyR);
-    bool swap = (!lt) ^ reverse;
-    if (swap) {
-        uint2 tk = keyL; keyL = keyR; keyR = tk;
-        int tv = valL; valL = valR; valR = tv;
-    }
-}
-
-static void loadShared(const uint threadGroupSize, const uint indexInThreadgroup, const uint position,
-                       device uint2* keys, device int* values,
-                       threadgroup uint2* sharedKeys, threadgroup int* sharedVals) {
-    const uint index = genLeftIndex(position, threadGroupSize);
-    sharedKeys[indexInThreadgroup] = keys[index];
-    sharedVals[indexInThreadgroup] = values[index];
-
-    uint index2 = index | threadGroupSize;
-    sharedKeys[indexInThreadgroup | threadGroupSize] = keys[index2];
-    sharedVals[indexInThreadgroup | threadGroupSize] = values[index2];
-
-}
-
-static void storeShared(const uint threadGroupSize, const uint indexInThreadgroup, const uint position,
-                        device uint2* keys, device int* values,
-                        threadgroup uint2* sharedKeys, threadgroup int* sharedVals) {
-    const uint index = genLeftIndex(position, threadGroupSize);
-    keys[index] = sharedKeys[indexInThreadgroup];
-    values[index] = sharedVals[indexInThreadgroup];
-
-    uint index2 = index | threadGroupSize;
-    keys[index2] = sharedKeys[indexInThreadgroup | threadGroupSize];
-    values[index2] = sharedVals[indexInThreadgroup | threadGroupSize];
-
-}
-
-kernel void bitonicSortFirstPass(
-    device uint2* keys [[buffer(0)]],
-    device int* values [[buffer(1)]],
-    const device TileAssignmentHeader* header [[buffer(2)]],
-    constant uint& logicalBlockSize [[buffer(3)]],
-    threadgroup uint2* sharedKeys [[threadgroup(0)]],
-    threadgroup int* sharedVals [[threadgroup(1)]],
-    const uint threadgroupSize [[threads_per_threadgroup]],
-    const uint indexInThreadgroup [[thread_index_in_threadgroup]],
-    const uint position [[thread_position_in_grid]]
-) {
-    uint gridSize = header->paddedCount;
-    if (position >= gridSize) { return; }
-
-    loadShared(threadgroupSize, indexInThreadgroup, position, keys, values, sharedKeys, sharedVals);
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-
-    for (uint unitSize = 1; unitSize <= logicalBlockSize; unitSize <<= 1) {
-        bool reverse = (position & unitSize) != 0;
-        for (uint blockSize = unitSize; blockSize > 0; blockSize >>= 1) {
-            const uint left = genLeftIndex(indexInThreadgroup, blockSize);
-            bitonicSwap(reverse, sharedKeys[left], sharedVals[left], sharedKeys[left | blockSize], sharedVals[left | blockSize]);
-            threadgroup_barrier(mem_flags::mem_threadgroup);
-        }
-    }
-    storeShared(threadgroupSize, indexInThreadgroup, position, keys, values, sharedKeys, sharedVals);
-}
-
-kernel void bitonicSortGeneralPass(
-    device uint2* keys [[buffer(0)]],
-    device int* values [[buffer(1)]],
-    const device TileAssignmentHeader* header [[buffer(2)]],
-    constant uint2& params [[buffer(3)]],
-    const uint position [[thread_position_in_grid]]
-) {
-    uint gridSize = header->paddedCount;
-    if (position >= gridSize) { return; }
-
-    bool reverse = (position & (params.x >> 1)) != 0;
-    uint blockSize = params.y;
-    const uint left = genLeftIndex(position, blockSize);
-
-    uint2 keyL = keys[left];
-    uint2 keyR = keys[left | blockSize];
-    int valL = values[left];
-    int valR = values[left | blockSize];
-
-    bool lt = bitonicKeyLess(keyL, keyR);
-    bool swap = (!lt) ^ reverse;
-
-    if (swap) {
-        keys[left] = keyR;
-        keys[left | blockSize] = keyL;
-        values[left] = valR;
-        values[left | blockSize] = valL;
-    }
-}
-
-kernel void bitonicSortFinalPass(
-    device uint2* keys [[buffer(0)]],
-    device int* values [[buffer(1)]],
-    const device TileAssignmentHeader* header [[buffer(2)]],
-    constant uint2& params [[buffer(3)]],
-    threadgroup uint2* sharedKeys [[threadgroup(0)]],
-    threadgroup int* sharedVals [[threadgroup(1)]],
-    const uint threadgroupSize [[threads_per_threadgroup]],
-    const uint indexInThreadgroup [[thread_index_in_threadgroup]],
-    const uint position [[thread_position_in_grid]]
-) {
-    uint gridSize = header->paddedCount;
-    if (position >= gridSize) { return; }
-
-    loadShared(threadgroupSize, indexInThreadgroup, position, keys, values, sharedKeys, sharedVals);
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-
-    uint unitSize = params.x;
-    uint blockSize = params.y;
-    bool reverse = (position & (unitSize >> 1)) != 0;
-
-    for (uint width = blockSize; width > 0; width >>= 1) {
-        const uint left = genLeftIndex(indexInThreadgroup, width);
-        bitonicSwap(reverse, sharedKeys[left], sharedVals[left], sharedKeys[left | width], sharedVals[left | width]);
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-    }
-    storeShared(threadgroupSize, indexInThreadgroup, position, keys, values, sharedKeys, sharedVals);
-}
-
-struct BitonicICBContainer {
-    command_buffer commandBuffer [[ id(0) ]];
-};
-
-kernel void encodeBitonicICB(
-    constant BitonicICBContainer& icb_container [[buffer(0)]],
-    const device TileAssignmentHeader* header [[buffer(1)]],
-    const device DispatchIndirectArgs* dispatchArgs [[buffer(2)]],
-    const device uint* passTypes [[buffer(3)]], // 0=first,1=general,2=final,3=unused
-    constant uint& unitSize [[buffer(4)]],
-    constant uint& maxCommands [[buffer(5)]],
-    constant uint& firstOffset [[buffer(6)]],
-    constant uint& generalOffset [[buffer(7)]],
-    constant uint& finalOffset [[buffer(8)]],
-    device uint* firstParams [[buffer(9)]],
-    uint tid [[thread_position_in_grid]]
-) {
-    const uint firstStride = 256u;
-    if (tid != 0) { return; }
-
-    uint pc = max(1u, header[0].paddedCount);
-    uint m = 31u - clz(pc);
-    uint u = 31u - clz(unitSize);
-    uint g = (m > u) ? (m - u) : 0u;
-    uint passesNeeded = 1u + g + (g * (g - 1u)) / 2u;
-    passesNeeded = min(passesNeeded, maxCommands);
-
-    // First-pass logical block size depends on the actual padded count.
-    if (firstParams != nullptr && maxCommands > 0) {
-        uint logical = min(unitSize, pc / 2u);
-        device uint* firstPtr = (device uint*)((device char*)firstParams + 0u * firstStride);
-        *firstPtr = max(1u, logical);
-    }
-
-    const device DispatchIndirectArgs* firstArgs = (const device DispatchIndirectArgs*)((const device char*)dispatchArgs + firstOffset);
-    const device DispatchIndirectArgs* generalArgs = (const device DispatchIndirectArgs*)((const device char*)dispatchArgs + generalOffset);
-    const device DispatchIndirectArgs* finalArgs = (const device DispatchIndirectArgs*)((const device char*)dispatchArgs + finalOffset);
-
-    uint firstGroupsX = firstArgs->threadgroupsPerGridX;
-    uint generalGroupsX = generalArgs->threadgroupsPerGridX;
-    uint finalGroupsX = finalArgs->threadgroupsPerGridX;
-
-    uint3 tgSize(unitSize, 1, 1);
-
-    for (uint slot = 0; slot < maxCommands; ++slot) {
-        compute_command cmd(icb_container.commandBuffer, slot);
-        uint3 tgCount(0, 1, 1);
-
-        if (slot < passesNeeded) {
-            uint t = passTypes[slot];
-            if (t == 0u) {
-                tgCount = uint3(firstGroupsX, 1, 1);
-            } else if (t == 1u) {
-                tgCount = uint3(generalGroupsX, 1, 1);
-            } else if (t == 2u) {
-                tgCount = uint3(finalGroupsX, 1, 1);
-            }
-        }
-
-        cmd.concurrent_dispatch_threadgroups(tgCount, tgSize);
-    }
-}
-
 // =============================================================================
 // MARK: - Two-Pass Tile Assignment with Indirect Dispatch
 // =============================================================================
@@ -1078,19 +878,18 @@ kernel void prepareAssignmentDispatchKernel(
         header[0].overflow = 1u;
     }
 
-    header[0].paddedCount = nextPowerOfTwo(total);
-    uint padded = header[0].paddedCount;
-
     uint sortTG = max(config.sortThreadgroupSize, 1u);
     uint fuseTG = max(config.fuseThreadgroupSize, 1u);
     uint unpackTG = max(config.unpackThreadgroupSize, 1u);
     uint packTG = max(config.packThreadgroupSize, 1u);
-    uint bitonicTG = max(config.bitonicThreadgroupSize, 1u);
     uint radixBlockSize = max(config.radixBlockSize, 1u);
     uint radixGrainSize = max(config.radixGrainSize, 1u);
 
-    // Sort key generation uses total (radix) or padded (bitonic)
-    // For radix path: use total count to avoid processing padding
+    // Radix sort alignment: blockSize * grainSize = 1024
+    uint radixAlignment = radixBlockSize * radixGrainSize;
+    header[0].paddedCount = ((total + radixAlignment - 1u) / radixAlignment) * radixAlignment;
+
+    // Sort key generation uses total count (not padded)
     uint sortGroups = (total > 0u) ? ((total + sortTG - 1u) / sortTG) : 0u;
     dispatchArgs[DispatchSlotSortKeys].threadgroupsPerGridX = sortGroups;
     dispatchArgs[DispatchSlotSortKeys].threadgroupsPerGridY = 1u;
@@ -1111,15 +910,6 @@ kernel void prepareAssignmentDispatchKernel(
     dispatchArgs[DispatchSlotPack].threadgroupsPerGridX = (total > 0u) ? packGroups : 0u;
     dispatchArgs[DispatchSlotPack].threadgroupsPerGridY = 1u;
     dispatchArgs[DispatchSlotPack].threadgroupsPerGridZ = 1u;
-
-    uint bitonicItems = padded;
-    uint bitonicThreads = bitonicItems / 2u;
-    uint bitonicGroups = (bitonicThreads > 0u) ? ((bitonicThreads + bitonicTG - 1u) / bitonicTG) : 0u;
-    dispatchArgs[DispatchSlotBitonicFirst].threadgroupsPerGridX = bitonicGroups;
-    dispatchArgs[DispatchSlotBitonicFirst].threadgroupsPerGridY = 1u;
-    dispatchArgs[DispatchSlotBitonicFirst].threadgroupsPerGridZ = 1u;
-    dispatchArgs[DispatchSlotBitonicGeneral] = dispatchArgs[DispatchSlotBitonicFirst];
-    dispatchArgs[DispatchSlotBitonicFinal] = dispatchArgs[DispatchSlotBitonicFirst];
 
     uint valuesPerGroup = max(radixBlockSize * radixGrainSize, 1u);
     uint radixGrid = (total > 0u) ? ((total + valuesPerGroup - 1u) / valuesPerGroup) : 0u;

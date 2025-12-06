@@ -24,17 +24,6 @@ inline float4 getRotation(PackedWorldGaussianHalf g) {
 // MATH HELPERS
 // =============================================================================
 
-/// Compute next power of two
-inline uint nextPowerOfTwo(uint v) {
-    v--;
-    v |= v >> 1;
-    v |= v >> 2;
-    v |= v >> 4;
-    v |= v >> 8;
-    v |= v >> 16;
-    return v + 1;
-}
-
 /// Matrix from row vectors (converts row-major input to column-major)
 inline float3x3 matrixFromRows(float3 r0, float3 r1, float3 r2) {
     return float3x3(

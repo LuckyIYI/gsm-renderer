@@ -53,7 +53,7 @@ final class GlobalSortUnitTests: XCTestCase {
             device: device, library: library,
             config: AssignmentDispatchConfigSwift(
                 sortThreadgroupSize: 256, fuseThreadgroupSize: 256, unpackThreadgroupSize: 256,
-                packThreadgroupSize: 256, bitonicThreadgroupSize: 256,
+                packThreadgroupSize: 256,
                 radixBlockSize: 256, radixGrainSize: 4, maxAssignments: UInt32(count * 10)
             )
         )
@@ -132,7 +132,7 @@ final class GlobalSortUnitTests: XCTestCase {
             device: device, library: library,
             config: AssignmentDispatchConfigSwift(
                 sortThreadgroupSize: 256, fuseThreadgroupSize: 256, unpackThreadgroupSize: 256,
-                packThreadgroupSize: 256, bitonicThreadgroupSize: 256,
+                packThreadgroupSize: 256,
                 radixBlockSize: 256, radixGrainSize: 4, maxAssignments: UInt32(count * 10)
             )
         )

@@ -160,7 +160,6 @@ typedef struct {
     UINT32 fuseThreadgroupSize;
     UINT32 unpackThreadgroupSize;
     UINT32 packThreadgroupSize;
-    UINT32 bitonicThreadgroupSize;
     UINT32 radixBlockSize;
     UINT32 radixGrainSize;
     UINT32 maxAssignments;
@@ -205,12 +204,6 @@ typedef struct {
     UINT32 totalAssignments;
 } SortKeyParams;
 
-typedef struct {
-    UINT32 j;
-    UINT32 k;
-    UINT32 total;
-} BitonicParams;
-
 // =============================================================================
 // CLUSTER CULLING (Morton-sorted optimization)
 // =============================================================================
@@ -245,13 +238,10 @@ enum DispatchSlots {
     DispatchSlotFuseKeys = 1,
     DispatchSlotUnpackKeys = 2,
     DispatchSlotPack = 3,
-    DispatchSlotBitonicFirst = 4,
-    DispatchSlotBitonicGeneral = 5,
-    DispatchSlotBitonicFinal = 6,
-    DispatchSlotRadixHistogram = 7,
-    DispatchSlotRadixScanBlocks = 8,
-    DispatchSlotRadixExclusive = 9,
-    DispatchSlotRadixApply = 10,
-    DispatchSlotRadixScatter = 11,
-    DispatchSlotRenderTiles = 12
+    DispatchSlotRadixHistogram = 4,
+    DispatchSlotRadixScanBlocks = 5,
+    DispatchSlotRadixExclusive = 6,
+    DispatchSlotRadixApply = 7,
+    DispatchSlotRadixScatter = 8,
+    DispatchSlotRenderTiles = 9
 };

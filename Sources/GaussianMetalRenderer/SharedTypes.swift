@@ -21,12 +21,12 @@ public typealias ClearTextureParamsSwift = ClearTextureParams
 public enum DispatchSlot: Int, CaseIterable {
     case sortKeys = 0
     case pack = 3
-    case radixHistogram = 7
-    case radixScanBlocks = 8
-    case radixExclusive = 9
-    case radixApply = 10
-    case radixScatter = 11
-    case renderTiles = 12
+    case radixHistogram = 4
+    case radixScanBlocks = 5
+    case radixExclusive = 6
+    case radixApply = 7
+    case radixScatter = 8
+    case renderTiles = 9
 }
 
 // RenderDispatchParamsSwift - used for dispatch computation

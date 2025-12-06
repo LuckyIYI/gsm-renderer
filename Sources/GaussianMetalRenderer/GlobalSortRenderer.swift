@@ -266,12 +266,8 @@ public final class GlobalSortRenderer: GaussianRenderer, @unchecked Sendable {
     // Reset tile builder state pipeline (replaces blit for lower overhead)
     private let resetTileBuilderStatePipeline: MTLComputePipelineState
 
-    // Frame Resources (Single Buffering for now)
-    private var frameResources: [FrameResources] = []
-    private var frameInUse: [Bool] = []
-    private var frameCursor: Int = 0
-    private let maxInFlightFrames = 1 // Enforce single buffering initially
-    private let frameLock = NSLock()
+    // Frame Resources (Single frame - no multi-buffering needed)
+    private var frame: FrameResources!
 
     // Gaussian projection output caches (Shared)
     private var gaussianBoundsCache: MTLBuffer? // int4 tile bounds
@@ -322,7 +318,6 @@ public final class GlobalSortRenderer: GaussianRenderer, @unchecked Sendable {
                 fuseThreadgroupSize: 256,
                 unpackThreadgroupSize: 256,
                 packThreadgroupSize: UInt32(self.packEncoder.packThreadgroupSize),
-                bitonicThreadgroupSize: 256,
                 radixBlockSize: UInt32(self.radixSortEncoder.blockSize),
                 radixGrainSize: UInt32(self.radixSortEncoder.grainSize),
                 maxAssignments: 0
@@ -353,16 +348,12 @@ public final class GlobalSortRenderer: GaussianRenderer, @unchecked Sendable {
             radixSortEncoder: self.radixSortEncoder
         )
 
-        // Initialize frame slots with fully allocated resources
-        for _ in 0 ..< self.maxInFlightFrames {
-            let frame = FrameResources(
-                device: device,
-                layout: self.frameLayout,
-                textureOnly: textureOnly
-            )
-            self.frameResources.append(frame)
-            self.frameInUse.append(false)
-        }
+        // Initialize single frame resources
+        self.frame = FrameResources(
+            device: device,
+            layout: self.frameLayout,
+            textureOnly: textureOnly
+        )
 
         // Preallocate shared CPU-visible caches for projection output
         let g = limits.maxGaussians
@@ -619,12 +610,8 @@ public final class GlobalSortRenderer: GaussianRenderer, @unchecked Sendable {
     ) -> RenderOutputBuffers? {
         let params = self.limits.buildParams(from: frameParams)
         guard self.validateLimits(gaussianCount: gaussianCount) else { return nil }
-        guard let (frame, slotIndex) = self.acquireFrame(width: limits.maxWidth, height: limits.maxHeight) else {
-            return nil
-        }
 
         guard let projectionOutput = self.prepareProjectionOutput(frame: frame) else {
-            self.releaseFrame(index: slotIndex)
             return nil
         }
 
@@ -649,7 +636,6 @@ public final class GlobalSortRenderer: GaussianRenderer, @unchecked Sendable {
             params: params,
             frame: frame
         ) else {
-            self.releaseFrame(index: slotIndex)
             if MTLCaptureManager.shared().isCapturing { MTLCaptureManager.shared().stopCapture() }
             return nil
         }
@@ -662,7 +648,6 @@ public final class GlobalSortRenderer: GaussianRenderer, @unchecked Sendable {
             params: params,
             frame: frame
         ) else {
-            self.releaseFrame(index: slotIndex)
             if MTLCaptureManager.shared().isCapturing { MTLCaptureManager.shared().stopCapture() }
             return nil
         }
@@ -672,18 +657,15 @@ public final class GlobalSortRenderer: GaussianRenderer, @unchecked Sendable {
             ordered: ordered,
             params: params,
             frame: frame,
-            slotIndex: slotIndex,
             precision: self.effectivePrecision
         )
 
         guard submission else {
-            self.releaseFrame(index: slotIndex)
             if MTLCaptureManager.shared().isCapturing { MTLCaptureManager.shared().stopCapture() }
             return nil
         }
 
-        commandBuffer.addCompletedHandler { [weak self] _ in
-            self?.releaseFrame(index: slotIndex)
+        commandBuffer.addCompletedHandler { _ in
             if MTLCaptureManager.shared().isCapturing { MTLCaptureManager.shared().stopCapture() }
         }
 
@@ -701,10 +683,6 @@ public final class GlobalSortRenderer: GaussianRenderer, @unchecked Sendable {
         let params = self.limits.buildParams(from: frameParams)
         guard self.validateLimits(gaussianCount: gaussianCount) else {
             fatalError("[encodeRenderToTextures] validateLimits failed")
-        }
-
-        guard let (frame, slotIndex) = self.acquireFrame(width: limits.maxWidth, height: limits.maxHeight) else {
-            fatalError("[encodeRenderToTextures] acquireFrame failed for \(self.limits.maxWidth)x\(self.limits.maxHeight)")
         }
 
         // Prepare projection output (packed renderData + radii + mask)
@@ -771,8 +749,7 @@ public final class GlobalSortRenderer: GaussianRenderer, @unchecked Sendable {
             dispatchOffset: dispatchOffset
         )
 
-        commandBuffer.addCompletedHandler { [weak self] _ in
-            self?.releaseFrame(index: slotIndex)
+        commandBuffer.addCompletedHandler { _ in
             if MTLCaptureManager.shared().isCapturing { MTLCaptureManager.shared().stopCapture() }
         }
 
@@ -794,12 +771,8 @@ public final class GlobalSortRenderer: GaussianRenderer, @unchecked Sendable {
         guard self.validateLimits(gaussianCount: gaussianCount) else {
             return false
         }
-        guard let (frame, slotIndex) = self.acquireFrame(width: limits.maxWidth, height: limits.maxHeight) else {
-            return false
-        }
 
         guard let projectionOutput = self.prepareProjectionOutput(frame: frame) else {
-            self.releaseFrame(index: slotIndex)
             return false
         }
 
@@ -824,7 +797,6 @@ public final class GlobalSortRenderer: GaussianRenderer, @unchecked Sendable {
             params: params,
             frame: frame
         ) else {
-            self.releaseFrame(index: slotIndex)
             return false
         }
 
@@ -836,7 +808,6 @@ public final class GlobalSortRenderer: GaussianRenderer, @unchecked Sendable {
             params: params,
             frame: frame
         ) else {
-            self.releaseFrame(index: slotIndex)
             return false
         }
 
@@ -850,7 +821,6 @@ public final class GlobalSortRenderer: GaussianRenderer, @unchecked Sendable {
         guard let renderData = ordered.renderData,
               let sortedIndices = ordered.sortedIndices
         else {
-            self.releaseFrame(index: slotIndex)
             return false
         }
         self.fusedPipelineEncoder.encodeCompleteRender(
@@ -864,10 +834,6 @@ public final class GlobalSortRenderer: GaussianRenderer, @unchecked Sendable {
             dispatchArgs: dispatchArgs,
             dispatchOffset: dispatchOffset
         )
-
-        commandBuffer.addCompletedHandler { [weak self] _ in
-            self?.releaseFrame(index: slotIndex)
-        }
 
         return true
     }
@@ -1066,7 +1032,6 @@ public final class GlobalSortRenderer: GaussianRenderer, @unchecked Sendable {
         ordered: OrderedGaussianBuffers,
         params: RenderParams,
         frame: FrameResources,
-        slotIndex _: Int,
         precision: Precision
     ) -> Bool {
         guard let outputBuffers = frame.outputBuffers else {
@@ -1118,33 +1083,6 @@ public final class GlobalSortRenderer: GaussianRenderer, @unchecked Sendable {
         encoder.dispatchThreads(MTLSize(width: 1, height: 1, depth: 1),
                                 threadsPerThreadgroup: MTLSize(width: 1, height: 1, depth: 1))
         encoder.endEncoding()
-    }
-
-    func acquireFrame(width: Int, height: Int) -> (FrameResources, Int)? {
-        guard width <= self.limits.maxWidth, height <= self.limits.maxHeight else { return nil }
-        self.frameLock.lock()
-        defer { frameLock.unlock() }
-
-        let available = min(maxInFlightFrames, frameResources.count)
-        guard available > 0 else { return nil }
-
-        for _ in 0 ..< available {
-            let idx = self.frameCursor % available
-            self.frameCursor = (self.frameCursor + 1) % max(available, 1)
-            if self.frameInUse[idx] == false {
-                self.frameInUse[idx] = true
-                return (self.frameResources[idx], idx)
-            }
-        }
-        return nil
-    }
-
-    func releaseFrame(index: Int) {
-        self.frameLock.lock()
-        defer { frameLock.unlock() }
-        if index >= 0, index < self.frameInUse.count {
-            self.frameInUse[index] = false
-        }
     }
 
     /// Pad assignment capacity for radix sort alignment (1024-aligned)

@@ -208,12 +208,18 @@ kernel void localProjectStore(
         return;
     }
 
+    // ==========================================================================
+    // OBB (Oriented Bounding Box) TILE BOUNDS - GSCore-style optimization
+    // Uses ellipse orientation for tighter bounds than circular AABB
+    // ==========================================================================
+    float2 obbExtents = computeOBBExtents(cov2d, 3.0f);
+
     float maxW = float(params.surfaceWidth - 1);
     float maxH = float(params.surfaceHeight - 1);
-    float xmin = clamp(px - radius, 0.0f, maxW);
-    float xmax = clamp(px + radius, 0.0f, maxW);
-    float ymin = clamp(py - radius, 0.0f, maxH);
-    float ymax = clamp(py + radius, 0.0f, maxH);
+    float xmin = clamp(px - obbExtents.x, 0.0f, maxW);
+    float xmax = clamp(px + obbExtents.x, 0.0f, maxW);
+    float ymin = clamp(py - obbExtents.y, 0.0f, maxH);
+    float ymax = clamp(py + obbExtents.y, 0.0f, maxH);
 
     int tileW = int(params.tileWidth);
     int tileH = int(params.tileHeight);

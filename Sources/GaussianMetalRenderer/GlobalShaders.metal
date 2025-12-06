@@ -149,9 +149,16 @@ kernel void projectGaussiansFused(
         return;
     }
 
-    // Off-screen culling
-    if (px + radius < 0.0f || px - radius > camera.width ||
-        py + radius < 0.0f || py - radius > camera.height) {
+    // ==========================================================================
+    // OBB (Oriented Bounding Box) COMPUTATION - GSCore-style optimization
+    // Uses ellipse orientation for tighter bounds than circular AABB
+    // Reduces tile assignments by ~30-50% for elongated gaussians
+    // ==========================================================================
+    float2 obbExtents = computeOBBExtents(cov2d, 3.0f);
+
+    // Off-screen culling using OBB extents (tighter than radius-based)
+    if (px + obbExtents.x < 0.0f || px - obbExtents.x > camera.width ||
+        py + obbExtents.y < 0.0f || py - obbExtents.y > camera.height) {
         outMask[gid] = 0;
         outBounds[gid] = int4(0, -1, 0, -1);
         return;
@@ -177,12 +184,12 @@ kernel void projectGaussiansFused(
     outRenderData[gid] = renderData;
 
     // =========================================================================
-    // FUSED TILE BOUNDS COMPUTATION (previously separate tileBoundsKernel)
+    // FUSED TILE BOUNDS - Using OBB extents (tighter than circular AABB)
     // =========================================================================
-    float xmin = px - radius;
-    float xmax = px + radius;
-    float ymin = py - radius;
-    float ymax = py + radius;
+    float xmin = px - obbExtents.x;
+    float xmax = px + obbExtents.x;
+    float ymin = py - obbExtents.y;
+    float ymax = py + obbExtents.y;
 
     float maxW = camera.width - 1.0f;
     float maxH = camera.height - 1.0f;

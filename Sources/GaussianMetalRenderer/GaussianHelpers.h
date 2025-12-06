@@ -174,6 +174,87 @@ inline float radiusFromCovariance(float2x2 cov) {
 }
 
 // =============================================================================
+// OBB (ORIENTED BOUNDING BOX) COMPUTATION - GSCore-style
+// =============================================================================
+// Computes tighter bounds by using ellipse orientation instead of circular AABB.
+// Reduces tile assignments by ~30-50% for elongated gaussians.
+// Reference: GSCore (ASPLOS'24) - https://dl.acm.org/doi/10.1145/3620666.3651385
+
+/// Compute OBB extents (half-widths along X and Y axes) from 2D covariance matrix
+/// Returns float2(xExtent, yExtent) - the half-widths of the AABB of the OBB
+/// sigma_multiplier: typically 3.0 for 3-sigma bounds
+inline float2 computeOBBExtents(float2x2 cov, float sigma_multiplier) {
+    float a = cov[0][0];
+    float b = cov[0][1];  // = cov[1][0], symmetric
+    float d = cov[1][1];
+
+    float det = a * d - b * b;
+    float mid = 0.5f * (a + d);
+    float disc = max(mid * mid - det, 1e-6f);
+    float sqrtDisc = sqrt(disc);
+
+    // Eigenvalues (variances along principal axes)
+    float lambda1 = mid + sqrtDisc;  // major axis variance
+    float lambda2 = max(mid - sqrtDisc, 1e-6f);  // minor axis variance
+
+    // Semi-axes lengths (standard deviations * sigma_multiplier)
+    float e1 = sigma_multiplier * sqrt(max(lambda1, 1e-6f));  // major half-extent
+    float e2 = sigma_multiplier * sqrt(max(lambda2, 1e-6f));  // minor half-extent
+
+    // Eigenvector for major axis (v1)
+    // For symmetric 2x2: if b != 0, v1 = normalize(b, lambda1 - a)
+    // else v1 = (1,0) if a > d, else (0,1)
+    float2 v1;
+    if (abs(b) > 1e-6f) {
+        float vx = b;
+        float vy = lambda1 - a;
+        float vlen = sqrt(vx * vx + vy * vy);
+        v1 = float2(vx, vy) / max(vlen, 1e-6f);
+    } else {
+        // Diagonal matrix - eigenvectors are axis-aligned
+        v1 = (a >= d) ? float2(1.0f, 0.0f) : float2(0.0f, 1.0f);
+    }
+
+    // Minor axis is perpendicular: v2 = (-v1.y, v1.x)
+    // |v2.x| = |v1.y|, |v2.y| = |v1.x|
+
+    // AABB of OBB: extent along each axis = |v1.component| * e1 + |v2.component| * e2
+    float xExtent = abs(v1.x) * e1 + abs(v1.y) * e2;
+    float yExtent = abs(v1.y) * e1 + abs(v1.x) * e2;
+
+    return float2(xExtent, yExtent);
+}
+
+/// Compute OBB extents from individual covariance components
+inline float2 computeOBBExtentsFromComponents(float a, float b, float d, float sigma_multiplier) {
+    float det = a * d - b * b;
+    float mid = 0.5f * (a + d);
+    float disc = max(mid * mid - det, 1e-6f);
+    float sqrtDisc = sqrt(disc);
+
+    float lambda1 = mid + sqrtDisc;
+    float lambda2 = max(mid - sqrtDisc, 1e-6f);
+
+    float e1 = sigma_multiplier * sqrt(max(lambda1, 1e-6f));
+    float e2 = sigma_multiplier * sqrt(max(lambda2, 1e-6f));
+
+    float2 v1;
+    if (abs(b) > 1e-6f) {
+        float vx = b;
+        float vy = lambda1 - a;
+        float vlen = sqrt(vx * vx + vy * vy);
+        v1 = float2(vx, vy) / max(vlen, 1e-6f);
+    } else {
+        v1 = (a >= d) ? float2(1.0f, 0.0f) : float2(0.0f, 1.0f);
+    }
+
+    float xExtent = abs(v1.x) * e1 + abs(v1.y) * e2;
+    float yExtent = abs(v1.y) * e1 + abs(v1.x) * e2;
+
+    return float2(xExtent, yExtent);
+}
+
+// =============================================================================
 // ELLIPSE-TILE INTERSECTION (FlashGS-style)
 // =============================================================================
 

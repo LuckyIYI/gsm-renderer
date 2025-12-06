@@ -137,10 +137,10 @@ typedef struct {
 } TileAssignmentHeader;
 
 typedef struct {
-    simd_float4 covariance_depth;
-    simd_float4 position_color;
-    simd_int2   min_tile;
-    simd_int2   max_tile;
+    simd_float4 covarianceDepth;
+    simd_float4 positionColor;
+    simd_int2   minTile;
+    simd_int2   maxTile;
     UINT32      originalIdx;    // World buffer index for deterministic tie-breaking
     UINT32      _pad0;          // Padding for alignment
 } CompactedGaussian;

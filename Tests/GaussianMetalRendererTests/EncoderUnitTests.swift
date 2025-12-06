@@ -103,10 +103,10 @@ final class EncoderUnitTests: XCTestCase {
             let maxTY = min(tilesY, Int((py + radius) / 16) + 1)
 
             var g = CompactedGaussian()
-            g.position_color = SIMD4<Float>(px, py, 0, 0)
-            g.covariance_depth = SIMD4<Float>(0.01, 0, 0.01, Float(i) / Float(visibleCount)) // Simple conic, depth
-            g.min_tile = SIMD2<Int32>(Int32(minTX), Int32(minTY))
-            g.max_tile = SIMD2<Int32>(Int32(maxTX), Int32(maxTY))
+            g.positionColor = SIMD4<Float>(px, py, 0, 0)
+            g.covarianceDepth = SIMD4<Float>(0.01, 0, 0.01, Float(i) / Float(visibleCount)) // Simple conic, depth
+            g.minTile = SIMD2<Int32>(Int32(minTX), Int32(minTY))
+            g.maxTile = SIMD2<Int32>(Int32(maxTX), Int32(maxTY))
             g.originalIdx = UInt32(i)
             compactedPtr[i] = g
         }

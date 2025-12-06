@@ -942,31 +942,31 @@ kernel void prepareAssignmentDispatchKernel(
 // =============================================================================
 
 kernel void radixHistogramKernel(
-    device const RadixKeyType*          input_keys     [[buffer(0)]],
-    device uint*                        hist_flat      [[buffer(1)]],
-    constant uint&                      current_digit  [[buffer(3)]],
-    const device TileAssignmentHeader*  header         [[buffer(4)]],
-    uint                                grid_size      [[threadgroups_per_grid]],
-    uint                                group_id       [[threadgroup_position_in_grid]],
-    ushort                              local_id       [[thread_position_in_threadgroup]]
+    device const RadixKeyType*          inputKeys     [[buffer(0)]],
+    device uint*                        histFlat      [[buffer(1)]],
+    constant uint&                      currentDigit  [[buffer(3)]],
+    const device TileAssignmentHeader*  header        [[buffer(4)]],
+    uint                                gridSize      [[threadgroups_per_grid]],
+    uint                                groupId       [[threadgroup_position_in_grid]],
+    ushort                              localId       [[thread_position_in_threadgroup]]
 ) {
     const uint elementsPerBlock = RADIX_BLOCK_SIZE * RADIX_GRAIN_SIZE;
 
-    uint base_id          = group_id * elementsPerBlock;
+    uint baseId           = groupId * elementsPerBlock;
     uint totalAssignments = header[0].totalAssignments;
     uint paddedCount      = header[0].paddedCount;
 
-    uint bufferRemaining   = (base_id < paddedCount)      ? (paddedCount      - base_id) : 0;
-    uint assignmentsRemain = (base_id < totalAssignments) ? (totalAssignments - base_id) : 0;
+    uint bufferRemaining   = (baseId < paddedCount)      ? (paddedCount      - baseId) : 0;
+    uint assignmentsRemain = (baseId < totalAssignments) ? (totalAssignments - baseId) : 0;
     uint available         = min(bufferRemaining, assignmentsRemain);
 
     // 1) Per-group local histogram in LDS
-    threadgroup uint local_hist[RADIX_BUCKETS];
+    threadgroup uint localHist[RADIX_BUCKETS];
 
     for (uint i = 0; i < (RADIX_BUCKETS + RADIX_BLOCK_SIZE - 1u) / RADIX_BLOCK_SIZE; ++i) {
-        uint bin = local_id + i * RADIX_BLOCK_SIZE;
+        uint bin = localId + i * RADIX_BLOCK_SIZE;
         if (bin < RADIX_BUCKETS) {
-            local_hist[bin] = 0u;
+            localHist[bin] = 0u;
         }
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -977,65 +977,65 @@ kernel void radixHistogramKernel(
 
     load_blocked_local_from_global<RADIX_GRAIN_SIZE>(
         keys,
-        &input_keys[base_id],
-        local_id,
+        &inputKeys[baseId],
+        localId,
         available,
         sentinelKey);
 
     // 3) Build local histogram using threadgroup atomics
-    volatile threadgroup atomic_uint* atomic_hist =
-        reinterpret_cast<volatile threadgroup atomic_uint*>(local_hist);
+    volatile threadgroup atomic_uint* atomicHist =
+        reinterpret_cast<volatile threadgroup atomic_uint*>(localHist);
 
     for (ushort i = 0; i < RADIX_GRAIN_SIZE; ++i) {
-        uint offset_in_block = local_id * RADIX_GRAIN_SIZE + i;
-        uint global_idx      = base_id + offset_in_block;
+        uint offsetInBlock = localId * RADIX_GRAIN_SIZE + i;
+        uint globalIdx     = baseId + offsetInBlock;
 
-        if (global_idx < totalAssignments) {
-            uchar bin = (uchar)value_to_key_at_digit(keys[i], (ushort)current_digit);
-            atomic_fetch_add_explicit(&atomic_hist[bin], 1u, memory_order_relaxed);
+        if (globalIdx < totalAssignments) {
+            uchar bin = (uchar)value_to_key_at_digit(keys[i], (ushort)currentDigit);
+            atomic_fetch_add_explicit(&atomicHist[bin], 1u, memory_order_relaxed);
         }
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
     // 4) Write out in bin-major layout: [bin][block]
     for (uint i = 0; i < (RADIX_BUCKETS + RADIX_BLOCK_SIZE - 1u) / RADIX_BLOCK_SIZE; ++i) {
-        uint bin = local_id + i * RADIX_BLOCK_SIZE;
+        uint bin = localId + i * RADIX_BLOCK_SIZE;
         if (bin < RADIX_BUCKETS) {
-            hist_flat[bin * grid_size + group_id] = local_hist[bin];
+            histFlat[bin * gridSize + groupId] = localHist[bin];
         }
     }
 }
 
 kernel void radixScanBlocksKernel(
-    device const uint*                 hist_flat   [[buffer(0)]],
-    device uint*                       block_sums  [[buffer(1)]],
-    const device TileAssignmentHeader* header      [[buffer(2)]],
-    uint                               group_id    [[threadgroup_position_in_grid]],
-    ushort                             local_id    [[thread_position_in_threadgroup]]
+    device const uint*                 histFlat   [[buffer(0)]],
+    device uint*                       blockSums  [[buffer(1)]],
+    const device TileAssignmentHeader* header     [[buffer(2)]],
+    uint                               groupId    [[threadgroup_position_in_grid]],
+    ushort                             localId    [[thread_position_in_threadgroup]]
 ) {
-    threadgroup uint shared_mem[RADIX_BLOCK_SIZE];
+    threadgroup uint sharedMem[RADIX_BLOCK_SIZE];
 
     const uint elementsPerBlock = RADIX_BLOCK_SIZE * RADIX_GRAIN_SIZE;
     uint paddedCount   = header[0].paddedCount;
     uint histGridSize  = (paddedCount + elementsPerBlock - 1u) / elementsPerBlock;
-    uint num_hist_elem = histGridSize * RADIX_BUCKETS;
+    uint numHistElem   = histGridSize * RADIX_BUCKETS;
 
-    uint block_base = group_id * RADIX_BLOCK_SIZE;
-    uint idx        = block_base + local_id;
+    uint blockBase = groupId * RADIX_BLOCK_SIZE;
+    uint idx       = blockBase + localId;
 
-    uint val = (idx < num_hist_elem) ? hist_flat[idx] : 0u;
-    shared_mem[local_id] = val;
+    uint val = (idx < numHistElem) ? histFlat[idx] : 0u;
+    sharedMem[localId] = val;
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
     for (uint stride = RADIX_BLOCK_SIZE >> 1; stride > 0; stride >>= 1) {
-        if (local_id < stride) {
-            shared_mem[local_id] += shared_mem[local_id + stride];
+        if (localId < stride) {
+            sharedMem[localId] += sharedMem[localId + stride];
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
     }
 
-    if (local_id == 0) {
-        block_sums[group_id] = shared_mem[0];
+    if (localId == 0) {
+        blockSums[groupId] = sharedMem[0];
     }
 }
 
@@ -1044,98 +1044,98 @@ kernel void radixScanBlocksKernel(
 
 // Each thread handles RADIX_SCAN_GRAIN elements, sums them, scans sums, then applies back
 kernel void radixExclusiveScanKernel(
-    device uint*                       block_sums  [[buffer(0)]],
-    const device TileAssignmentHeader* header      [[buffer(1)]],
-    threadgroup uint*                  shared_mem  [[threadgroup(0)]],
-    ushort                             lid         [[thread_position_in_threadgroup]]
+    device uint*                       blockSums  [[buffer(0)]],
+    const device TileAssignmentHeader* header     [[buffer(1)]],
+    threadgroup uint*                  sharedMem  [[threadgroup(0)]],
+    ushort                             lid        [[thread_position_in_threadgroup]]
 ) {
 
     const uint elementsPerBlock = RADIX_BLOCK_SIZE * RADIX_GRAIN_SIZE;
     uint paddedCount   = header[0].paddedCount;
     uint histGridSize  = (paddedCount + elementsPerBlock - 1u) / elementsPerBlock;
-    uint num_hist_elem = histGridSize * RADIX_BUCKETS;
-    uint num_block_sums = (num_hist_elem + RADIX_BLOCK_SIZE - 1u) / RADIX_BLOCK_SIZE;
+    uint numHistElem   = histGridSize * RADIX_BUCKETS;
+    uint numBlockSums  = (numHistElem + RADIX_BLOCK_SIZE - 1u) / RADIX_BLOCK_SIZE;
 
     // Calculate elements per thread (up to RADIX_SCAN_GRAIN)
-    uint elems_per_thread = (num_block_sums + RADIX_BLOCK_SIZE - 1u) / RADIX_BLOCK_SIZE;
-    elems_per_thread = min(elems_per_thread, (uint)RADIX_SCAN_GRAIN);
+    uint elemsPerThread = (numBlockSums + RADIX_BLOCK_SIZE - 1u) / RADIX_BLOCK_SIZE;
+    elemsPerThread = min(elemsPerThread, (uint)RADIX_SCAN_GRAIN);
 
     // Load multiple elements and compute local sum
-    uint local_vals[RADIX_SCAN_GRAIN];
-    uint local_sum = 0u;
-    uint thread_base = lid * elems_per_thread;
+    uint localVals[RADIX_SCAN_GRAIN];
+    uint localSum = 0u;
+    uint threadBase = lid * elemsPerThread;
 
-    for (uint i = 0u; i < elems_per_thread; ++i) {
-        uint idx = thread_base + i;
-        uint val = (idx < num_block_sums) ? block_sums[idx] : 0u;
-        local_vals[i] = val;
-        local_sum += val;
+    for (uint i = 0u; i < elemsPerThread; ++i) {
+        uint idx = threadBase + i;
+        uint val = (idx < numBlockSums) ? blockSums[idx] : 0u;
+        localVals[i] = val;
+        localSum += val;
     }
 
     // Scan the per-thread sums using helper (exclusive scan of 256 values)
-    uint scanned_sum = radix_threadgroup_prefix_scan<RADIX_SCAN_TYPE_EXCLUSIVE>(local_sum, shared_mem, lid, radix_sum_op<uint>());
+    uint scannedSum = radix_threadgroup_prefix_scan<RADIX_SCAN_TYPE_EXCLUSIVE>(localSum, sharedMem, lid, radix_sum_op<uint>());
 
-    // Write back: each element gets scanned_sum + prefix of local values
-    uint running = scanned_sum;
-    for (uint i = 0u; i < elems_per_thread; ++i) {
-        uint idx = thread_base + i;
-        if (idx < num_block_sums) {
-            block_sums[idx] = running;
-            running += local_vals[i];
+    // Write back: each element gets scannedSum + prefix of local values
+    uint running = scannedSum;
+    for (uint i = 0u; i < elemsPerThread; ++i) {
+        uint idx = threadBase + i;
+        if (idx < numBlockSums) {
+            blockSums[idx] = running;
+            running += localVals[i];
         }
     }
 }
 
 
 kernel void radixApplyScanOffsetsKernel(
-    device const uint*                 hist_flat       [[buffer(0)]],
-    device const uint*                 scanned_blocks  [[buffer(1)]],
-    device uint*                       offsets_flat    [[buffer(2)]],
-    const device TileAssignmentHeader* header          [[buffer(3)]],
-    threadgroup uint*                  shared_mem      [[threadgroup(0)]],
-    uint                               group_id        [[threadgroup_position_in_grid]],
-    ushort                             local_id        [[thread_position_in_threadgroup]]
+    device const uint*                 histFlat       [[buffer(0)]],
+    device const uint*                 scannedBlocks  [[buffer(1)]],
+    device uint*                       offsetsFlat    [[buffer(2)]],
+    const device TileAssignmentHeader* header         [[buffer(3)]],
+    threadgroup uint*                  sharedMem      [[threadgroup(0)]],
+    uint                               groupId        [[threadgroup_position_in_grid]],
+    ushort                             localId        [[thread_position_in_threadgroup]]
 ) {
     const uint elementsPerBlock = RADIX_BLOCK_SIZE * RADIX_GRAIN_SIZE;
     uint paddedCount   = header[0].paddedCount;
     uint histGridSize  = (paddedCount + elementsPerBlock - 1u) / elementsPerBlock;
-    uint num_hist_elem = histGridSize * RADIX_BUCKETS;
+    uint numHistElem   = histGridSize * RADIX_BUCKETS;
 
-    uint block_base = group_id * RADIX_BLOCK_SIZE;
-    uint idx        = block_base + local_id;
+    uint blockBase = groupId * RADIX_BLOCK_SIZE;
+    uint idx       = blockBase + localId;
 
-    uint val = (idx < num_hist_elem) ? hist_flat[idx] : 0u;
+    uint val = (idx < numHistElem) ? histFlat[idx] : 0u;
 
-    uint local_scanned = radix_threadgroup_prefix_scan<RADIX_SCAN_TYPE_EXCLUSIVE>(
-        val, shared_mem, local_id, radix_sum_op<uint>());
+    uint localScanned = radix_threadgroup_prefix_scan<RADIX_SCAN_TYPE_EXCLUSIVE>(
+        val, sharedMem, localId, radix_sum_op<uint>());
 
-    uint block_offset = scanned_blocks[group_id];
+    uint blockOffset = scannedBlocks[groupId];
 
-    if (idx < num_hist_elem) {
-        offsets_flat[idx] = local_scanned + block_offset;
+    if (idx < numHistElem) {
+        offsetsFlat[idx] = localScanned + blockOffset;
     }
 }
 
 kernel void radixScatterKernel(
-    device RadixKeyType*               output_keys     [[buffer(0)]],
-    device const RadixKeyType*         input_keys      [[buffer(1)]],
-    device uint*                       output_payload  [[buffer(2)]],
-    device const uint*                 input_payload   [[buffer(3)]],
-    device const uint*                 offsets_flat    [[buffer(5)]],
-    constant uint&                     current_digit   [[buffer(6)]],
-    const device TileAssignmentHeader* header          [[buffer(7)]],
-    uint                               group_id        [[threadgroup_position_in_grid]],
-    uint                               grid_size       [[threadgroups_per_grid]],
-    ushort                             local_id        [[thread_position_in_threadgroup]]
+    device RadixKeyType*               outputKeys     [[buffer(0)]],
+    device const RadixKeyType*         inputKeys      [[buffer(1)]],
+    device uint*                       outputPayload  [[buffer(2)]],
+    device const uint*                 inputPayload   [[buffer(3)]],
+    device const uint*                 offsetsFlat    [[buffer(5)]],
+    constant uint&                     currentDigit   [[buffer(6)]],
+    const device TileAssignmentHeader* header         [[buffer(7)]],
+    uint                               groupId        [[threadgroup_position_in_grid]],
+    uint                               gridSize       [[threadgroups_per_grid]],
+    ushort                             localId        [[thread_position_in_threadgroup]]
 ) {
     const uint elementsPerBlock = RADIX_BLOCK_SIZE * RADIX_GRAIN_SIZE;
 
-    uint base_id          = group_id * elementsPerBlock;
+    uint baseId           = groupId * elementsPerBlock;
     uint totalAssignments = header[0].totalAssignments;
     uint paddedCount      = header[0].paddedCount;
 
-    uint bufferRemaining   = (base_id < paddedCount)      ? (paddedCount      - base_id) : 0;
-    uint assignmentsRemain = (base_id < totalAssignments) ? (totalAssignments - base_id) : 0;
+    uint bufferRemaining   = (baseId < paddedCount)      ? (paddedCount      - baseId) : 0;
+    uint assignmentsRemain = (baseId < totalAssignments) ? (totalAssignments - baseId) : 0;
     uint available         = min(bufferRemaining, assignmentsRemain);
 
     // Use max key as sentinel
@@ -1144,19 +1144,19 @@ kernel void radixScatterKernel(
     // 1) Load keys / payloads in STRIPED fashion
     RadixKeyType keys[RADIX_GRAIN_SIZE];
     uint payloads[RADIX_GRAIN_SIZE];
-    load_striped_local_from_global<RADIX_GRAIN_SIZE, RADIX_BLOCK_SIZE>(keys, &input_keys[base_id], local_id, available, keySentinel);
-    load_striped_local_from_global<RADIX_GRAIN_SIZE, RADIX_BLOCK_SIZE>(payloads, &input_payload[base_id], local_id, available, UINT_MAX);
+    load_striped_local_from_global<RADIX_GRAIN_SIZE, RADIX_BLOCK_SIZE>(keys, &inputKeys[baseId], localId, available, keySentinel);
+    load_striped_local_from_global<RADIX_GRAIN_SIZE, RADIX_BLOCK_SIZE>(payloads, &inputPayload[baseId], localId, available, UINT_MAX);
 
     // 2) Shared memory for bin offsets and ranking
-    threadgroup uint global_bin_base[RADIX_BUCKETS];
-    threadgroup RadixKeyPayload tg_kp[RADIX_BLOCK_SIZE];
-    threadgroup ushort tg_short[RADIX_BLOCK_SIZE];
+    threadgroup uint globalBinBase[RADIX_BUCKETS];
+    threadgroup RadixKeyPayload tgKp[RADIX_BLOCK_SIZE];
+    threadgroup ushort tgShort[RADIX_BLOCK_SIZE];
 
     // Load global bin offsets
     for (uint i = 0; i < (RADIX_BUCKETS + RADIX_BLOCK_SIZE - 1u) / RADIX_BLOCK_SIZE; ++i) {
-        uint bin = local_id + i * RADIX_BLOCK_SIZE;
+        uint bin = localId + i * RADIX_BLOCK_SIZE;
         if (bin < RADIX_BUCKETS) {
-            global_bin_base[bin] = offsets_flat[bin * grid_size + group_id];
+            globalBinBase[bin] = offsetsFlat[bin * gridSize + groupId];
         }
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -1168,31 +1168,31 @@ kernel void radixScatterKernel(
         kp.payload = payloads[chunk];
 
         // Partial radix sort: groups same-bin elements together, preserving relative order
-        kp = radix_partial_sort(kp, tg_kp, local_id, (ushort)current_digit);
+        kp = radix_partial_sort(kp, tgKp, localId, (ushort)currentDigit);
 
         // Extract bin after sorting
-        ushort my_bin = value_to_key_at_digit(kp.key, (ushort)current_digit);
+        ushort myBin = value_to_key_at_digit(kp.key, (ushort)currentDigit);
 
         // Head discontinuity + max scan to find run start
-        uchar head_flag = flag_head_discontinuity<RADIX_BLOCK_SIZE>(my_bin, tg_short, local_id);
-        ushort run_start = radix_threadgroup_prefix_scan<RADIX_SCAN_TYPE_INCLUSIVE>(
-            head_flag ? local_id : (ushort)0, tg_short, local_id, radix_max_op<ushort>());
-        ushort local_offset = local_id - run_start;
+        uchar headFlag = flag_head_discontinuity<RADIX_BLOCK_SIZE>(myBin, tgShort, localId);
+        ushort runStart = radix_threadgroup_prefix_scan<RADIX_SCAN_TYPE_INCLUSIVE>(
+            headFlag ? localId : (ushort)0, tgShort, localId, radix_max_op<ushort>());
+        ushort localOffset = localId - runStart;
 
         // Tail discontinuity for offset updates
-        uchar tail_flag = flag_tail_discontinuity<RADIX_BLOCK_SIZE>(my_bin, tg_short, local_id);
+        uchar tailFlag = flag_tail_discontinuity<RADIX_BLOCK_SIZE>(myBin, tgShort, localId);
 
         // Check validity and scatter
-        bool is_valid = (kp.payload != UINT_MAX);
-        if (is_valid) {
-            uint dst = global_bin_base[my_bin] + local_offset;
-            output_keys[dst] = kp.key;
-            output_payload[dst] = kp.payload;
+        bool isValid = (kp.payload != UINT_MAX);
+        if (isValid) {
+            uint dst = globalBinBase[myBin] + localOffset;
+            outputKeys[dst] = kp.key;
+            outputPayload[dst] = kp.payload;
         }
 
         // Update global offsets at run boundaries
-        if (tail_flag && is_valid) {
-            global_bin_base[my_bin] += local_offset + 1;
+        if (tailFlag && isValid) {
+            globalBinBase[myBin] += localOffset + 1;
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
     }
@@ -1223,10 +1223,10 @@ kernel void globalSortRender(
     texture2d<half, access::write>   colorOut        [[texture(0)]],
     texture2d<half, access::write>   depthOut        [[texture(1)]],  // half like Local
     constant RenderParams&           params          [[buffer(5)]],
-    uint2                            group_id        [[threadgroup_position_in_grid]],
-    uint2                            local_id        [[thread_position_in_threadgroup]]
+    uint2                            groupId         [[threadgroup_position_in_grid]],
+    uint2                            localId         [[thread_position_in_threadgroup]]
 ) {
-    uint tileIdx = group_id.x;
+    uint tileIdx = groupId.x;
     if (tileIdx >= *activeTileCount) return;
 
     uint tile = activeTiles[tileIdx];
@@ -1236,8 +1236,8 @@ kernel void globalSortRender(
     uint tileY = tile / params.tilesX;
 
     // 32x16 tile, 8x8 threads, 4x2 pixels per thread
-    uint baseX = tileX * 32 + local_id.x * RENDER_V3_PIXELS_X;
-    uint baseY = tileY * 16 + local_id.y * RENDER_V3_PIXELS_Y;
+    uint baseX = tileX * 32 + localId.x * RENDER_V3_PIXELS_X;
+    uint baseY = tileY * 16 + localId.y * RENDER_V3_PIXELS_Y;
 
     // Pixel positions (8 pixels: 4 wide x 2 tall)
     half2 pos00 = half2(half(baseX + 0), half(baseY + 0));

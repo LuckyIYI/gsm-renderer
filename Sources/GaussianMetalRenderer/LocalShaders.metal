@@ -221,10 +221,10 @@ kernel void localProjectStore(
     color = max(color + 0.5f, float3(0.0f));
 
     // Store to temp buffer at original index
-    tempBuffer[gid].covariance_depth = float4(conic, depth);
-    tempBuffer[gid].position_color = float4(px, py, LocalPackHalf4(half4(half3(color), half(opacity))));
-    tempBuffer[gid].min_tile = minTile;
-    tempBuffer[gid].max_tile = maxTile;
+    tempBuffer[gid].covarianceDepth = float4(conic, depth);
+    tempBuffer[gid].positionColor = float4(px, py, LocalPackHalf4(half4(half3(color), half(opacity))));
+    tempBuffer[gid].minTile = minTile;
+    tempBuffer[gid].maxTile = maxTile;
     tempBuffer[gid].originalIdx = gid;
 
     visibilityMarks[gid] = 1u;
@@ -467,18 +467,18 @@ kernel void localScatterSimd(
     constant int& tileWidth [[buffer(7)]],
     constant int& tileHeight [[buffer(8)]],
     uint gid [[thread_position_in_grid]],
-    uint simd_lane [[thread_index_in_simdgroup]],
-    uint simd_group_id [[simdgroup_index_in_threadgroup]],
-    uint tg_id [[threadgroup_position_in_grid]]
+    uint simdLane [[thread_index_in_simdgroup]],
+    uint simdGroupId [[simdgroup_index_in_threadgroup]],
+    uint tgId [[threadgroup_position_in_grid]]
 ) {
     // Each SIMD group (32 threads) processes gaussians cooperatively
     // Thread group: multiple SIMD groups, each processing different gaussians
     uint visibleCount = atomic_load_explicit((const device atomic_uint*)&header->totalAssignments, memory_order_relaxed);
 
     // Calculate which gaussian this SIMD group is responsible for
-    uint simd_groups_per_tg = 4;  // 128 threads / 32 = 4 SIMD groups per threadgroup
-    uint global_simd_id = tg_id * simd_groups_per_tg + simd_group_id;
-    uint gaussianIdx = global_simd_id;
+    uint simdGroupsPerTg = 4;  // 128 threads / 32 = 4 SIMD groups per threadgroup
+    uint globalSimdId = tgId * simdGroupsPerTg + simdGroupId;
+    uint gaussianIdx = globalSimdId;
 
     if (gaussianIdx >= visibleCount) return;
 
@@ -491,21 +491,21 @@ kernel void localScatterSimd(
     int minTX = 0, minTY = 0, maxTX = 0, maxTY = 0;
 
     float opacity = 0;
-    if (simd_lane == 0) {
+    if (simdLane == 0) {
         g = compacted[gaussianIdx];
-        conic = g.covariance_depth.xyz;
-        center = g.position_color.xy;
-        half4 colorOp = LocalUnpackHalf4(g.position_color.zw);
+        conic = g.covarianceDepth.xyz;
+        center = g.positionColor.xy;
+        half4 colorOp = LocalUnpackHalf4(g.positionColor.zw);
         opacity = float(colorOp.w);
         power = gaussianComputePower(opacity);
         // 32-bit stable key: (depth16 << 16) | originalIdx for deterministic tie-breaking
         // Use originalIdx (world buffer index) instead of compactedIdx to ensure determinism
-        uint depth16 = ((as_type<uint>(g.covariance_depth.w) ^ 0x80000000u) >> 16u) & 0xFFFFu;
+        uint depth16 = ((as_type<uint>(g.covarianceDepth.w) ^ 0x80000000u) >> 16u) & 0xFFFFu;
         depthKey = (depth16 << 16) | (g.originalIdx & 0xFFFFu);
-        minTX = g.min_tile.x;
-        minTY = g.min_tile.y;
-        maxTX = g.max_tile.x;
-        maxTY = g.max_tile.y;
+        minTX = g.minTile.x;
+        minTY = g.minTile.y;
+        maxTX = g.maxTile.x;
+        maxTY = g.maxTile.y;
     }
     opacity = simd_shuffle(opacity, 0);
 
@@ -528,18 +528,18 @@ kernel void localScatterSimd(
     int totalTiles = tileRangeX * tileRangeY;
 
     // Each lane handles a subset of tiles
-    for (int tileIdx = int(simd_lane); tileIdx < totalTiles; tileIdx += 32) {
+    for (int tileIdx = int(simdLane); tileIdx < totalTiles; tileIdx += 32) {
         int localY = tileIdx / tileRangeX;
         int localX = tileIdx % tileRangeX;
         int tx = minTX + localX;
         int ty = minTY + localY;
 
         // Pixel bounds for intersection test
-        int2 pix_min = int2(tx * tileWidth, ty * tileHeight);
-        int2 pix_max = int2(pix_min.x + tileWidth - 1, pix_min.y + tileHeight - 1);
+        int2 pixMin = int2(tx * tileWidth, ty * tileHeight);
+        int2 pixMax = int2(pixMin.x + tileWidth - 1, pixMin.y + tileHeight - 1);
 
         // Shared ellipse intersection test (from GaussianShared.h)
-        bool valid = gaussianIntersectsTile(pix_min, pix_max, center, conic, power);
+        bool valid = gaussianIntersectsTile(pixMin, pixMax, center, conic, power);
 
         // SIMD early-out: skip iteration if no lanes are valid
         simd_vote ballot = simd_ballot(valid);
@@ -598,8 +598,8 @@ kernel void localPerTileSort16(
     uint tileId [[threadgroup_position_in_grid]],
     ushort localId [[thread_position_in_threadgroup]],
     ushort tgSize [[threads_per_threadgroup]],
-    ushort simd_lane [[thread_index_in_simdgroup]],
-    ushort simd_id [[simdgroup_index_in_threadgroup]]
+    ushort simdLane [[thread_index_in_simdgroup]],
+    ushort simdId [[simdgroup_index_in_threadgroup]]
 ) {
     // Fixed layout: each tile's data at tileId * maxPerTile
     uint start = tileId * maxPerTile;
@@ -695,15 +695,15 @@ kernel void localScatterSimd16(
     constant int& tileWidth [[buffer(7)]],
     constant int& tileHeight [[buffer(8)]],
     uint gid [[thread_position_in_grid]],
-    uint simd_lane [[thread_index_in_simdgroup]],
-    uint simd_group_id [[simdgroup_index_in_threadgroup]],
-    uint tg_id [[threadgroup_position_in_grid]]
+    uint simdLane [[thread_index_in_simdgroup]],
+    uint simdGroupId [[simdgroup_index_in_threadgroup]],
+    uint tgId [[threadgroup_position_in_grid]]
 ) {
     uint visibleCount = atomic_load_explicit((const device atomic_uint*)&header->totalAssignments, memory_order_relaxed);
 
-    uint simd_groups_per_tg = 4;
-    uint global_simd_id = tg_id * simd_groups_per_tg + simd_group_id;
-    uint gaussianIdx = global_simd_id;
+    uint simdGroupsPerTg = 4;
+    uint globalSimdId = tgId * simdGroupsPerTg + simdGroupId;
+    uint gaussianIdx = globalSimdId;
 
     if (gaussianIdx >= visibleCount) return;
 
@@ -718,22 +718,22 @@ kernel void localScatterSimd16(
     int minTX = 0, minTY = 0, maxTX = 0, maxTY = 0;
 
     float opacity16 = 0;
-    if (simd_lane == 0) {
+    if (simdLane == 0) {
         g = compacted[gaussianIdx];
-        conic = g.covariance_depth.xyz;
-        center = g.position_color.xy;
-        half4 colorOp = LocalUnpackHalf4(g.position_color.zw);
+        conic = g.covarianceDepth.xyz;
+        center = g.positionColor.xy;
+        half4 colorOp = LocalUnpackHalf4(g.positionColor.zw);
         opacity16 = float(colorOp.w);
         power = gaussianComputePower(opacity16);
         // Full depth bits for sort
-        depthBits = as_type<uint>(g.covariance_depth.w);
+        depthBits = as_type<uint>(g.covarianceDepth.w);
         originalIdx = g.originalIdx;
         // 16-bit depth (for backwards compat)
         depth16 = ushort((depthBits ^ 0x80000000u) >> 16u);
-        minTX = g.min_tile.x;
-        minTY = g.min_tile.y;
-        maxTX = g.max_tile.x;
-        maxTY = g.max_tile.y;
+        minTX = g.minTile.x;
+        minTY = g.minTile.y;
+        maxTX = g.maxTile.x;
+        maxTY = g.maxTile.y;
     }
 
     // Broadcast to all lanes via simd_shuffle
@@ -754,17 +754,17 @@ kernel void localScatterSimd16(
     int totalTiles = tileRangeX * tileRangeY;
 
     // Process tiles in strided pattern for better cache locality
-    for (int tileIdx = int(simd_lane); tileIdx < totalTiles; tileIdx += 32) {
+    for (int tileIdx = int(simdLane); tileIdx < totalTiles; tileIdx += 32) {
         int localY = tileIdx / tileRangeX;
         int localX = tileIdx % tileRangeX;
         int tx = minTX + localX;
         int ty = minTY + localY;
 
-        int2 pix_min = int2(tx * tileWidth, ty * tileHeight);
-        int2 pix_max = int2(pix_min.x + tileWidth - 1, pix_min.y + tileHeight - 1);
+        int2 pixMin = int2(tx * tileWidth, ty * tileHeight);
+        int2 pixMax = int2(pixMin.x + tileWidth - 1, pixMin.y + tileHeight - 1);
 
         // Shared ellipse intersection test (from GaussianShared.h)
-        bool valid = gaussianIntersectsTile(pix_min, pix_max, center, conic, power);
+        bool valid = gaussianIntersectsTile(pixMin, pixMax, center, conic, power);
 
         // SIMD early-out: skip iteration if no lanes are valid
         simd_vote ballot = simd_ballot(valid);
@@ -881,7 +881,7 @@ kernel void localRenderImpl(
     uint2 groupId [[threadgroup_position_in_grid]],
     uint2 localId [[thread_position_in_threadgroup]],
     uint localIdx [[thread_index_in_threadgroup]],
-    uint simd_lane [[thread_index_in_simdgroup]]
+    uint simdLane [[thread_index_in_simdgroup]]
 ) {
     // Get tile ID from indirect dispatch (1D grid, active tiles only)
     uint groupIdx = groupId.x;
@@ -929,9 +929,9 @@ kernel void localRenderImpl(
         }
         CompactedGaussian g = compacted[gIdx];
 
-        half2 gPos = half2(g.position_color.xy);
-        half3 cov = half3(g.covariance_depth.xyz);
-        half4 colorOp = LocalUnpackHalf4(g.position_color.zw);
+        half2 gPos = half2(g.positionColor.xy);
+        half3 cov = half3(g.covarianceDepth.xyz);
+        half4 colorOp = LocalUnpackHalf4(g.positionColor.zw);
 
         half cxx = cov.x, cyy = cov.z, cxy2 = 2.0h * cov.y;
         half3 gColor = colorOp.xyz;
@@ -1041,23 +1041,23 @@ kernel void localScatterSimd16V7(
         if (gaussianIdx >= visibleCount) return;
 
         CompactedGaussian gaussian = compacted[gaussianIdx];
-        float3 conic = gaussian.covariance_depth.xyz;
-        float2 center = gaussian.position_color.xy;
-        half4 colorOp = LocalUnpackHalf4(gaussian.position_color.zw);
+        float3 conic = gaussian.covarianceDepth.xyz;
+        float2 center = gaussian.positionColor.xy;
+        half4 colorOp = LocalUnpackHalf4(gaussian.positionColor.zw);
         float power = gaussianComputePower(float(colorOp.w));
-        ushort depth16 = ushort((as_type<uint>(gaussian.covariance_depth.w) ^ 0x80000000u) >> 16u);
+        ushort depth16 = ushort((as_type<uint>(gaussian.covarianceDepth.w) ^ 0x80000000u) >> 16u);
 
-        int minTX = gaussian.min_tile.x;
-        int minTY = gaussian.min_tile.y;
-        int maxTX = gaussian.max_tile.x;
-        int maxTY = gaussian.max_tile.y;
+        int minTX = gaussian.minTile.x;
+        int minTY = gaussian.minTile.y;
+        int maxTX = gaussian.maxTile.x;
+        int maxTY = gaussian.maxTile.y;
 
         for (int ty = minTY; ty < maxTY; ty++) {
             for (int tx = minTX; tx < maxTX; tx++) {
-                int2 pix_min = int2(tx * tileWidth, ty * tileHeight);
-                int2 pix_max = int2(pix_min.x + tileWidth - 1, pix_min.y + tileHeight - 1);
+                int2 pixMin = int2(tx * tileWidth, ty * tileHeight);
+                int2 pixMax = int2(pixMin.x + tileWidth - 1, pixMin.y + tileHeight - 1);
 
-                if (gaussianIntersectsTile(pix_min, pix_max, center, conic, power)) {
+                if (gaussianIntersectsTile(pixMin, pixMax, center, conic, power)) {
                     uint tileId = uint(ty) * tilesX + uint(tx);
                     uint localIdx = atomic_fetch_add_explicit(&tileCounters[tileId], 1u, memory_order_relaxed);
                     if (localIdx < maxPerTile) {
@@ -1106,23 +1106,23 @@ kernel void localScatterSimd16Sparse(
 
         // Read from SPARSE projected buffer (indexed by original gaussian ID)
         CompactedGaussian gaussian = projected[originalIdx];
-        float3 conic = gaussian.covariance_depth.xyz;
-        float2 center = gaussian.position_color.xy;
-        half4 colorOp = LocalUnpackHalf4(gaussian.position_color.zw);
+        float3 conic = gaussian.covarianceDepth.xyz;
+        float2 center = gaussian.positionColor.xy;
+        half4 colorOp = LocalUnpackHalf4(gaussian.positionColor.zw);
         float power = gaussianComputePower(float(colorOp.w));
-        ushort depth16 = ushort((as_type<uint>(gaussian.covariance_depth.w) ^ 0x80000000u) >> 16u);
+        ushort depth16 = ushort((as_type<uint>(gaussian.covarianceDepth.w) ^ 0x80000000u) >> 16u);
 
-        int minTX = gaussian.min_tile.x;
-        int minTY = gaussian.min_tile.y;
-        int maxTX = gaussian.max_tile.x;
-        int maxTY = gaussian.max_tile.y;
+        int minTX = gaussian.minTile.x;
+        int minTY = gaussian.minTile.y;
+        int maxTX = gaussian.maxTile.x;
+        int maxTY = gaussian.maxTile.y;
 
         for (int ty = minTY; ty < maxTY; ty++) {
             for (int tx = minTX; tx < maxTX; tx++) {
-                int2 pix_min = int2(tx * tileWidth, ty * tileHeight);
-                int2 pix_max = int2(pix_min.x + tileWidth - 1, pix_min.y + tileHeight - 1);
+                int2 pixMin = int2(tx * tileWidth, ty * tileHeight);
+                int2 pixMax = int2(pixMin.x + tileWidth - 1, pixMin.y + tileHeight - 1);
 
-                if (gaussianIntersectsTile(pix_min, pix_max, center, conic, power)) {
+                if (gaussianIntersectsTile(pixMin, pixMax, center, conic, power)) {
                     uint tileId = uint(ty) * tilesX + uint(tx);
                     uint localIdx = atomic_fetch_add_explicit(&tileCounters[tileId], 1u, memory_order_relaxed);
                     if (localIdx < maxPerTile) {

@@ -685,8 +685,13 @@ kernel void localScatterSimd16Sparse(
         float3 conic = gaussian.covarianceDepth.xyz;
         float2 center = gaussian.positionColor.xy;
         half4 colorOp = localUnpackHalf4(gaussian.positionColor.zw);
-        float power = gaussianComputePower(float(colorOp.w));
+        float opacity = float(colorOp.w);
         ushort depth16 = ushort((as_type<uint>(gaussian.covarianceDepth.w) ^ 0x80000000u) >> 16u);
+
+        // Pre-compute OBB extents for this gaussian (used if INTERSECTION_MODE=1)
+        float2 obbExtents = computeOBBExtentsFromConic(conic, 3.0f);
+        // Compute radius for AABB mode (max of OBB extents as conservative estimate)
+        float radius = max(obbExtents.x, obbExtents.y);
 
         ushort minTX = gaussian.minTile.x;
         ushort minTY = gaussian.minTile.y;
@@ -699,7 +704,8 @@ kernel void localScatterSimd16Sparse(
                 int2 pixMin = int2(tx * tileWidth, ty * tileHeight);
                 int2 pixMax = int2(pixMin.x + tileWidth - 1, pixMin.y + tileHeight - 1);
 
-                if (gaussianIntersectsTile(pixMin, pixMax, center, conic, power)) {
+                // Unified intersection - mode selected via INTERSECTION_MODE function constant
+                if (intersectsTile(pixMin, pixMax, center, conic, opacity, radius, obbExtents)) {
                     uint tileId = uint(ty) * tilesX + uint(tx);
                     uint localIdx = atomic_fetch_add_explicit(&tileCounters[tileId], 1u, memory_order_relaxed);
                     if (localIdx < maxPerTile) {

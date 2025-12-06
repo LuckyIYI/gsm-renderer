@@ -139,10 +139,8 @@ typedef struct {
 typedef struct {
     simd_float4 covarianceDepth;
     simd_float4 positionColor;
-    simd_int2   minTile;
-    simd_int2   maxTile;
-    UINT32      originalIdx;    // World buffer index for deterministic tie-breaking
-    UINT32      _pad0;          // Padding for alignment
+    simd_ushort2 minTile;
+    simd_ushort2 maxTile;
 } ProjectedGaussian;
 
 // =============================================================================

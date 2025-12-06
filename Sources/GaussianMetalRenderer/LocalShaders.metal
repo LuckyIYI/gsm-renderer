@@ -123,7 +123,7 @@ kernel void localProjectStore(
     if (gid >= params.gaussianCount) return;
 
     // Zero tile bounds = invisible (scatter loops won't process)
-    constexpr int2 zeroTile = int2(0, 0);
+    constexpr ushort2 zeroTile = ushort2(0, 0);
 
     // Cluster culling
     if (USE_CLUSTER_CULL) {
@@ -217,12 +217,12 @@ kernel void localProjectStore(
 
     int tileW = int(params.tileWidth);
     int tileH = int(params.tileHeight);
-    int2 minTile = int2(max(0, int(floor(xmin / float(tileW)))),
-                        max(0, int(floor(ymin / float(tileH)))));
-    int2 maxTile = int2(min(int(params.tilesX), int(ceil(xmax / float(tileW)))),
-                        min(int(params.tilesY), int(ceil(ymax / float(tileH)))));
+    int minTileX = max(0, int(floor(xmin / float(tileW))));
+    int minTileY = max(0, int(floor(ymin / float(tileH))));
+    int maxTileX = min(int(params.tilesX), int(ceil(xmax / float(tileW))));
+    int maxTileY = min(int(params.tilesY), int(ceil(ymax / float(tileH))));
 
-    if (minTile.x >= maxTile.x || minTile.y >= maxTile.y) {
+    if (minTileX >= maxTileX || minTileY >= maxTileY) {
         tempBuffer[gid].minTile = zeroTile;
         tempBuffer[gid].maxTile = zeroTile;
         return;
@@ -235,9 +235,8 @@ kernel void localProjectStore(
     // Store to temp buffer at original index
     tempBuffer[gid].covarianceDepth = float4(conic, depth);
     tempBuffer[gid].positionColor = float4(px, py, localPackHalf4(half4(half3(color), half(opacity))));
-    tempBuffer[gid].minTile = minTile;
-    tempBuffer[gid].maxTile = maxTile;
-    tempBuffer[gid].originalIdx = gid;
+    tempBuffer[gid].minTile = ushort2(minTileX, minTileY);
+    tempBuffer[gid].maxTile = ushort2(maxTileX, maxTileY);
 }
 
 // Template instantiations for ProjectStore
@@ -683,10 +682,10 @@ kernel void localScatterSimd16Sparse(
         float power = gaussianComputePower(float(colorOp.w));
         ushort depth16 = ushort((as_type<uint>(gaussian.covarianceDepth.w) ^ 0x80000000u) >> 16u);
 
-        int minTX = gaussian.minTile.x;
-        int minTY = gaussian.minTile.y;
-        int maxTX = gaussian.maxTile.x;
-        int maxTY = gaussian.maxTile.y;
+        ushort minTX = gaussian.minTile.x;
+        ushort minTY = gaussian.minTile.y;
+        ushort maxTX = gaussian.maxTile.x;
+        ushort maxTY = gaussian.maxTile.y;
 
         // Loops naturally skip invisible gaussians (minTile == maxTile == 0)
         for (int ty = minTY; ty < maxTY; ty++) {

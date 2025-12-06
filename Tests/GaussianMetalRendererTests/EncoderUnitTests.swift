@@ -91,8 +91,8 @@ final class EncoderUnitTests: XCTestCase {
 
             // Randomly cull some gaussians (set zero tile bounds)
             if drand48() > visibilityRate {
-                g.minTile = SIMD2<Int32>(0, 0)
-                g.maxTile = SIMD2<Int32>(0, 0)
+                g.minTile = SIMD2<UInt16>(0, 0)
+                g.maxTile = SIMD2<UInt16>(0, 0)
             } else {
                 // Assign to a random cluster with gaussian distribution around center
                 let clusterIdx = Int(drand48() * Double(numClusters))
@@ -114,12 +114,10 @@ final class EncoderUnitTests: XCTestCase {
 
                 g.positionColor = SIMD4<Float>(px, py, 0, 0)
                 g.covarianceDepth = SIMD4<Float>(0.01, 0, 0.01, Float(i) / Float(gaussianCount))
-                g.minTile = SIMD2<Int32>(Int32(minTX), Int32(minTY))
-                g.maxTile = SIMD2<Int32>(Int32(maxTX), Int32(maxTY))
+                g.minTile = SIMD2<UInt16>(UInt16(minTX), UInt16(minTY))
+                g.maxTile = SIMD2<UInt16>(UInt16(maxTX), UInt16(maxTY))
                 visibleCount += 1
             }
-
-            g.originalIdx = UInt32(i)
             projectedPtr[i] = g
         }
 

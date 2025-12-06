@@ -1,6 +1,14 @@
 import RendererTypes
 import Metal
 
+/// Intersection mode for tile assignment (must match GaussianHelpers.h INTERSECTION_MODE)
+public enum IntersectionMode: UInt32 {
+    case aabb = 0      // Fastest test, circular radius
+    case obb = 1       // Medium, oriented bounding box
+    case ellipse = 2   // Slowest, exact FlashGS-style
+    case none = 3      // Skip test, trust projection bounds (fastest overall)
+}
+
 /// Two-pass tile assignment encoder with deterministic compaction:
 /// MarkVisibility → PrefixSum → ScatterCompact → PrepareDispatch → Count → PrefixSum → Scatter
 /// Uses prefix-sum based compaction for deterministic ordering (atomic-based was non-deterministic)
@@ -30,15 +38,25 @@ final class TwoPassTileAssignEncoder {
         let indirectDispatchArgs: MTLBuffer // Dispatch args (12 bytes)
     }
 
-    init(device: MTLDevice, library: MTLLibrary) throws {
-        // Deterministic compaction kernels
+    init(device: MTLDevice, library: MTLLibrary, intersectionMode: IntersectionMode = .none) throws {
+        // Function constants for intersection mode
+        let constantValues = MTLFunctionConstantValues()
+        var mode = intersectionMode.rawValue
+        constantValues.setConstantValue(&mode, type: .uint, index: 10)  // INTERSECTION_MODE
+
+        // Deterministic compaction kernels (don't need function constants)
         guard let markFn = library.makeFunction(name: "markVisibilityKernel"),
               let scatterCompactFn = library.makeFunction(name: "scatterCompactKernel"),
-              let prepareIndirectFn = library.makeFunction(name: "prepareIndirectDispatchKernel"),
-              let countFn = library.makeFunction(name: "tileCountIndirectKernel"),
-              let scatterFn = library.makeFunction(name: "tileScatterIndirectKernel")
+              let prepareIndirectFn = library.makeFunction(name: "prepareIndirectDispatchKernel")
         else {
             fatalError("Tile assign kernels not found in library")
+        }
+
+        // Tile count/scatter kernels (need function constants for intersection mode)
+        guard let countFn = try? library.makeFunction(name: "tileCountIndirectKernel", constantValues: constantValues),
+              let scatterFn = try? library.makeFunction(name: "tileScatterIndirectKernel", constantValues: constantValues)
+        else {
+            fatalError("Tile count/scatter kernels not found in library")
         }
 
         // Prefix sum kernels

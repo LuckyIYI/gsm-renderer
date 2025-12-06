@@ -799,13 +799,27 @@ kernel void tileCountIndirectKernel(
         return;
     }
 
-    const uint aabbWidth = uint(maxTX - minTX + 1);
-    const uint aabbHeight = uint(maxTY - minTY + 1);
-    const uint aabbCount = aabbWidth * aabbHeight;
+    // Extract gaussian properties for intersection test
+    float2 center = float2(g.meanX, g.meanY);
+    float3 conic = float3(g.conicA, g.conicB, g.conicC);
+    float radius = float(g.conicD);  // conicD stores radius
 
-    // Use AABB directly - ellipse check disabled for simplicity
-    // (Ellipse check was duplicating work between count and scatter)
-    tileCounts[gid] = aabbCount;
+    uint count = 0;
+    const int tileW = int(params.tileWidth);
+    const int tileH = int(params.tileHeight);
+
+    for (int ty = minTY; ty <= maxTY; ty++) {
+        for (int tx = minTX; tx <= maxTX; tx++) {
+            int2 pixMin = int2(tx * tileW, ty * tileH);
+            int2 pixMax = int2(pixMin.x + tileW - 1, pixMin.y + tileH - 1);
+
+            if (intersectsTile(pixMin, pixMax, center, conic, alpha, radius, float2(0.0f))) {
+                count++;
+            }
+        }
+    }
+
+    tileCounts[gid] = count;
 }
 
 template [[host_name("tileCountIndirectKernel")]]
@@ -839,20 +853,30 @@ kernel void tileScatterIndirectKernel(
     const float alpha = float(g.opacity);
     if (alpha < 1e-4f) return;
 
+    // Extract gaussian properties for intersection test
+    float2 center = float2(g.meanX, g.meanY);
+    float3 conic = float3(g.conicA, g.conicB, g.conicC);
+    float radius = float(g.conicD);  // conicD stores radius
+
     const uint tilesX = params.tilesX;
     const uint maxAssignments = params.maxAssignments;
+    const int tileW = int(params.tileWidth);
+    const int tileH = int(params.tileHeight);
 
     uint writePos = offsets[gid];
     const int gaussianIdx = int(originalIdx);
 
-    // Use AABB directly - ellipse check disabled for simplicity
-    // (Ellipse check was duplicating work between count and scatter)
     for (int ty = minTY; ty <= maxTY; ty++) {
         for (int tx = minTX; tx <= maxTX; tx++) {
-            if (writePos < maxAssignments) {
-                tileIds[writePos] = ty * int(tilesX) + tx;
-                tileIndices[writePos] = gaussianIdx;
-                writePos++;
+            int2 pixMin = int2(tx * tileW, ty * tileH);
+            int2 pixMax = int2(pixMin.x + tileW - 1, pixMin.y + tileH - 1);
+
+            if (intersectsTile(pixMin, pixMax, center, conic, alpha, radius, float2(0.0f))) {
+                if (writePos < maxAssignments) {
+                    tileIds[writePos] = ty * int(tilesX) + tx;
+                    tileIndices[writePos] = gaussianIdx;
+                    writePos++;
+                }
             }
         }
     }

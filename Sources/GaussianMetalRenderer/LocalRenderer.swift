@@ -5,7 +5,7 @@ import simd
 /// Conforms to GaussianRenderer protocol with exactly 2 render methods
 public final class LocalRenderer: GaussianRenderer, @unchecked Sendable {
     public let device: MTLDevice
-    private let encoder: LocalPipelineEncoder
+    public let encoder: LocalPipelineEncoder  // Public for benchmarking variant access
 
     // Tile configuration (16×16 = 256 pixels per tile)
     private let tileWidth = 16

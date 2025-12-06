@@ -1,4 +1,4 @@
-import GaussianMetalRendererTypes
+import RendererTypes
 import Metal
 
 /// Encodes the render stage - blends sorted gaussians to output textures (16-bit, indirect dispatch only)
@@ -86,7 +86,7 @@ public final class LocalRenderEncoder {
     /// Encode indirect render pass (16-bit indices, fixed layout)
     public func encodeIndirect16(
         commandBuffer: MTLCommandBuffer,
-        compactedGaussians: MTLBuffer,
+        projectedGaussians: MTLBuffer,
         tileCounts: MTLBuffer,
         maxPerTile: Int,
         sortedLocalIdx: MTLBuffer,
@@ -121,7 +121,7 @@ public final class LocalRenderEncoder {
 
         encoder.label = "Local_RenderIndirect16"
         encoder.setComputePipelineState(renderIndirect16Pipeline)
-        encoder.setBuffer(compactedGaussians, offset: 0, index: 0)
+        encoder.setBuffer(projectedGaussians, offset: 0, index: 0)
         encoder.setBuffer(tileCounts, offset: 0, index: 1)
         encoder.setBytes(&maxPerTileU, length: 4, index: 2)
         encoder.setBuffer(sortedLocalIdx, offset: 0, index: 3)

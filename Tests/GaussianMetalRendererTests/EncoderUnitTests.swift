@@ -59,7 +59,7 @@ final class EncoderUnitTests: XCTestCase {
         let maxPerTile = 4096
 
         // Create test buffers
-        let projectedSize = gaussianCount * MemoryLayout<CompactedGaussian>.stride
+        let projectedSize = gaussianCount * MemoryLayout<ProjectedGaussian>.stride
         guard let projectedBuffer = self.device.makeBuffer(length: projectedSize, options: .storageModeShared),
               let headerBuffer = self.device.makeBuffer(length: 16, options: .storageModeShared),
               let tileCountersBuffer = self.device.makeBuffer(length: totalTiles * 4, options: .storageModeShared),
@@ -72,7 +72,7 @@ final class EncoderUnitTests: XCTestCase {
 
         // Initialize projected gaussians with CLUSTERED distribution
         // Sparse mode: invisible gaussians have minTile == maxTile (zero bounds)
-        let projectedPtr = projectedBuffer.contents().bindMemory(to: CompactedGaussian.self, capacity: gaussianCount)
+        let projectedPtr = projectedBuffer.contents().bindMemory(to: ProjectedGaussian.self, capacity: gaussianCount)
         srand48(42)
 
         // Create 100 clusters spread across the screen
@@ -87,7 +87,7 @@ final class EncoderUnitTests: XCTestCase {
         var visibleCount = 0
 
         for i in 0 ..< gaussianCount {
-            var g = CompactedGaussian()
+            var g = ProjectedGaussian()
 
             // Randomly cull some gaussians (set zero tile bounds)
             if drand48() > visibilityRate {
@@ -137,7 +137,7 @@ final class EncoderUnitTests: XCTestCase {
             guard let cb = self.queue.makeCommandBuffer() else { return }
             scatterEncoder.encode16(
                 commandBuffer: cb,
-                compactedGaussians: projectedBuffer,
+                projectedGaussians: projectedBuffer,
                 compactedHeader: headerBuffer,
                 tileCounters: tileCountersBuffer,
                 depthKeys16: depthKeys16Buffer,

@@ -20,21 +20,21 @@ let package = Package(
     targets: [
         // C target exposing shared types for Swift/Metal interop
         .target(
-            name: "GaussianMetalRendererTypes",
-            path: "Sources/GaussianMetalRendererTypes",
+            name: "RendererTypes",
+            path: "Sources/RendererTypes",
             publicHeadersPath: "include"
         ),
         .target(
             name: "GaussianMetalRenderer",
-            dependencies: ["GaussianMetalRendererTypes"],
+            dependencies: ["RendererTypes"],
             path: "Sources/GaussianMetalRenderer",
             exclude: [
-                "GaussianMetalRenderer.air",
+                "GlobalShaders.air",
                 "LocalShaders.air",
             ],
             resources: [
-                .process("GaussianMetalRenderer.metallib"),
-                .process("GaussianMetalRenderer.metal"),
+                .process("GlobalShaders.metallib"),
+                .process("GlobalShaders.metal"),
                 .process("LocalShaders.metallib"),
                 .process("LocalShaders.metal"),
             ]

@@ -3,7 +3,7 @@ import Metal
 import simd
 import XCTest
 
-/// End-to-end tests for GlobalSort and Local renderers
+/// End-to-end tests for Global and Local renderers
 final class RendererE2ETests: XCTestCase {
     // MARK: - Test Data Helpers
 
@@ -149,15 +149,15 @@ final class RendererE2ETests: XCTestCase {
         return count
     }
 
-    // MARK: - GlobalSort Tests
+    // MARK: - Global Tests
 
-    func testGlobalSortRendersCorrectly() throws {
+    func testGlobalRendersCorrectly() throws {
         let width = 256
         let height = 256
         let count = 1000
 
         let config = RendererConfig(maxGaussians: 10000, maxWidth: width, maxHeight: height, precision: .float32)
-        let renderer = try GlobalSortRenderer(config: config)
+        let renderer = try GlobalRenderer(config: config)
 
         let (positions, scales, rotations, opacities, colors) = self.generateGaussians(count: count)
         guard let buffers = createPackedBuffers(device: renderer.device, positions: positions,
@@ -183,20 +183,20 @@ final class RendererE2ETests: XCTestCase {
             packedWorldBuffers: buffers, cameraUniforms: camera, frameParams: frameParams
         )
 
-        XCTAssertNotNil(textures, "GlobalSort should produce textures")
-        XCTAssertNotNil(textures?.color, "GlobalSort should produce color texture")
+        XCTAssertNotNil(textures, "Global should produce textures")
+        XCTAssertNotNil(textures?.color, "Global should produce color texture")
         cb.commit()
         cb.waitUntilCompleted()
         XCTAssertEqual(cb.status, MTLCommandBufferStatus.completed)
     }
 
-    func testGlobalSortAtScale() throws {
+    func testGlobalAtScale() throws {
         let width = 512
         let height = 512
         let count = 50000
 
         let config = RendererConfig(maxGaussians: 100_000, maxWidth: width, maxHeight: height, precision: .float16)
-        let renderer = try GlobalSortRenderer(config: config)
+        let renderer = try GlobalRenderer(config: config)
 
         let (positions, scales, rotations, opacities, colors) = self.generateGaussians(count: count)
         guard let buffers = createPackedBuffers(device: renderer.device, positions: positions,
@@ -228,13 +228,13 @@ final class RendererE2ETests: XCTestCase {
         XCTAssertEqual(cb.status, MTLCommandBufferStatus.completed)
     }
 
-    func testGlobalSortHalfPrecision() throws {
+    func testGlobalHalfPrecision() throws {
         let width = 256
         let height = 256
         let count = 1000
 
         let config = RendererConfig(maxGaussians: 10000, maxWidth: width, maxHeight: height, precision: .float16)
-        let renderer = try GlobalSortRenderer(config: config)
+        let renderer = try GlobalRenderer(config: config)
 
         let (positions, scales, rotations, opacities, colors) = self.generateGaussians(count: count)
         guard let buffers = createPackedBuffers(device: renderer.device, positions: positions,
@@ -404,7 +404,7 @@ final class RendererE2ETests: XCTestCase {
 
     // MARK: - Pixel Comparison Tests
 
-    func testGlobalSortVsLocalPixelComparison() throws {
+    func testGlobalVsLocalPixelComparison() throws {
         let width = 256
         let height = 256
         let count = 500
@@ -412,15 +412,15 @@ final class RendererE2ETests: XCTestCase {
         // Generate same gaussians for both renderers
         let (positions, scales, rotations, opacities, colors) = self.generateGaussians(count: count, seed: 999)
 
-        // === Render with GlobalSort ===
+        // === Render with Global ===
         let globalConfig = RendererConfig(maxGaussians: 10000, maxWidth: width, maxHeight: height, precision: .float32)
-        let globalRenderer = try GlobalSortRenderer(config: globalConfig)
+        let globalRenderer = try GlobalRenderer(config: globalConfig)
 
         guard let globalBuffers = createPackedBuffers(device: globalRenderer.device, positions: positions,
                                                       scales: scales, rotations: rotations,
                                                       opacities: opacities, colors: colors)
         else {
-            XCTFail("Failed to create GlobalSort buffers")
+            XCTFail("Failed to create Global buffers")
             return
         }
 
@@ -430,7 +430,7 @@ final class RendererE2ETests: XCTestCase {
         guard let globalQueue = globalRenderer.device.makeCommandQueue(),
               let globalCB = globalQueue.makeCommandBuffer()
         else {
-            XCTFail("Failed to create GlobalSort command buffer")
+            XCTFail("Failed to create Global command buffer")
             return
         }
 
@@ -443,12 +443,12 @@ final class RendererE2ETests: XCTestCase {
         globalCB.waitUntilCompleted()
 
         guard let globalColorTexture = globalTextures?.color else {
-            XCTFail("GlobalSort didn't produce color texture")
+            XCTFail("Global didn't produce color texture")
             return
         }
 
         guard let globalPixels = readPixels(texture: globalColorTexture, device: globalRenderer.device, queue: globalQueue) else {
-            XCTFail("Failed to read GlobalSort pixels")
+            XCTFail("Failed to read Global pixels")
             return
         }
 
@@ -526,7 +526,7 @@ final class RendererE2ETests: XCTestCase {
         let globalNonBlack = self.countNonBlackPixels(globalPixels)
         let localNonBlack = self.countNonBlackPixels(localPixels)
 
-        XCTAssertGreaterThan(globalNonBlack, 100, "GlobalSort should render visible gaussians")
+        XCTAssertGreaterThan(globalNonBlack, 100, "Global should render visible gaussians")
         XCTAssertGreaterThan(localNonBlack, 100, "Local should render visible gaussians")
 
         // Compute similarity metrics
@@ -558,7 +558,7 @@ final class RendererE2ETests: XCTestCase {
         print("==============================")
 
         // Both renderers should produce similar overall output (at least 50% matching)
-        // Note: GlobalSort and Local use different tile/sort approaches so exact match isn't expected
+        // Note: Global and Local use different tile/sort approaches so exact match isn't expected
         XCTAssertGreaterThan(matchPercent, 50.0,
                              "Renderers should produce similar output: \(matchPercent)% matching")
 
@@ -667,11 +667,11 @@ final class RendererE2ETests: XCTestCase {
         let (positions, scales, rotations, opacities, colors) = self.generateGaussians(count: config.count, seed: 42)
         let camera = self.createCameraParams(width: config.width, height: config.height)
 
-        // GlobalSort
+        // Global
         let globalRendererConfig = RendererConfig(
             maxGaussians: config.count + 1000, maxWidth: config.width, maxHeight: config.height, precision: config.precision
         )
-        let globalRenderer = try GlobalSortRenderer(config: globalRendererConfig)
+        let globalRenderer = try GlobalRenderer(config: globalRendererConfig)
 
         guard let globalBuffers = createPackedBuffers(
             device: globalRenderer.device, positions: positions, scales: scales,
@@ -685,7 +685,7 @@ final class RendererE2ETests: XCTestCase {
             shComponents: 0
         )
 
-        guard let globalResult = measureRenderer(globalRenderer, input: globalInput, camera: camera, config: config, label: "GlobalSort") else {
+        guard let globalResult = measureRenderer(globalRenderer, input: globalInput, camera: camera, config: config, label: "Global") else {
             return nil
         }
 
@@ -715,15 +715,15 @@ final class RendererE2ETests: XCTestCase {
     }
 
     func printComparisonResult(label: String, global: PerfResult, local: PerfResult, showMinMax: Bool = true) {
-        let faster = global.avg < local.avg ? "GlobalSort" : "Local"
+        let faster = global.avg < local.avg ? "Global" : "Local"
         let speedup = global.avg < local.avg ? local.avg / global.avg : global.avg / local.avg
 
         print("[\(label)]")
         if showMinMax {
-            print("  GlobalSort: \(String(format: "%.2f", global.avg))ms avg (min: \(String(format: "%.2f", global.min)), max: \(String(format: "%.2f", global.max)))")
+            print("  Global: \(String(format: "%.2f", global.avg))ms avg (min: \(String(format: "%.2f", global.min)), max: \(String(format: "%.2f", global.max)))")
             print("  Local:      \(String(format: "%.2f", local.avg))ms avg (min: \(String(format: "%.2f", local.min)), max: \(String(format: "%.2f", local.max)))")
         } else {
-            print("  GlobalSort: \(String(format: "%.2f", global.avg))ms (\(String(format: "%.1f", global.fps)) FPS)")
+            print("  Global: \(String(format: "%.2f", global.avg))ms (\(String(format: "%.1f", global.fps)) FPS)")
             print("  Local:      \(String(format: "%.2f", local.avg))ms (\(String(format: "%.1f", local.fps)) FPS)")
         }
         print("  Winner:     \(faster) (\(String(format: "%.2f", speedup))x faster)\n")
@@ -731,7 +731,7 @@ final class RendererE2ETests: XCTestCase {
 
     // MARK: - Performance Tests
 
-    /// End-to-end performance comparison between GlobalSort and Local renderers
+    /// End-to-end performance comparison between Global and Local renderers
     func testPerformanceComparison() throws {
         let testCases: [(count: Int, name: String)] = [
             (10000, "10K"),

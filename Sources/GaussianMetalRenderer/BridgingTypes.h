@@ -1,1 +1,1 @@
-../GaussianMetalRendererTypes/include/BridgingTypes.h
+../RendererTypes/include/BridgingTypes.h

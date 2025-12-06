@@ -54,7 +54,7 @@ public final class LocalRenderer: GaussianRenderer, @unchecked Sendable {
     private var sortedLocalIdx16Buffer: MTLBuffer?
 
     // Projection buffer (sparse mode - no compaction)
-    private var tempProjectionBuffer: MTLBuffer?
+    private var projectionBuffer: MTLBuffer?
 
     // Indirect dispatch buffers
     private var activeTileIndicesBuffer: MTLBuffer?
@@ -83,10 +83,10 @@ public final class LocalRenderer: GaussianRenderer, @unchecked Sendable {
             throw RendererError.failedToCreatePipeline("LocalShaders.metallib not found")
         }
 
-        guard let mainLibraryURL = Bundle.module.url(forResource: "GaussianMetalRenderer", withExtension: "metallib"),
+        guard let mainLibraryURL = Bundle.module.url(forResource: "GlobalShaders", withExtension: "metallib"),
               let mainLibrary = try? device.makeLibrary(URL: mainLibraryURL)
         else {
-            throw RendererError.failedToCreatePipeline("GaussianMetalRenderer.metallib not found")
+            throw RendererError.failedToCreatePipeline("GlobalShaders.metallib not found")
         }
 
         // Initialize stage encoders
@@ -182,7 +182,7 @@ public final class LocalRenderer: GaussianRenderer, @unchecked Sendable {
               let tileOffsets = tileOffsetsBuffer,
               let partialSums = partialSumsBuffer,
               let sortIndices = sortIndicesBuffer,
-              let tempProjection = tempProjectionBuffer,
+              let projection = projectionBuffer,
               let colorTex = colorTexture,
               let depthTex = depthTexture,
               let activeTileIndices = activeTileIndicesBuffer,
@@ -245,7 +245,7 @@ public final class LocalRenderer: GaussianRenderer, @unchecked Sendable {
             camera: camera,
             params: params,
             gaussianCount: gaussianCount,
-            tempProjectionBuffer: tempProjection,
+            projectionBuffer: projection,
             compactedHeader: header,
             useHalfWorld: useHalfWorld,
             clusterVisibility: nil,
@@ -257,7 +257,7 @@ public final class LocalRenderer: GaussianRenderer, @unchecked Sendable {
         self.scatterEncoder.totalGaussianCount = gaussianCount
         self.scatterEncoder.encode16(
             commandBuffer: commandBuffer,
-            compactedGaussians: tempProjection,
+            projectedGaussians: projection,
             compactedHeader: header,
             tileCounters: tileCounts,
             depthKeys16: depth16,
@@ -311,7 +311,7 @@ public final class LocalRenderer: GaussianRenderer, @unchecked Sendable {
         // === PIPELINE STAGE 8: RENDER (16-bit only) ===
         self.renderEncoder.encodeIndirect16(
             commandBuffer: commandBuffer,
-            compactedGaussians: tempProjection,
+            projectedGaussians: projection,
             tileCounts: tileCounts,
             maxPerTile: LocalRenderer.maxPerTile,
             sortedLocalIdx: sortedLocal16,
@@ -378,8 +378,8 @@ public final class LocalRenderer: GaussianRenderer, @unchecked Sendable {
             options: priv)
 
         // Projection buffer (sparse mode - no compaction)
-        self.tempProjectionBuffer = makeBuffer("TempProjection",
-            length: maxCompacted * MemoryLayout<CompactedGaussianSwift>.stride,
+        self.projectionBuffer = makeBuffer("Projection",
+            length: maxCompacted * MemoryLayout<ProjectedGaussianSwift>.stride,
             options: priv)
 
         // 16-bit sort buffers (sparse mode only)

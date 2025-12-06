@@ -1,4 +1,4 @@
-import GaussianMetalRendererTypes
+import RendererTypes
 import Metal
 
 /// Encoder for fused pipeline operations using AoS (Array of Structures) data
@@ -15,7 +15,7 @@ final class FusedPipelineEncoder {
 
     init(device: MTLDevice, library: MTLLibrary) throws {
         // Unified render kernel (like Local)
-        guard let renderFn = library.makeFunction(name: "globalSortRender") else {
+        guard let renderFn = library.makeFunction(name: "globalRender") else {
             throw NSError(domain: "FusedPipelineEncoder", code: 3,
                           userInfo: [NSLocalizedDescriptionKey: "Render kernel function missing"])
         }
@@ -58,7 +58,7 @@ final class FusedPipelineEncoder {
     ) {
         guard let encoder = commandBuffer.makeComputeCommandEncoder() else { return }
 
-        encoder.label = "GlobalSortRender"
+        encoder.label = "GlobalRender"
         encoder.setComputePipelineState(self.renderPipeline)
 
         encoder.setBuffer(headers, offset: 0, index: 0)

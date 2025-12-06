@@ -4,12 +4,12 @@ set -e
 SDK="macosx"
 
 # Include path for shared types
-INCLUDE="-I Sources/GaussianMetalRendererTypes/include"
+INCLUDE="-I Sources/RendererTypes/include"
 
-# Main shaders (GlobalSort)
-SRC="Sources/GaussianMetalRenderer/GaussianMetalRenderer.metal"
-AIR="Sources/GaussianMetalRenderer/GaussianMetalRenderer.air"
-LIB="Sources/GaussianMetalRenderer/GaussianMetalRenderer.metallib"
+# Global shaders (radix sort pipeline)
+SRC="Sources/GaussianMetalRenderer/GlobalShaders.metal"
+AIR="Sources/GaussianMetalRenderer/GlobalShaders.air"
+LIB="Sources/GaussianMetalRenderer/GlobalShaders.metallib"
 
 echo "Compiling Metal Shaders (Debug Mode)..."
 xcrun -sdk $SDK metal \

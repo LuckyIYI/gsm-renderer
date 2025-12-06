@@ -3,8 +3,8 @@ import Metal
 import simd
 import XCTest
 
-/// Unit tests for GlobalSort pipeline stages
-final class GlobalSortUnitTests: XCTestCase {
+/// Unit tests for Global pipeline stages
+final class GlobalUnitTests: XCTestCase {
     var device: MTLDevice!
     var library: MTLLibrary!
     var queue: MTLCommandQueue!
@@ -12,7 +12,7 @@ final class GlobalSortUnitTests: XCTestCase {
     override func setUp() {
         super.setUp()
         let config = RendererConfig(maxGaussians: 100_000, maxWidth: 512, maxHeight: 512)
-        let renderer = try! GlobalSortRenderer(config: config)
+        let renderer = try! GlobalRenderer(config: config)
         self.device = renderer.device
         self.library = renderer.library
         self.queue = self.device.makeCommandQueue()!

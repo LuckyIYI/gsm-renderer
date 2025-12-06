@@ -1,4 +1,4 @@
-import GaussianMetalRendererTypes
+import RendererTypes
 import Metal
 
 /// Encoder for buffer-based rendering (for Python/MLX readback)

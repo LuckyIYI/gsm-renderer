@@ -1,4 +1,4 @@
-import GaussianMetalRendererTypes
+import RendererTypes
 import Metal
 
 /// Two-pass tile assignment encoder with deterministic compaction:

@@ -9,7 +9,7 @@
 #include "GaussianPrefixScan.h"
 using namespace metal;
 
-// Function constant for optional cluster culling (index 1, matches GaussianMetalRenderer.metal)
+// Function constant for optional cluster culling (index 1, matches GlobalShaders.metal)
 constant bool USE_CLUSTER_CULL [[function_constant(1)]];
 
 // =============================================================================
@@ -111,7 +111,7 @@ template <typename PackedWorldT, typename HarmonicsT>
 kernel void localProjectStore(
     const device PackedWorldT* worldGaussians [[buffer(0)]],
     const device HarmonicsT* harmonics [[buffer(1)]],
-    device CompactedGaussian* tempBuffer [[buffer(2)]],     // Temp storage at gid
+    device ProjectedGaussian* tempBuffer [[buffer(2)]],     // Temp storage at gid
     constant CameraUniforms& camera [[buffer(4)]],
     constant TileBinningParams& params [[buffer(5)]],
     const device uchar* clusterVisible [[buffer(6), function_constant(USE_CLUSTER_CULL)]],
@@ -242,21 +242,21 @@ kernel void localProjectStore(
 template [[host_name("LocalProjectStoreFloat")]]
 kernel void localProjectStore<PackedWorldGaussian, float>(
     const device PackedWorldGaussian*, const device float*,
-    device CompactedGaussian*,
+    device ProjectedGaussian*,
     constant CameraUniforms&, constant TileBinningParams&,
     const device uchar*, constant uint&, uint);
 
 template [[host_name("LocalProjectStoreHalf")]]
 kernel void localProjectStore<PackedWorldGaussianHalf, float>(
     const device PackedWorldGaussianHalf*, const device float*,
-    device CompactedGaussian*,
+    device ProjectedGaussian*,
     constant CameraUniforms&, constant TileBinningParams&,
     const device uchar*, constant uint&, uint);
 
 template [[host_name("LocalProjectStoreHalfHalfSh")]]
 kernel void localProjectStore<PackedWorldGaussianHalf, half>(
     const device PackedWorldGaussianHalf*, const device half*,
-    device CompactedGaussian*,
+    device ProjectedGaussian*,
     constant CameraUniforms&, constant TileBinningParams&,
     const device uchar*, constant uint&, uint);
 
@@ -527,7 +527,7 @@ kernel void localPerTileSort16(
 // Indirect dispatch: uses activeTileIndices to get tileId, framebuffer pre-cleared
 
 kernel void localRender16(
-    const device CompactedGaussian* compacted [[buffer(0)]],
+    const device ProjectedGaussian* compacted [[buffer(0)]],
     const device uint* counts [[buffer(1)]],
     constant uint& maxPerTile [[buffer(2)]],
     const device ushort* sortedLocalIdx [[buffer(3)]],
@@ -576,7 +576,7 @@ kernel void localRender16(
         // Two-level indirection: sortedLocalIdx → globalIndices → compacted
         ushort localSortedIdx = sortedLocalIdx[offset + i];
         uint gIdx = globalIndices[offset + localSortedIdx];
-        CompactedGaussian g = compacted[gIdx];
+        ProjectedGaussian g = compacted[gIdx];
 
         half2 gPos = half2(g.positionColor.xy);
         half3 cov = half3(g.covarianceDepth.xyz);
@@ -653,7 +653,7 @@ kernel void localRender16(
 #define SPARSE_GAUSSIANS_PER_THREAD 32
 
 kernel void localScatterSimd16Sparse(
-    const device CompactedGaussian* projected [[buffer(0)]],  // Sparse! Indexed by original gaussian ID
+    const device ProjectedGaussian* projected [[buffer(0)]],  // Sparse! Indexed by original gaussian ID
     device atomic_uint* tileCounters [[buffer(2)]],
     device ushort* depthKeys16 [[buffer(3)]],
     device uint* globalIndices [[buffer(4)]],
@@ -673,7 +673,7 @@ kernel void localScatterSimd16Sparse(
 
         // Read from SPARSE projected buffer (indexed by original gaussian ID)
         // Invisible gaussians have minTile == maxTile, so loops below won't execute
-        CompactedGaussian gaussian = projected[originalIdx];
+        ProjectedGaussian gaussian = projected[originalIdx];
         float3 conic = gaussian.covarianceDepth.xyz;
         float2 center = gaussian.positionColor.xy;
         half4 colorOp = localUnpackHalf4(gaussian.positionColor.zw);

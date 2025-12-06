@@ -1,4 +1,4 @@
-import GaussianMetalRendererTypes
+import RendererTypes
 import Metal
 
 final class TileBoundsEncoder {

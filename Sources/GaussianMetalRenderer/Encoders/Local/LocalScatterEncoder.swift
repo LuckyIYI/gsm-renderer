@@ -19,7 +19,7 @@ public final class LocalScatterEncoder {
     /// Dispatches for ALL gaussians, skips invisible via zero tile bounds
     public func encode16(
         commandBuffer: MTLCommandBuffer,
-        compactedGaussians: MTLBuffer,  // Actually tempProjectionBuffer (sparse)
+        projectedGaussians: MTLBuffer,  // Sparse projection buffer
         compactedHeader: MTLBuffer,     // Unused in sparse mode
         tileCounters: MTLBuffer,
         depthKeys16: MTLBuffer,
@@ -44,7 +44,7 @@ public final class LocalScatterEncoder {
         if let encoder = commandBuffer.makeComputeCommandEncoder() {
             encoder.label = "Local_Scatter16_sparse"
             encoder.setComputePipelineState(scatterSparsePipeline)
-            encoder.setBuffer(compactedGaussians, offset: 0, index: 0)
+            encoder.setBuffer(projectedGaussians, offset: 0, index: 0)
             // index 1 unused (was visibilityMask)
             encoder.setBuffer(tileCounters, offset: 0, index: 2)
             encoder.setBuffer(depthKeys16, offset: 0, index: 3)

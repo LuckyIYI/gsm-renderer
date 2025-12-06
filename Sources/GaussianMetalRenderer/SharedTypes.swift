@@ -1,5 +1,5 @@
 import Foundation
-import GaussianMetalRendererTypes
+import RendererTypes
 import Metal
 import simd
 

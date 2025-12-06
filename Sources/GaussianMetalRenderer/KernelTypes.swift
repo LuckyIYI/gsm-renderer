@@ -1,10 +1,10 @@
 import Foundation
-@_exported import GaussianMetalRendererTypes
+@_exported import RendererTypes
 import simd
 
 // =============================================================================
 // TYPE ALIASES FOR API COMPATIBILITY
-// All types come from BridgingTypes.h via GaussianMetalRendererTypes
+// All types come from BridgingTypes.h via RendererTypes
 // =============================================================================
 
 public typealias CameraUniformsSwift = CameraUniforms
@@ -12,7 +12,7 @@ public typealias RenderParamsSwift = RenderParams
 public typealias TileBinningParamsSwift = TileBinningParams
 public typealias TileAssignmentHeaderSwift = TileAssignmentHeader
 public typealias CompactedHeaderSwift = TileAssignmentHeader
-public typealias CompactedGaussianSwift = CompactedGaussian
+public typealias ProjectedGaussianSwift = ProjectedGaussian
 
 // =============================================================================
 // CONVENIENCE EXTENSIONS

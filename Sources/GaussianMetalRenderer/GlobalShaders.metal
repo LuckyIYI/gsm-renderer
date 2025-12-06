@@ -8,7 +8,7 @@
 using namespace metal;
 
 // =============================================================================
-// STRUCT ACCESSOR HELPERS - GaussianRenderData (specific to GlobalSort)
+// STRUCT ACCESSOR HELPERS - GaussianRenderData (specific to Global)
 // =============================================================================
 
 // GaussianRenderData accessors (device address space)
@@ -1199,7 +1199,7 @@ kernel void radixScatterKernel(
 }
 
 // =============================================================================
-// MARK: - GlobalSort Render Kernel
+// MARK: - Global Render Kernel
 // =============================================================================
 // 32x16 tile, 8x8 threadgroup (64 threads), 4x2 pixels per thread = 512 pixels
 #define RENDER_V3_TG_WIDTH 8
@@ -1214,7 +1214,7 @@ kernel void radixScatterKernel(
 // - Uses index-based access via sortedIndices (no Pack step needed)
 // - Half precision only (matching Local)
 
-kernel void globalSortRender(
+kernel void globalRender(
     const device GaussianHeader* headers [[buffer(0)]],
     const device GaussianRenderData* gaussians [[buffer(1)]],  // interleavedGaussians
     const device int* sortedIndices [[buffer(2)]],  // indices into gaussians

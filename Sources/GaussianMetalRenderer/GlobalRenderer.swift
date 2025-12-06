@@ -1,5 +1,5 @@
 import Foundation
-import GaussianMetalRendererTypes
+import RendererTypes
 @preconcurrency import Metal
 import simd
 
@@ -220,7 +220,7 @@ final class FrameResources {
 // MARK: - Global Sort Renderer
 
 /// High-quality Gaussian splatting renderer using global radix sort
-public final class GlobalSortRenderer: GaussianRenderer, @unchecked Sendable {
+public final class GlobalRenderer: GaussianRenderer, @unchecked Sendable {
     private static let maxSupportedGaussians = 10_000_000
     private static let tileWidth = 32
     private static let tileHeight = 16
@@ -260,8 +260,8 @@ public final class GlobalSortRenderer: GaussianRenderer, @unchecked Sendable {
 
     /// Primary initializer
     public init(device: MTLDevice? = nil, config: RendererConfig = RendererConfig()) throws {
-        guard config.maxGaussians <= GlobalSortRenderer.maxSupportedGaussians else {
-            throw RendererError.invalidInput("maxGaussians (\(config.maxGaussians)) exceeds limit of \(GlobalSortRenderer.maxSupportedGaussians)")
+        guard config.maxGaussians <= GlobalRenderer.maxSupportedGaussians else {
+            throw RendererError.invalidInput("maxGaussians (\(config.maxGaussians)) exceeds limit of \(GlobalRenderer.maxSupportedGaussians)")
         }
 
         let device = device ?? MTLCreateSystemDefaultDevice()
@@ -271,8 +271,8 @@ public final class GlobalSortRenderer: GaussianRenderer, @unchecked Sendable {
         self.device = device
         self.config = config
 
-        guard let metallibURL = Bundle.module.url(forResource: "GaussianMetalRenderer", withExtension: "metallib") else {
-            throw RendererError.failedToCreatePipeline("GaussianMetalRenderer.metallib not found in bundle")
+        guard let metallibURL = Bundle.module.url(forResource: "GlobalShaders", withExtension: "metallib") else {
+            throw RendererError.failedToCreatePipeline("GlobalShaders.metallib not found in bundle")
         }
         let library = try device.makeLibrary(URL: metallibURL)
         self.library = library
@@ -305,12 +305,12 @@ public final class GlobalSortRenderer: GaussianRenderer, @unchecked Sendable {
         // Compute limits and layout
         self.limits = RendererLimits(
             from: config,
-            tileWidth: GlobalSortRenderer.tileWidth,
-            tileHeight: GlobalSortRenderer.tileHeight,
-            maxPerTile: GlobalSortRenderer.maxPerTile
+            tileWidth: GlobalRenderer.tileWidth,
+            tileHeight: GlobalRenderer.tileHeight,
+            maxPerTile: GlobalRenderer.maxPerTile
         )
 
-        self.frameLayout = GlobalSortRenderer.computeLayout(
+        self.frameLayout = GlobalRenderer.computeLayout(
             limits: self.limits,
             precision: config.precision,
             radixSortEncoder: self.radixSortEncoder

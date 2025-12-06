@@ -50,7 +50,7 @@ public final class LocalProjectEncoder {
         params: TileBinningParams,
         gaussianCount: Int,
         // Output
-        tempProjectionBuffer: MTLBuffer,
+        projectionBuffer: MTLBuffer,
         compactedHeader: MTLBuffer,
         // Options
         useHalfWorld: Bool,
@@ -74,7 +74,7 @@ public final class LocalProjectEncoder {
             encoder.setComputePipelineState(pipeline)
             encoder.setBuffer(worldGaussians, offset: 0, index: 0)
             encoder.setBuffer(harmonics, offset: 0, index: 1)
-            encoder.setBuffer(tempProjectionBuffer, offset: 0, index: 2)
+            encoder.setBuffer(projectionBuffer, offset: 0, index: 2)
             encoder.setBytes(&cameraUniforms, length: MemoryLayout<CameraUniformsSwift>.stride, index: 4)
             encoder.setBytes(&binParams, length: MemoryLayout<TileBinningParams>.stride, index: 5)
             if let clusterVis = clusterVisibility {

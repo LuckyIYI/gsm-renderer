@@ -143,7 +143,7 @@ typedef struct {
     simd_int2   maxTile;
     UINT32      originalIdx;    // World buffer index for deterministic tie-breaking
     UINT32      _pad0;          // Padding for alignment
-} CompactedGaussian;
+} ProjectedGaussian;
 
 // =============================================================================
 // DISPATCH & KERNEL PARAMS

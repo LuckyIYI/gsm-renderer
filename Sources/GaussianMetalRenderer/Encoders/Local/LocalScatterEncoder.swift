@@ -1,5 +1,13 @@
 import Metal
 
+/// Intersection mode for tile assignment (must match GaussianHelpers.h INTERSECTION_MODE)
+public enum IntersectionMode: UInt32 {
+    case aabb = 0      // Fastest test, circular radius
+    case obb = 1       // Medium, oriented bounding box
+    case ellipse = 2   // Slowest, exact FlashGS-style
+    case none = 3      // Skip test, trust projection bounds (fastest overall)
+}
+
 /// Encodes scatter stage: assigns gaussians to tiles (sparse mode - no compaction)
 /// Visibility encoded in zero tile bounds: minTile == maxTile == 0 means invisible
 public final class LocalScatterEncoder {
@@ -8,8 +16,12 @@ public final class LocalScatterEncoder {
     /// Total gaussian count for sparse dispatch
     public var totalGaussianCount: Int = 0
 
-    public init(library: MTLLibrary, device: MTLDevice) throws {
-        guard let scatterSparseFn = library.makeFunction(name: "localScatterSimd16Sparse") else {
+    public init(library: MTLLibrary, device: MTLDevice, intersectionMode: IntersectionMode = .none) throws {
+        let constantValues = MTLFunctionConstantValues()
+        var mode = intersectionMode.rawValue
+        constantValues.setConstantValue(&mode, type: .uint, index: 10)  // INTERSECTION_MODE
+
+        guard let scatterSparseFn = try? library.makeFunction(name: "localScatterSimd16Sparse", constantValues: constantValues) else {
             fatalError("Missing localScatterSimd16Sparse kernel")
         }
         self.scatterSparsePipeline = try device.makeComputePipelineState(function: scatterSparseFn)

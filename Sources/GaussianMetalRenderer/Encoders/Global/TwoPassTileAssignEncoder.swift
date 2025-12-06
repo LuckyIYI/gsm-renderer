@@ -1,17 +1,10 @@
 import RendererTypes
 import Metal
 
-/// Intersection mode for tile assignment (must match GaussianHelpers.h INTERSECTION_MODE)
-public enum IntersectionMode: UInt32 {
-    case aabb = 0      // Fastest test, circular radius
-    case obb = 1       // Medium, oriented bounding box
-    case ellipse = 2   // Slowest, exact FlashGS-style
-    case none = 3      // Skip test, trust projection bounds (fastest overall)
-}
-
 /// Two-pass tile assignment encoder with deterministic compaction:
 /// MarkVisibility → PrefixSum → ScatterCompact → PrepareDispatch → Count → PrefixSum → Scatter
 /// Uses prefix-sum based compaction for deterministic ordering (atomic-based was non-deterministic)
+/// Uses ellipse intersection for precise tile filtering (benchmarked as optimal)
 final class TwoPassTileAssignEncoder {
     // Deterministic compaction pipelines
     private let markVisibilityPipeline: MTLComputePipelineState
@@ -38,11 +31,11 @@ final class TwoPassTileAssignEncoder {
         let indirectDispatchArgs: MTLBuffer // Dispatch args (12 bytes)
     }
 
-    init(device: MTLDevice, library: MTLLibrary, intersectionMode: IntersectionMode = .none) throws {
-        // Function constants for intersection mode
+    init(device: MTLDevice, library: MTLLibrary) throws {
+        // Function constants - always use ellipse intersection (benchmarked as best)
         let constantValues = MTLFunctionConstantValues()
-        var mode = intersectionMode.rawValue
-        constantValues.setConstantValue(&mode, type: .uint, index: 10)  // INTERSECTION_MODE
+        var mode: UInt32 = 2  // INTERSECTION_MODE = ellipse
+        constantValues.setConstantValue(&mode, type: .uint, index: 10)
 
         // Deterministic compaction kernels (don't need function constants)
         guard let markFn = library.makeFunction(name: "markVisibilityKernel"),

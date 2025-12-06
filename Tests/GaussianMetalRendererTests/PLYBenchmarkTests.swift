@@ -35,20 +35,18 @@ final class PLYBenchmarkTests: XCTestCase {
         let far: Float = 1000.0
         let f = 1.0 / tan(fov / 2.0)
 
-        // Camera position - place along -Z axis (so scene is in +Z direction from camera)
         let cameraPos = center - SIMD3<Float>(0, 0, distance)
 
         // View matrix: translate world so camera is at origin, scene is at +Z
-        // Camera at (0, 0, -distance), scene at origin -> after view transform, scene at (0, 0, +distance)
         var viewMatrix = matrix_identity_float4x4
         viewMatrix.columns.3 = SIMD4(-cameraPos.x, -cameraPos.y, -cameraPos.z, 1)
 
-        // Projection matrix - same as E2E tests (standard perspective with -Z forward in clip space)
+        // Standard perspective projection matrix (Metal NDC: z in [0, 1])
         var projMatrix = matrix_identity_float4x4
         projMatrix.columns.0 = SIMD4(f / aspect, 0, 0, 0)
         projMatrix.columns.1 = SIMD4(0, f, 0, 0)
-        projMatrix.columns.2 = SIMD4(0, 0, -1.002, -1)
-        projMatrix.columns.3 = SIMD4(0, 0, -0.2, 0)
+        projMatrix.columns.2 = SIMD4(0, 0, -far / (far - near), -1)
+        projMatrix.columns.3 = SIMD4(0, 0, -(far * near) / (far - near), 0)
 
         return CameraParams(
             viewMatrix: viewMatrix,
@@ -59,87 +57,6 @@ final class PLYBenchmarkTests: XCTestCase {
         )
     }
 
-    // MARK: - Simple Render Test (no PLY)
-
-    func testSimpleRender() throws {
-        print("\n=== Simple Render Test (no PLY) ===")
-
-        let width = 512
-        let height = 512
-        let gaussianCount = 100
-
-        // Create simple test gaussians
-        var packed: [PackedWorldGaussian] = []
-        for i in 0..<gaussianCount {
-            let angle = Float(i) / Float(gaussianCount) * Float.pi * 2
-            let pos = SIMD3<Float>(cos(angle) * 2, sin(angle) * 2, 0)
-            let scale = SIMD3<Float>(0.1, 0.1, 0.1)
-            let rot = SIMD4<Float>(0, 0, 0, 1) // identity quaternion
-            packed.append(PackedWorldGaussian(position: pos, scale: scale, rotation: rot, opacity: 1.0))
-        }
-
-        // Create harmonics (DC color only)
-        var harmonics = [Float](repeating: 0.5, count: gaussianCount * 3)
-
-        guard let gaussianBuf = device.makeBuffer(bytes: &packed, length: packed.count * MemoryLayout<PackedWorldGaussian>.stride, options: .storageModeShared),
-              let harmonicsBuf = device.makeBuffer(bytes: &harmonics, length: harmonics.count * MemoryLayout<Float>.stride, options: .storageModeShared)
-        else {
-            XCTFail("Failed to create buffers")
-            return
-        }
-
-        let config = RendererConfig(maxGaussians: gaussianCount + 100, maxWidth: width, maxHeight: height)
-        let renderer = try LocalRenderer(config: config)
-
-        let camera = createCameraParams(lookAt: .zero, distance: 1, width: width, height: height)
-
-        let input = GaussianInput(
-            gaussians: gaussianBuf,
-            harmonics: harmonicsBuf,
-            gaussianCount: gaussianCount,
-            shComponents: 0
-        )
-
-        // Create output textures (caller's responsibility with new API)
-        let colorDesc = MTLTextureDescriptor.texture2DDescriptor(
-            pixelFormat: .rgba16Float, width: width, height: height, mipmapped: false)
-        colorDesc.usage = [.shaderRead, .shaderWrite]
-        colorDesc.storageMode = .private
-        guard let colorTexture = device.makeTexture(descriptor: colorDesc) else {
-            XCTFail("Failed to create color texture")
-            return
-        }
-
-        let depthDesc = MTLTextureDescriptor.texture2DDescriptor(
-            pixelFormat: .r16Float, width: width, height: height, mipmapped: false)
-        depthDesc.usage = [.shaderRead, .shaderWrite]
-        depthDesc.storageMode = .private
-        let depthTexture = device.makeTexture(descriptor: depthDesc)
-
-        guard let q = renderer.device.makeCommandQueue(),
-              let cb = q.makeCommandBuffer()
-        else {
-            XCTFail("Failed to create command buffer")
-            return
-        }
-
-        print("Rendering \(gaussianCount) gaussians...")
-        renderer.render(
-            commandBuffer: cb,
-            colorTexture: colorTexture,
-            depthTexture: depthTexture,
-            input: input,
-            camera: camera,
-            width: width,
-            height: height,
-            whiteBackground: true
-        )
-
-        cb.commit()
-        cb.waitUntilCompleted()
-
-        print("Simple render test passed!")
-    }
 
     // MARK: - PLY Loading Test
 
@@ -198,10 +115,10 @@ final class PLYBenchmarkTests: XCTestCase {
         let height = 1080
 
         // Create packed gaussians from PLY data (half precision to match default renderer config)
-        var packed: [PackedWorldGaussianHalf] = []
+        var packed: [PackedWorldGaussian] = []
         packed.reserveCapacity(gaussianCount)
         for record in dataset.records {
-            packed.append(PackedWorldGaussianHalf(
+            packed.append(PackedWorldGaussian(
                 position: record.position,
                 scale: record.scale,
                 rotation: SIMD4<Float>(record.rotation.imag.x, record.rotation.imag.y, record.rotation.imag.z, record.rotation.real),
@@ -212,7 +129,7 @@ final class PLYBenchmarkTests: XCTestCase {
         // Extract DC coefficients from harmonics - planar layout is:
         // [R0..R15, G0..G15, B0..B15] per gaussian where shComponents=16
         // DC coefficients are at indices 0 (R), shComponents (G), shComponents*2 (B)
-        var harmonics = [Float16]()
+        var harmonics = [Float]()
         harmonics.reserveCapacity(gaussianCount * 3)
         let shComponents = dataset.shComponents
         let shCoeffsPerGaussian = shComponents * 3
@@ -220,18 +137,18 @@ final class PLYBenchmarkTests: XCTestCase {
             let baseIdx = i * shCoeffsPerGaussian
             if baseIdx + shComponents * 2 < dataset.harmonics.count {
                 // DC_R at offset 0, DC_G at offset shComponents, DC_B at offset shComponents*2
-                harmonics.append(Float16(dataset.harmonics[baseIdx + 0]))              // R DC
-                harmonics.append(Float16(dataset.harmonics[baseIdx + shComponents]))   // G DC
-                harmonics.append(Float16(dataset.harmonics[baseIdx + shComponents * 2])) // B DC
+                harmonics.append(dataset.harmonics[baseIdx + 0])              // R DC
+                harmonics.append(dataset.harmonics[baseIdx + shComponents])   // G DC
+                harmonics.append(dataset.harmonics[baseIdx + shComponents * 2]) // B DC
             } else {
-                harmonics.append(Float16(0.5))
-                harmonics.append(Float16(0.5))
-                harmonics.append(Float16(0.5))
+                harmonics.append(0.5)
+                harmonics.append(0.5)
+                harmonics.append(0.5)
             }
         }
 
-        guard let gaussianBuf = device.makeBuffer(bytes: &packed, length: packed.count * MemoryLayout<PackedWorldGaussianHalf>.stride, options: .storageModeShared),
-              let harmonicsBuf = device.makeBuffer(bytes: &harmonics, length: harmonics.count * MemoryLayout<Float16>.stride, options: .storageModeShared)
+        guard let gaussianBuf = device.makeBuffer(bytes: &packed, length: packed.count * MemoryLayout<PackedWorldGaussian>.stride, options: .storageModeShared),
+              let harmonicsBuf = device.makeBuffer(bytes: &harmonics, length: harmonics.count * MemoryLayout<Float>.stride, options: .storageModeShared)
         else {
             XCTFail("Failed to create buffers")
             return
@@ -239,8 +156,8 @@ final class PLYBenchmarkTests: XCTestCase {
 
         print("Buffers: gaussians=\(gaussianBuf.length) bytes, harmonics=\(harmonicsBuf.length) bytes")
 
-        let config = RendererConfig(maxGaussians: gaussianCount, maxWidth: width, maxHeight: height)
-        let renderer = try GlobalRenderer(config: config)
+        let config = RendererConfig(maxGaussians: gaussianCount, maxWidth: width, maxHeight: height, precision: .float32)
+        let renderer = try LocalRenderer(config: config)
 
         let cameraMargin: Float = 0.15
         let cameraDistance = bounds.radius * cameraMargin
@@ -290,11 +207,11 @@ final class PLYBenchmarkTests: XCTestCase {
             height: height,
             whiteBackground: false
         )
-
+        
         cb.commit()
         cb.waitUntilCompleted()
 
-        let renderTime = (CFAbsoluteTimeGetCurrent() - start) * 1000
+        let renderTime = (cb.gpuEndTime - cb.gpuStartTime) * 1000
         print("Render time: \(String(format: "%.2f", renderTime))ms")
         print("Output: \(colorTexture.width)x\(colorTexture.height) texture")
 

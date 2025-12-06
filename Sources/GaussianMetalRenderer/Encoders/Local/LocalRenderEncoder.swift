@@ -34,7 +34,7 @@ public final class LocalRenderEncoder {
     public func encodeClearTextures(
         commandBuffer: MTLCommandBuffer,
         colorTexture: MTLTexture,
-        depthTexture: MTLTexture,
+        depthTexture: MTLTexture?,
         width: Int,
         height: Int,
         whiteBackground: Bool
@@ -48,7 +48,7 @@ public final class LocalRenderEncoder {
         encoder.label = "Local_ClearTextures"
         encoder.setComputePipelineState(self.clearTexturesPipeline)
         encoder.setTexture(colorTexture, index: 0)
-        encoder.setTexture(depthTexture, index: 1)
+        if let depthTexture { encoder.setTexture(depthTexture, index: 1) }
         encoder.setBytes(&w, length: MemoryLayout<UInt32>.stride, index: 0)
         encoder.setBytes(&h, length: MemoryLayout<UInt32>.stride, index: 1)
         encoder.setBytes(&bg, length: MemoryLayout<UInt32>.stride, index: 2)
@@ -94,7 +94,7 @@ public final class LocalRenderEncoder {
         activeTileIndices: MTLBuffer,
         dispatchArgs: MTLBuffer,
         colorTexture: MTLTexture,
-        depthTexture: MTLTexture,
+        depthTexture: MTLTexture?,
         tilesX: Int,
         tilesY: Int,
         width: Int,
@@ -128,7 +128,7 @@ public final class LocalRenderEncoder {
         encoder.setBuffer(globalIndices, offset: 0, index: 4)
         encoder.setBuffer(activeTileIndices, offset: 0, index: 5)
         encoder.setTexture(colorTexture, index: 0)
-        encoder.setTexture(depthTexture, index: 1)
+        if let depthTexture { encoder.setTexture(depthTexture, index: 1) }
         encoder.setBytes(&params, length: MemoryLayout<RenderParams>.stride, index: 6)
 
         // 4×8 threadgroup for 16×16 tile (4×2 pixels per thread)

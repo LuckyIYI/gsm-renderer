@@ -295,12 +295,10 @@ public final class LocalRenderer: GaussianRenderer, @unchecked Sendable {
         )
 
         // === PIPELINE STAGE 6: CLEAR TEXTURES ===
-        // Use provided depth texture or skip depth clear if nil
-        let depthTex = depthTexture ?? colorTexture // Fallback to color if no depth provided
         self.renderEncoder.encodeClearTextures(
             commandBuffer: commandBuffer,
             colorTexture: colorTexture,
-            depthTexture: depthTex,
+            depthTexture: depthTexture,
             width: width,
             height: height,
             whiteBackground: whiteBackground
@@ -324,7 +322,7 @@ public final class LocalRenderer: GaussianRenderer, @unchecked Sendable {
             activeTileIndices: activeTileIndicesBuffer,
             dispatchArgs: dispatchArgsBuffer,
             colorTexture: colorTexture,
-            depthTexture: depthTex,
+            depthTexture: depthTexture,
             tilesX: tilesX,
             tilesY: tilesY,
             width: width,

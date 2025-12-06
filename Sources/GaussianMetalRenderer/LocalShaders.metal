@@ -81,7 +81,9 @@ kernel void localClearTextures(
     if (gid.x >= width || gid.y >= height) return;
     half bg = whiteBackground ? 1.0h : 0.0h;
     colorTex.write(half4(bg, bg, bg, 0.0h), gid);
-    depthTex.write(half4(0), gid);
+    if (!is_null_texture(depthTex)) {
+        depthTex.write(half4(0), gid);
+    }
 }
 
 // =============================================================================
@@ -633,15 +635,16 @@ kernel void localRender16(
     // Write output
     uint w = params.width, h = params.height;
     uint bx = uint(px0), by = uint(py0);
+    bool hasDepth = !is_null_texture(depthOut);
 
-    if (bx < w && by < h)     { colorOut.write(half4(c00, 1.0h - t00), uint2(bx, by));     depthOut.write(half4(0), uint2(bx, by)); }
-    if (bx+1 < w && by < h)   { colorOut.write(half4(c10, 1.0h - t10), uint2(bx+1, by));   depthOut.write(half4(0), uint2(bx+1, by)); }
-    if (bx+2 < w && by < h)   { colorOut.write(half4(c20, 1.0h - t20), uint2(bx+2, by));   depthOut.write(half4(0), uint2(bx+2, by)); }
-    if (bx+3 < w && by < h)   { colorOut.write(half4(c30, 1.0h - t30), uint2(bx+3, by));   depthOut.write(half4(0), uint2(bx+3, by)); }
-    if (bx < w && by+1 < h)   { colorOut.write(half4(c01, 1.0h - t01), uint2(bx, by+1));   depthOut.write(half4(0), uint2(bx, by+1)); }
-    if (bx+1 < w && by+1 < h) { colorOut.write(half4(c11, 1.0h - t11), uint2(bx+1, by+1)); depthOut.write(half4(0), uint2(bx+1, by+1)); }
-    if (bx+2 < w && by+1 < h) { colorOut.write(half4(c21, 1.0h - t21), uint2(bx+2, by+1)); depthOut.write(half4(0), uint2(bx+2, by+1)); }
-    if (bx+3 < w && by+1 < h) { colorOut.write(half4(c31, 1.0h - t31), uint2(bx+3, by+1)); depthOut.write(half4(0), uint2(bx+3, by+1)); }
+    if (bx < w && by < h)     { colorOut.write(half4(c00, 1.0h - t00), uint2(bx, by));     if (hasDepth) depthOut.write(half4(0), uint2(bx, by)); }
+    if (bx+1 < w && by < h)   { colorOut.write(half4(c10, 1.0h - t10), uint2(bx+1, by));   if (hasDepth) depthOut.write(half4(0), uint2(bx+1, by)); }
+    if (bx+2 < w && by < h)   { colorOut.write(half4(c20, 1.0h - t20), uint2(bx+2, by));   if (hasDepth) depthOut.write(half4(0), uint2(bx+2, by)); }
+    if (bx+3 < w && by < h)   { colorOut.write(half4(c30, 1.0h - t30), uint2(bx+3, by));   if (hasDepth) depthOut.write(half4(0), uint2(bx+3, by)); }
+    if (bx < w && by+1 < h)   { colorOut.write(half4(c01, 1.0h - t01), uint2(bx, by+1));   if (hasDepth) depthOut.write(half4(0), uint2(bx, by+1)); }
+    if (bx+1 < w && by+1 < h) { colorOut.write(half4(c11, 1.0h - t11), uint2(bx+1, by+1)); if (hasDepth) depthOut.write(half4(0), uint2(bx+1, by+1)); }
+    if (bx+2 < w && by+1 < h) { colorOut.write(half4(c21, 1.0h - t21), uint2(bx+2, by+1)); if (hasDepth) depthOut.write(half4(0), uint2(bx+2, by+1)); }
+    if (bx+3 < w && by+1 < h) { colorOut.write(half4(c31, 1.0h - t31), uint2(bx+3, by+1)); if (hasDepth) depthOut.write(half4(0), uint2(bx+3, by+1)); }
 }
 
 // =============================================================================

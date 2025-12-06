@@ -444,7 +444,9 @@ kernel void clearRenderTexturesKernel(
     }
     half bg = (params.whiteBackground != 0u) ? 1.0h : 0.0h;
     colorTex.write(half4(bg, bg, bg, 1.0h), gid);
-    depthTex.write(half4(0.0h), gid);
+    if (!is_null_texture(depthTex)) {
+        depthTex.write(half4(0.0h), gid);
+    }
 }
 
 // Reset tile builder state - replaces blit with single-thread compute for lower overhead
@@ -1345,36 +1347,37 @@ kernel void globalRender(
 
     // Write 8 pixels (color with alpha in .a channel, depth in separate texture)
     uint w = params.width, h = params.height;
+    bool hasDepth = !is_null_texture(depthOut);
     if (baseX + 0 < w && baseY + 0 < h) {
         colorOut.write(half4(color00, 1.0h - trans00), uint2(baseX + 0, baseY + 0));
-        depthOut.write(half4(depth00, 0, 0, 0), uint2(baseX + 0, baseY + 0));
+        if (hasDepth) depthOut.write(half4(depth00, 0, 0, 0), uint2(baseX + 0, baseY + 0));
     }
     if (baseX + 1 < w && baseY + 0 < h) {
         colorOut.write(half4(color10, 1.0h - trans10), uint2(baseX + 1, baseY + 0));
-        depthOut.write(half4(depth10, 0, 0, 0), uint2(baseX + 1, baseY + 0));
+        if (hasDepth) depthOut.write(half4(depth10, 0, 0, 0), uint2(baseX + 1, baseY + 0));
     }
     if (baseX + 2 < w && baseY + 0 < h) {
         colorOut.write(half4(color20, 1.0h - trans20), uint2(baseX + 2, baseY + 0));
-        depthOut.write(half4(depth20, 0, 0, 0), uint2(baseX + 2, baseY + 0));
+        if (hasDepth) depthOut.write(half4(depth20, 0, 0, 0), uint2(baseX + 2, baseY + 0));
     }
     if (baseX + 3 < w && baseY + 0 < h) {
         colorOut.write(half4(color30, 1.0h - trans30), uint2(baseX + 3, baseY + 0));
-        depthOut.write(half4(depth30, 0, 0, 0), uint2(baseX + 3, baseY + 0));
+        if (hasDepth) depthOut.write(half4(depth30, 0, 0, 0), uint2(baseX + 3, baseY + 0));
     }
     if (baseX + 0 < w && baseY + 1 < h) {
         colorOut.write(half4(color01, 1.0h - trans01), uint2(baseX + 0, baseY + 1));
-        depthOut.write(half4(depth01, 0, 0, 0), uint2(baseX + 0, baseY + 1));
+        if (hasDepth) depthOut.write(half4(depth01, 0, 0, 0), uint2(baseX + 0, baseY + 1));
     }
     if (baseX + 1 < w && baseY + 1 < h) {
         colorOut.write(half4(color11, 1.0h - trans11), uint2(baseX + 1, baseY + 1));
-        depthOut.write(half4(depth11, 0, 0, 0), uint2(baseX + 1, baseY + 1));
+        if (hasDepth) depthOut.write(half4(depth11, 0, 0, 0), uint2(baseX + 1, baseY + 1));
     }
     if (baseX + 2 < w && baseY + 1 < h) {
         colorOut.write(half4(color21, 1.0h - trans21), uint2(baseX + 2, baseY + 1));
-        depthOut.write(half4(depth21, 0, 0, 0), uint2(baseX + 2, baseY + 1));
+        if (hasDepth) depthOut.write(half4(depth21, 0, 0, 0), uint2(baseX + 2, baseY + 1));
     }
     if (baseX + 3 < w && baseY + 1 < h) {
         colorOut.write(half4(color31, 1.0h - trans31), uint2(baseX + 3, baseY + 1));
-        depthOut.write(half4(depth31, 0, 0, 0), uint2(baseX + 3, baseY + 1));
+        if (hasDepth) depthOut.write(half4(depth31, 0, 0, 0), uint2(baseX + 3, baseY + 1));
     }
 }

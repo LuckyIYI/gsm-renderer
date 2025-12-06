@@ -131,61 +131,33 @@ public struct RendererConfig: Sendable {
 // MARK: - Gaussian Renderer Protocol
 
 /// Protocol for Gaussian splatting renderers
-/// Exactly 2 render methods: one for textures, one for buffers
+/// Two render methods: one for textures (fastest), one for buffers (CPU-readable)
 public protocol GaussianRenderer: AnyObject, Sendable {
     /// The Metal device used by this renderer
     var device: MTLDevice { get }
 
+    /// Last GPU execution time in seconds (from command buffer timestamps)
+    var lastGPUTime: Double? { get }
+
     /// Render to GPU textures (fastest path, no CPU readback)
-    /// - Parameter mortonSorted: If true, enables cluster-level culling optimization for Morton-sorted gaussians
     func render(
         toTexture commandBuffer: MTLCommandBuffer,
         input: GaussianInput,
         camera: CameraParams,
         width: Int,
         height: Int,
-        whiteBackground: Bool,
-        mortonSorted: Bool
+        whiteBackground: Bool
     ) -> TextureRenderResult?
 
-    /// Render to CPU-readable buffers
-    /// - Parameter mortonSorted: If true, enables cluster-level culling optimization for Morton-sorted gaussians
+    /// Render to CPU-readable buffers (returns nil if not supported)
     func render(
         toBuffer commandBuffer: MTLCommandBuffer,
         input: GaussianInput,
         camera: CameraParams,
         width: Int,
         height: Int,
-        whiteBackground: Bool,
-        mortonSorted: Bool
+        whiteBackground: Bool
     ) -> BufferRenderResult?
-}
-
-/// Default parameter extension
-public extension GaussianRenderer {
-    func render(
-        toTexture commandBuffer: MTLCommandBuffer,
-        input: GaussianInput,
-        camera: CameraParams,
-        width: Int,
-        height: Int,
-        whiteBackground: Bool
-    ) -> TextureRenderResult? {
-        self.render(toTexture: commandBuffer, input: input, camera: camera,
-                    width: width, height: height, whiteBackground: whiteBackground, mortonSorted: false)
-    }
-
-    func render(
-        toBuffer commandBuffer: MTLCommandBuffer,
-        input: GaussianInput,
-        camera: CameraParams,
-        width: Int,
-        height: Int,
-        whiteBackground: Bool
-    ) -> BufferRenderResult? {
-        self.render(toBuffer: commandBuffer, input: input, camera: camera,
-                    width: width, height: height, whiteBackground: whiteBackground, mortonSorted: false)
-    }
 }
 
 // MARK: - Errors

@@ -156,10 +156,8 @@ final class RendererE2ETests: XCTestCase {
         let height = 256
         let count = 1000
 
-        let renderer = GlobalSortRenderer(
-            precision: .float32,
-            limits: RendererLimits(maxGaussians: 10000, maxWidth: width, maxHeight: height)
-        )
+        let config = RendererConfig(maxGaussians: 10000, maxWidth: width, maxHeight: height, precision: .float32)
+        let renderer = try GlobalSortRenderer(config: config)
 
         let (positions, scales, rotations, opacities, colors) = self.generateGaussians(count: count)
         guard let buffers = createPackedBuffers(device: renderer.device, positions: positions,
@@ -197,11 +195,8 @@ final class RendererE2ETests: XCTestCase {
         let height = 512
         let count = 50000
 
-        let renderer = GlobalSortRenderer(
-            precision: .float16,
-            textureOnly: true,
-            limits: RendererLimits(maxGaussians: 100_000, maxWidth: width, maxHeight: height)
-        )
+        let config = RendererConfig(maxGaussians: 100_000, maxWidth: width, maxHeight: height, precision: .float16)
+        let renderer = try GlobalSortRenderer(config: config)
 
         let (positions, scales, rotations, opacities, colors) = self.generateGaussians(count: count)
         guard let buffers = createPackedBuffers(device: renderer.device, positions: positions,
@@ -238,10 +233,8 @@ final class RendererE2ETests: XCTestCase {
         let height = 256
         let count = 1000
 
-        let renderer = GlobalSortRenderer(
-            precision: .float16,
-            limits: RendererLimits(maxGaussians: 10000, maxWidth: width, maxHeight: height)
-        )
+        let config = RendererConfig(maxGaussians: 10000, maxWidth: width, maxHeight: height, precision: .float16)
+        let renderer = try GlobalSortRenderer(config: config)
 
         let (positions, scales, rotations, opacities, colors) = self.generateGaussians(count: count)
         guard let buffers = createPackedBuffers(device: renderer.device, positions: positions,
@@ -334,8 +327,7 @@ final class RendererE2ETests: XCTestCase {
             camera: camera,
             width: width,
             height: height,
-            whiteBackground: false,
-            mortonSorted: false
+            whiteBackground: false
         )
 
         cb.commit()
@@ -401,8 +393,7 @@ final class RendererE2ETests: XCTestCase {
             camera: camera,
             width: width,
             height: height,
-            whiteBackground: false,
-            mortonSorted: false
+            whiteBackground: false
         )
 
         cb.commit()
@@ -422,10 +413,8 @@ final class RendererE2ETests: XCTestCase {
         let (positions, scales, rotations, opacities, colors) = self.generateGaussians(count: count, seed: 999)
 
         // === Render with GlobalSort ===
-        let globalRenderer = GlobalSortRenderer(
-            precision: .float32,
-            limits: RendererLimits(maxGaussians: 10000, maxWidth: width, maxHeight: height)
-        )
+        let globalConfig = RendererConfig(maxGaussians: 10000, maxWidth: width, maxHeight: height, precision: .float32)
+        let globalRenderer = try GlobalSortRenderer(config: globalConfig)
 
         guard let globalBuffers = createPackedBuffers(device: globalRenderer.device, positions: positions,
                                                       scales: scales, rotations: rotations,
@@ -514,8 +503,7 @@ final class RendererE2ETests: XCTestCase {
             camera: localCamera,
             width: width,
             height: height,
-            whiteBackground: false,
-            mortonSorted: false
+            whiteBackground: false
         )
 
         localCB.commit()
@@ -649,8 +637,7 @@ final class RendererE2ETests: XCTestCase {
             _ = renderer.render(
                 toTexture: cb, input: input, camera: camera,
                 width: config.width, height: config.height,
-                whiteBackground: false, mortonSorted: false
-            )
+                whiteBackground: false            )
             cb.commit()
             cb.waitUntilCompleted()
         }
@@ -663,8 +650,7 @@ final class RendererE2ETests: XCTestCase {
             _ = renderer.render(
                 toTexture: cb, input: input, camera: camera,
                 width: config.width, height: config.height,
-                whiteBackground: false, mortonSorted: false
-            )
+                whiteBackground: false            )
             cb.commit()
             cb.waitUntilCompleted()
             let elapsed = (CFAbsoluteTimeGetCurrent() - start) * 1000.0
@@ -682,11 +668,10 @@ final class RendererE2ETests: XCTestCase {
         let camera = self.createCameraParams(width: config.width, height: config.height)
 
         // GlobalSort
-        let globalRenderer = GlobalSortRenderer(
-            precision: config.precision,
-            textureOnly: true,
-            limits: RendererLimits(maxGaussians: config.count + 1000, maxWidth: config.width, maxHeight: config.height)
+        let globalRendererConfig = RendererConfig(
+            maxGaussians: config.count + 1000, maxWidth: config.width, maxHeight: config.height, precision: config.precision
         )
+        let globalRenderer = try GlobalSortRenderer(config: globalRendererConfig)
 
         guard let globalBuffers = createPackedBuffers(
             device: globalRenderer.device, positions: positions, scales: scales,

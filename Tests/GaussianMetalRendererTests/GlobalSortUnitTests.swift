@@ -11,7 +11,8 @@ final class GlobalSortUnitTests: XCTestCase {
 
     override func setUp() {
         super.setUp()
-        let renderer = GlobalSortRenderer(limits: RendererLimits(maxGaussians: 100_000, maxWidth: 512, maxHeight: 512))
+        let config = RendererConfig(maxGaussians: 100_000, maxWidth: 512, maxHeight: 512)
+        let renderer = try! GlobalSortRenderer(config: config)
         self.device = renderer.device
         self.library = renderer.library
         self.queue = self.device.makeCommandQueue()!

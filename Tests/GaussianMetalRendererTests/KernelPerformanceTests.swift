@@ -251,8 +251,7 @@ final class KernelPerformanceTests: XCTestCase {
                     camera: camera,
                     width: width,
                     height: height,
-                    whiteBackground: false,
-                    mortonSorted: false
+                    whiteBackground: false
                 )
                 cb.commit()
                 cb.waitUntilCompleted()
@@ -342,8 +341,7 @@ final class KernelPerformanceTests: XCTestCase {
                     camera: camera,
                     width: res.width,
                     height: res.height,
-                    whiteBackground: false,
-                    mortonSorted: false
+                    whiteBackground: false
                 )
                 cb.commit()
                 cb.waitUntilCompleted()
@@ -432,8 +430,7 @@ final class KernelPerformanceTests: XCTestCase {
                     camera: camera,
                     width: width,
                     height: height,
-                    whiteBackground: false,
-                    mortonSorted: false
+                    whiteBackground: false
                 )
                 cb.commit()
                 cb.waitUntilCompleted()
@@ -472,8 +469,7 @@ final class KernelPerformanceTests: XCTestCase {
                     camera: camera,
                     width: width,
                     height: height,
-                    whiteBackground: false,
-                    mortonSorted: false
+                    whiteBackground: false
                 )
                 cb.commit()
                 cb.waitUntilCompleted()

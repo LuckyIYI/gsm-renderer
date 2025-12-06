@@ -3,45 +3,29 @@ import GaussianMetalRendererTypes
 @preconcurrency import Metal
 import simd
 
-public struct RendererLimits: Sendable {
-    public let maxGaussians: Int
-    public let maxWidth: Int
-    public let maxHeight: Int
-    public let tileWidth: Int
-    public let tileHeight: Int
-    public let maxPerTile: Int
+// MARK: - Internal Limits (computed from RendererConfig)
 
-    public var tilesX: Int { (self.maxWidth + self.tileWidth - 1) / self.tileWidth }
-    public var tilesY: Int { (self.maxHeight + self.tileHeight - 1) / self.tileHeight }
-    public var maxTileCount: Int { max(1, self.tilesX * self.tilesY) }
+struct RendererLimits: Sendable {
+    let maxGaussians: Int
+    let maxWidth: Int
+    let maxHeight: Int
+    let tileWidth: Int
+    let tileHeight: Int
+    let maxPerTile: Int
 
-    /// Initialize with viewport size - tile dimensions computed automatically
-    /// - Parameters:
-    ///   - maxGaussians: Maximum number of gaussians to render
-    ///   - viewportSize: Viewport dimensions (width, height)
-    ///   - tileSize: Optional custom tile size (default: 32x16 for multi-pixel rendering)
-    ///   - maxPerTile: Optional max gaussians per tile (default: 1024)
-    public init(maxGaussians: Int, viewportSize: (width: Int, height: Int), tileSize: (width: Int, height: Int)? = nil, maxPerTile: Int? = nil) {
-        self.maxGaussians = max(1, maxGaussians)
-        self.maxWidth = max(1, viewportSize.width)
-        self.maxHeight = max(1, viewportSize.height)
-        // Default tile size: 32x16 (optimized for multi-pixel rendering)
-        self.tileWidth = max(1, tileSize?.width ?? 32)
-        self.tileHeight = max(1, tileSize?.height ?? 16)
-        self.maxPerTile = max(1, maxPerTile ?? 1024)
-    }
+    var tilesX: Int { (self.maxWidth + self.tileWidth - 1) / self.tileWidth }
+    var tilesY: Int { (self.maxHeight + self.tileHeight - 1) / self.tileHeight }
+    var maxTileCount: Int { max(1, self.tilesX * self.tilesY) }
 
-    /// Legacy initializer for backwards compatibility
-    public init(maxGaussians: Int, maxWidth: Int, maxHeight: Int, tileWidth: Int = 32, tileHeight: Int = 16, maxPerTile: Int? = nil) {
-        self.maxGaussians = max(1, maxGaussians)
-        self.maxWidth = max(1, maxWidth)
-        self.maxHeight = max(1, maxHeight)
+    init(from config: RendererConfig, tileWidth: Int = 32, tileHeight: Int = 16, maxPerTile: Int = 2048) {
+        self.maxGaussians = max(1, config.maxGaussians)
+        self.maxWidth = max(1, config.maxWidth)
+        self.maxHeight = max(1, config.maxHeight)
         self.tileWidth = max(1, tileWidth)
         self.tileHeight = max(1, tileHeight)
-        self.maxPerTile = max(1, maxPerTile ?? 2048)
+        self.maxPerTile = max(1, maxPerTile)
     }
 
-    /// Build RenderParams from FrameParams (runtime settings only)
     func buildParams(from frame: FrameParams) -> RenderParams {
         RenderParams(
             width: UInt32(self.maxWidth),
@@ -55,11 +39,6 @@ public struct RendererLimits: Sendable {
             activeTileCount: 0,
             gaussianCount: UInt32(frame.gaussianCount)
         )
-    }
-
-    /// Build RenderParams from individual values (internal helper)
-    func buildParams(gaussianCount: Int, whiteBackground: Bool) -> RenderParams {
-        self.buildParams(from: FrameParams(gaussianCount: gaussianCount, whiteBackground: whiteBackground))
     }
 }
 
@@ -241,129 +220,115 @@ final class FrameResources {
 // MARK: - Global Sort Renderer
 
 /// High-quality Gaussian splatting renderer using global radix sort
-/// Conforms to GaussianRenderer protocol with exactly 2 render methods
 public final class GlobalSortRenderer: GaussianRenderer, @unchecked Sendable {
-    private static let supportedMaxGaussians = 10_000_000
+    private static let maxSupportedGaussians = 10_000_000
+    private static let tileWidth = 32
+    private static let tileHeight = 16
+    private static let maxPerTile = 2048
+    private static let dispatchArgsSize = 10 * MemoryLayout<DispatchIndirectArgsSwift>.stride
 
     public let device: MTLDevice
     let library: MTLLibrary
 
     // Encoders
-    // Note: tileBoundsEncoder removed - tile bounds now computed in fused projection kernel
     let sortKeyGenEncoder: SortKeyGenEncoder
     let radixSortEncoder: RadixSortEncoder
     let packEncoder: PackEncoder
     let renderEncoder: RenderEncoder
     let projectEncoder: ProjectEncoder
     let dispatchEncoder: DispatchEncoder
-
-    // Fused pipeline encoder (for interleaved data optimization)
     let fusedPipelineEncoder: FusedPipelineEncoder
-
-    // Two-pass tile assignment encoder with compaction (Compact → Count → PrefixSum → Scatter)
     let twoPassTileAssignEncoder: TwoPassTileAssignEncoder
 
-    // Reset tile builder state pipeline (replaces blit for lower overhead)
+    // Reset tile builder state pipeline
     private let resetTileBuilderStatePipeline: MTLComputePipelineState
 
-    // Frame Resources (Single frame - no multi-buffering needed)
+    // Frame Resources
     private var frame: FrameResources!
 
-    // Gaussian projection output caches (Shared)
-    private var gaussianBoundsCache: MTLBuffer? // int4 tile bounds
-    private var gaussianMaskCache: MTLBuffer?
+    // Gaussian projection output caches
+    private var gaussianBoundsCache: MTLBuffer!
+    private var gaussianMaskCache: MTLBuffer!
 
-    private let precision: Precision
-    private let effectivePrecision: Precision
-    public var precisionSetting: Precision { self.effectivePrecision }
+    // Configuration
+    private let config: RendererConfig
+    private let limits: RendererLimits
+    let frameLayout: FrameResourceLayout
 
-    /// Last GPU execution time in seconds (from command buffer GPUStartTime/GPUEndTime)
+    /// Last GPU execution time in seconds
     public private(set) var lastGPUTime: Double?
 
-    private let limits: RendererLimits
-    let frameLayout: FrameResourceLayout // internal for tests
+    /// Primary initializer
+    public init(device: MTLDevice? = nil, config: RendererConfig = RendererConfig()) throws {
+        guard config.maxGaussians <= GlobalSortRenderer.maxSupportedGaussians else {
+            throw RendererError.invalidInput("maxGaussians (\(config.maxGaussians)) exceeds limit of \(GlobalSortRenderer.maxSupportedGaussians)")
+        }
 
-    /// Recommended tile size (32x16 for multi-pixel rendering)
-    public var recommendedTileWidth: UInt32 { 32 }
-    public var recommendedTileHeight: UInt32 { 16 }
-
-    public init(
-        precision: Precision = .float32,
-        textureOnly: Bool = false, // Skip buffer output allocation to save ~20MB
-        limits: RendererLimits = RendererLimits(maxGaussians: 1_000_000, maxWidth: 2048, maxHeight: 2048)
-    ) {
-        precondition(limits.maxGaussians <= GlobalSortRenderer.supportedMaxGaussians, "GlobalSortRenderer supports up to 10,000,000 gaussians; requested \(limits.maxGaussians)")
-        guard let device = MTLCreateSystemDefaultDevice() else {
-            fatalError("Metal device unavailable")
+        let device = device ?? MTLCreateSystemDefaultDevice()
+        guard let device else {
+            throw RendererError.deviceNotAvailable
         }
         self.device = device
-        do {
-            guard let metallibURL = Bundle.module.url(forResource: "GaussianMetalRenderer", withExtension: "metallib") else {
-                fatalError("Failed to find GaussianMetalRenderer.metallib in bundle")
-            }
-            let library = try device.makeLibrary(URL: metallibURL)
+        self.config = config
 
-            self.library = library
-            self.effectivePrecision = precision
-
-            // Note: tileBoundsEncoder removed - tile bounds now computed in fused projection kernel
-            self.sortKeyGenEncoder = try SortKeyGenEncoder(device: device, library: library)
-            self.radixSortEncoder = try RadixSortEncoder(device: device, library: library)
-            self.packEncoder = try PackEncoder(device: device, library: library)
-            self.renderEncoder = try RenderEncoder(device: device, library: library)
-            self.projectEncoder = try ProjectEncoder(device: device, library: library)
-
-            let config = AssignmentDispatchConfigSwift(
-                sortThreadgroupSize: UInt32(self.sortKeyGenEncoder.threadgroupSize),
-                fuseThreadgroupSize: 256,
-                unpackThreadgroupSize: 256,
-                packThreadgroupSize: UInt32(self.packEncoder.packThreadgroupSize),
-                radixBlockSize: UInt32(self.radixSortEncoder.blockSize),
-                radixGrainSize: UInt32(self.radixSortEncoder.grainSize),
-                maxAssignments: 0
-            )
-            self.dispatchEncoder = try DispatchEncoder(device: device, library: library, config: config)
-            self.fusedPipelineEncoder = try FusedPipelineEncoder(device: device, library: library)
-
-            // Two-pass tile assignment encoder with compaction
-            self.twoPassTileAssignEncoder = try TwoPassTileAssignEncoder(device: device, library: library)
-
-            // Reset tile builder state pipeline (replaces blit for lower overhead)
-            guard let resetFn = library.makeFunction(name: "resetTileBuilderStateKernel") else {
-                fatalError("resetTileBuilderStateKernel not found in library")
-            }
-            self.resetTileBuilderStatePipeline = try device.makeComputePipelineState(function: resetFn)
-
-        } catch {
-            fatalError("Failed to load library or initialize encoders: \(error)")
+        guard let metallibURL = Bundle.module.url(forResource: "GaussianMetalRenderer", withExtension: "metallib") else {
+            throw RendererError.failedToCreatePipeline("GaussianMetalRenderer.metallib not found in bundle")
         }
-        self.precision = precision
-        self.limits = limits
+        let library = try device.makeLibrary(URL: metallibURL)
+        self.library = library
 
-        // Compute layout once using max precision for safety
+        // Initialize encoders
+        self.sortKeyGenEncoder = try SortKeyGenEncoder(device: device, library: library)
+        self.radixSortEncoder = try RadixSortEncoder(device: device, library: library)
+        self.packEncoder = try PackEncoder(device: device, library: library)
+        self.renderEncoder = try RenderEncoder(device: device, library: library)
+        self.projectEncoder = try ProjectEncoder(device: device, library: library)
+        self.fusedPipelineEncoder = try FusedPipelineEncoder(device: device, library: library)
+        self.twoPassTileAssignEncoder = try TwoPassTileAssignEncoder(device: device, library: library)
+
+        let dispatchConfig = AssignmentDispatchConfigSwift(
+            sortThreadgroupSize: UInt32(self.sortKeyGenEncoder.threadgroupSize),
+            fuseThreadgroupSize: 256,
+            unpackThreadgroupSize: 256,
+            packThreadgroupSize: UInt32(self.packEncoder.packThreadgroupSize),
+            radixBlockSize: UInt32(self.radixSortEncoder.blockSize),
+            radixGrainSize: UInt32(self.radixSortEncoder.grainSize),
+            maxAssignments: 0
+        )
+        self.dispatchEncoder = try DispatchEncoder(device: device, library: library, config: dispatchConfig)
+
+        guard let resetFn = library.makeFunction(name: "resetTileBuilderStateKernel") else {
+            throw RendererError.failedToCreatePipeline("resetTileBuilderStateKernel not found")
+        }
+        self.resetTileBuilderStatePipeline = try device.makeComputePipelineState(function: resetFn)
+
+        // Compute limits and layout
+        self.limits = RendererLimits(
+            from: config,
+            tileWidth: GlobalSortRenderer.tileWidth,
+            tileHeight: GlobalSortRenderer.tileHeight,
+            maxPerTile: GlobalSortRenderer.maxPerTile
+        )
+
         self.frameLayout = GlobalSortRenderer.computeLayout(
-            limits: limits,
-            precision: Precision.float32,
-            device: device,
+            limits: self.limits,
+            precision: config.precision,
             radixSortEncoder: self.radixSortEncoder
         )
 
-        // Initialize single frame resources
+        // Initialize frame resources
         self.frame = FrameResources(
             device: device,
             layout: self.frameLayout,
-            textureOnly: textureOnly
+            textureOnly: !config.useTexturedRender
         )
 
-        // Preallocate shared CPU-visible caches for projection output
-        let g = limits.maxGaussians
-        let shared: MTLResourceOptions = .storageModeShared
-
-        // Bounds (int4) and Mask (used for tile assignment)
-        guard let boundsCache = device.makeBuffer(length: g * MemoryLayout<SIMD4<Int32>>.stride, options: shared),
-              let maskCache = device.makeBuffer(length: g, options: shared)
+        // Allocate projection caches
+        let g = self.limits.maxGaussians
+        guard let boundsCache = device.makeBuffer(length: g * MemoryLayout<SIMD4<Int32>>.stride, options: .storageModeShared),
+              let maskCache = device.makeBuffer(length: g, options: .storageModeShared)
         else {
-            fatalError("Failed to allocate projection caches")
+            throw RendererError.failedToCreatePipeline("Failed to allocate projection caches")
         }
         boundsCache.label = "GaussianBounds"
         maskCache.label = "GaussianMask"
@@ -371,32 +336,15 @@ public final class GlobalSortRenderer: GaussianRenderer, @unchecked Sendable {
         self.gaussianMaskCache = maskCache
     }
 
-    /// Convenience initializer from RendererConfig
-    public convenience init(config: RendererConfig) {
-        let limits = RendererLimits(
-            maxGaussians: config.maxGaussians,
-            maxWidth: config.maxWidth,
-            maxHeight: config.maxHeight
-        )
-        let precision: Precision = config.precision
-        self.init(
-            precision: precision,
-            textureOnly: false,
-            limits: limits
-        )
-    }
-
     // MARK: - GaussianRenderer Protocol Methods
 
-    /// Render to GPU textures (protocol method)
     public func render(
         toTexture commandBuffer: MTLCommandBuffer,
         input: GaussianInput,
         camera: CameraParams,
         width: Int,
         height: Int,
-        whiteBackground: Bool,
-        mortonSorted _: Bool
+        whiteBackground: Bool
     ) -> TextureRenderResult? {
         let cameraUniforms = CameraUniformsSwift(
             viewMatrix: camera.viewMatrix,
@@ -434,15 +382,13 @@ public final class GlobalSortRenderer: GaussianRenderer, @unchecked Sendable {
         return TextureRenderResult(color: output.color, depth: output.depth, alpha: nil)
     }
 
-    /// Render to CPU-readable buffers (protocol method)
     public func render(
         toBuffer commandBuffer: MTLCommandBuffer,
         input: GaussianInput,
         camera: CameraParams,
         width: Int,
         height: Int,
-        whiteBackground: Bool,
-        mortonSorted _: Bool
+        whiteBackground: Bool
     ) -> BufferRenderResult? {
         let cameraUniforms = CameraUniformsSwift(
             viewMatrix: camera.viewMatrix,
@@ -469,7 +415,6 @@ public final class GlobalSortRenderer: GaussianRenderer, @unchecked Sendable {
             harmonics: input.harmonics
         )
 
-        // Note: Buffer render path doesn't support mortonSorted yet
         guard let output = encodeRender(
             commandBuffer: commandBuffer,
             gaussianCount: input.gaussianCount,
@@ -490,7 +435,6 @@ public final class GlobalSortRenderer: GaussianRenderer, @unchecked Sendable {
     private static func computeLayout(
         limits: RendererLimits,
         precision: Precision,
-        device _: MTLDevice,
         radixSortEncoder: RadixSortEncoder
     ) -> FrameResourceLayout {
         let gaussianCapacity = limits.maxGaussians
@@ -593,13 +537,7 @@ public final class GlobalSortRenderer: GaussianRenderer, @unchecked Sendable {
         )
     }
 
-    // MARK: - Public Render Methods (Packed Input Only)
-
-    /* Internal C-API methods removed - use public encodeRender* methods with PackedWorldBuffers */
-
-    /* REMOVED: render, renderRaw, renderWorld - these used old non-packed buffers
-        and were for the disabled C API. Use encodeRender/encodeRenderToTextures instead.
-     */
+    // MARK: - Internal Render Methods
 
     func encodeRender(
         commandBuffer: MTLCommandBuffer,
@@ -626,7 +564,7 @@ public final class GlobalSortRenderer: GaussianRenderer, @unchecked Sendable {
             tileHeight: params.tileHeight,
             tilesX: params.tilesX,
             tilesY: UInt32(self.limits.tilesY),
-            useHalfWorld: self.effectivePrecision == .float16
+            useHalfWorld: self.config.precision == .float16
         )
 
         guard let assignment = self.buildTileAssignments(
@@ -657,7 +595,7 @@ public final class GlobalSortRenderer: GaussianRenderer, @unchecked Sendable {
             ordered: ordered,
             params: params,
             frame: frame,
-            precision: self.effectivePrecision
+            precision: self.config.precision
         )
 
         guard submission else {
@@ -701,7 +639,7 @@ public final class GlobalSortRenderer: GaussianRenderer, @unchecked Sendable {
             tileHeight: params.tileHeight,
             tilesX: params.tilesX,
             tilesY: UInt32(self.limits.tilesY),
-            useHalfWorld: self.effectivePrecision == .float16
+            useHalfWorld: self.config.precision == .float16
         )
 
         // Build tile assignments from packed render data
@@ -787,7 +725,7 @@ public final class GlobalSortRenderer: GaussianRenderer, @unchecked Sendable {
             tileHeight: params.tileHeight,
             tilesX: params.tilesX,
             tilesY: UInt32(self.limits.tilesY),
-            useHalfWorld: self.effectivePrecision == .float16
+            useHalfWorld: self.config.precision == .float16
         )
 
         guard let assignment = self.buildTileAssignments(
@@ -1021,7 +959,7 @@ public final class GlobalSortRenderer: GaussianRenderer, @unchecked Sendable {
             tileCount: assignment.tileCount,
             activeTileIndices: frame.activeTileIndices,
             activeTileCount: frame.activeTileCount,
-            precision: self.effectivePrecision,
+            precision: self.config.precision,
             renderData: projectionOutput.renderData,
             sortedIndices: sortedIndicesBuffer
         )
@@ -1052,10 +990,6 @@ public final class GlobalSortRenderer: GaussianRenderer, @unchecked Sendable {
 
     // MARK: - Resource Management
 
-    /* REMOVED: prepareWorldBuffers - was for C API with non-packed buffers */
-
-    /// Prepare ProjectionOutput for fused projection kernel output
-    /// Uses frame's interleavedGaussians for packed render data, shared caches for bounds/mask
     func prepareProjectionOutput(frame: FrameResources) -> ProjectionOutput? {
         guard
             let renderData = frame.interleavedGaussians,

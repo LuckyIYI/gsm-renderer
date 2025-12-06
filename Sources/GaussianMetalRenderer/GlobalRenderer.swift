@@ -115,11 +115,7 @@ final class FrameResources {
         self.tileAssignmentMaxAssignments = layout.maxAssignmentCapacity
         self.tileAssignmentPaddedCapacity = layout.paddedCapacity
 
-        guard let dispatchArgs = device.makeBuffer(length: 4096, options: .storageModePrivate) else {
-            fatalError("Failed to allocate dispatch args")
-        }
-        dispatchArgs.label = "FrameDispatchArgs"
-        self.dispatchArgs = dispatchArgs
+        self.dispatchArgs = try! device.makeBuffer(count: 1024, type: UInt32.self, options: .storageModePrivate, label: "FrameDispatchArgs")
 
         // Buffer allocation helper
         var bufferMap: [String: MTLBuffer] = [:]
@@ -185,18 +181,13 @@ final class FrameResources {
         self.tileAssignDispatchArgs = buffer("TileAssignDispatchArgs")
 
         // Output buffers (skipped in textureOnly mode to save ~20MB)
-        let pixelBytes = layout.pixelCapacity
+        let pixelCount = layout.pixelCapacity
         if textureOnly {
             self.outputBuffers = nil
         } else {
-            guard
-                let color = device.makeBuffer(length: pixelBytes * 12, options: .storageModeShared),
-                let depth = device.makeBuffer(length: pixelBytes * 4, options: .storageModeShared),
-                let alpha = device.makeBuffer(length: pixelBytes * 4, options: .storageModeShared)
-            else { fatalError("Failed to allocate output buffers") }
-            color.label = "RenderColorOutput"
-            depth.label = "RenderDepthOutput"
-            alpha.label = "RenderAlphaOutput"
+            let color = try! device.makeBuffer(count: pixelCount * 3, type: Float.self, options: .storageModeShared, label: "RenderColorOutput")
+            let depth = try! device.makeBuffer(count: pixelCount, type: Float.self, options: .storageModeShared, label: "RenderDepthOutput")
+            let alpha = try! device.makeBuffer(count: pixelCount, type: Float.self, options: .storageModeShared, label: "RenderAlphaOutput")
             self.outputBuffers = RenderOutputBuffers(colorOutGPU: color, depthOutGPU: depth, alphaOutGPU: alpha)
         }
 
@@ -339,13 +330,15 @@ public final class GlobalRenderer: GaussianRenderer, @unchecked Sendable {
     // MARK: - GaussianRenderer Protocol Methods
 
     public func render(
-        toTexture commandBuffer: MTLCommandBuffer,
+        commandBuffer: MTLCommandBuffer,
+        colorTexture: MTLTexture,
+        depthTexture: MTLTexture?,
         input: GaussianInput,
         camera: CameraParams,
         width: Int,
         height: Int,
         whiteBackground: Bool
-    ) -> TextureRenderResult? {
+    ) {
         let cameraUniforms = CameraUniformsSwift(
             viewMatrix: camera.viewMatrix,
             projectionMatrix: camera.projectionMatrix,
@@ -371,15 +364,15 @@ public final class GlobalRenderer: GaussianRenderer, @unchecked Sendable {
             harmonics: input.harmonics
         )
 
-        guard let output = encodeRenderToTextures(
+        _ = encodeRenderToTargetTexture(
             commandBuffer: commandBuffer,
             gaussianCount: input.gaussianCount,
             packedWorldBuffers: packedWorld,
             cameraUniforms: cameraUniforms,
-            frameParams: frameParams
-        ) else { return nil }
-
-        return TextureRenderResult(color: output.color, depth: output.depth, alpha: nil)
+            frameParams: frameParams,
+            targetColor: colorTexture,
+            targetDepth: depthTexture
+        )
     }
 
     public func render(

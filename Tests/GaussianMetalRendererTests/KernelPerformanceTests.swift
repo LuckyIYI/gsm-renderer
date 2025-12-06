@@ -241,11 +241,29 @@ final class KernelPerformanceTests: XCTestCase {
                 focalX: Float(width) * f / (2 * aspect),
                 focalY: Float(height) * f / 2
             )
+            
+            // Create output textures (caller's responsibility with new API)
+            let colorDesc = MTLTextureDescriptor.texture2DDescriptor(
+                pixelFormat: .rgba16Float, width: width, height: height, mipmapped: false)
+            colorDesc.usage = [.shaderRead, .shaderWrite]
+            colorDesc.storageMode = .private
+            guard let colorTexture = device.makeTexture(descriptor: colorDesc) else {
+                XCTFail("Failed to create color texture")
+                return
+            }
+
+            let depthDesc = MTLTextureDescriptor.texture2DDescriptor(
+                pixelFormat: .r16Float, width: width, height: height, mipmapped: false)
+            depthDesc.usage = [.shaderRead, .shaderWrite]
+            depthDesc.storageMode = .private
+            let depthTexture = device.makeTexture(descriptor: depthDesc)
 
             let timing = self.measureKernel(name: "Full Pipeline", warmup: 3, iterations: 10) {
                 guard let cb = self.queue.makeCommandBuffer() else { return }
-                _ = renderer.render(
-                    toTexture: cb,
+                renderer.render(
+                    commandBuffer: cb,
+                    colorTexture: colorTexture,
+                    depthTexture: depthTexture,
                     input: input,
                     camera: camera,
                     width: width,
@@ -330,11 +348,32 @@ final class KernelPerformanceTests: XCTestCase {
                 focalX: Float(res.width) * f / (2 * aspect),
                 focalY: Float(res.height) * f / 2
             )
+            
+            
+            // Create output textures (caller's responsibility with new API)
+            let colorDesc = MTLTextureDescriptor.texture2DDescriptor(
+                pixelFormat: .rgba16Float, width: res.width, height: res.height, mipmapped: false)
+            colorDesc.usage = [.shaderRead, .shaderWrite]
+            colorDesc.storageMode = .private
+            guard let colorTexture = device.makeTexture(descriptor: colorDesc) else {
+                XCTFail("Failed to create color texture")
+                return
+            }
+
+            let depthDesc = MTLTextureDescriptor.texture2DDescriptor(
+                pixelFormat: .r16Float, width: res.width, height: res.height, mipmapped: false)
+            depthDesc.usage = [.shaderRead, .shaderWrite]
+            depthDesc.storageMode = .private
+            let depthTexture = device.makeTexture(descriptor: depthDesc)
+
+            
 
             let timing = self.measureKernel(name: res.name, warmup: 3, iterations: 10) {
                 guard let cb = self.queue.makeCommandBuffer() else { return }
                 _ = renderer.render(
-                    toTexture: cb,
+                    commandBuffer: cb,
+                    colorTexture: colorTexture,
+                    depthTexture: depthTexture,
                     input: input,
                     camera: camera,
                     width: res.width,
@@ -417,11 +456,29 @@ final class KernelPerformanceTests: XCTestCase {
                 focalX: Float(width) * f / (2 * aspect),
                 focalY: Float(height) * f / 2
             )
+            
+            // Create output textures (caller's responsibility with new API)
+            let colorDesc = MTLTextureDescriptor.texture2DDescriptor(
+                pixelFormat: .rgba16Float, width: width, height: height, mipmapped: false)
+            colorDesc.usage = [.shaderRead, .shaderWrite]
+            colorDesc.storageMode = .private
+            guard let colorTexture = device.makeTexture(descriptor: colorDesc) else {
+                XCTFail("Failed to create color texture")
+                return
+            }
+
+            let depthDesc = MTLTextureDescriptor.texture2DDescriptor(
+                pixelFormat: .r16Float, width: width, height: height, mipmapped: false)
+            depthDesc.usage = [.shaderRead, .shaderWrite]
+            depthDesc.storageMode = .private
+            let depthTexture = device.makeTexture(descriptor: depthDesc)
 
             let timing = self.measureKernel(name: "16-bit", warmup: 3, iterations: 10) {
                 guard let cb = self.queue.makeCommandBuffer() else { return }
-                _ = renderer.render(
-                    toTexture: cb,
+                renderer.render(
+                    commandBuffer: cb,
+                    colorTexture: colorTexture,
+                    depthTexture: depthTexture,
                     input: input,
                     camera: camera,
                     width: width,

@@ -321,8 +321,29 @@ final class RendererE2ETests: XCTestCase {
             return
         }
 
-        let result = renderer.render(
-            toTexture: cb,
+        // Create color and depth textures
+        let colorDesc = MTLTextureDescriptor.texture2DDescriptor(
+            pixelFormat: .rgba16Float, width: width, height: height, mipmapped: false)
+        colorDesc.usage = [.shaderRead, .shaderWrite]
+        colorDesc.storageMode = .private
+        guard let colorTexture = device.makeTexture(descriptor: colorDesc) else {
+            XCTFail("Failed to create color texture")
+            return
+        }
+
+        let depthDesc = MTLTextureDescriptor.texture2DDescriptor(
+            pixelFormat: .r16Float, width: width, height: height, mipmapped: false)
+        depthDesc.usage = [.shaderRead, .shaderWrite]
+        depthDesc.storageMode = .private
+        guard let depthTexture = device.makeTexture(descriptor: depthDesc) else {
+            XCTFail("Failed to create depth texture")
+            return
+        }
+
+        renderer.render(
+            commandBuffer: cb,
+            colorTexture: colorTexture,
+            depthTexture: depthTexture,
             input: input,
             camera: camera,
             width: width,
@@ -333,7 +354,7 @@ final class RendererE2ETests: XCTestCase {
         cb.commit()
         cb.waitUntilCompleted()
 
-        XCTAssertNotNil(result, "Local should return render result")
+        XCTAssertEqual(cb.status, MTLCommandBufferStatus.completed, "Local should complete successfully")
     }
 
     func testLocalAtScale() throws {
@@ -387,8 +408,29 @@ final class RendererE2ETests: XCTestCase {
             return
         }
 
-        let result = renderer.render(
-            toTexture: cb,
+        // Create color and depth textures
+        let colorDesc = MTLTextureDescriptor.texture2DDescriptor(
+            pixelFormat: .rgba16Float, width: width, height: height, mipmapped: false)
+        colorDesc.usage = [.shaderRead, .shaderWrite]
+        colorDesc.storageMode = .private
+        guard let colorTexture = device.makeTexture(descriptor: colorDesc) else {
+            XCTFail("Failed to create color texture")
+            return
+        }
+
+        let depthDesc = MTLTextureDescriptor.texture2DDescriptor(
+            pixelFormat: .r16Float, width: width, height: height, mipmapped: false)
+        depthDesc.usage = [.shaderRead, .shaderWrite]
+        depthDesc.storageMode = .private
+        guard let depthTexture = device.makeTexture(descriptor: depthDesc) else {
+            XCTFail("Failed to create depth texture")
+            return
+        }
+
+        renderer.render(
+            commandBuffer: cb,
+            colorTexture: colorTexture,
+            depthTexture: depthTexture,
             input: input,
             camera: camera,
             width: width,
@@ -399,7 +441,7 @@ final class RendererE2ETests: XCTestCase {
         cb.commit()
         cb.waitUntilCompleted()
 
-        XCTAssertNotNil(result, "Local at scale should return render result")
+        XCTAssertEqual(cb.status, MTLCommandBufferStatus.completed, "Local at scale should complete successfully")
     }
 
     // MARK: - Pixel Comparison Tests
@@ -497,8 +539,29 @@ final class RendererE2ETests: XCTestCase {
             return
         }
 
-        let localResult = localRenderer.render(
-            toTexture: localCB,
+        // Create color and depth textures for local renderer
+        let localColorDesc = MTLTextureDescriptor.texture2DDescriptor(
+            pixelFormat: .rgba16Float, width: width, height: height, mipmapped: false)
+        localColorDesc.usage = [.shaderRead, .shaderWrite]
+        localColorDesc.storageMode = .private
+        guard let localColorTexture = localRenderer.device.makeTexture(descriptor: localColorDesc) else {
+            XCTFail("Failed to create local color texture")
+            return
+        }
+
+        let localDepthDesc = MTLTextureDescriptor.texture2DDescriptor(
+            pixelFormat: .r16Float, width: width, height: height, mipmapped: false)
+        localDepthDesc.usage = [.shaderRead, .shaderWrite]
+        localDepthDesc.storageMode = .private
+        guard let localDepthTexture = localRenderer.device.makeTexture(descriptor: localDepthDesc) else {
+            XCTFail("Failed to create local depth texture")
+            return
+        }
+
+        localRenderer.render(
+            commandBuffer: localCB,
+            colorTexture: localColorTexture,
+            depthTexture: localDepthTexture,
             input: input,
             camera: localCamera,
             width: width,
@@ -508,11 +571,6 @@ final class RendererE2ETests: XCTestCase {
 
         localCB.commit()
         localCB.waitUntilCompleted()
-
-        guard let localColorTexture = localResult?.color else {
-            XCTFail("Local didn't produce color texture")
-            return
-        }
 
         guard let localPixels = readPixels(texture: localColorTexture, device: localRenderer.device, queue: localQueue) else {
             XCTFail("Failed to read Local pixels")
@@ -631,13 +689,32 @@ final class RendererE2ETests: XCTestCase {
     ) -> PerfResult? {
         guard let queue = renderer.device.makeCommandQueue() else { return nil }
 
+        // Create color and depth textures for rendering
+        let colorDesc = MTLTextureDescriptor.texture2DDescriptor(
+            pixelFormat: .rgba16Float, width: config.width, height: config.height, mipmapped: false)
+        colorDesc.usage = [.shaderRead, .shaderWrite]
+        colorDesc.storageMode = .private
+        guard let colorTexture = renderer.device.makeTexture(descriptor: colorDesc) else { return nil }
+
+        let depthDesc = MTLTextureDescriptor.texture2DDescriptor(
+            pixelFormat: .r16Float, width: config.width, height: config.height, mipmapped: false)
+        depthDesc.usage = [.shaderRead, .shaderWrite]
+        depthDesc.storageMode = .private
+        guard let depthTexture = renderer.device.makeTexture(descriptor: depthDesc) else { return nil }
+
         // Warmup
         for _ in 0 ..< config.warmupFrames {
             guard let cb = queue.makeCommandBuffer() else { continue }
-            _ = renderer.render(
-                toTexture: cb, input: input, camera: camera,
-                width: config.width, height: config.height,
-                whiteBackground: false            )
+            renderer.render(
+                commandBuffer: cb,
+                colorTexture: colorTexture,
+                depthTexture: depthTexture,
+                input: input,
+                camera: camera,
+                width: config.width,
+                height: config.height,
+                whiteBackground: false
+            )
             cb.commit()
             cb.waitUntilCompleted()
         }
@@ -647,10 +724,16 @@ final class RendererE2ETests: XCTestCase {
         for i in 0 ..< config.measureFrames {
             guard let cb = queue.makeCommandBuffer() else { continue }
             let start = CFAbsoluteTimeGetCurrent()
-            _ = renderer.render(
-                toTexture: cb, input: input, camera: camera,
-                width: config.width, height: config.height,
-                whiteBackground: false            )
+            renderer.render(
+                commandBuffer: cb,
+                colorTexture: colorTexture,
+                depthTexture: depthTexture,
+                input: input,
+                camera: camera,
+                width: config.width,
+                height: config.height,
+                whiteBackground: false
+            )
             cb.commit()
             cb.waitUntilCompleted()
             let elapsed = (CFAbsoluteTimeGetCurrent() - start) * 1000.0

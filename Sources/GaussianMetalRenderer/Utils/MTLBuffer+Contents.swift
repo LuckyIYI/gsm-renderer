@@ -1,5 +1,40 @@
 import Metal
 
+// MARK: - Buffer Allocation Error
+
+public struct BufferAllocationError: Error, LocalizedError {
+    public let label: String
+    public var errorDescription: String? { "Failed to allocate buffer: \(label)" }
+}
+
+// MARK: - MTLDevice Buffer Creation
+
+public extension MTLDevice {
+    /// Create a buffer with typed count and automatic size calculation.
+    /// - Parameters:
+    ///   - count: Number of elements
+    ///   - type: Element type for stride calculation
+    ///   - options: Resource options (default: .storageModePrivate)
+    ///   - label: Buffer label (used in error message on failure)
+    /// - Returns: Created buffer
+    /// - Throws: BufferAllocationError if allocation fails
+    func makeBuffer<T>(
+        count: Int,
+        type: T.Type,
+        options: MTLResourceOptions = .storageModePrivate,
+        label: String
+    ) throws -> MTLBuffer {
+        let length = max(1, count) * MemoryLayout<T>.stride
+        guard let buffer = makeBuffer(length: length, options: options) else {
+            throw BufferAllocationError(label: label)
+        }
+        buffer.label = label
+        return buffer
+    }
+}
+
+// MARK: - MTLBuffer Utilities
+
 public extension MTLBuffer {
     func copy(
         to other: MTLBuffer,

@@ -125,15 +125,18 @@ public protocol GaussianRenderer: AnyObject, Sendable {
     /// Last GPU execution time in seconds (from command buffer timestamps)
     var lastGPUTime: Double? { get }
 
-    /// Render to GPU textures (fastest path, no CPU readback)
+    /// Render to user-provided GPU textures (fastest path, no CPU readback)
+    /// Caller is responsible for creating and managing the textures
     func render(
-        toTexture commandBuffer: MTLCommandBuffer,
+        commandBuffer: MTLCommandBuffer,
+        colorTexture: MTLTexture,
+        depthTexture: MTLTexture?,
         input: GaussianInput,
         camera: CameraParams,
         width: Int,
         height: Int,
         whiteBackground: Bool
-    ) -> TextureRenderResult?
+    )
 
     /// Render to CPU-readable buffers (returns nil if not supported)
     func render(

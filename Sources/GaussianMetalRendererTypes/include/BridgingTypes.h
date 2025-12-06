@@ -200,6 +200,14 @@ typedef struct {
 } ScatterParams;
 
 typedef struct {
+    UINT32 gaussianCount;
+    UINT32 tileWidth;
+    UINT32 tileHeight;
+    UINT32 tilesX;
+    UINT32 maxAssignments;
+} TileAssignParams;
+
+typedef struct {
     UINT32 maxAssignments;
     UINT32 totalAssignments;
 } SortKeyParams;

@@ -207,26 +207,22 @@ public struct PackedWorldGaussianHalf {
     }
 }
 
-/// Half-precision render data (32 bytes) - Swift side for reading GPU output
-public struct GaussianRenderDataSwift {
-    public var meanX: Float16
-    public var meanY: Float16
-    public var _alignPad: UInt32
-    public var conicA: Float16
-    public var conicB: Float16
-    public var conicC: Float16
-    public var conicD: Float16
-    public var colorR: Float16
-    public var colorG: Float16
-    public var colorB: Float16
-    public var opacity: Float16
-    public var depth: Float16
-    public var _pad: UInt16
-    public var _structPad: UInt32
+// GaussianRenderData is defined in BridgingTypes.h (uses HALF type)
+// If you need Float convenience accessors, add an extension to GaussianRenderData
 
-    public var mean: SIMD2<Float> { SIMD2(Float(self.meanX), Float(self.meanY)) }
-    public var conic: SIMD4<Float> { SIMD4(Float(self.conicA), Float(self.conicB), Float(self.conicC), Float(self.conicD)) }
-    public var color: SIMD3<Float> { SIMD3(Float(self.colorR), Float(self.colorG), Float(self.colorB)) }
+public extension TileAssignParams {
+    init(
+        gaussianCount: UInt32,
+        tileWidth: UInt32,
+        tileHeight: UInt32,
+        tilesX: UInt32,
+        maxAssignments: UInt32
+    ) {
+        self.init()
+        self.gaussianCount = gaussianCount
+        self.tileWidth = tileWidth
+        self.tileHeight = tileHeight
+        self.tilesX = tilesX
+        self.maxAssignments = maxAssignments
+    }
 }
-
-// ProjectCompactParamsSwift removed - use TileBinningParams from C header instead

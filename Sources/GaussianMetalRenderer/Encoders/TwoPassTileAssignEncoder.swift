@@ -1,3 +1,4 @@
+import GaussianMetalRendererTypes
 import Metal
 
 /// Two-pass tile assignment encoder with deterministic compaction:
@@ -262,7 +263,7 @@ final class TwoPassTileAssignEncoder {
             blit.endEncoding()
         }
 
-        var params = TileAssignParamsSwift(
+        var params = TileAssignParams(
             gaussianCount: UInt32(gaussianCount),
             tileWidth: UInt32(tileWidth),
             tileHeight: UInt32(tileHeight),
@@ -277,7 +278,7 @@ final class TwoPassTileAssignEncoder {
             encoder.setBuffer(renderData, offset: 0, index: 1)
             encoder.setBuffer(coverageBuffer, offset: 0, index: 2)
             encoder.setBuffer(indirectBuffers.visibleIndices, offset: 0, index: 3)
-            encoder.setBytes(&params, length: MemoryLayout<TileAssignParamsSwift>.stride, index: 4)
+            encoder.setBytes(&params, length: MemoryLayout<TileAssignParams>.stride, index: 4)
 
             let tg = MTLSize(width: threadgroupSize, height: 1, depth: 1)
             encoder.dispatchThreadgroups(indirectBuffer: indirectBuffers.indirectDispatchArgs,
@@ -323,7 +324,7 @@ final class TwoPassTileAssignEncoder {
             encoder.setBuffer(indirectBuffers.visibleIndices, offset: 0, index: 3)
             encoder.setBuffer(tileIndicesBuffer, offset: 0, index: 4)
             encoder.setBuffer(tileIdsBuffer, offset: 0, index: 5)
-            encoder.setBytes(&params, length: MemoryLayout<TileAssignParamsSwift>.stride, index: 6)
+            encoder.setBytes(&params, length: MemoryLayout<TileAssignParams>.stride, index: 6)
 
             let tg = MTLSize(width: threadgroupSize, height: 1, depth: 1)
             encoder.dispatchThreadgroups(indirectBuffer: indirectBuffers.indirectDispatchArgs,
@@ -334,11 +335,4 @@ final class TwoPassTileAssignEncoder {
     }
 }
 
-// Swift struct matching Metal TileAssignParams
-struct TileAssignParamsSwift {
-    var gaussianCount: UInt32
-    var tileWidth: UInt32
-    var tileHeight: UInt32
-    var tilesX: UInt32
-    var maxAssignments: UInt32
-}
+// TileAssignParams is defined in BridgingTypes.h

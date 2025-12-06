@@ -9,12 +9,13 @@ public final class LocalRenderer: GaussianRenderer, @unchecked Sendable {
     private static let tileHeight = 16
     private static let maxGaussiansPerTile32Bit = 2048
     private static let maxGaussiansPerTile16Bit = 4096
+    private static let maxPerTile = 2048 // Fixed layout sort capacity
     private static let partialSumsCapacity = 1024
+    private static let renderTexWidth = 4096
 
     // MARK: - Public Properties
 
     public let device: MTLDevice
-    public let encoder: LocalPipelineEncoder
 
     /// Last GPU execution time in seconds
     public private(set) var lastGPUTime: Double?
@@ -28,6 +29,14 @@ public final class LocalRenderer: GaussianRenderer, @unchecked Sendable {
     // MARK: - Private Properties
 
     private let config: RendererConfig
+
+    // Stage encoders (internal helpers)
+    private let clearEncoder: LocalClearEncoder
+    private let projectEncoder: LocalProjectEncoder
+    private let prefixScanEncoder: LocalPrefixScanEncoder
+    private let scatterEncoder: LocalScatterEncoder
+    private let sortEncoder: LocalSortEncoder
+    private let renderEncoder: LocalRenderEncoder
 
     private var maxGaussiansPerTile: Int {
         self.config.sortMode == .sort16Bit ? LocalRenderer.maxGaussiansPerTile16Bit : LocalRenderer.maxGaussiansPerTile32Bit
@@ -45,8 +54,6 @@ public final class LocalRenderer: GaussianRenderer, @unchecked Sendable {
 
     // 32-bit sort buffers
     private var sortKeysBuffer: MTLBuffer?
-    private var tempSortKeysBuffer: MTLBuffer?
-    private var tempSortIndicesBuffer: MTLBuffer?
 
     // 16-bit sort buffers
     private var depthKeys16Buffer: MTLBuffer?
@@ -56,9 +63,6 @@ public final class LocalRenderer: GaussianRenderer, @unchecked Sendable {
     private var tempProjectionBuffer: MTLBuffer?
     private var visibilityMarksBuffer: MTLBuffer?
     private var visibilityPartialSumsBuffer: MTLBuffer?
-
-    // Textured render
-    private var gaussianRenderTexture: MTLTexture?
 
     // Indirect dispatch buffers
     private var activeTileIndicesBuffer: MTLBuffer?
@@ -79,7 +83,31 @@ public final class LocalRenderer: GaussianRenderer, @unchecked Sendable {
         }
         self.device = device
         self.config = config
-        self.encoder = try LocalPipelineEncoder(device: device)
+
+        // Load shader libraries
+        guard let localLibraryURL = Bundle.module.url(forResource: "LocalShaders", withExtension: "metallib"),
+              let localLibrary = try? device.makeLibrary(URL: localLibraryURL)
+        else {
+            throw RendererError.failedToCreatePipeline("LocalShaders.metallib not found")
+        }
+
+        guard let mainLibraryURL = Bundle.module.url(forResource: "GaussianMetalRenderer", withExtension: "metallib"),
+              let mainLibrary = try? device.makeLibrary(URL: mainLibraryURL)
+        else {
+            throw RendererError.failedToCreatePipeline("GaussianMetalRenderer.metallib not found")
+        }
+
+        // Initialize stage encoders
+        self.clearEncoder = try LocalClearEncoder(library: localLibrary, device: device)
+        self.projectEncoder = try LocalProjectEncoder(LocalLibrary: localLibrary, mainLibrary: mainLibrary, device: device)
+        self.prefixScanEncoder = try LocalPrefixScanEncoder(library: localLibrary, device: device)
+        self.scatterEncoder = try LocalScatterEncoder(library: localLibrary, device: device)
+        self.sortEncoder = try LocalSortEncoder(library: localLibrary, device: device)
+        self.renderEncoder = try LocalRenderEncoder(library: localLibrary, device: device)
+
+        // Enable sparse scatter by default (22-38% faster)
+        self.projectEncoder.skipCompaction = true
+        self.scatterEncoder.activeVariant = .sparse
     }
 
     // MARK: - GaussianRenderer Protocol Methods
@@ -123,6 +151,20 @@ public final class LocalRenderer: GaussianRenderer, @unchecked Sendable {
         nil // LocalRenderer only supports texture output
     }
 
+    // MARK: - Public Helpers
+
+    public func getVisibleCount() -> UInt32 {
+        guard let header = headerBuffer else { return 0 }
+        let ptr = header.contents().bindMemory(to: CompactedHeaderSwift.self, capacity: 1)
+        return ptr.pointee.visibleCount
+    }
+
+    public func hadOverflow() -> Bool {
+        guard let header = headerBuffer else { return false }
+        let ptr = header.contents().bindMemory(to: CompactedHeaderSwift.self, capacity: 1)
+        return ptr.pointee.overflow != 0
+    }
+
     // MARK: - Internal Render Implementation
 
     private func renderInternal(
@@ -143,12 +185,9 @@ public final class LocalRenderer: GaussianRenderer, @unchecked Sendable {
     ) -> MTLTexture? {
         guard gaussianCount > 0, width > 0, height > 0 else { return nil }
 
-        // Cluster culling disabled (archived)
-        let clusterVisibility: MTLBuffer? = nil
-        let clusterSize = UInt32(CLUSTER_SIZE)
         self.ensureBuffers(gaussianCount: gaussianCount, width: width, height: height)
 
-        // Core buffers required for all modes
+        // Validate required buffers
         guard let compacted = compactedBuffer,
               let header = headerBuffer,
               let tileCounts = tileCountsBuffer,
@@ -159,21 +198,18 @@ public final class LocalRenderer: GaussianRenderer, @unchecked Sendable {
               let visibilityMarks = visibilityMarksBuffer,
               let visibilityPartialSums = visibilityPartialSumsBuffer,
               let colorTex = colorTexture,
-              let depthTex = depthTexture
+              let depthTex = depthTexture,
+              let activeTileIndices = activeTileIndicesBuffer,
+              let activeTileCount = activeTileCountBuffer,
+              let dispatchArgs = dispatchArgsBuffer
         else {
             return nil
         }
 
-        // Mode-specific buffer validation
-        let sortKeys = self.sortKeysBuffer // May be nil in 16-bit mode
-        let tempSortKeys = self.tempSortKeysBuffer
-        let tempSortIndices = self.tempSortIndicesBuffer
-
         let tilesX = (width + LocalRenderer.tileWidth - 1) / LocalRenderer.tileWidth
         let tilesY = (height + LocalRenderer.tileHeight - 1) / LocalRenderer.tileHeight
+        let tileCount = tilesX * tilesY
         let maxCompacted = gaussianCount
-        // Tile-bounded: tileCount × maxPerTile (matches ensureBuffers allocation)
-        let maxAssignments = (tilesX * tilesY) * self.maxGaussiansPerTile
 
         var projMatrix = projectionMatrix
         if self.flipY {
@@ -195,60 +231,124 @@ public final class LocalRenderer: GaussianRenderer, @unchecked Sendable {
             gaussianCount: UInt32(gaussianCount)
         )
 
-        let tileCount = tilesX * tilesY
+        let params = TileBinningParams(
+            gaussianCount: UInt32(gaussianCount),
+            tilesX: UInt32(tilesX),
+            tilesY: UInt32(tilesY),
+            tileWidth: UInt32(LocalRenderer.tileWidth),
+            tileHeight: UInt32(LocalRenderer.tileHeight),
+            surfaceWidth: UInt32(width),
+            surfaceHeight: UInt32(height),
+            maxCapacity: UInt32(maxCompacted)
+        )
 
-        // Indirect dispatch buffers required for all render paths
-        guard let activeTileIndices = activeTileIndicesBuffer,
-              let activeTileCount = activeTileCountBuffer,
-              let dispatchArgs = dispatchArgsBuffer
-        else {
-            return nil
-        }
+        // Check if 16-bit sort is available and enabled
+        let use16BitSort = self.config.sortMode == .sort16Bit &&
+            self.scatterEncoder.has16BitScatter &&
+            self.sortEncoder.has16BitSort &&
+            self.renderEncoder.has16BitRender &&
+            self.depthKeys16Buffer != nil &&
+            self.sortedLocalIdx16Buffer != nil
 
-        // Check if 16-bit sort is available and enabled (based on config, not runtime flag)
-        let effective16BitSort = self.config.sortMode == .sort16Bit && self.encoder.has16BitSort &&
-            self.sortedLocalIdx16Buffer != nil && self.depthKeys16Buffer != nil
+        // === PIPELINE STAGE 1: CLEAR ===
+        self.clearEncoder.encode(
+            commandBuffer: commandBuffer,
+            tileCounts: tileCounts,
+            header: header,
+            tileCount: tileCount,
+            maxCompacted: maxCompacted
+        )
 
-        // Efficient single-pass projection pipeline with optional cluster visibility
-        // Also computes active tile list during prefix scan (fused)
-        self.encoder.encode(
+        // === PIPELINE STAGE 2: PROJECT + VISIBILITY PREFIX SUM + COMPACT ===
+        self.projectEncoder.encode(
             commandBuffer: commandBuffer,
             worldGaussians: worldGaussians,
             harmonics: harmonics,
             camera: camera,
+            params: params,
             gaussianCount: gaussianCount,
-            tilesX: tilesX,
-            tilesY: tilesY,
-            tileWidth: LocalRenderer.tileWidth,
-            tileHeight: LocalRenderer.tileHeight,
-            surfaceWidth: width,
-            surfaceHeight: height,
-            compactedGaussians: compacted,
-            compactedHeader: header,
-            tileCounts: tileCounts,
-            tileOffsets: tileOffsets,
-            partialSums: partialSums,
-            sortKeys: sortKeys,
-            sortIndices: sortIndices,
-            maxCompacted: maxCompacted,
-            maxAssignments: maxAssignments,
             tempProjectionBuffer: tempProjection,
             visibilityMarks: visibilityMarks,
             visibilityPartialSums: visibilityPartialSums,
-            activeTileIndices: activeTileIndices,
-            activeTileCount: activeTileCount,
+            compactedGaussians: compacted,
+            compactedHeader: header,
             useHalfWorld: useHalfWorld,
-            skipSort: effective16BitSort,
-            tempSortKeys: effective16BitSort ? nil : tempSortKeys,
-            tempSortIndices: effective16BitSort ? nil : tempSortIndices,
-            clusterVisibility: clusterVisibility,
-            clusterSize: clusterSize,
-            use16BitSort: effective16BitSort,
-            depthKeys16: self.depthKeys16Buffer
+            clusterVisibility: nil,
+            clusterSize: UInt32(CLUSTER_SIZE)
         )
 
-        // 1. Clear textures
-        self.encoder.encodeClearTextures(
+        // === PIPELINE STAGE 3: SCATTER (fixed layout: tileId * maxPerTile) ===
+        // For sparse mode: set visibility mask and gaussian count
+        let useSparseScatter = self.projectEncoder.skipCompaction
+        if useSparseScatter {
+            self.scatterEncoder.visibilityMask = visibilityMarks
+            self.scatterEncoder.totalGaussianCount = gaussianCount
+        }
+
+        if use16BitSort, let depth16 = depthKeys16Buffer {
+            let gaussianBuffer = useSparseScatter ? tempProjection : compacted
+            self.scatterEncoder.encode16(
+                commandBuffer: commandBuffer,
+                compactedGaussians: gaussianBuffer,
+                compactedHeader: header,
+                tileCounters: tileCounts,
+                depthKeys16: depth16,
+                globalIndices: sortIndices,
+                tilesX: tilesX,
+                maxPerTile: LocalRenderer.maxPerTile,
+                tileWidth: LocalRenderer.tileWidth,
+                tileHeight: LocalRenderer.tileHeight
+            )
+        } else if let sortKeys = sortKeysBuffer {
+            self.scatterEncoder.encode(
+                commandBuffer: commandBuffer,
+                compactedGaussians: compacted,
+                compactedHeader: header,
+                tileCounters: tileCounts,
+                sortKeys: sortKeys,
+                sortIndices: sortIndices,
+                tilesX: tilesX,
+                maxPerTile: LocalRenderer.maxPerTile,
+                tileWidth: LocalRenderer.tileWidth,
+                tileHeight: LocalRenderer.tileHeight
+            )
+        }
+
+        // === PIPELINE STAGE 4: TILE PREFIX SCAN + ACTIVE TILE COMPACTION ===
+        self.prefixScanEncoder.encode(
+            commandBuffer: commandBuffer,
+            tileCounts: tileCounts,
+            tileOffsets: tileOffsets,
+            partialSums: partialSums,
+            tileCount: tileCount,
+            activeTileIndices: activeTileIndices,
+            activeTileCount: activeTileCount
+        )
+
+        // === PIPELINE STAGE 5: PER-TILE SORT ===
+        if use16BitSort, let depth16 = depthKeys16Buffer, let sortedLocal16 = sortedLocalIdx16Buffer {
+            self.sortEncoder.encode16(
+                commandBuffer: commandBuffer,
+                depthKeys16: depth16,
+                globalIndices: sortIndices,
+                sortedLocalIdx: sortedLocal16,
+                tileCounts: tileCounts,
+                maxPerTile: LocalRenderer.maxPerTile,
+                tileCount: tileCount
+            )
+        } else if let sortKeys = sortKeysBuffer {
+            self.sortEncoder.encode(
+                commandBuffer: commandBuffer,
+                sortKeys: sortKeys,
+                sortIndices: sortIndices,
+                tileCounts: tileCounts,
+                maxPerTile: LocalRenderer.maxPerTile,
+                tileCount: tileCount
+            )
+        }
+
+        // === PIPELINE STAGE 6: CLEAR TEXTURES ===
+        self.renderEncoder.encodeClearTextures(
             commandBuffer: commandBuffer,
             colorTexture: colorTex,
             depthTexture: depthTex,
@@ -257,38 +357,22 @@ public final class LocalRenderer: GaussianRenderer, @unchecked Sendable {
             whiteBackground: whiteBackground
         )
 
-        // 2. Prepare indirect dispatch args (active tiles already computed in prefix scan)
-        self.encoder.encodePrepareRenderDispatch(
+        // === PIPELINE STAGE 7: PREPARE INDIRECT DISPATCH ===
+        self.renderEncoder.encodePrepareRenderDispatch(
             commandBuffer: commandBuffer,
             activeTileCount: activeTileCount,
             dispatchArgs: dispatchArgs
         )
 
-        // maxPerTile for fixed layout (same as SORT_MAX_SIZE in shader)
-        let maxPerTile = 2048
+        // === PIPELINE STAGE 8: RENDER ===
+        let gaussianBufferForRender = useSparseScatter ? tempProjection : compacted
 
-        // In sparse mode, render reads from tempProjection (sparse, original indices)
-        // In normal mode, render reads from compacted (dense, compacted indices)
-        let gaussianBufferForRender = self.encoder.useSparseScatter ? tempProjection : compacted
-
-        // 16-bit sort path - reads depthKeys16 directly (sequential 2-byte reads!)
-        if effective16BitSort, let sortedLocal16 = sortedLocalIdx16Buffer, let depth16 = depthKeys16Buffer {
-            self.encoder.encodeSort16(
-                commandBuffer: commandBuffer,
-                depthKeys16: depth16, // Sequential 2-byte reads - much faster than sortInfo!
-                globalIndices: sortIndices,
-                sortedLocalIdx: sortedLocal16,
-                tileCounts: tileCounts,
-                maxPerTile: maxPerTile,
-                tileCount: tileCount
-            )
-
-            // 16-bit render via indirect dispatch (two-level indirection)
-            self.encoder.encodeRenderIndirect16(
+        if use16BitSort, let sortedLocal16 = sortedLocalIdx16Buffer {
+            self.renderEncoder.encodeIndirect16(
                 commandBuffer: commandBuffer,
                 compactedGaussians: gaussianBufferForRender,
                 tileCounts: tileCounts,
-                maxPerTile: maxPerTile,
+                maxPerTile: LocalRenderer.maxPerTile,
                 sortedLocalIdx: sortedLocal16,
                 globalIndices: sortIndices,
                 activeTileIndices: activeTileIndices,
@@ -304,12 +388,11 @@ public final class LocalRenderer: GaussianRenderer, @unchecked Sendable {
                 whiteBackground: whiteBackground
             )
         } else {
-            // 32-bit render via indirect dispatch (fixed layout)
-            self.encoder.encodeRenderIndirect(
+            self.renderEncoder.encodeIndirect(
                 commandBuffer: commandBuffer,
                 compactedGaussians: gaussianBufferForRender,
                 tileCounts: tileCounts,
-                maxPerTile: maxPerTile,
+                maxPerTile: LocalRenderer.maxPerTile,
                 sortedIndices: sortIndices,
                 activeTileIndices: activeTileIndices,
                 dispatchArgs: dispatchArgs,
@@ -326,16 +409,6 @@ public final class LocalRenderer: GaussianRenderer, @unchecked Sendable {
         }
 
         return colorTex
-    }
-
-    public func getVisibleCount() -> UInt32 {
-        guard let header = headerBuffer else { return 0 }
-        return LocalPipelineEncoder.readVisibleCount(from: header)
-    }
-
-    public func hadOverflow() -> Bool {
-        guard let header = headerBuffer else { return false }
-        return LocalPipelineEncoder.readOverflow(from: header)
     }
 
     // MARK: - Buffer Management
@@ -360,7 +433,6 @@ public final class LocalRenderer: GaussianRenderer, @unchecked Sendable {
         let priv: MTLResourceOptions = self.useSharedBuffers ? .storageModeShared : .storageModePrivate
         let shared: MTLResourceOptions = .storageModeShared
 
-        // Helper to create and label buffer
         func makeBuffer(_ label: String, length: Int, options: MTLResourceOptions) -> MTLBuffer? {
             let buf = self.device.makeBuffer(length: length, options: options)
             buf?.label = label
@@ -411,12 +483,6 @@ public final class LocalRenderer: GaussianRenderer, @unchecked Sendable {
             self.sortKeysBuffer = makeBuffer("SortKeys",
                 length: maxAssignments * MemoryLayout<UInt32>.stride,
                 options: priv)
-            self.tempSortKeysBuffer = makeBuffer("TempSortKeys",
-                length: maxAssignments * MemoryLayout<UInt32>.stride,
-                options: priv)
-            self.tempSortIndicesBuffer = makeBuffer("TempSortIndices",
-                length: maxAssignments * MemoryLayout<UInt32>.stride,
-                options: priv)
             self.depthKeys16Buffer = nil
             self.sortedLocalIdx16Buffer = nil
 
@@ -428,8 +494,6 @@ public final class LocalRenderer: GaussianRenderer, @unchecked Sendable {
                 length: maxAssignments * MemoryLayout<UInt16>.stride,
                 options: priv)
             self.sortKeysBuffer = nil
-            self.tempSortKeysBuffer = nil
-            self.tempSortIndicesBuffer = nil
         }
 
         // Textures
@@ -446,21 +510,6 @@ public final class LocalRenderer: GaussianRenderer, @unchecked Sendable {
         depthDesc.storageMode = .private
         self.depthTexture = self.device.makeTexture(descriptor: depthDesc)
         self.depthTexture?.label = "OutputDepth"
-
-        // Textured render texture
-        if self.config.useTexturedRender {
-            let renderTexWidth = LocalPipelineEncoder.renderTexWidth
-            let texelCount = maxCompacted * 2
-            let renderTexHeight = (texelCount + renderTexWidth - 1) / renderTexWidth
-            let gaussianTexDesc = MTLTextureDescriptor.texture2DDescriptor(
-                pixelFormat: .rgba32Float, width: renderTexWidth, height: max(1, renderTexHeight), mipmapped: false)
-            gaussianTexDesc.usage = [.shaderRead, .shaderWrite]
-            gaussianTexDesc.storageMode = .private
-            self.gaussianRenderTexture = self.device.makeTexture(descriptor: gaussianTexDesc)
-            self.gaussianRenderTexture?.label = "GaussianRenderTexture"
-        } else {
-            self.gaussianRenderTexture = nil
-        }
 
         // Indirect dispatch buffers
         self.activeTileIndicesBuffer = makeBuffer("ActiveTileIndices",

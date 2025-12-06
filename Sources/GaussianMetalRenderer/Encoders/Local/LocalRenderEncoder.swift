@@ -1,3 +1,4 @@
+import GaussianMetalRendererTypes
 import Metal
 
 /// Encodes the render stage - blends sorted gaussians to output textures (indirect dispatch only)
@@ -123,7 +124,7 @@ public final class LocalRenderEncoder {
         guard let encoder = commandBuffer.makeComputeCommandEncoder() else { return }
         var maxPerTileU = UInt32(maxPerTile)
 
-        var params = LocalRenderParamsSwift(
+        var params = RenderParams(
             width: UInt32(width),
             height: UInt32(height),
             tileWidth: UInt32(tileWidth),
@@ -138,19 +139,14 @@ public final class LocalRenderEncoder {
 
         encoder.label = "Local_RenderIndirect"
         encoder.setComputePipelineState(self.renderIndirectPipeline)
-        // Fixed layout buffer bindings:
-        // buffer(0): compacted, buffer(1): counts, buffer(2): maxPerTile
-        // buffer(3): sortBuffer, buffer(4): globalIndices (unused), buffer(5): activeTileIndices
-        // buffer(6): params
         encoder.setBuffer(compactedGaussians, offset: 0, index: 0)
         encoder.setBuffer(tileCounts, offset: 0, index: 1)
         encoder.setBytes(&maxPerTileU, length: 4, index: 2)
         encoder.setBuffer(sortedIndices, offset: 0, index: 3)
-        // buffer(4) unused in 32-bit path
         encoder.setBuffer(activeTileIndices, offset: 0, index: 5)
         encoder.setTexture(colorTexture, index: 0)
         encoder.setTexture(depthTexture, index: 1)
-        encoder.setBytes(&params, length: MemoryLayout<LocalRenderParamsSwift>.stride, index: 6)
+        encoder.setBytes(&params, length: MemoryLayout<RenderParams>.stride, index: 6)
 
         // 4×8 threadgroup for 16×16 tile (4×2 pixels per thread)
         let tg = MTLSize(width: 4, height: 8, depth: 1)
@@ -182,7 +178,7 @@ public final class LocalRenderEncoder {
         guard let encoder = commandBuffer.makeComputeCommandEncoder() else { return }
         var maxPerTileU = UInt32(maxPerTile)
 
-        var params = LocalRenderParamsSwift(
+        var params = RenderParams(
             width: UInt32(width),
             height: UInt32(height),
             tileWidth: UInt32(tileWidth),
@@ -197,10 +193,6 @@ public final class LocalRenderEncoder {
 
         encoder.label = "Local_RenderIndirect16"
         encoder.setComputePipelineState(pipeline)
-        // Fixed layout buffer bindings:
-        // buffer(0): compacted, buffer(1): counts, buffer(2): maxPerTile
-        // buffer(3): sortBuffer (ushort*), buffer(4): globalIndices, buffer(5): activeTileIndices
-        // buffer(6): params
         encoder.setBuffer(compactedGaussians, offset: 0, index: 0)
         encoder.setBuffer(tileCounts, offset: 0, index: 1)
         encoder.setBytes(&maxPerTileU, length: 4, index: 2)
@@ -209,7 +201,7 @@ public final class LocalRenderEncoder {
         encoder.setBuffer(activeTileIndices, offset: 0, index: 5)
         encoder.setTexture(colorTexture, index: 0)
         encoder.setTexture(depthTexture, index: 1)
-        encoder.setBytes(&params, length: MemoryLayout<LocalRenderParamsSwift>.stride, index: 6)
+        encoder.setBytes(&params, length: MemoryLayout<RenderParams>.stride, index: 6)
 
         // 4×8 threadgroup for 16×16 tile (4×2 pixels per thread)
         let tg = MTLSize(width: 4, height: 8, depth: 1)

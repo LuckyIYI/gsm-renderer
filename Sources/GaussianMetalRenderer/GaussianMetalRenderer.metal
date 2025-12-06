@@ -661,14 +661,7 @@ kernel void prepareRenderDispatchKernel(
 // Pass 3: Scatter tiles using precomputed offsets (indirect dispatch)
 // =============================================================================
 
-
-struct TileAssignParams {
-    uint gaussianCount;
-    uint tileWidth;
-    uint tileHeight;
-    uint tilesX;
-    uint maxAssignments;
-};
+// TileAssignParams is defined in BridgingTypes.h
 
 // -----------------------------------------------------------------------------
 // Pass 2: Prefix sum (block-level reduce + scan)

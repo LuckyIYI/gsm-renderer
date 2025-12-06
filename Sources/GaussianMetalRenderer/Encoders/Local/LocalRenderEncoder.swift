@@ -1,15 +1,11 @@
 import RendererTypes
 import Metal
 
-/// Encodes the render stage - blends sorted gaussians to output textures (16-bit, indirect dispatch only)
 public final class LocalRenderEncoder {
     // Indirect dispatch pipelines
     private let clearTexturesPipeline: MTLComputePipelineState
     private let prepareRenderDispatchPipeline: MTLComputePipelineState
     private let renderIndirect16Pipeline: MTLComputePipelineState
-
-    /// Texture width for render texture (must match RENDER_TEX_WIDTH in shader)
-    public static let renderTexWidth = 4096
 
     public init(library: MTLLibrary, device: MTLDevice) throws {
         // Required indirect dispatch pipelines

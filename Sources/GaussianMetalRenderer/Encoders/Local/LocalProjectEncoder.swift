@@ -1,14 +1,10 @@
 import Metal
 
-/// Encodes projection stage: ProjectStore only (sparse mode - no compaction)
-/// Visibility is encoded in tile bounds: minTile == maxTile == 0 means invisible
 public final class LocalProjectEncoder {
-    // Projection pipelines by (shDegree, useClusterCull)
     private var projectStoreFloatPipelines: [UInt64: MTLComputePipelineState] = [:]
     private var projectStoreHalfPipelines: [UInt64: MTLComputePipelineState] = [:]
 
     public init(LocalLibrary: MTLLibrary, mainLibrary: MTLLibrary, device: MTLDevice) throws {
-        // Create projection pipeline variants: SH degree (0-3) x cluster cull (true/false)
         for degree: UInt32 in 0 ... 3 {
             for useClusterCull in [false, true] {
                 let constantValues = MTLFunctionConstantValues()

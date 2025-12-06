@@ -7,8 +7,8 @@ public final class LocalRenderer: GaussianRenderer, @unchecked Sendable {
 
     private static let tileWidth = 16
     private static let tileHeight = 16
-    private static let maxGaussiansPerTile16Bit = 4096
-    private static let maxPerTile = 2048 // Fixed layout sort capacity
+    private static let maxGaussiansPerTile16Bit = 2048
+    private static let maxPerTile = 2048
     private static let partialSumsCapacity = 1024
 
     // MARK: - Public Properties

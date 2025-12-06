@@ -32,24 +32,14 @@ final class TwoPassTileAssignEncoder {
     }
 
     init(device: MTLDevice, library: MTLLibrary) throws {
-        // Function constants - always use ellipse intersection (benchmarked as best)
-        let constantValues = MTLFunctionConstantValues()
-        var mode: UInt32 = 2  // INTERSECTION_MODE = ellipse
-        constantValues.setConstantValue(&mode, type: .uint, index: 10)
-
-        // Deterministic compaction kernels (don't need function constants)
+        // Deterministic compaction kernels
         guard let markFn = library.makeFunction(name: "markVisibilityKernel"),
               let scatterCompactFn = library.makeFunction(name: "scatterCompactKernel"),
-              let prepareIndirectFn = library.makeFunction(name: "prepareIndirectDispatchKernel")
+              let prepareIndirectFn = library.makeFunction(name: "prepareIndirectDispatchKernel"),
+              let countFn = library.makeFunction(name: "tileCountIndirectKernel"),
+              let scatterFn = library.makeFunction(name: "tileScatterIndirectKernel")
         else {
             fatalError("Tile assign kernels not found in library")
-        }
-
-        // Tile count/scatter kernels (need function constants for intersection mode)
-        guard let countFn = try? library.makeFunction(name: "tileCountIndirectKernel", constantValues: constantValues),
-              let scatterFn = try? library.makeFunction(name: "tileScatterIndirectKernel", constantValues: constantValues)
-        else {
-            fatalError("Tile count/scatter kernels not found in library")
         }
 
         // Prefix sum kernels

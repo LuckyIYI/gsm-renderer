@@ -10,11 +10,7 @@ public final class LocalScatterEncoder {
     public var totalGaussianCount: Int = 0
 
     public init(library: MTLLibrary, device: MTLDevice) throws {
-        let constantValues = MTLFunctionConstantValues()
-        var mode: UInt32 = 2  // INTERSECTION_MODE = ellipse (benchmarked as best for local)
-        constantValues.setConstantValue(&mode, type: .uint, index: 10)
-
-        guard let scatterSparseFn = try? library.makeFunction(name: "localScatterSimd16Sparse", constantValues: constantValues) else {
+        guard let scatterSparseFn = library.makeFunction(name: "localScatterSimd16Sparse") else {
             fatalError("Missing localScatterSimd16Sparse kernel")
         }
         self.scatterSparsePipeline = try device.makeComputePipelineState(function: scatterSparseFn)

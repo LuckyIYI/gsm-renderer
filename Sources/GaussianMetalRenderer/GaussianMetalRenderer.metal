@@ -860,8 +860,6 @@ kernel void encodeBitonicICB(
 // Pass 3: Scatter tiles using precomputed offsets (indirect dispatch)
 // =============================================================================
 
-// For large AABBs (> PRECISE_THRESHOLD tiles), use precise ellipse-tile intersection
-#define PRECISE_THRESHOLD 16u
 
 struct TileAssignParams {
     uint gaussianCount;

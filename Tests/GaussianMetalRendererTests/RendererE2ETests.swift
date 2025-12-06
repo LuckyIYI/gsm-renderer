@@ -771,6 +771,72 @@ final class RendererE2ETests: XCTestCase {
         print("========================================\n")
     }
 
+    /// Compare sparse vs compacted scatter modes
+    func testCompareSparseModes() throws {
+        let count = 2_000_000
+        let config = PerfConfig(
+            width: 1024, height: 1024, count: count,
+            precision: .float16, warmupFrames: 2, measureFrames: 5, verbose: true
+        )
+
+        print("\n=== Sparse vs Compacted Mode Comparison ===")
+        print("Resolution: \(config.width)x\(config.height), Count: \(config.count)")
+
+        let (positions, scales, rotations, opacities, colors) = self.generateGaussians(count: config.count, seed: 42)
+        let camera = self.createCameraParams(width: config.width, height: config.height)
+
+        // Create renderer
+        let rendererConfig = RendererConfig(
+            maxGaussians: config.count + 1000, maxWidth: config.width, maxHeight: config.height, precision: config.precision
+        )
+        let renderer = try LocalRenderer(config: rendererConfig)
+
+        guard let buffers = createPackedBuffers(
+            device: renderer.device, positions: positions, scales: scales,
+            rotations: rotations, opacities: opacities, colors: colors
+        ) else {
+            XCTFail("Failed to create buffers")
+            return
+        }
+
+        let input = GaussianInput(
+            gaussians: buffers.packedGaussians,
+            harmonics: buffers.harmonics,
+            gaussianCount: config.count,
+            shComponents: 0
+        )
+
+        // Test 1: Compacted mode (default)
+        renderer.encoder.useSparseScatter = false
+        print("\n--- Compacted Mode (default) ---")
+        guard let compactedResult = measureRenderer(renderer, input: input, camera: camera, config: config, label: "Compacted") else {
+            XCTFail("Failed to measure compacted mode")
+            return
+        }
+
+        // Test 2: Sparse mode
+        renderer.encoder.useSparseScatter = true
+        print("\n--- Sparse Mode (no compaction) ---")
+        guard let sparseResult = measureRenderer(renderer, input: input, camera: camera, config: config, label: "Sparse") else {
+            XCTFail("Failed to measure sparse mode")
+            return
+        }
+
+        // Results
+        print("\n=== RESULTS ===")
+        print("Compacted: \(String(format: "%.2f", compactedResult.avg))ms (\(String(format: "%.1f", compactedResult.fps)) FPS)")
+        print("Sparse:    \(String(format: "%.2f", sparseResult.avg))ms (\(String(format: "%.1f", sparseResult.fps)) FPS)")
+
+        let diff = sparseResult.avg - compactedResult.avg
+        let diffPercent = (diff / compactedResult.avg) * 100
+        if sparseResult.avg < compactedResult.avg {
+            print("Winner: Sparse (\(String(format: "%.2f", -diff))ms faster, \(String(format: "%.1f", -diffPercent))% improvement)")
+        } else {
+            print("Winner: Compacted (\(String(format: "%.2f", diff))ms faster, \(String(format: "%.1f", diffPercent))% slower with sparse)")
+        }
+        print("=====================================\n")
+    }
+
     /// Focused performance test for 2M gaussians (larger scale)
     func testPerformance2M() throws {
         let config = PerfConfig(

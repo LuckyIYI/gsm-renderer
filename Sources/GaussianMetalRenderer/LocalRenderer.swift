@@ -269,6 +269,10 @@ public final class LocalRenderer: GaussianRenderer, @unchecked Sendable {
         // maxPerTile for fixed layout (same as SORT_MAX_SIZE in shader)
         let maxPerTile = 2048
 
+        // In sparse mode, render reads from tempProjection (sparse, original indices)
+        // In normal mode, render reads from compacted (dense, compacted indices)
+        let gaussianBufferForRender = self.encoder.useSparseScatter ? tempProjection : compacted
+
         // 16-bit sort path - reads depthKeys16 directly (sequential 2-byte reads!)
         if effective16BitSort, let sortedLocal16 = sortedLocalIdx16Buffer, let depth16 = depthKeys16Buffer {
             self.encoder.encodeSort16(
@@ -284,7 +288,7 @@ public final class LocalRenderer: GaussianRenderer, @unchecked Sendable {
             // 16-bit render via indirect dispatch (two-level indirection)
             self.encoder.encodeRenderIndirect16(
                 commandBuffer: commandBuffer,
-                compactedGaussians: compacted,
+                compactedGaussians: gaussianBufferForRender,
                 tileCounts: tileCounts,
                 maxPerTile: maxPerTile,
                 sortedLocalIdx: sortedLocal16,
@@ -305,7 +309,7 @@ public final class LocalRenderer: GaussianRenderer, @unchecked Sendable {
             // 32-bit render via indirect dispatch (fixed layout)
             self.encoder.encodeRenderIndirect(
                 commandBuffer: commandBuffer,
-                compactedGaussians: compacted,
+                compactedGaussians: gaussianBufferForRender,
                 tileCounts: tileCounts,
                 maxPerTile: maxPerTile,
                 sortedIndices: sortIndices,

@@ -1070,3 +1070,68 @@ kernel void localScatterSimd16V7(
         }
     }
 }
+
+// =============================================================================
+// SPARSE SCATTER: No compaction, use visibility mask
+// =============================================================================
+// Experiment: Skip compaction entirely. Dispatch for ALL gaussians (2M),
+// use visibility mask to skip invisible ones. Trade-off: 75% threads wasted
+// but saves 5% compact kernel time.
+
+#define SPARSE_GAUSSIANS_PER_THREAD 32
+
+kernel void localScatterSimd16Sparse(
+    const device CompactedGaussian* projected [[buffer(0)]],  // Sparse! Indexed by original gaussian ID
+    const device uint* visibilityMask [[buffer(1)]],          // Prefix sum (visibility[i] < visibility[i+1] means visible)
+    device atomic_uint* tileCounters [[buffer(2)]],
+    device ushort* depthKeys16 [[buffer(3)]],
+    device uint* globalIndices [[buffer(4)]],
+    constant uint& tilesX [[buffer(5)]],
+    constant uint& maxPerTile [[buffer(6)]],
+    constant int& tileWidth [[buffer(7)]],
+    constant int& tileHeight [[buffer(8)]],
+    constant uint& gaussianCount [[buffer(9)]],
+    uint gid [[thread_position_in_grid]]
+) {
+    uint baseIdx = gid * SPARSE_GAUSSIANS_PER_THREAD;
+
+    // Process 32 gaussians per thread
+    for (uint g = 0; g < SPARSE_GAUSSIANS_PER_THREAD; g++) {
+        uint originalIdx = baseIdx + g;
+        if (originalIdx >= gaussianCount) return;
+
+        // Check visibility via raw mark (0 = invisible, 1 = visible)
+        // No prefix sum needed in sparse mode!
+        if (visibilityMask[originalIdx] == 0) continue;  // Not visible, skip
+
+        // Read from SPARSE projected buffer (indexed by original gaussian ID)
+        CompactedGaussian gaussian = projected[originalIdx];
+        float3 conic = gaussian.covariance_depth.xyz;
+        float2 center = gaussian.position_color.xy;
+        half4 colorOp = LocalUnpackHalf4(gaussian.position_color.zw);
+        float power = gaussianComputePower(float(colorOp.w));
+        ushort depth16 = ushort((as_type<uint>(gaussian.covariance_depth.w) ^ 0x80000000u) >> 16u);
+
+        int minTX = gaussian.min_tile.x;
+        int minTY = gaussian.min_tile.y;
+        int maxTX = gaussian.max_tile.x;
+        int maxTY = gaussian.max_tile.y;
+
+        for (int ty = minTY; ty < maxTY; ty++) {
+            for (int tx = minTX; tx < maxTX; tx++) {
+                int2 pix_min = int2(tx * tileWidth, ty * tileHeight);
+                int2 pix_max = int2(pix_min.x + tileWidth - 1, pix_min.y + tileHeight - 1);
+
+                if (gaussianIntersectsTile(pix_min, pix_max, center, conic, power)) {
+                    uint tileId = uint(ty) * tilesX + uint(tx);
+                    uint localIdx = atomic_fetch_add_explicit(&tileCounters[tileId], 1u, memory_order_relaxed);
+                    if (localIdx < maxPerTile) {
+                        uint writePos = tileId * maxPerTile + localIdx;
+                        depthKeys16[writePos] = depth16;
+                        globalIndices[writePos] = originalIdx;  // Store ORIGINAL index!
+                    }
+                }
+            }
+        }
+    }
+}

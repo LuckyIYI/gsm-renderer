@@ -125,6 +125,7 @@ final class EncoderUnitTests: XCTestCase {
             switch variant {
             case .baseline: variantName = "Baseline (4 gauss/TG)"
             case .optimized: variantName = "Optimized (32 gauss/thread)"
+            case .sparse: continue // Skip sparse in this test (needs different setup)
             }
 
             // Clear counters before each test

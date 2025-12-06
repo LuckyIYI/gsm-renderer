@@ -13,11 +13,20 @@ public final class LocalPipelineEncoder {
 
     // Per-stage encoders
     private let clearEncoder: LocalClearEncoder
-    private let projectEncoder: LocalProjectEncoder
+    public let projectEncoder: LocalProjectEncoder
     private let prefixScanEncoder: LocalPrefixScanEncoder
-    private let scatterEncoder: LocalScatterEncoder
+    public let scatterEncoder: LocalScatterEncoder
     private let sortEncoder: LocalSortEncoder
     private let renderEncoder: LocalRenderEncoder
+
+    /// Enable sparse scatter mode (skips compaction, dispatches for all gaussians)
+    /// Default: true (22-38% faster than compacted mode)
+    public var useSparseScatter: Bool = true {
+        didSet {
+            self.projectEncoder.skipCompaction = useSparseScatter
+            self.scatterEncoder.activeVariant = useSparseScatter ? .sparse : .optimized
+        }
+    }
 
     public init(device: MTLDevice) throws {
         self.device = device
@@ -48,6 +57,10 @@ public final class LocalPipelineEncoder {
         self.scatterEncoder = try LocalScatterEncoder(library: library, device: device)
         self.sortEncoder = try LocalSortEncoder(library: library, device: device)
         self.renderEncoder = try LocalRenderEncoder(library: library, device: device)
+
+        // Apply default sparse mode settings
+        self.projectEncoder.skipCompaction = true
+        self.scatterEncoder.activeVariant = .sparse
     }
 
     /// Legacy init for backwards compatibility
@@ -143,11 +156,19 @@ public final class LocalPipelineEncoder {
         let maxPerTile = 2048
 
         // === 3. SCATTER (fixed layout: tileId * maxPerTile, atomics give counts) ===
+        // For sparse mode: set visibility mask and gaussian count, use tempProjectionBuffer
+        if self.useSparseScatter {
+            self.scatterEncoder.visibilityMask = visibilityMarks
+            self.scatterEncoder.totalGaussianCount = gaussianCount
+        }
+
         let effective16Bit = use16BitSort && self.scatterEncoder.has16BitScatter && depthKeys16 != nil
         if effective16Bit, let depth16 = depthKeys16 {
+            // In sparse mode, pass tempProjectionBuffer instead of compactedGaussians
+            let gaussianBuffer = self.useSparseScatter ? tempProjectionBuffer : compactedGaussians
             self.scatterEncoder.encode16(
                 commandBuffer: commandBuffer,
-                compactedGaussians: compactedGaussians,
+                compactedGaussians: gaussianBuffer,
                 compactedHeader: compactedHeader,
                 tileCounters: tileCounts,
                 depthKeys16: depth16,

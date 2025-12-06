@@ -17,6 +17,9 @@ public final class LocalProjectEncoder {
 
     private let prefixBlockSize = 256
 
+    /// Skip compaction - for sparse scatter experiment
+    public var skipCompaction: Bool = false
+
     public init(LocalLibrary: MTLLibrary, mainLibrary: MTLLibrary, device: MTLDevice) throws {
         // Load compaction kernels (LocalCompact - just copies, no counting)
         guard let compactFn = LocalLibrary.makeFunction(name: "localCompact"),
@@ -123,38 +126,46 @@ public final class LocalProjectEncoder {
         }
 
         // === HIERARCHICAL PREFIX SUM ON VISIBILITY ===
-        self.encodeVisibilityPrefixSum(
-            commandBuffer: commandBuffer,
-            visibilityMarks: visibilityMarks,
-            visibilityPartialSums: visibilityPartialSums,
-            gaussianCount: gaussianCount
-        )
+        // Only needed for compaction mode - sparse mode reads raw 0/1 marks directly
+        if !self.skipCompaction {
+            self.encodeVisibilityPrefixSum(
+                commandBuffer: commandBuffer,
+                visibilityMarks: visibilityMarks,
+                visibilityPartialSums: visibilityPartialSums,
+                gaussianCount: gaussianCount
+            )
+        }
 
         // === WRITE VISIBLE COUNT TO HEADER ===
-        if let encoder = commandBuffer.makeComputeCommandEncoder() {
-            encoder.label = "Local_WriteVisibleCount"
-            encoder.setComputePipelineState(self.writeVisibleCountPipeline)
-            encoder.setBuffer(visibilityMarks, offset: 0, index: 0)
-            encoder.setBuffer(compactedHeader, offset: 0, index: 1)
-            encoder.setBytes(&gaussianCountU, length: 4, index: 2)
-            encoder.dispatchThreads(MTLSize(width: 1, height: 1, depth: 1),
-                                    threadsPerThreadgroup: MTLSize(width: 1, height: 1, depth: 1))
-            encoder.endEncoding()
-        }
+        // (Still needed for scatter indirect dispatch in non-sparse mode)
+        if !self.skipCompaction {
+            if let encoder = commandBuffer.makeComputeCommandEncoder() {
+                encoder.label = "Local_WriteVisibleCount"
+                encoder.setComputePipelineState(self.writeVisibleCountPipeline)
+                encoder.setBuffer(visibilityMarks, offset: 0, index: 0)
+                encoder.setBuffer(compactedHeader, offset: 0, index: 1)
+                encoder.setBytes(&gaussianCountU, length: 4, index: 2)
+                encoder.dispatchThreads(MTLSize(width: 1, height: 1, depth: 1),
+                                        threadsPerThreadgroup: MTLSize(width: 1, height: 1, depth: 1))
+                encoder.endEncoding()
+            }
 
-        // === COMPACT (no counting - scatter atomics give count for free) ===
-        if let encoder = commandBuffer.makeComputeCommandEncoder() {
-            encoder.label = "Local_Compact"
-            encoder.setComputePipelineState(self.compactPipeline)
-            encoder.setBuffer(tempProjectionBuffer, offset: 0, index: 0)
-            encoder.setBuffer(visibilityMarks, offset: 0, index: 1) // prefix sum offsets
-            encoder.setBuffer(compactedGaussians, offset: 0, index: 2)
-            encoder.setBytes(&gaussianCountU, length: 4, index: 3)
-            let threads = MTLSize(width: gaussianCount, height: 1, depth: 1)
-            let tg = MTLSize(width: compactPipeline.threadExecutionWidth, height: 1, depth: 1)
-            encoder.dispatchThreads(threads, threadsPerThreadgroup: tg)
-            encoder.endEncoding()
+            // === COMPACT (no counting - scatter atomics give count for free) ===
+            if let encoder = commandBuffer.makeComputeCommandEncoder() {
+                encoder.label = "Local_Compact"
+                encoder.setComputePipelineState(self.compactPipeline)
+                encoder.setBuffer(tempProjectionBuffer, offset: 0, index: 0)
+                encoder.setBuffer(visibilityMarks, offset: 0, index: 1) // prefix sum offsets
+                encoder.setBuffer(compactedGaussians, offset: 0, index: 2)
+                encoder.setBytes(&gaussianCountU, length: 4, index: 3)
+                let threads = MTLSize(width: gaussianCount, height: 1, depth: 1)
+                let tg = MTLSize(width: compactPipeline.threadExecutionWidth, height: 1, depth: 1)
+                encoder.dispatchThreads(threads, threadsPerThreadgroup: tg)
+                encoder.endEncoding()
+            }
         }
+        // When skipCompaction=true, scatter will read from tempProjectionBuffer (sparse)
+        // and use visibilityMarks for visibility checks
     }
 
     private func encodeVisibilityPrefixSum(

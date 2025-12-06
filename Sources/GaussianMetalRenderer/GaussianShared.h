@@ -293,14 +293,16 @@ inline bool gaussianPixelOBBIntersectsTile(int2 pix_min, int2 pix_max, float2 ce
 //   0 = AABB (fastest, least precise - circular radius)
 //   1 = OBB  (medium - oriented bounding box, GSCore-style)
 //   2 = Ellipse (slowest, exact - FlashGS-style)
+//   3 = None (skip test - trust tile bounds from projection, fastest)
 
 constant uint INTERSECTION_MODE [[function_constant(10)]];
 constant bool USE_AABB_MODE = (INTERSECTION_MODE == 0);
 constant bool USE_OBB_MODE = (INTERSECTION_MODE == 1);
 constant bool USE_ELLIPSE_MODE = (INTERSECTION_MODE == 2);
+constant bool USE_NONE_MODE = (INTERSECTION_MODE == 3);
 
 /// Unified tile intersection test - single entry point
-/// Automatically selects AABB, OBB, or Ellipse based on INTERSECTION_MODE
+/// Automatically selects AABB, OBB, Ellipse, or None based on INTERSECTION_MODE
 /// @param pix_min Tile minimum pixel coordinates
 /// @param pix_max Tile maximum pixel coordinates
 /// @param center Gaussian center in pixel coordinates
@@ -317,8 +319,13 @@ inline bool intersectsTile(
     float radius,
     float2 obbExtents
 ) {
-    if (USE_AABB_MODE) {
-        // AABB mode - fastest, uses circular radius
+    if (USE_NONE_MODE) {
+        // None mode - skip intersection test, trust tile bounds from projection
+        // Best when using OBB bounds in projection stage
+        return true;
+    }
+    else if (USE_AABB_MODE) {
+        // AABB mode - fastest test, uses circular radius
         return gaussianPixelAABBIntersectsTile(pix_min, pix_max, center, radius);
     }
     else if (USE_OBB_MODE) {

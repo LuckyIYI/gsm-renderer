@@ -387,4 +387,258 @@ inline bool ellipseIntersectsTileHalf(half2 center, half3 conic, half qMax,
     return false;
 }
 
+// =============================================================================
+// FLASHGS-STYLE ELLIPSE INTERSECTION (faster edge-only check)
+// =============================================================================
+// Alternative ellipse intersection using closest-edge approach.
+// Faster than full corner+edge check for tile-based rendering.
+
+constant float GAUSSIAN_LN2 = 0.693147180559945f;
+
+/// Compute power threshold from opacity (FlashGS exact)
+inline float gaussianComputePower(float opacity) {
+    return GAUSSIAN_LN2 * 8.0f + GAUSSIAN_LN2 * log2(max(opacity, 1e-6f));
+}
+
+/// Segment-ellipse intersection helper (FlashGS exact)
+inline bool gaussianSegmentIntersectEllipse(float a, float b, float c, float d, float l, float r) {
+    float delta = b * b - 4.0f * a * c;
+    float t1 = (l - d) * (2.0f * a) + b;
+    float t2 = (r - d) * (2.0f * a) + b;
+    return delta >= 0.0f && (t1 <= 0.0f || t1 * t1 <= delta) && (t2 >= 0.0f || t2 * t2 <= delta);
+}
+
+/// Check if tile contains gaussian center
+inline bool gaussianTileContainsCenter(int2 pix_min, int2 pix_max, float2 center) {
+    return center.x >= float(pix_min.x) && center.x <= float(pix_max.x) &&
+           center.y >= float(pix_min.y) && center.y <= float(pix_max.y);
+}
+
+/// Full ellipse-tile intersection test (FlashGS closest-edge)
+inline bool gaussianTileIntersectsEllipse(int2 pix_min, int2 pix_max, float2 center, float3 conic, float power) {
+    float w = 2.0f * power;
+    float dx, dy;
+    float a, b, c;
+
+    // Check closest vertical edge
+    if (center.x * 2.0f < float(pix_min.x + pix_max.x)) {
+        dx = center.x - float(pix_min.x);
+    } else {
+        dx = center.x - float(pix_max.x);
+    }
+    a = conic.z;
+    b = -2.0f * conic.y * dx;
+    c = conic.x * dx * dx - w;
+
+    if (gaussianSegmentIntersectEllipse(a, b, c, center.y, float(pix_min.y), float(pix_max.y))) {
+        return true;
+    }
+
+    // Check closest horizontal edge
+    if (center.y * 2.0f < float(pix_min.y + pix_max.y)) {
+        dy = center.y - float(pix_min.y);
+    } else {
+        dy = center.y - float(pix_max.y);
+    }
+    a = conic.x;
+    b = -2.0f * conic.y * dy;
+    c = conic.z * dy * dy - w;
+
+    if (gaussianSegmentIntersectEllipse(a, b, c, center.x, float(pix_min.x), float(pix_max.x))) {
+        return true;
+    }
+
+    return false;
+}
+
+/// Combined ellipse intersection: center containment OR edge intersection
+inline bool gaussianIntersectsTile(int2 pix_min, int2 pix_max, float2 center, float3 conic, float power) {
+    return gaussianTileContainsCenter(pix_min, pix_max, center) ||
+           gaussianTileIntersectsEllipse(pix_min, pix_max, center, conic, power);
+}
+
+// =============================================================================
+// AABB-TILE INTERSECTION (simple box overlap)
+// =============================================================================
+
+/// Check if pixel-space circular AABB intersects tile
+inline bool gaussianPixelAABBIntersectsTile(int2 pix_min, int2 pix_max, float2 center, float radius) {
+    float gaussianMinX = center.x - radius;
+    float gaussianMaxX = center.x + radius;
+    float gaussianMinY = center.y - radius;
+    float gaussianMaxY = center.y + radius;
+
+    return gaussianMaxX >= float(pix_min.x) && gaussianMinX <= float(pix_max.x) &&
+           gaussianMaxY >= float(pix_min.y) && gaussianMinY <= float(pix_max.y);
+}
+
+/// Check if pixel-space OBB (as AABB) intersects tile
+inline bool gaussianPixelOBBIntersectsTile(int2 pix_min, int2 pix_max, float2 center, float2 obbExtents) {
+    float gaussianMinX = center.x - obbExtents.x;
+    float gaussianMaxX = center.x + obbExtents.x;
+    float gaussianMinY = center.y - obbExtents.y;
+    float gaussianMaxY = center.y + obbExtents.y;
+
+    return gaussianMaxX >= float(pix_min.x) && gaussianMinX <= float(pix_max.x) &&
+           gaussianMaxY >= float(pix_min.y) && gaussianMinY <= float(pix_max.y);
+}
+
+// =============================================================================
+// OBB FROM CONIC (for scatter stage where only conic is available)
+// =============================================================================
+
+/// Compute OBB extents from conic (inverse covariance)
+/// conic = (inv_cov[0][0], inv_cov[0][1], inv_cov[1][1])
+inline float2 computeOBBExtentsFromConic(float3 conic, float sigma_multiplier) {
+    // conic is inverse of covariance, invert back
+    float invA = conic.x;
+    float invB = conic.y;
+    float invD = conic.z;
+
+    float conicDet = invA * invD - invB * invB;
+    if (abs(conicDet) < 1e-8f) {
+        return float2(sigma_multiplier * 10.0f, sigma_multiplier * 10.0f);
+    }
+
+    // Invert: cov = (invD, -invB, invA) / conicDet
+    float a = invD / conicDet;
+    float b = -invB / conicDet;
+    float d = invA / conicDet;
+
+    // Reuse existing OBB computation
+    return computeOBBExtentsFromComponents(a, b, d, sigma_multiplier);
+}
+
+// =============================================================================
+// UNIFIED TILE INTERSECTION - Single entry point with method selection
+// =============================================================================
+// Function constant INTERSECTION_MODE selects the method at compile time:
+//   0 = AABB (fastest, least precise - circular radius)
+//   1 = OBB  (medium - oriented bounding box, GSCore-style)
+//   2 = Ellipse (slowest, exact - FlashGS-style)
+//   3 = None (skip test - trust tile bounds from projection, fastest)
+
+constant uint INTERSECTION_MODE [[function_constant(10)]];
+constant bool USE_AABB_MODE = (INTERSECTION_MODE == 0);
+constant bool USE_OBB_MODE = (INTERSECTION_MODE == 1);
+constant bool USE_ELLIPSE_MODE = (INTERSECTION_MODE == 2);
+constant bool USE_NONE_MODE = (INTERSECTION_MODE == 3);
+
+/// Unified tile intersection test - single entry point
+/// Automatically selects AABB, OBB, Ellipse, or None based on INTERSECTION_MODE
+inline bool intersectsTile(
+    int2 pix_min,
+    int2 pix_max,
+    float2 center,
+    float3 conic,
+    float opacity,
+    float radius,
+    float2 obbExtents
+) {
+    if (USE_NONE_MODE) {
+        return true;
+    }
+    else if (USE_AABB_MODE) {
+        return gaussianPixelAABBIntersectsTile(pix_min, pix_max, center, radius);
+    }
+    else if (USE_OBB_MODE) {
+        float2 extents = (obbExtents.x > 0.0f) ? obbExtents : computeOBBExtentsFromConic(conic, 3.0f);
+        return gaussianPixelOBBIntersectsTile(pix_min, pix_max, center, extents);
+    }
+    else {
+        float power = gaussianComputePower(opacity);
+        return gaussianIntersectsTile(pix_min, pix_max, center, conic, power);
+    }
+}
+
+/// Simplified unified intersection (computes OBB on-the-fly if needed)
+inline bool intersectsTileSimple(
+    int2 pix_min,
+    int2 pix_max,
+    float2 center,
+    float3 conic,
+    float opacity,
+    float radius
+) {
+    return intersectsTile(pix_min, pix_max, center, conic, opacity, radius, float2(0.0f));
+}
+
+// =============================================================================
+// HALF-PRECISION UNIFIED INTERSECTION
+// =============================================================================
+
+inline half2 computeOBBExtentsFromConicHalf(half3 conic, half sigma_multiplier) {
+    half invA = conic.x;
+    half invB = conic.y;
+    half invD = conic.z;
+
+    half conicDet = invA * invD - invB * invB;
+    if (abs(conicDet) < half(1e-6h)) {
+        return half2(sigma_multiplier * half(10.0h), sigma_multiplier * half(10.0h));
+    }
+
+    half a = invD / conicDet;
+    half b = -invB / conicDet;
+    half d = invA / conicDet;
+
+    half det = a * d - b * b;
+    half mid = half(0.5h) * (a + d);
+    half disc = max(mid * mid - det, half(1e-6h));
+    half sqrtDisc = sqrt(disc);
+
+    half lambda1 = mid + sqrtDisc;
+    half lambda2 = max(mid - sqrtDisc, half(1e-6h));
+
+    half e1 = sigma_multiplier * sqrt(max(lambda1, half(1e-6h)));
+    half e2 = sigma_multiplier * sqrt(max(lambda2, half(1e-6h)));
+
+    half2 v1;
+    if (abs(b) > half(1e-6h)) {
+        half vx = b;
+        half vy = lambda1 - a;
+        half vlen = sqrt(vx * vx + vy * vy);
+        v1 = half2(vx, vy) / max(vlen, half(1e-6h));
+    } else {
+        v1 = (a >= d) ? half2(half(1.0h), half(0.0h)) : half2(half(0.0h), half(1.0h));
+    }
+
+    return half2(abs(v1.x) * e1 + abs(v1.y) * e2,
+                 abs(v1.y) * e1 + abs(v1.x) * e2);
+}
+
+inline bool intersectsTileHalf(
+    int2 pix_min,
+    int2 pix_max,
+    half2 center,
+    half3 conic,
+    half opacity,
+    half radius,
+    half2 obbExtents
+) {
+    if (USE_NONE_MODE) {
+        return true;
+    }
+    else if (USE_AABB_MODE) {
+        half gaussianMinX = center.x - radius;
+        half gaussianMaxX = center.x + radius;
+        half gaussianMinY = center.y - radius;
+        half gaussianMaxY = center.y + radius;
+        return gaussianMaxX >= half(pix_min.x) && gaussianMinX <= half(pix_max.x) &&
+               gaussianMaxY >= half(pix_min.y) && gaussianMinY <= half(pix_max.y);
+    }
+    else if (USE_OBB_MODE) {
+        half2 extents = (obbExtents.x > half(0.0h)) ? obbExtents : computeOBBExtentsFromConicHalf(conic, half(3.0h));
+        half gaussianMinX = center.x - extents.x;
+        half gaussianMaxX = center.x + extents.x;
+        half gaussianMinY = center.y - extents.y;
+        half gaussianMaxY = center.y + extents.y;
+        return gaussianMaxX >= half(pix_min.x) && gaussianMinX <= half(pix_max.x) &&
+               gaussianMaxY >= half(pix_min.y) && gaussianMinY <= half(pix_max.y);
+    }
+    else {
+        float power = gaussianComputePower(float(opacity));
+        return gaussianIntersectsTile(pix_min, pix_max, float2(center), float3(conic), power);
+    }
+}
+
 #endif // GAUSSIAN_HELPERS_H

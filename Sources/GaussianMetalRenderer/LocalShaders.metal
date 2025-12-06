@@ -17,13 +17,13 @@ constant bool USE_CLUSTER_CULL [[function_constant(1)]];
 // =============================================================================
 
 // Pack half4 to float2
-inline float2 LocalPackHalf4(half4 v) {
+inline float2 localPackHalf4(half4 v) {
     uint2 u = uint2(as_type<uint>(half2(v.xy)), as_type<uint>(half2(v.zw)));
     return float2(as_type<float>(u.x), as_type<float>(u.y));
 }
 
 // Unpack float2 to half4
-inline half4 LocalUnpackHalf4(float2 v) {
+inline half4 localUnpackHalf4(float2 v) {
     uint2 u = uint2(as_type<uint>(v.x), as_type<uint>(v.y));
     return half4(as_type<half2>(u.x), as_type<half2>(u.y));
 }
@@ -104,15 +104,14 @@ kernel void localPrepareRenderDispatch(
 // =============================================================================
 // KERNEL 2a: PROJECT + STORE (efficient temp buffer approach)
 // =============================================================================
-// Projects all gaussians, stores full results to temp buffer, marks visibility.
-// Temp buffer can share memory with other buffers not used during projection.
+// Projects all gaussians, stores full results to temp buffer.
+// Culled gaussians get minTile == maxTile (zero bounds), so scatter loops skip them naturally.
 
 template <typename PackedWorldT, typename HarmonicsT>
 kernel void localProjectStore(
     const device PackedWorldT* worldGaussians [[buffer(0)]],
     const device HarmonicsT* harmonics [[buffer(1)]],
     device CompactedGaussian* tempBuffer [[buffer(2)]],     // Temp storage at gid
-    device uint* visibilityMarks [[buffer(3)]],             // 1 if visible, 0 if culled
     constant CameraUniforms& camera [[buffer(4)]],
     constant TileBinningParams& params [[buffer(5)]],
     const device uchar* clusterVisible [[buffer(6), function_constant(USE_CLUSTER_CULL)]],
@@ -121,11 +120,15 @@ kernel void localProjectStore(
 ) {
     if (gid >= params.gaussianCount) return;
 
+    // Zero tile bounds = invisible (scatter loops won't process)
+    constexpr int2 zeroTile = int2(0, 0);
+
     // Cluster culling
     if (USE_CLUSTER_CULL) {
         uint clusterId = gid / clusterSize;
         if (clusterVisible[clusterId] == 0) {
-            visibilityMarks[gid] = 0u;
+            tempBuffer[gid].minTile = zeroTile;
+            tempBuffer[gid].maxTile = zeroTile;
             return;
         }
     }
@@ -136,7 +139,8 @@ kernel void localProjectStore(
     float3 scale = float3(g.sx, g.sy, g.sz);
     float maxScale = max(scale.x, max(scale.y, scale.z));
     if (maxScale < 0.0005f) {
-        visibilityMarks[gid] = 0u;
+        tempBuffer[gid].minTile = zeroTile;
+        tempBuffer[gid].maxTile = zeroTile;
         return;
     }
 
@@ -147,19 +151,22 @@ kernel void localProjectStore(
     if (fabs(depth) < 1e-4f) depth = (depth >= 0) ? 1e-4f : -1e-4f;
 
     if (depth <= camera.nearPlane) {
-        visibilityMarks[gid] = 0u;
+        tempBuffer[gid].minTile = zeroTile;
+        tempBuffer[gid].maxTile = zeroTile;
         return;
     }
 
     float opacity = float(g.opacity);
     if (opacity < 0.004f) {
-        visibilityMarks[gid] = 0u;
+        tempBuffer[gid].minTile = zeroTile;
+        tempBuffer[gid].maxTile = zeroTile;
         return;
     }
 
     float4 clip = camera.projectionMatrix * viewPos;
     if (fabs(clip.w) < 1e-6f) {
-        visibilityMarks[gid] = 0u;
+        tempBuffer[gid].minTile = zeroTile;
+        tempBuffer[gid].maxTile = zeroTile;
         return;
     }
 
@@ -186,14 +193,16 @@ kernel void localProjectStore(
     float3 conic = conic4.xyz;
 
     if (radius < 0.5f) {
-        visibilityMarks[gid] = 0u;
+        tempBuffer[gid].minTile = zeroTile;
+        tempBuffer[gid].maxTile = zeroTile;
         return;
     }
 
     float det = conic.x * conic.z - conic.y * conic.y;
     float totalInk = opacity * 6.283185f / sqrt(max(det, 1e-6f));
     if (totalInk < 3.0f) {
-        visibilityMarks[gid] = 0u;
+        tempBuffer[gid].minTile = zeroTile;
+        tempBuffer[gid].maxTile = zeroTile;
         return;
     }
 
@@ -212,7 +221,8 @@ kernel void localProjectStore(
                         min(int(params.tilesY), int(ceil(ymax / float(tileH)))));
 
     if (minTile.x >= maxTile.x || minTile.y >= maxTile.y) {
-        visibilityMarks[gid] = 0u;
+        tempBuffer[gid].minTile = zeroTile;
+        tempBuffer[gid].maxTile = zeroTile;
         return;
     }
 
@@ -222,70 +232,33 @@ kernel void localProjectStore(
 
     // Store to temp buffer at original index
     tempBuffer[gid].covarianceDepth = float4(conic, depth);
-    tempBuffer[gid].positionColor = float4(px, py, LocalPackHalf4(half4(half3(color), half(opacity))));
+    tempBuffer[gid].positionColor = float4(px, py, localPackHalf4(half4(half3(color), half(opacity))));
     tempBuffer[gid].minTile = minTile;
     tempBuffer[gid].maxTile = maxTile;
     tempBuffer[gid].originalIdx = gid;
-
-    visibilityMarks[gid] = 1u;
 }
 
 // Template instantiations for ProjectStore
 template [[host_name("LocalProjectStoreFloat")]]
 kernel void localProjectStore<PackedWorldGaussian, float>(
     const device PackedWorldGaussian*, const device float*,
-    device CompactedGaussian*, device uint*,
+    device CompactedGaussian*,
     constant CameraUniforms&, constant TileBinningParams&,
     const device uchar*, constant uint&, uint);
 
 template [[host_name("LocalProjectStoreHalf")]]
 kernel void localProjectStore<PackedWorldGaussianHalf, float>(
     const device PackedWorldGaussianHalf*, const device float*,
-    device CompactedGaussian*, device uint*,
+    device CompactedGaussian*,
     constant CameraUniforms&, constant TileBinningParams&,
     const device uchar*, constant uint&, uint);
 
 template [[host_name("LocalProjectStoreHalfHalfSh")]]
 kernel void localProjectStore<PackedWorldGaussianHalf, half>(
     const device PackedWorldGaussianHalf*, const device half*,
-    device CompactedGaussian*, device uint*,
+    device CompactedGaussian*,
     constant CameraUniforms&, constant TileBinningParams&,
     const device uchar*, constant uint&, uint);
-
-// =============================================================================
-// KERNEL 2b: COMPACT (copies visible from temp to compacted, NO counting)
-// =============================================================================
-// Uses prefix sum offsets to deterministically copy visible gaussians.
-// Counting eliminated - scatter atomics give us count for free.
-
-kernel void localCompact(
-    const device CompactedGaussian* tempBuffer [[buffer(0)]],
-    const device uint* prefixOffsets [[buffer(1)]],  // Exclusive prefix sum
-    device CompactedGaussian* compacted [[buffer(2)]],
-    constant uint& gaussianCount [[buffer(3)]],
-    uint gid [[thread_position_in_grid]]
-) {
-    if (gid >= gaussianCount) return;
-
-    // Check visibility via prefix sum
-    uint myOffset = prefixOffsets[gid];
-    uint nextOffset = prefixOffsets[gid + 1];
-    if (nextOffset <= myOffset) return;  // Not visible
-
-    // Copy from temp to compacted (deterministic index from prefix sum)
-    compacted[myOffset] = tempBuffer[gid];
-}
-
-// Write visible count to header
-kernel void localWriteVisibleCount(
-    const device uint* prefixOffsets [[buffer(0)]],
-    device TileAssignmentHeader* header [[buffer(1)]],
-    constant uint& gaussianCount [[buffer(2)]],
-    uint gid [[thread_position_in_grid]]
-) {
-    if (gid != 0) return;
-    header->totalAssignments = prefixOffsets[gaussianCount];
-}
 
 // =============================================================================
 // KERNEL 3: PREFIX SCAN (reuse from main file or inline simple version)
@@ -428,137 +401,6 @@ kernel void localFinalizeScanAndZero(
     }
 }
 
-// =============================================================================
-// KERNEL: PREPARE INDIRECT DISPATCH (GPU-driven dispatch args)
-// =============================================================================
-// Writes MTLDispatchThreadgroupsIndirectArguments based on visibleCount
-// Uses Metal's built-in MTLDispatchThreadgroupsIndirectArguments struct
-
-kernel void localPrepareScatterDispatch(
-    const device TileAssignmentHeader* header [[buffer(0)]],
-    device MTLDispatchThreadgroupsIndirectArguments* dispatchArgs [[buffer(1)]],
-    constant uint& threadgroupWidth [[buffer(2)]]
-) {
-    uint visibleCount = atomic_load_explicit((const device atomic_uint*)&header->totalAssignments, memory_order_relaxed);
-    uint threadgroups = (visibleCount + threadgroupWidth - 1) / threadgroupWidth;
-    dispatchArgs->threadgroupsPerGrid[0] = max(threadgroups, 1u);
-    dispatchArgs->threadgroupsPerGrid[1] = 1;
-    dispatchArgs->threadgroupsPerGrid[2] = 1;
-}
-
-
-// =============================================================================
-// KERNEL 4: SIMD-COOPERATIVE SCATTER (FlashGS-style)
-// =============================================================================
-// All 32 threads in SIMD group work on ONE gaussian cooperatively
-// - Broadcasts gaussian data via simd_shuffle
-// - Threads divide up tile range
-// - Warp-level atomic batching (only lane 0 does atomic)
-// - Each thread computes its write position via popcount
-
-kernel void localScatterSimd(
-    const device CompactedGaussian* compacted [[buffer(0)]],
-    const device TileAssignmentHeader* header [[buffer(1)]],
-    device atomic_uint* tileCounters [[buffer(2)]],
-    device uint* sortKeys [[buffer(3)]],
-    device uint* sortIndices [[buffer(4)]],
-    constant uint& tilesX [[buffer(5)]],
-    constant uint& maxPerTile [[buffer(6)]],
-    constant int& tileWidth [[buffer(7)]],
-    constant int& tileHeight [[buffer(8)]],
-    uint gid [[thread_position_in_grid]],
-    uint simdLane [[thread_index_in_simdgroup]],
-    uint simdGroupId [[simdgroup_index_in_threadgroup]],
-    uint tgId [[threadgroup_position_in_grid]]
-) {
-    // Each SIMD group (32 threads) processes gaussians cooperatively
-    // Thread group: multiple SIMD groups, each processing different gaussians
-    uint visibleCount = atomic_load_explicit((const device atomic_uint*)&header->totalAssignments, memory_order_relaxed);
-
-    // Calculate which gaussian this SIMD group is responsible for
-    uint simdGroupsPerTg = 4;  // 128 threads / 32 = 4 SIMD groups per threadgroup
-    uint globalSimdId = tgId * simdGroupsPerTg + simdGroupId;
-    uint gaussianIdx = globalSimdId;
-
-    if (gaussianIdx >= visibleCount) return;
-
-    // Lane 0 loads gaussian data
-    CompactedGaussian g;
-    float3 conic = 0;
-    float2 center = 0;
-    float power = 0;
-    uint depthKey = 0;
-    int minTX = 0, minTY = 0, maxTX = 0, maxTY = 0;
-
-    float opacity = 0;
-    if (simdLane == 0) {
-        g = compacted[gaussianIdx];
-        conic = g.covarianceDepth.xyz;
-        center = g.positionColor.xy;
-        half4 colorOp = LocalUnpackHalf4(g.positionColor.zw);
-        opacity = float(colorOp.w);
-        power = gaussianComputePower(opacity);
-        // 32-bit stable key: (depth16 << 16) | originalIdx for deterministic tie-breaking
-        // Use originalIdx (world buffer index) instead of compactedIdx to ensure determinism
-        uint depth16 = ((as_type<uint>(g.covarianceDepth.w) ^ 0x80000000u) >> 16u) & 0xFFFFu;
-        depthKey = (depth16 << 16) | (g.originalIdx & 0xFFFFu);
-        minTX = g.minTile.x;
-        minTY = g.minTile.y;
-        maxTX = g.maxTile.x;
-        maxTY = g.maxTile.y;
-    }
-    opacity = simd_shuffle(opacity, 0);
-
-    // Broadcast to all lanes in SIMD group
-    conic.x = simd_shuffle(conic.x, 0);
-    conic.y = simd_shuffle(conic.y, 0);
-    conic.z = simd_shuffle(conic.z, 0);
-    center.x = simd_shuffle(center.x, 0);
-    center.y = simd_shuffle(center.y, 0);
-    power = simd_shuffle(power, 0);
-    depthKey = simd_shuffle(depthKey, 0);
-    minTX = simd_shuffle(minTX, 0);
-    minTY = simd_shuffle(minTY, 0);
-    maxTX = simd_shuffle(maxTX, 0);
-    maxTY = simd_shuffle(maxTY, 0);
-
-    // Tile range
-    int tileRangeX = maxTX - minTX;
-    int tileRangeY = maxTY - minTY;
-    int totalTiles = tileRangeX * tileRangeY;
-
-    // Each lane handles a subset of tiles
-    for (int tileIdx = int(simdLane); tileIdx < totalTiles; tileIdx += 32) {
-        int localY = tileIdx / tileRangeX;
-        int localX = tileIdx % tileRangeX;
-        int tx = minTX + localX;
-        int ty = minTY + localY;
-
-        // Pixel bounds for intersection test
-        int2 pixMin = int2(tx * tileWidth, ty * tileHeight);
-        int2 pixMax = int2(pixMin.x + tileWidth - 1, pixMin.y + tileHeight - 1);
-
-        // Shared ellipse intersection test (from GaussianShared.h)
-        bool valid = gaussianIntersectsTile(pixMin, pixMax, center, conic, power);
-
-        // SIMD early-out: skip iteration if no lanes are valid
-        simd_vote ballot = simd_ballot(valid);
-        if (simd_vote::vote_t(ballot) == 0) continue;
-
-        // Valid lanes write to their tiles (parallel atomics across SIMD)
-        // Fixed layout: tileId * maxPerTile + localIdx (no prefix sum needed)
-        if (valid) {
-            uint tileId = uint(ty) * tilesX + uint(tx);
-            uint localIdx = atomic_fetch_add_explicit(&tileCounters[tileId], 1u, memory_order_relaxed);
-
-            if (localIdx < maxPerTile) {
-                uint writePos = tileId * maxPerTile + localIdx;
-                sortKeys[writePos] = depthKey;
-                sortIndices[writePos] = gaussianIdx;
-            }
-        }
-    }
-}
 
 // =============================================================================
 // KERNEL 5: PER-TILE BITONIC SORT (Optimized)
@@ -677,203 +519,19 @@ kernel void localPerTileSort16(
     }
 }
 
-// =============================================================================
-// OPTIMIZED SCATTER: Batched SIMD-cooperative with reduced atomic contention
-// =============================================================================
-// Optimization 1: Process multiple gaussians per SIMD group (better occupancy)
-// Optimization 2: Prefetch gaussian data while processing previous
-// Optimization 3: SIMD ballot to batch atomics across valid lanes
-
-kernel void localScatterSimd16(
-    const device CompactedGaussian* compacted [[buffer(0)]],
-    const device TileAssignmentHeader* header [[buffer(1)]],
-    device atomic_uint* tileCounters [[buffer(2)]],
-    device ushort* depthKeys16 [[buffer(3)]],      // 16-bit depth keys - used directly by sort16
-    device uint* globalIndices [[buffer(4)]],       // local → global mapping for render
-    constant uint& tilesX [[buffer(5)]],
-    constant uint& maxPerTile [[buffer(6)]],
-    constant int& tileWidth [[buffer(7)]],
-    constant int& tileHeight [[buffer(8)]],
-    uint gid [[thread_position_in_grid]],
-    uint simdLane [[thread_index_in_simdgroup]],
-    uint simdGroupId [[simdgroup_index_in_threadgroup]],
-    uint tgId [[threadgroup_position_in_grid]]
-) {
-    uint visibleCount = atomic_load_explicit((const device atomic_uint*)&header->totalAssignments, memory_order_relaxed);
-
-    uint simdGroupsPerTg = 4;
-    uint globalSimdId = tgId * simdGroupsPerTg + simdGroupId;
-    uint gaussianIdx = globalSimdId;
-
-    if (gaussianIdx >= visibleCount) return;
-
-    // Lane 0 loads gaussian data
-    CompactedGaussian g;
-    float3 conic = 0;
-    float2 center = 0;
-    float power = 0;
-    ushort depth16 = 0;
-    uint depthBits = 0;
-    uint originalIdx = 0;
-    int minTX = 0, minTY = 0, maxTX = 0, maxTY = 0;
-
-    float opacity16 = 0;
-    if (simdLane == 0) {
-        g = compacted[gaussianIdx];
-        conic = g.covarianceDepth.xyz;
-        center = g.positionColor.xy;
-        half4 colorOp = LocalUnpackHalf4(g.positionColor.zw);
-        opacity16 = float(colorOp.w);
-        power = gaussianComputePower(opacity16);
-        // Full depth bits for sort
-        depthBits = as_type<uint>(g.covarianceDepth.w);
-        originalIdx = g.originalIdx;
-        // 16-bit depth (for backwards compat)
-        depth16 = ushort((depthBits ^ 0x80000000u) >> 16u);
-        minTX = g.minTile.x;
-        minTY = g.minTile.y;
-        maxTX = g.maxTile.x;
-        maxTY = g.maxTile.y;
-    }
-
-    // Broadcast to all lanes via simd_shuffle
-    conic.x = simd_shuffle(conic.x, 0);
-    conic.y = simd_shuffle(conic.y, 0);
-    conic.z = simd_shuffle(conic.z, 0);
-    center.x = simd_shuffle(center.x, 0);
-    center.y = simd_shuffle(center.y, 0);
-    power = simd_shuffle(power, 0);
-    depth16 = simd_shuffle(depth16, 0);
-    minTX = simd_shuffle(minTX, 0);
-    minTY = simd_shuffle(minTY, 0);
-    maxTX = simd_shuffle(maxTX, 0);
-    maxTY = simd_shuffle(maxTY, 0);
-
-    int tileRangeX = maxTX - minTX;
-    int tileRangeY = maxTY - minTY;
-    int totalTiles = tileRangeX * tileRangeY;
-
-    // Process tiles in strided pattern for better cache locality
-    for (int tileIdx = int(simdLane); tileIdx < totalTiles; tileIdx += 32) {
-        int localY = tileIdx / tileRangeX;
-        int localX = tileIdx % tileRangeX;
-        int tx = minTX + localX;
-        int ty = minTY + localY;
-
-        int2 pixMin = int2(tx * tileWidth, ty * tileHeight);
-        int2 pixMax = int2(pixMin.x + tileWidth - 1, pixMin.y + tileHeight - 1);
-
-        // Shared ellipse intersection test (from GaussianShared.h)
-        bool valid = gaussianIntersectsTile(pixMin, pixMax, center, conic, power);
-
-        // SIMD early-out: skip iteration if no lanes are valid
-        simd_vote ballot = simd_ballot(valid);
-        if (simd_vote::vote_t(ballot) == 0) continue;
-
-        // Fixed layout: tileId * maxPerTile + localIdx
-        if (valid) {
-            uint tileId = uint(ty) * tilesX + uint(tx);
-            uint localIdx = atomic_fetch_add_explicit(&tileCounters[tileId], 1u, memory_order_relaxed);
-
-            if (localIdx < maxPerTile) {
-                uint writePos = tileId * maxPerTile + localIdx;
-                depthKeys16[writePos] = depth16;
-                globalIndices[writePos] = gaussianIdx;
-            }
-        }
-    }
-}
-
-kernel void localPerTileSort(
-    device uint* keys [[buffer(0)]],
-    device uint* values [[buffer(1)]],
-    const device uint* counts [[buffer(2)]],
-    constant uint& maxPerTile [[buffer(3)]],
-    uint tileId [[threadgroup_position_in_grid]],
-    ushort localId [[thread_position_in_threadgroup]],
-    ushort tgSize [[threads_per_threadgroup]]
-) {
-    // Fixed layout: each tile's data starts at tileId * maxPerTile
-    uint start = tileId * maxPerTile;
-    uint count = counts[tileId];
-
-    if (count <= 1) return;
-
-    uint n = min(count, uint(SORT_MAX_SIZE));
-
-    // 32-bit keys for stable sorting (depth16 << 16 | compactedIdx16)
-    // This allows deterministic tie-breaking when depths are equal
-    threadgroup uint sharedKeys[SORT_MAX_SIZE];
-    threadgroup uint sharedVals[SORT_MAX_SIZE];
-
-    // Pad to next power of 2
-    uint padded = 1;
-    while (padded < n) padded <<= 1;
-
-    // Parallel load with padding
-    for (uint i = localId; i < padded; i += tgSize) {
-        if (i < n) {
-            sharedKeys[i] = keys[start + i];  // Full 32-bit key
-            sharedVals[i] = values[start + i];
-        } else {
-            sharedKeys[i] = 0xFFFFFFFFu;  // Max key for padding
-            sharedVals[i] = 0;
-        }
-    }
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-
-    // Bitonic sort - each thread handles multiple elements per step
-    for (uint k = 2; k <= padded; k <<= 1) {
-        for (uint j = k >> 1; j > 0; j >>= 1) {
-            // Each thread processes elements strided by tgSize
-            for (uint i = localId; i < padded; i += tgSize) {
-                uint ixj = i ^ j;
-                if (ixj > i) {
-                    uint aKey = sharedKeys[i];
-                    uint bKey = sharedKeys[ixj];
-                    uint aVal = sharedVals[i];
-                    uint bVal = sharedVals[ixj];
-
-                    bool ascending = ((i & k) == 0);
-                    bool needSwap = ascending ? (aKey > bKey) : (aKey < bKey);
-
-                    if (needSwap) {
-                        sharedKeys[i] = bKey;
-                        sharedKeys[ixj] = aKey;
-                        sharedVals[i] = bVal;
-                        sharedVals[ixj] = aVal;
-                    }
-                }
-            }
-            threadgroup_barrier(mem_flags::mem_threadgroup);
-        }
-    }
-
-    // Parallel write back
-    for (uint i = localId; i < n; i += tgSize) {
-        keys[start + i] = uint(sharedKeys[i]);
-        values[start + i] = sharedVals[i];
-    }
-}
 
 // =============================================================================
-// KERNEL 6: RENDER (Templated - supports 32/16-bit, indirect dispatch)
+// KERNEL 6: RENDER (16-bit only, indirect dispatch)
 // =============================================================================
-// USE_16BIT: uses sortedLocalIdx + globalIndices instead of sortedIndices
+// Uses sortedLocalIdx + globalIndices for two-level indirection
 // Indirect dispatch: uses activeTileIndices to get tileId, framebuffer pre-cleared
 
-constant bool USE_16BIT_RENDER [[function_constant(2)]];
-
-template <bool USE_16BIT>
-kernel void localRenderImpl(
+kernel void localRender16(
     const device CompactedGaussian* compacted [[buffer(0)]],
     const device uint* counts [[buffer(1)]],
     constant uint& maxPerTile [[buffer(2)]],
-    // 32-bit: sortedIndices, 16-bit: sortedLocalIdx
-    const device void* sortBuffer [[buffer(3)]],
-    // 16-bit only: globalIndices (unused in 32-bit path)
-    const device uint* globalIndices [[buffer(4), function_constant(USE_16BIT_RENDER)]],
-    // Indirect dispatch: active tile indices
+    const device ushort* sortedLocalIdx [[buffer(3)]],
+    const device uint* globalIndices [[buffer(4)]],
     const device uint* activeTileIndices [[buffer(5)]],
     texture2d<half, access::write> colorOut [[texture(0)]],
     texture2d<half, access::write> depthOut [[texture(1)]],
@@ -907,10 +565,6 @@ kernel void localRenderImpl(
     half px0 = half(tileX * LOCAL_SORT_TILE_WIDTH + localId.x * LOCAL_SORT_PIXELS_X);
     half py0 = half(tileY * LOCAL_SORT_TILE_HEIGHT + localId.y * LOCAL_SORT_PIXELS_Y);
 
-    // Cast sort buffer to appropriate type
-    const device uint* sortedIndices32 = (const device uint*)sortBuffer;
-    const device ushort* sortedLocalIdx16 = (const device ushort*)sortBuffer;
-
     // Explicit accumulators - no arrays to prevent register spilling
     half3 c00 = 0, c10 = 0, c20 = 0, c30 = 0;
     half3 c01 = 0, c11 = 0, c21 = 0, c31 = 0;
@@ -919,19 +573,14 @@ kernel void localRenderImpl(
 
     // Process all gaussians
     for (uint i = 0; i < gaussCount; ++i) {
-        uint gIdx;
-        if (USE_16BIT) {
-            // Two-level indirection: sortedLocalIdx → globalIndices → compacted
-            ushort localSortedIdx = sortedLocalIdx16[offset + i];
-            gIdx = globalIndices[offset + localSortedIdx];
-        } else {
-            gIdx = sortedIndices32[offset + i];
-        }
+        // Two-level indirection: sortedLocalIdx → globalIndices → compacted
+        ushort localSortedIdx = sortedLocalIdx[offset + i];
+        uint gIdx = globalIndices[offset + localSortedIdx];
         CompactedGaussian g = compacted[gIdx];
 
         half2 gPos = half2(g.positionColor.xy);
         half3 cov = half3(g.covarianceDepth.xyz);
-        half4 colorOp = LocalUnpackHalf4(g.positionColor.zw);
+        half4 colorOp = localUnpackHalf4(g.positionColor.zw);
 
         half cxx = cov.x, cyy = cov.z, cxy2 = 2.0h * cov.y;
         half3 gColor = colorOp.xyz;
@@ -995,94 +644,16 @@ kernel void localRenderImpl(
     if (bx+3 < w && by+1 < h) { colorOut.write(half4(c31, 1.0h - t31), uint2(bx+3, by+1)); depthOut.write(half4(0), uint2(bx+3, by+1)); }
 }
 
-// Explicit instantiations
-template [[host_name("LocalRenderIndirect")]]
-kernel void localRenderImpl<false>(
-    const device CompactedGaussian*, const device uint*, constant uint&,
-    const device void*, const device uint*, const device uint*,
-    texture2d<half, access::write>, texture2d<half, access::write>,
-    constant RenderParams&, uint2, uint2, uint, uint);
-
-template [[host_name("LocalRenderIndirect16")]]
-kernel void localRenderImpl<true>(
-    const device CompactedGaussian*, const device uint*, constant uint&,
-    const device void*, const device uint*, const device uint*,
-    texture2d<half, access::write>, texture2d<half, access::write>,
-    constant RenderParams&, uint2, uint2, uint, uint);
-
 // =============================================================================
-// OPTIMIZED SCATTER: 32 gaussians per thread (3.9x speedup)
+// SPARSE SCATTER: No compaction, visibility via zero tile bounds
 // =============================================================================
-// The issue is "Compute Shader Launch Limiter: 100%" - too many threadgroups.
-// Solution: Each thread processes MANY gaussians (32) sequentially.
-// This reduces threadgroup count by 32x.
-
-#define V7_GAUSSIANS_PER_THREAD 32
-
-kernel void localScatterSimd16V7(
-    const device CompactedGaussian* compacted [[buffer(0)]],
-    const device TileAssignmentHeader* header [[buffer(1)]],
-    device atomic_uint* tileCounters [[buffer(2)]],
-    device ushort* depthKeys16 [[buffer(3)]],
-    device uint* globalIndices [[buffer(4)]],
-    constant uint& tilesX [[buffer(5)]],
-    constant uint& maxPerTile [[buffer(6)]],
-    constant int& tileWidth [[buffer(7)]],
-    constant int& tileHeight [[buffer(8)]],
-    uint gid [[thread_position_in_grid]]
-) {
-    uint visibleCount = atomic_load_explicit((const device atomic_uint*)&header->totalAssignments, memory_order_relaxed);
-
-    uint baseIdx = gid * V7_GAUSSIANS_PER_THREAD;
-
-    // Process 32 gaussians per thread
-    for (uint g = 0; g < V7_GAUSSIANS_PER_THREAD; g++) {
-        uint gaussianIdx = baseIdx + g;
-        if (gaussianIdx >= visibleCount) return;
-
-        CompactedGaussian gaussian = compacted[gaussianIdx];
-        float3 conic = gaussian.covarianceDepth.xyz;
-        float2 center = gaussian.positionColor.xy;
-        half4 colorOp = LocalUnpackHalf4(gaussian.positionColor.zw);
-        float power = gaussianComputePower(float(colorOp.w));
-        ushort depth16 = ushort((as_type<uint>(gaussian.covarianceDepth.w) ^ 0x80000000u) >> 16u);
-
-        int minTX = gaussian.minTile.x;
-        int minTY = gaussian.minTile.y;
-        int maxTX = gaussian.maxTile.x;
-        int maxTY = gaussian.maxTile.y;
-
-        for (int ty = minTY; ty < maxTY; ty++) {
-            for (int tx = minTX; tx < maxTX; tx++) {
-                int2 pixMin = int2(tx * tileWidth, ty * tileHeight);
-                int2 pixMax = int2(pixMin.x + tileWidth - 1, pixMin.y + tileHeight - 1);
-
-                if (gaussianIntersectsTile(pixMin, pixMax, center, conic, power)) {
-                    uint tileId = uint(ty) * tilesX + uint(tx);
-                    uint localIdx = atomic_fetch_add_explicit(&tileCounters[tileId], 1u, memory_order_relaxed);
-                    if (localIdx < maxPerTile) {
-                        uint writePos = tileId * maxPerTile + localIdx;
-                        depthKeys16[writePos] = depth16;
-                        globalIndices[writePos] = gaussianIdx;
-                    }
-                }
-            }
-        }
-    }
-}
-
-// =============================================================================
-// SPARSE SCATTER: No compaction, use visibility mask
-// =============================================================================
-// Experiment: Skip compaction entirely. Dispatch for ALL gaussians (2M),
-// use visibility mask to skip invisible ones. Trade-off: 75% threads wasted
-// but saves 5% compact kernel time.
+// Skip compaction entirely. Dispatch for ALL gaussians (2M).
+// Invisible gaussians have minTile == maxTile (zero), so loops naturally skip them.
 
 #define SPARSE_GAUSSIANS_PER_THREAD 32
 
 kernel void localScatterSimd16Sparse(
     const device CompactedGaussian* projected [[buffer(0)]],  // Sparse! Indexed by original gaussian ID
-    const device uint* visibilityMask [[buffer(1)]],          // Prefix sum (visibility[i] < visibility[i+1] means visible)
     device atomic_uint* tileCounters [[buffer(2)]],
     device ushort* depthKeys16 [[buffer(3)]],
     device uint* globalIndices [[buffer(4)]],
@@ -1100,15 +671,12 @@ kernel void localScatterSimd16Sparse(
         uint originalIdx = baseIdx + g;
         if (originalIdx >= gaussianCount) return;
 
-        // Check visibility via raw mark (0 = invisible, 1 = visible)
-        // No prefix sum needed in sparse mode!
-        if (visibilityMask[originalIdx] == 0) continue;  // Not visible, skip
-
         // Read from SPARSE projected buffer (indexed by original gaussian ID)
+        // Invisible gaussians have minTile == maxTile, so loops below won't execute
         CompactedGaussian gaussian = projected[originalIdx];
         float3 conic = gaussian.covarianceDepth.xyz;
         float2 center = gaussian.positionColor.xy;
-        half4 colorOp = LocalUnpackHalf4(gaussian.positionColor.zw);
+        half4 colorOp = localUnpackHalf4(gaussian.positionColor.zw);
         float power = gaussianComputePower(float(colorOp.w));
         ushort depth16 = ushort((as_type<uint>(gaussian.covarianceDepth.w) ^ 0x80000000u) >> 16u);
 
@@ -1117,6 +685,7 @@ kernel void localScatterSimd16Sparse(
         int maxTX = gaussian.maxTile.x;
         int maxTY = gaussian.maxTile.y;
 
+        // Loops naturally skip invisible gaussians (minTile == maxTile == 0)
         for (int ty = minTY; ty < maxTY; ty++) {
             for (int tx = minTX; tx < maxTX; tx++) {
                 int2 pixMin = int2(tx * tileWidth, ty * tileHeight);

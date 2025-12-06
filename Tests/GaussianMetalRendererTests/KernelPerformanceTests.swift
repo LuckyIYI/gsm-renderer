@@ -205,8 +205,7 @@ final class KernelPerformanceTests: XCTestCase {
                 maxGaussians: testCase.count,
                 maxWidth: width,
                 maxHeight: height,
-                precision: .float16,
-                sortMode: .sort16Bit
+                precision: .float16
             )
 
             let renderer = try LocalRenderer(config: config)
@@ -296,8 +295,7 @@ final class KernelPerformanceTests: XCTestCase {
                 maxGaussians: gaussianCount,
                 maxWidth: res.width,
                 maxHeight: res.height,
-                precision: .float16,
-                sortMode: .sort16Bit
+                precision: .float16
             )
 
             let renderer = try LocalRenderer(config: config)
@@ -358,7 +356,7 @@ final class KernelPerformanceTests: XCTestCase {
         print("\n" + String(repeating: "=", count: 60) + "\n")
     }
 
-    // MARK: - 32-bit vs 16-bit Sort Comparison
+    // MARK: - Sort Performance Test (16-bit only)
 
     func testSortModeComparison() throws {
         let testCases: [(count: Int, name: String)] = [
@@ -370,7 +368,7 @@ final class KernelPerformanceTests: XCTestCase {
         let height = 1080
 
         print("\n" + String(repeating: "=", count: 60))
-        print("SORT MODE COMPARISON (32-bit vs 16-bit)")
+        print("16-BIT SORT PERFORMANCE")
         print("Resolution: \(width)x\(height)")
         print("Device: \(self.device.name)")
         print(String(repeating: "=", count: 60))
@@ -380,27 +378,25 @@ final class KernelPerformanceTests: XCTestCase {
 
             let (positions, scales, rotations, opacities, colors) = self.generateGaussians(count: testCase.count)
 
-            // 32-bit sort
-            let config32 = RendererConfig(
+            let config = RendererConfig(
                 maxGaussians: testCase.count,
                 maxWidth: width,
                 maxHeight: height,
-                precision: .float16,
-                sortMode: .sort32Bit
+                precision: .float16
             )
 
-            let renderer32 = try LocalRenderer(config: config32)
+            let renderer = try LocalRenderer(config: config)
 
-            guard let buffers32 = self.createPackedBuffers(positions: positions, scales: scales,
-                                                           rotations: rotations, opacities: opacities, colors: colors)
+            guard let buffers = self.createPackedBuffers(positions: positions, scales: scales,
+                                                         rotations: rotations, opacities: opacities, colors: colors)
             else {
                 XCTFail("Failed to create buffers")
                 return
             }
 
-            let input32 = GaussianInput(
-                gaussians: buffers32.packedGaussians,
-                harmonics: buffers32.harmonics,
+            let input = GaussianInput(
+                gaussians: buffers.packedGaussians,
+                harmonics: buffers.harmonics,
                 gaussianCount: testCase.count,
                 shComponents: 0
             )
@@ -422,11 +418,11 @@ final class KernelPerformanceTests: XCTestCase {
                 focalY: Float(height) * f / 2
             )
 
-            let timing32 = self.measureKernel(name: "32-bit", warmup: 3, iterations: 10) {
+            let timing = self.measureKernel(name: "16-bit", warmup: 3, iterations: 10) {
                 guard let cb = self.queue.makeCommandBuffer() else { return }
-                _ = renderer32.render(
+                _ = renderer.render(
                     toTexture: cb,
-                    input: input32,
+                    input: input,
                     camera: camera,
                     width: width,
                     height: height,
@@ -436,49 +432,7 @@ final class KernelPerformanceTests: XCTestCase {
                 cb.waitUntilCompleted()
             }
 
-            // 16-bit sort
-            let config16 = RendererConfig(
-                maxGaussians: testCase.count,
-                maxWidth: width,
-                maxHeight: height,
-                precision: .float16,
-                sortMode: .sort16Bit
-            )
-
-            let renderer16 = try LocalRenderer(config: config16)
-
-            guard let buffers16 = self.createPackedBuffers(positions: positions, scales: scales,
-                                                           rotations: rotations, opacities: opacities, colors: colors)
-            else {
-                XCTFail("Failed to create buffers")
-                return
-            }
-
-            let input16 = GaussianInput(
-                gaussians: buffers16.packedGaussians,
-                harmonics: buffers16.harmonics,
-                gaussianCount: testCase.count,
-                shComponents: 0
-            )
-
-            let timing16 = self.measureKernel(name: "16-bit", warmup: 3, iterations: 10) {
-                guard let cb = self.queue.makeCommandBuffer() else { return }
-                _ = renderer16.render(
-                    toTexture: cb,
-                    input: input16,
-                    camera: camera,
-                    width: width,
-                    height: height,
-                    whiteBackground: false
-                )
-                cb.commit()
-                cb.waitUntilCompleted()
-            }
-
-            let speedup = timing32.avg / timing16.avg
-            print("  32-bit: \(String(format: "%.2f", timing32.avg))ms (\(String(format: "%.1f", 1000.0 / timing32.avg)) FPS)")
-            print("  16-bit: \(String(format: "%.2f", timing16.avg))ms (\(String(format: "%.1f", 1000.0 / timing16.avg)) FPS)")
-            print("  Speedup: \(String(format: "%.2f", speedup))x")
+            print("  Time: \(String(format: "%.2f", timing.avg))ms (\(String(format: "%.1f", 1000.0 / timing.avg)) FPS)")
         }
 
         print("\n" + String(repeating: "=", count: 60) + "\n")

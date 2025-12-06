@@ -1,13 +1,12 @@
 import GaussianMetalRendererTypes
 import Metal
 
-/// Encodes the render stage - blends sorted gaussians to output textures (indirect dispatch only)
+/// Encodes the render stage - blends sorted gaussians to output textures (16-bit, indirect dispatch only)
 public final class LocalRenderEncoder {
     // Indirect dispatch pipelines
     private let clearTexturesPipeline: MTLComputePipelineState
     private let prepareRenderDispatchPipeline: MTLComputePipelineState
-    private let renderIndirectPipeline: MTLComputePipelineState
-    private let renderIndirect16Pipeline: MTLComputePipelineState?
+    private let renderIndirect16Pipeline: MTLComputePipelineState
 
     /// Texture width for render texture (must match RENDER_TEX_WIDTH in shader)
     public static let renderTexWidth = 4096
@@ -22,30 +21,12 @@ public final class LocalRenderEncoder {
         self.clearTexturesPipeline = try device.makeComputePipelineState(function: clearFn)
         self.prepareRenderDispatchPipeline = try device.makeComputePipelineState(function: prepareFn)
 
-        // Create function constant values for 32-bit render (USE_16BIT_RENDER = false)
-        let constantValues32 = MTLFunctionConstantValues()
-        var use16Bit = false
-        constantValues32.setConstantValue(&use16Bit, type: .bool, index: 2)
-
-        guard let renderIndFn = try? library.makeFunction(name: "LocalRenderIndirect", constantValues: constantValues32) else {
-            fatalError("Failed to create LocalRenderIndirect function")
+        // 16-bit render pipeline
+        guard let renderInd16Fn = library.makeFunction(name: "localRender16") else {
+            fatalError("Missing localRender16 kernel")
         }
-        self.renderIndirectPipeline = try device.makeComputePipelineState(function: renderIndFn)
-
-        // Create function constant values for 16-bit render (USE_16BIT_RENDER = true)
-        let constantValues16 = MTLFunctionConstantValues()
-        var use16BitTrue = true
-        constantValues16.setConstantValue(&use16BitTrue, type: .bool, index: 2)
-
-        if let renderInd16Fn = try? library.makeFunction(name: "LocalRenderIndirect16", constantValues: constantValues16) {
-            self.renderIndirect16Pipeline = try? device.makeComputePipelineState(function: renderInd16Fn)
-        } else {
-            self.renderIndirect16Pipeline = nil
-        }
+        self.renderIndirect16Pipeline = try device.makeComputePipelineState(function: renderInd16Fn)
     }
-
-    /// Check if 16-bit render is available
-    public var has16BitRender: Bool { self.renderIndirect16Pipeline != nil }
 
     // MARK: - Indirect Dispatch Methods
 
@@ -102,59 +83,7 @@ public final class LocalRenderEncoder {
         encoder.endEncoding()
     }
 
-    /// Encode indirect render pass (only active tiles, 32-bit indices, fixed layout)
-    public func encodeIndirect(
-        commandBuffer: MTLCommandBuffer,
-        compactedGaussians: MTLBuffer,
-        tileCounts: MTLBuffer,
-        maxPerTile: Int,
-        sortedIndices: MTLBuffer,
-        activeTileIndices: MTLBuffer,
-        dispatchArgs: MTLBuffer,
-        colorTexture: MTLTexture,
-        depthTexture: MTLTexture,
-        tilesX: Int,
-        tilesY: Int,
-        width: Int,
-        height: Int,
-        tileWidth: Int,
-        tileHeight: Int,
-        whiteBackground: Bool = false
-    ) {
-        guard let encoder = commandBuffer.makeComputeCommandEncoder() else { return }
-        var maxPerTileU = UInt32(maxPerTile)
-
-        var params = RenderParams(
-            width: UInt32(width),
-            height: UInt32(height),
-            tileWidth: UInt32(tileWidth),
-            tileHeight: UInt32(tileHeight),
-            tilesX: UInt32(tilesX),
-            tilesY: UInt32(tilesY),
-            maxPerTile: UInt32(maxPerTile),
-            whiteBackground: whiteBackground ? 1 : 0,
-            activeTileCount: 0,
-            gaussianCount: 0
-        )
-
-        encoder.label = "Local_RenderIndirect"
-        encoder.setComputePipelineState(self.renderIndirectPipeline)
-        encoder.setBuffer(compactedGaussians, offset: 0, index: 0)
-        encoder.setBuffer(tileCounts, offset: 0, index: 1)
-        encoder.setBytes(&maxPerTileU, length: 4, index: 2)
-        encoder.setBuffer(sortedIndices, offset: 0, index: 3)
-        encoder.setBuffer(activeTileIndices, offset: 0, index: 5)
-        encoder.setTexture(colorTexture, index: 0)
-        encoder.setTexture(depthTexture, index: 1)
-        encoder.setBytes(&params, length: MemoryLayout<RenderParams>.stride, index: 6)
-
-        // 4×8 threadgroup for 16×16 tile (4×2 pixels per thread)
-        let tg = MTLSize(width: 4, height: 8, depth: 1)
-        encoder.dispatchThreadgroups(indirectBuffer: dispatchArgs, indirectBufferOffset: 0, threadsPerThreadgroup: tg)
-        encoder.endEncoding()
-    }
-
-    /// Encode indirect render pass (only active tiles, 16-bit indices, fixed layout)
+    /// Encode indirect render pass (16-bit indices, fixed layout)
     public func encodeIndirect16(
         commandBuffer: MTLCommandBuffer,
         compactedGaussians: MTLBuffer,
@@ -174,7 +103,6 @@ public final class LocalRenderEncoder {
         tileHeight: Int,
         whiteBackground: Bool = false
     ) {
-        guard let pipeline = renderIndirect16Pipeline else { return }
         guard let encoder = commandBuffer.makeComputeCommandEncoder() else { return }
         var maxPerTileU = UInt32(maxPerTile)
 
@@ -192,7 +120,7 @@ public final class LocalRenderEncoder {
         )
 
         encoder.label = "Local_RenderIndirect16"
-        encoder.setComputePipelineState(pipeline)
+        encoder.setComputePipelineState(renderIndirect16Pipeline)
         encoder.setBuffer(compactedGaussians, offset: 0, index: 0)
         encoder.setBuffer(tileCounts, offset: 0, index: 1)
         encoder.setBytes(&maxPerTileU, length: 4, index: 2)

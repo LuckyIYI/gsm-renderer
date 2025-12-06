@@ -127,54 +127,58 @@ final class LocalUnitTests: XCTestCase {
         }
     }
 
-    // MARK: - Per-Tile Sort Tests
+    // MARK: - Per-Tile Sort Tests (16-bit)
 
     func testPerTileSortCorrectness() throws {
         let sortEncoder = try LocalSortEncoder(library: library, device: device)
 
-        // Test 4 tiles with known data
+        // Test 4 tiles with known data (16-bit sort)
         let tileCount = 4
         let maxPerTile = 64
         let totalAssignments = tileCount * maxPerTile
 
-        // Generate sort keys: [depth:32] for each tile
-        // Data layout: tile i's data at i * maxPerTile
-        var sortKeys = [UInt32](repeating: 0, count: totalAssignments)
-        var sortIndices = [Int32](repeating: 0, count: totalAssignments)
+        // Generate 16-bit depth keys
+        var depthKeys16 = [UInt16](repeating: 0, count: totalAssignments)
+        var globalIndices = [UInt32](repeating: 0, count: totalAssignments)
         let tileCounts = [UInt32](repeating: UInt32(maxPerTile), count: tileCount)
 
-        // Fill each tile with random depths (fixed layout: tile * maxPerTile)
         srand48(42)
         for tile in 0 ..< tileCount {
             let offset = tile * maxPerTile
             for j in 0 ..< maxPerTile {
-                let depth = UInt32(drand48() * 65535.0)
-                sortKeys[offset + j] = depth
-                sortIndices[offset + j] = Int32(offset + j)
+                depthKeys16[offset + j] = UInt16(drand48() * 65535.0)
+                globalIndices[offset + j] = UInt32(offset + j)
             }
         }
 
-        // CPU reference: sort each tile
-        var expectedKeys = sortKeys
+        // CPU reference: compute expected sorted order
+        // The 16-bit sort creates 32-bit keys as (depth16 << 16) | localIdx
+        var expectedSortedIdx = [UInt16](repeating: 0, count: totalAssignments)
         for tile in 0 ..< tileCount {
             let offset = tile * maxPerTile
-            let tileSlice = Array(expectedKeys[offset ..< (offset + maxPerTile)])
-            let sorted = tileSlice.sorted()
+            var keysWithIdx = [(key: UInt32, localIdx: UInt16)]()
             for j in 0 ..< maxPerTile {
-                expectedKeys[offset + j] = sorted[j]
+                let key = (UInt32(depthKeys16[offset + j]) << 16) | UInt32(j)
+                keysWithIdx.append((key, UInt16(j)))
+            }
+            keysWithIdx.sort { $0.key < $1.key }
+            for j in 0 ..< maxPerTile {
+                expectedSortedIdx[offset + j] = keysWithIdx[j].localIdx
             }
         }
 
         // GPU buffers
-        let sortKeysBuffer = self.device.makeBuffer(bytes: sortKeys, length: totalAssignments * 4, options: .storageModeShared)!
-        let sortIndicesBuffer = self.device.makeBuffer(bytes: sortIndices, length: totalAssignments * 4, options: .storageModeShared)!
+        let depthKeys16Buffer = self.device.makeBuffer(bytes: depthKeys16, length: totalAssignments * 2, options: .storageModeShared)!
+        let globalIndicesBuffer = self.device.makeBuffer(bytes: globalIndices, length: totalAssignments * 4, options: .storageModeShared)!
+        let sortedLocalIdxBuffer = self.device.makeBuffer(length: totalAssignments * 2, options: .storageModeShared)!
         let tileCountsBuffer = self.device.makeBuffer(bytes: tileCounts, length: tileCount * 4, options: .storageModeShared)!
 
         let cb = self.queue.makeCommandBuffer()!
-        sortEncoder.encode(
+        sortEncoder.encode16(
             commandBuffer: cb,
-            sortKeys: sortKeysBuffer,
-            sortIndices: sortIndicesBuffer,
+            depthKeys16: depthKeys16Buffer,
+            globalIndices: globalIndicesBuffer,
+            sortedLocalIdx: sortedLocalIdxBuffer,
             tileCounts: tileCountsBuffer,
             maxPerTile: maxPerTile,
             tileCount: tileCount
@@ -182,19 +186,10 @@ final class LocalUnitTests: XCTestCase {
         cb.commit()
         cb.waitUntilCompleted()
 
-        // Verify each tile is sorted
-        let gpuKeys = sortKeysBuffer.contents().bindMemory(to: UInt32.self, capacity: totalAssignments)
-        for tile in 0 ..< tileCount {
-            let offset = tile * maxPerTile
-            for j in 0 ..< (maxPerTile - 1) {
-                XCTAssertLessThanOrEqual(gpuKeys[offset + j], gpuKeys[offset + j + 1],
-                                         "Tile \(tile) not sorted at position \(j): \(gpuKeys[offset + j]) > \(gpuKeys[offset + j + 1])")
-            }
-        }
-
-        // Verify keys match expected
+        // Verify sorted local indices match expected
+        let gpuSortedIdx = sortedLocalIdxBuffer.contents().bindMemory(to: UInt16.self, capacity: totalAssignments)
         for i in 0 ..< totalAssignments {
-            XCTAssertEqual(gpuKeys[i], expectedKeys[i], "Key mismatch at \(i)")
+            XCTAssertEqual(gpuSortedIdx[i], expectedSortedIdx[i], "Sorted index mismatch at \(i)")
         }
     }
 
@@ -203,34 +198,36 @@ final class LocalUnitTests: XCTestCase {
 
         // Test with variable tile counts (fixed layout: maxPerTile per tile)
         let tileCount = 8
-        let maxPerTile = 128 // Fixed layout - each tile gets maxPerTile slots
+        let maxPerTile = 128
         let tileCounts: [UInt32] = [10, 50, 5, 100, 25, 0, 75, 30]
         let totalSize = tileCount * maxPerTile
 
-        // Generate data using fixed layout
-        var sortKeys = [UInt32](repeating: 0xFFFF_FFFF, count: totalSize)
-        var sortIndices = [Int32](repeating: 0, count: totalSize)
+        // Generate 16-bit depth keys with variable counts
+        var depthKeys16 = [UInt16](repeating: 0xFFFF, count: totalSize)
+        var globalIndices = [UInt32](repeating: 0, count: totalSize)
 
         srand48(123)
         for tile in 0 ..< tileCount {
             let offset = tile * maxPerTile
             let count = Int(tileCounts[tile])
             for j in 0 ..< count {
-                sortKeys[offset + j] = UInt32(drand48() * 65535.0)
-                sortIndices[offset + j] = Int32(offset + j)
+                depthKeys16[offset + j] = UInt16(drand48() * 65535.0)
+                globalIndices[offset + j] = UInt32(offset + j)
             }
         }
 
         // GPU buffers
-        let sortKeysBuffer = self.device.makeBuffer(bytes: sortKeys, length: totalSize * 4, options: .storageModeShared)!
-        let sortIndicesBuffer = self.device.makeBuffer(bytes: sortIndices, length: totalSize * 4, options: .storageModeShared)!
+        let depthKeys16Buffer = self.device.makeBuffer(bytes: depthKeys16, length: totalSize * 2, options: .storageModeShared)!
+        let globalIndicesBuffer = self.device.makeBuffer(bytes: globalIndices, length: totalSize * 4, options: .storageModeShared)!
+        let sortedLocalIdxBuffer = self.device.makeBuffer(length: totalSize * 2, options: .storageModeShared)!
         let tileCountsBuffer = self.device.makeBuffer(bytes: tileCounts, length: tileCount * 4, options: .storageModeShared)!
 
         let cb = self.queue.makeCommandBuffer()!
-        sortEncoder.encode(
+        sortEncoder.encode16(
             commandBuffer: cb,
-            sortKeys: sortKeysBuffer,
-            sortIndices: sortIndicesBuffer,
+            depthKeys16: depthKeys16Buffer,
+            globalIndices: globalIndicesBuffer,
+            sortedLocalIdx: sortedLocalIdxBuffer,
             tileCounts: tileCountsBuffer,
             maxPerTile: maxPerTile,
             tileCount: tileCount
@@ -238,15 +235,19 @@ final class LocalUnitTests: XCTestCase {
         cb.commit()
         cb.waitUntilCompleted()
 
-        // Verify each tile is sorted
-        let gpuKeys = sortKeysBuffer.contents().bindMemory(to: UInt32.self, capacity: totalSize)
+        // Verify each tile's sorted output is in order by depth
+        let gpuSortedIdx = sortedLocalIdxBuffer.contents().bindMemory(to: UInt16.self, capacity: totalSize)
         for tile in 0 ..< tileCount {
-            let tileOffset = tile * maxPerTile // Fixed layout
+            let offset = tile * maxPerTile
             let count = Int(tileCounts[tile])
             guard count > 1 else { continue }
             for j in 0 ..< (count - 1) {
-                XCTAssertLessThanOrEqual(gpuKeys[tileOffset + j], gpuKeys[tileOffset + j + 1],
-                                         "Tile \(tile) not sorted at position \(j)")
+                let idx1 = Int(gpuSortedIdx[offset + j])
+                let idx2 = Int(gpuSortedIdx[offset + j + 1])
+                let depth1 = depthKeys16[offset + idx1]
+                let depth2 = depthKeys16[offset + idx2]
+                XCTAssertLessThanOrEqual(depth1, depth2,
+                                         "Tile \(tile) not sorted at position \(j): depth \(depth1) > \(depth2)")
             }
         }
     }

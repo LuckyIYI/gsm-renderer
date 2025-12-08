@@ -88,6 +88,114 @@ public struct StereoRenderOutput: Sendable {
     }
 }
 
+// MARK: - Foveated Stereo Rendering Types
+
+/// Texture layout for foveated stereo rendering
+public enum StereoTextureLayout: Sendable {
+    /// Two array slices in a single texture (recommended for Vision Pro)
+    case layered
+    /// Two separate textures, one per eye
+    case dedicated
+    /// Single texture with two viewports side by side
+    case shared
+}
+
+/// Per-eye view configuration for foveated stereo rendering
+public struct FoveatedEyeView: Sendable {
+    /// The viewport for this eye within the render target
+    public let viewport: MTLViewport
+    /// View matrix for this eye
+    public let viewMatrix: simd_float4x4
+    /// Projection matrix for this eye
+    public let projectionMatrix: simd_float4x4
+    /// Camera position in world space
+    public let cameraPosition: SIMD3<Float>
+    /// Focal length X
+    public let focalX: Float
+    /// Focal length Y
+    public let focalY: Float
+    /// Near plane
+    public let near: Float
+    /// Far plane
+    public let far: Float
+    /// Render target array index (for layered layout)
+    public let renderTargetArrayIndex: Int
+
+    public init(
+        viewport: MTLViewport,
+        viewMatrix: simd_float4x4,
+        projectionMatrix: simd_float4x4,
+        cameraPosition: SIMD3<Float>,
+        focalX: Float,
+        focalY: Float,
+        near: Float = 0.1,
+        far: Float = 10.0,
+        renderTargetArrayIndex: Int = 0
+    ) {
+        self.viewport = viewport
+        self.viewMatrix = viewMatrix
+        self.projectionMatrix = projectionMatrix
+        self.cameraPosition = cameraPosition
+        self.focalX = focalX
+        self.focalY = focalY
+        self.near = near
+        self.far = far
+        self.renderTargetArrayIndex = renderTargetArrayIndex
+    }
+}
+
+/// Configuration for foveated stereo rendering with Vision Pro Compositor Services
+public struct FoveatedStereoConfiguration: Sendable {
+    /// Left eye view configuration
+    public let leftEye: FoveatedEyeView
+    /// Right eye view configuration
+    public let rightEye: FoveatedEyeView
+    /// Position used for depth sorting (typically midpoint between eyes)
+    public let sortPosition: SIMD3<Float>
+    /// Texture layout being used
+    public let layout: StereoTextureLayout
+
+    public init(
+        leftEye: FoveatedEyeView,
+        rightEye: FoveatedEyeView,
+        sortPosition: SIMD3<Float>? = nil,
+        layout: StereoTextureLayout = .layered
+    ) {
+        self.leftEye = leftEye
+        self.rightEye = rightEye
+        self.sortPosition = sortPosition ?? (leftEye.cameraPosition + rightEye.cameraPosition) * 0.5
+        self.layout = layout
+    }
+}
+
+/// Drawable output for foveated stereo rendering (from Compositor Services)
+public struct FoveatedStereoDrawable: Sendable {
+    /// Color texture - either a texture array (layered) or single texture (shared/dedicated)
+    public let colorTexture: MTLTexture
+    /// Depth texture (optional) - matches colorTexture format
+    public let depthTexture: MTLTexture?
+    /// Rasterization rate map for foveated rendering (from Compositor Services)
+    public let rasterizationRateMap: MTLRasterizationRateMap?
+    /// Color texture pixel format
+    public let colorPixelFormat: MTLPixelFormat
+    /// Depth texture pixel format (if depth texture provided)
+    public let depthPixelFormat: MTLPixelFormat
+
+    public init(
+        colorTexture: MTLTexture,
+        depthTexture: MTLTexture?,
+        rasterizationRateMap: MTLRasterizationRateMap?,
+        colorPixelFormat: MTLPixelFormat = .bgra8Unorm_srgb,
+        depthPixelFormat: MTLPixelFormat = .depth32Float
+    ) {
+        self.colorTexture = colorTexture
+        self.depthTexture = depthTexture
+        self.rasterizationRateMap = rasterizationRateMap
+        self.colorPixelFormat = colorPixelFormat
+        self.depthPixelFormat = depthPixelFormat
+    }
+}
+
 public struct RendererConfig: Sendable {
     public let maxGaussians: Int
     public let maxWidth: Int

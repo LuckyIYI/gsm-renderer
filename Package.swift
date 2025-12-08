@@ -30,10 +30,12 @@ let package = Package(
                 "GlobalRenderer/GlobalShaders.air",
                 "LocalRenderer/LocalShaders.air",
                 "DepthFirstRenderer/DepthFirstShaders.air",
+                "DepthFirstRenderer/FoveatedStereoShaders.air",
                 // Metal source files (kept for reference, compiled separately)
                 "GlobalRenderer/GlobalShaders.metal",
                 "LocalRenderer/LocalShaders.metal",
                 "DepthFirstRenderer/DepthFirstShaders.metal",
+                "DepthFirstRenderer/FoveatedStereoShaders.metal",
             ],
             resources: [
                 // Pre-compiled Metal libraries (run ./compile_shaders.sh to rebuild)

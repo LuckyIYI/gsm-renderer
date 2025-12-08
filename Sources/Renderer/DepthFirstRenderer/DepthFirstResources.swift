@@ -77,7 +77,7 @@ final class DepthFirstViewResources {
         let tileCount = max(1, tilesX * tilesY)
         self.tileCount = tileCount
 
-        let maxInstances = maxGaussians * 8
+        let maxInstances = maxGaussians * 4
         self.maxInstances = maxInstances
 
         // Padded capacities for radix sort alignment

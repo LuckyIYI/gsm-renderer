@@ -765,8 +765,8 @@ kernel void radixScanBlocksKernel(
     }
 }
 
-// Parallel exclusive scan - 256 threads, up to 8192 elements
-#define RADIX_SCAN_GRAIN 32
+// Parallel exclusive scan - 256 threads, up to 16384 elements (~16M instances)
+#define RADIX_SCAN_GRAIN 64
 
 // Each thread handles RADIX_SCAN_GRAIN elements, sums them, scans sums, then applies back
 kernel void radixExclusiveScanKernel(

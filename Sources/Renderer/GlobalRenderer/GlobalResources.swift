@@ -75,7 +75,7 @@ final class GlobalViewResources {
         let tilesY = (maxHeight + tileHeight - 1) / tileHeight
         let tileCount = max(1, tilesX * tilesY)
 
-        let gaussianTileCapacity = maxGaussians * 8
+        let gaussianTileCapacity = maxGaussians * 4
         let maxAssignmentCapacity = gaussianTileCapacity
         self.tileAssignmentMaxAssignments = maxAssignmentCapacity
 

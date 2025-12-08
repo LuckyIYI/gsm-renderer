@@ -372,8 +372,8 @@ kernel void tileRadixScanBlocksKernel(
     }
 }
 
-// Tile exclusive scan kernel (handles up to 8192 block sums)
-#define TILE_RADIX_SCAN_GRAIN 32
+// Tile exclusive scan kernel (handles up to 16384 block sums = ~16M instances)
+#define TILE_RADIX_SCAN_GRAIN 64
 
 kernel void tileRadixExclusiveScanKernel(
     device uint* blockSums [[buffer(0)]],

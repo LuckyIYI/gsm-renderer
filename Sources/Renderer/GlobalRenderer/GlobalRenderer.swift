@@ -413,7 +413,7 @@ public final class GlobalRenderer: GaussianRenderer, @unchecked Sendable {
             throw RendererError.invalidTileCount(provided: tileCount, maximum: self.limits.maxTileCount)
         }
 
-        let requiredCapacity = gaussianCount * 8
+        let requiredCapacity = gaussianCount * 4
         guard requiredCapacity <= frame.tileAssignmentMaxAssignments else {
             throw RendererError.invalidAssignmentCapacity(required: requiredCapacity, available: frame.tileAssignmentMaxAssignments)
         }

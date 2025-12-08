@@ -770,7 +770,7 @@ final class DepthFirstUnitTests: XCTestCase {
         let tilesX = (width + 31) / 32
         let tilesY = (height + 15) / 16
         let tileCount = tilesX * tilesY
-        let maxInstances = min(gaussianCount * 32, tileCount * 2048)
+        let maxInstances = gaussianCount * 32
         print("\nMax instances: \(maxInstances)")
         print("Instance utilization: \(Float(header.totalInstances) / Float(maxInstances) * 100)%")
 

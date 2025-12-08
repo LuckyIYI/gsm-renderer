@@ -8,7 +8,7 @@ import XCTest
 /// Standard near/far planes for test cameras
 enum TestCameraDefaults {
     static let near: Float = 0.1
-    static let far: Float = 100.0
+    static let far: Float = 10.0
     static let fovDegrees: Float = 60.0
 }
 

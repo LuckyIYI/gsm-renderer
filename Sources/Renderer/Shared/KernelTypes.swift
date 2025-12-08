@@ -129,7 +129,6 @@ extension RenderParams {
         tileHeight: UInt32,
         tilesX: UInt32,
         tilesY: UInt32,
-        maxPerTile: UInt32,
         activeTileCount: UInt32,
         gaussianCount: UInt32
     ) {
@@ -140,7 +139,6 @@ extension RenderParams {
         self.tileHeight = tileHeight
         self.tilesX = tilesX
         self.tilesY = tilesY
-        self.maxPerTile = maxPerTile
         self.activeTileCount = activeTileCount
         self.gaussianCount = gaussianCount
     }
@@ -171,8 +169,8 @@ extension TileBinningParams {
         surfaceWidth: UInt32,
         surfaceHeight: UInt32,
         maxCapacity: UInt32,
-        alphaThreshold: Float = 0.005,
-        totalInkThreshold: Float = 3.0
+        alphaThreshold: Float,
+        totalInkThreshold: Float
     ) {
         self.init()
         self.gaussianCount = gaussianCount

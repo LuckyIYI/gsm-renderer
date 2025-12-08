@@ -9,19 +9,17 @@ struct RendererLimits: Sendable {
     let maxHeight: Int
     let tileWidth: Int
     let tileHeight: Int
-    let maxPerTile: Int
 
     var tilesX: Int { (self.maxWidth + self.tileWidth - 1) / self.tileWidth }
     var tilesY: Int { (self.maxHeight + self.tileHeight - 1) / self.tileHeight }
     var maxTileCount: Int { max(1, self.tilesX * self.tilesY) }
 
-    init(from config: RendererConfig, tileWidth: Int = 32, tileHeight: Int = 16, maxPerTile: Int = 2048) {
+    init(from config: RendererConfig, tileWidth: Int = 32, tileHeight: Int = 16,) {
         self.maxGaussians = max(1, config.maxGaussians)
         self.maxWidth = max(1, config.maxWidth)
         self.maxHeight = max(1, config.maxHeight)
         self.tileWidth = max(1, tileWidth)
         self.tileHeight = max(1, tileHeight)
-        self.maxPerTile = max(1, maxPerTile)
     }
 
     func buildParams(from frame: FrameParams) -> RenderParams {
@@ -32,13 +30,12 @@ struct RendererLimits: Sendable {
             tileHeight: UInt32(self.tileHeight),
             tilesX: UInt32(self.tilesX),
             tilesY: UInt32(self.tilesY),
-            maxPerTile: UInt32(self.maxPerTile),
             activeTileCount: 0,
             gaussianCount: UInt32(frame.gaussianCount)
         )
     }
 
-    func buildBinningParams(gaussianCount: Int, alphaThreshold: Float = 0.005, totalInkThreshold: Float = 3.0) -> TileBinningParams {
+    func buildBinningParams(gaussianCount: Int) -> TileBinningParams {
         TileBinningParams(
             gaussianCount: UInt32(gaussianCount),
             tilesX: UInt32(self.tilesX),
@@ -48,27 +45,17 @@ struct RendererLimits: Sendable {
             surfaceWidth: UInt32(self.maxWidth),
             surfaceHeight: UInt32(self.maxHeight),
             maxCapacity: UInt32(gaussianCount),
-            alphaThreshold: alphaThreshold,
-            totalInkThreshold: totalInkThreshold
+            alphaThreshold: 0.005,
+            totalInkThreshold: 3.0
         )
     }
 }
 
-struct GlobalResourceLayout {
-    let limits: RendererLimits
-    /// Maximum tile assignments capacity (tileCount * maxPerTile, clamped by gaussianCapacity)
-    let maxAssignmentCapacity: Int
-    /// Padded capacity for radix sort alignment (1024-aligned)
-    let paddedCapacity: Int
-    let bufferAllocations: [(label: String, length: Int, options: MTLResourceOptions)]
-    let precisionStride: Int
-}
 
 public final class GlobalRenderer: GaussianRenderer, @unchecked Sendable {
-    private static let maxSupportedGaussians = 10_000_000
+    private static let maxSupportedGaussians = 30_000_000
     private static let tileWidth = 32
     private static let tileHeight = 16
-    private static let maxPerTile = 2048
     private static let dispatchArgsSize = 10 * MemoryLayout<DispatchIndirectArgsSwift>.stride
 
     public let device: MTLDevice
@@ -145,22 +132,25 @@ public final class GlobalRenderer: GaussianRenderer, @unchecked Sendable {
         }
         self.resetTileBuilderStatePipeline = try device.makeComputePipelineState(function: resetFn)
 
-        // Compute limits and layout
+        // Compute limits
         self.limits = RendererLimits(
             from: config,
             tileWidth: GlobalRenderer.tileWidth,
             tileHeight: GlobalRenderer.tileHeight,
-            maxPerTile: GlobalRenderer.maxPerTile
-        )
-
-        let resourceLayout = GlobalRenderer.computeLayout(
-            limits: self.limits,
-            precision: config.precision,
-            radixSortEncoder: self.radixSortEncoder
         )
 
         // Initialize stereo resources (left for mono, both for stereo)
-        self.stereoResources = try GlobalMultiViewResources(device: device, layout: resourceLayout)
+        self.stereoResources = try GlobalMultiViewResources(
+            device: device,
+            maxGaussians: limits.maxGaussians,
+            maxWidth: limits.maxWidth,
+            maxHeight: limits.maxHeight,
+            tileWidth: limits.tileWidth,
+            tileHeight: limits.tileHeight,
+            radixBlockSize: radixSortEncoder.blockSize,
+            radixGrainSize: radixSortEncoder.grainSize,
+            precision: config.precision
+        )
 
         // Allocate projection caches (per-eye for stereo)
         let g = self.limits.maxGaussians
@@ -285,109 +275,6 @@ public final class GlobalRenderer: GaussianRenderer, @unchecked Sendable {
         )
     }
 
-    private static func computeLayout(
-        limits: RendererLimits,
-        precision: Precision,
-        radixSortEncoder: RadixSortEncoder
-    ) -> GlobalResourceLayout {
-        let gaussianCapacity = limits.maxGaussians
-        let tileCount = limits.maxTileCount
-
-        let tileCapacity = tileCount * limits.maxPerTile
-        let gaussianTileCapacity = gaussianCapacity * 32
-        let maxAssignmentCapacity = min(tileCapacity, gaussianTileCapacity)
-
-        // paddedCapacity: 1024-aligned for radix sort (blockSize * grainSize)
-        let block = radixSortEncoder.blockSize * radixSortEncoder.grainSize
-        let paddedCapacity = ((maxAssignmentCapacity + block - 1) / block) * block
-
-        let strideForPrecision: Int = (precision == .float16) ? 2 : 4
-        let half2Stride = MemoryLayout<UInt16>.stride * 2
-        let half4Stride = MemoryLayout<UInt16>.stride * 4
-        func strideForMeans() -> Int { precision == .float16 ? half2Stride : 8 }
-        func strideForConics() -> Int { precision == .float16 ? half4Stride : 16 }
-        func strideForColors() -> Int { precision == .float16 ? MemoryLayout<UInt16>.stride * 3 : 12 }
-        func strideForOpacities() -> Int { precision == .float16 ? MemoryLayout<UInt16>.stride : 4 }
-        func strideForDepths() -> Int { precision == .float16 ? MemoryLayout<UInt16>.stride : 4 }
-        // Metal half4 requires 8-byte alignment (28 bytes) + struct padding to 32 for stride
-        func strideForInterleaved() -> Int { precision == .float16 ? 32 : 48 }
-
-        let prefixBlockSize = 256
-        let prefixGrainSize = 4
-        let elementsPerGroup = prefixBlockSize * prefixGrainSize
-        let groups = (gaussianCapacity + elementsPerGroup - 1) / elementsPerGroup
-
-        var bufferAllocations: [(label: String, length: Int, options: MTLResourceOptions)] = []
-        func add(_ label: String, _ length: Int, _ opts: MTLResourceOptions = .storageModePrivate) {
-            bufferAllocations.append((label, max(1, length), opts))
-        }
-
-        // Shared allocations (CPU-visible)
-        add("TileHeader", MemoryLayout<TileAssignmentHeaderSwift>.stride, .storageModeShared)
-        add("ActiveTileCount", MemoryLayout<UInt32>.stride, .storageModeShared)
-
-        // Per-gaussian buffers (sized to gaussianCapacity)
-        add("Bounds", gaussianCapacity * MemoryLayout<SIMD4<Int32>>.stride)
-        add("Coverage", gaussianCapacity * MemoryLayout<UInt32>.stride)
-        add("Offsets", (gaussianCapacity + 1) * MemoryLayout<UInt32>.stride)
-        add("PartialSums", max(groups, 1) * MemoryLayout<UInt32>.stride)
-        add("ScatterDispatch", 3 * MemoryLayout<UInt32>.stride)
-
-        // Tile assignment buffers (sized to paddedCapacity for sort alignment)
-        add("TileIndices", paddedCapacity * MemoryLayout<Int32>.stride)
-        add("TileIds", paddedCapacity * MemoryLayout<Int32>.stride)
-
-        // Ordered/packed buffers (sized to maxAssignmentCapacity)
-        add("OrderedHeaders", tileCount * MemoryLayout<GaussianHeader>.stride)
-        add("PackedMeans", maxAssignmentCapacity * strideForMeans())
-        add("PackedConics", maxAssignmentCapacity * strideForConics())
-        add("PackedColors", maxAssignmentCapacity * strideForColors())
-        add("PackedOpacities", maxAssignmentCapacity * strideForOpacities())
-        add("PackedDepths", maxAssignmentCapacity * strideForDepths())
-        add("ActiveTileIndices", tileCount * MemoryLayout<UInt32>.stride)
-
-        // Sort key/index buffers (sized to paddedCapacity for sort alignment)
-        // Keys are now single uint32: [tile:16][depth:16]
-        add("SortKeys", paddedCapacity * MemoryLayout<UInt32>.stride)
-        add("SortedIndices", paddedCapacity * MemoryLayout<Int32>.stride)
-
-        // Radix sort buffers (gridCapacity sized for worst-case)
-        let valuesPerGroup = radixSortEncoder.blockSize * radixSortEncoder.grainSize
-        let gridCapacity = max(1, (maxAssignmentCapacity + valuesPerGroup - 1) / valuesPerGroup)
-        let histogramCapacity = gridCapacity * radixSortEncoder.radix
-        add("RadixHist", histogramCapacity * MemoryLayout<UInt32>.stride)
-        add("RadixBlockSums", gridCapacity * MemoryLayout<UInt32>.stride)
-        add("RadixScanned", histogramCapacity * MemoryLayout<UInt32>.stride)
-        // Scratch buffers for ping-pong during radix sort
-        add("RadixScratch", maxAssignmentCapacity * MemoryLayout<UInt32>.stride)
-        add("RadixPayload", maxAssignmentCapacity * MemoryLayout<UInt32>.stride)
-
-        // Interleaved gaussian data
-        add("InterleavedGaussians", gaussianCapacity * strideForInterleaved())
-
-        // Two-pass tile assignment scratch buffer (hierarchical prefix sum block sums)
-        // Block size is 256, so numBlocks = ceil(gaussianCapacity / 256)
-        // For hierarchical scan: level1 needs numBlocks+1, level2 needs level2Blocks+1
-        let tileAssignBlockSize = 256
-        let tileAssignNumBlocks = (gaussianCapacity + tileAssignBlockSize - 1) / tileAssignBlockSize
-        let tileAssignLevel2Blocks = (tileAssignNumBlocks + tileAssignBlockSize - 1) / tileAssignBlockSize
-        let tileAssignBlockSumsSize = (tileAssignNumBlocks + 1 + tileAssignLevel2Blocks + 1) * MemoryLayout<UInt32>.stride
-        add("TileAssignBlockSums", tileAssignBlockSumsSize)
-
-        // Indirect dispatch buffers for compacted visible gaussians
-        add("VisibleIndices", gaussianCapacity * MemoryLayout<UInt32>.stride)
-        add("VisibleCount", MemoryLayout<UInt32>.stride, .storageModeShared) // Atomic counter
-        add("TileAssignDispatchArgs", 12) // MTLDispatchThreadgroupsIndirectArguments (3 x uint32)
-
-        return GlobalResourceLayout(
-            limits: limits,
-            maxAssignmentCapacity: maxAssignmentCapacity,
-            paddedCapacity: paddedCapacity,
-            bufferAllocations: bufferAllocations,
-            precisionStride: strideForPrecision
-        )
-    }
-
     func encodeRenderToTextures(
         commandBuffer: MTLCommandBuffer,
         gaussianCount: Int,
@@ -432,15 +319,12 @@ public final class GlobalRenderer: GaussianRenderer, @unchecked Sendable {
             return false
         }
 
-        guard let projectionOutput = self.prepareProjectionOutput(
+        let projectionOutput = self.prepareProjectionOutput(
             frame: frame,
             boundsCache: boundsCache,
             maskCache: maskCache
-        ) else {
-            return false
-        }
+        )
 
-        // Fused projection + tile bounds (single pass)
         let binningParams = self.limits.buildBinningParams(gaussianCount: gaussianCount)
         self.projectEncoder.encode(
             commandBuffer: commandBuffer,
@@ -529,20 +413,12 @@ public final class GlobalRenderer: GaussianRenderer, @unchecked Sendable {
             throw RendererError.invalidTileCount(provided: tileCount, maximum: self.limits.maxTileCount)
         }
 
-        let perTileLimit = (params.maxPerTile == 0) ? UInt32(self.limits.maxPerTile) : min(params.maxPerTile, UInt32(self.limits.maxPerTile))
-        let tileCapacity = tileCount * Int(perTileLimit)
-        let gaussianTileCapacity = gaussianCount * 8
-        let requiredCapacity = min(tileCapacity, gaussianTileCapacity)
-
+        let requiredCapacity = gaussianCount * 8
         guard requiredCapacity <= frame.tileAssignmentMaxAssignments else {
             throw RendererError.invalidAssignmentCapacity(required: requiredCapacity, available: frame.tileAssignmentMaxAssignments)
         }
 
         self.resetTileBuilderState(commandBuffer: commandBuffer, frame: frame)
-
-        guard let blockSumsBuffer = frame.tileAssignBlockSums else {
-            throw RendererError.missingRequiredBuffer("tileAssignBlockSums")
-        }
 
         let indirectBuffers = TwoPassTileAssignEncoder.IndirectBuffers(
             visibleIndices: frame.visibleIndices,
@@ -563,7 +439,7 @@ public final class GlobalRenderer: GaussianRenderer, @unchecked Sendable {
             tileIndicesBuffer: frame.tileIndices,
             tileIdsBuffer: frame.tileIds,
             tileAssignmentHeader: frame.tileAssignmentHeader,
-            blockSumsBuffer: blockSumsBuffer,
+            blockSumsBuffer: frame.tileAssignBlockSums,
             indirectBuffers: indirectBuffers
         )
 
@@ -617,22 +493,12 @@ public final class GlobalRenderer: GaussianRenderer, @unchecked Sendable {
             dispatchOffset: DispatchSlot.sortKeys.rawValue * MemoryLayout<DispatchIndirectArgsSwift>.stride
         )
 
-        // Radix sort - validate required buffers
-        guard let radixHistogram = frame.radixHistogram,
-              let radixBlockSums = frame.radixBlockSums,
-              let radixScannedHistogram = frame.radixScannedHistogram,
-              let radixKeysScratch = frame.radixKeysScratch,
-              let radixPayloadScratch = frame.radixPayloadScratch
-        else {
-            throw RendererError.missingRequiredBuffer("radixSort buffers")
-        }
-
         let radixBuffers = RadixBufferSet(
-            histogram: radixHistogram,
-            blockSums: radixBlockSums,
-            scannedHistogram: radixScannedHistogram,
-            scratchKeys: radixKeysScratch,
-            scratchPayload: radixPayloadScratch
+            histogram: frame.radixHistogram,
+            blockSums: frame.radixBlockSums,
+            scannedHistogram: frame.radixScannedHistogram,
+            scratchKeys: frame.radixKeysScratch,
+            scratchPayload: frame.radixPayloadScratch
         )
 
         let offsets = (
@@ -694,12 +560,10 @@ public final class GlobalRenderer: GaussianRenderer, @unchecked Sendable {
         frame: GlobalViewResources,
         boundsCache: MTLBuffer,
         maskCache: MTLBuffer
-    ) -> ProjectionOutput? {
-        guard let renderData = frame.interleavedGaussians else { return nil }
-
+    ) -> ProjectionOutput {
         return ProjectionOutput(
-            renderData: renderData,
-            bounds: boundsCache, // int4 tile bounds (computed directly in fused projection)
+            renderData: frame.interleavedGaussians,
+            bounds: boundsCache,
             mask: maskCache
         )
     }

@@ -102,7 +102,6 @@ final class LocalRenderEncoder {
             tileHeight: UInt32(tileHeight),
             tilesX: UInt32(tilesX),
             tilesY: UInt32(tilesY),
-            maxPerTile: UInt32(maxPerTile),
             activeTileCount: 0,
             gaussianCount: 0
         )

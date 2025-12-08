@@ -4,10 +4,9 @@ import RendererTypes
 import simd
 
 public final class DepthFirstRenderer: GaussianRenderer, @unchecked Sendable {
-    private static let maxSupportedGaussians = 10_000_000
+    private static let maxSupportedGaussians = 30_000_000
     private static let tileWidth = 16
     private static let tileHeight = 16
-    private static let maxPerTile = 2048
 
     public let device: MTLDevice
     let library: MTLLibrary
@@ -65,21 +64,23 @@ public final class DepthFirstRenderer: GaussianRenderer, @unchecked Sendable {
         self.tileRangeEncoder = try TileRangeEncoder(device: device, library: library)
         self.renderEncoder = try DepthFirstRenderEncoder(device: device, library: library)
 
-        // Compute limits and layout
+        // Compute limits
         self.limits = RendererLimits(
             from: config,
             tileWidth: DepthFirstRenderer.tileWidth,
-            tileHeight: DepthFirstRenderer.tileHeight,
-            maxPerTile: DepthFirstRenderer.maxPerTile
+            tileHeight: DepthFirstRenderer.tileHeight
         )
 
-        let layout = DepthFirstRenderer.computeLayout(
-            limits: limits,
+        self.stereoResources = try DepthFirstMultiViewResources(
+            device: device,
+            maxGaussians: limits.maxGaussians,
+            maxWidth: limits.maxWidth,
+            maxHeight: limits.maxHeight,
+            tileWidth: limits.tileWidth,
+            tileHeight: limits.tileHeight,
             radixBlockSize: radixBlockSize,
             radixGrainSize: radixGrainSize
         )
-
-        self.stereoResources = try DepthFirstMultiViewResources(device: device, layout: layout)
     }
 
     public func render(
@@ -361,7 +362,6 @@ public final class DepthFirstRenderer: GaussianRenderer, @unchecked Sendable {
             tileHeight: UInt32(DepthFirstRenderer.tileHeight),
             tilesX: UInt32(tilesX),
             tilesY: UInt32(tilesY),
-            maxPerTile: UInt32(DepthFirstRenderer.maxPerTile),
             activeTileCount: 0,
             gaussianCount: UInt32(gaussianCount)
         )
@@ -378,88 +378,6 @@ public final class DepthFirstRenderer: GaussianRenderer, @unchecked Sendable {
             params: renderParams,
             dispatchArgs: frame.dispatchArgs,
             dispatchOffset: DepthFirstDispatchSlot.render.offset
-        )
-    }
-
-    private static func computeLayout(
-        limits: RendererLimits,
-        radixBlockSize: Int,
-        radixGrainSize: Int
-    ) -> DepthFirstResourceLayout {
-        let maxGaussians = limits.maxGaussians
-        let tileCount = limits.maxTileCount
-
-        // Instance capacity: each gaussian can touch up to 32 tiles on average
-        let maxInstances = min(maxGaussians * 32, tileCount * limits.maxPerTile)
-
-        // Padded capacities for radix sort alignment
-        let radixAlignment = radixBlockSize * radixGrainSize
-        let paddedGaussianCapacity = ((maxGaussians + radixAlignment - 1) / radixAlignment) * radixAlignment
-        let paddedInstanceCapacity = ((maxInstances + radixAlignment - 1) / radixAlignment) * radixAlignment
-
-        // Radix sort histogram size
-        let radix = 256
-        let gaussianGridSize = max(1, (paddedGaussianCapacity + radixAlignment - 1) / radixAlignment)
-        let instanceGridSize = max(1, (paddedInstanceCapacity + radixAlignment - 1) / radixAlignment)
-
-        // Prefix sum block sums size
-        let prefixBlockSize = 256
-        let prefixNumBlocks = (maxGaussians + prefixBlockSize - 1) / prefixBlockSize
-        let prefixLevel2Blocks = (prefixNumBlocks + prefixBlockSize - 1) / prefixBlockSize
-        let prefixBlockSumsSize = (prefixNumBlocks + 1 + prefixLevel2Blocks + 1) * MemoryLayout<UInt32>.stride
-
-        var bufferAllocations: [(label: String, length: Int, options: MTLResourceOptions)] = []
-        func add(_ label: String, _ length: Int, _ opts: MTLResourceOptions = .storageModePrivate) {
-            bufferAllocations.append((label, max(1, length), opts))
-        }
-
-        // Per-gaussian buffers
-        add("RenderData", maxGaussians * MemoryLayout<GaussianRenderData>.stride)
-        add("Bounds", maxGaussians * MemoryLayout<SIMD4<Int32>>.stride)
-        add("DepthKeys", paddedGaussianCapacity * MemoryLayout<UInt32>.stride)
-        add("PrimitiveIndices", paddedGaussianCapacity * MemoryLayout<Int32>.stride)
-        add("NTouchedTiles", maxGaussians * MemoryLayout<UInt32>.stride)
-        add("OrderedTileCounts", maxGaussians * MemoryLayout<UInt32>.stride)
-
-        // Counters (shared for CPU readback)
-        add("VisibleCount", MemoryLayout<UInt32>.stride, .storageModeShared)
-        add("TotalInstances", MemoryLayout<UInt32>.stride, .storageModeShared)
-        add("ActiveTileCount", MemoryLayout<UInt32>.stride, .storageModeShared)
-        add("Header", 32, .storageModeShared) // DepthFirstHeader
-        add("DispatchArgs", DepthFirstDispatchSlot.count * MemoryLayout<DispatchIndirectArgsSwift>.stride)
-
-        // Per-instance buffers (tile IDs are 16-bit - max 65535 tiles)
-        add("InstanceTileIds", paddedInstanceCapacity * MemoryLayout<UInt16>.stride)
-        add("InstanceGaussianIndices", paddedInstanceCapacity * MemoryLayout<Int32>.stride)
-
-        // Tile headers
-        add("TileHeaders", tileCount * MemoryLayout<GaussianHeader>.stride)
-        add("ActiveTiles", tileCount * MemoryLayout<UInt32>.stride)
-
-        // Depth sort buffers
-        add("DepthSortHistogram", gaussianGridSize * radix * MemoryLayout<UInt32>.stride)
-        add("DepthSortBlockSums", gaussianGridSize * MemoryLayout<UInt32>.stride)
-        add("DepthSortScannedHist", gaussianGridSize * radix * MemoryLayout<UInt32>.stride)
-        add("DepthSortScratchKeys", paddedGaussianCapacity * MemoryLayout<UInt32>.stride)
-        add("DepthSortScratchPayload", paddedGaussianCapacity * MemoryLayout<Int32>.stride)
-
-        // Tile sort buffers (stable radix sort for tile IDs)
-        add("TileSortHistogram", instanceGridSize * radix * MemoryLayout<UInt32>.stride)
-        add("TileSortBlockSums", instanceGridSize * MemoryLayout<UInt32>.stride)
-        add("TileSortScannedHist", instanceGridSize * radix * MemoryLayout<UInt32>.stride)
-        add("TileSortScratchTileIds", paddedInstanceCapacity * MemoryLayout<UInt16>.stride)
-        add("TileSortScratchIndices", paddedInstanceCapacity * MemoryLayout<Int32>.stride)
-
-        // Prefix sum block sums
-        add("PrefixSumBlockSums", prefixBlockSumsSize)
-
-        return DepthFirstResourceLayout(
-            limits: limits,
-            maxGaussians: maxGaussians,
-            maxInstances: maxInstances,
-            paddedGaussianCapacity: paddedGaussianCapacity,
-            paddedInstanceCapacity: paddedInstanceCapacity,
-            bufferAllocations: bufferAllocations
         )
     }
 }

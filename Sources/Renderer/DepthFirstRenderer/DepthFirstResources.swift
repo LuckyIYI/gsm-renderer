@@ -1,36 +1,27 @@
 import Metal
 import RendererTypes
 
-/// Resource layout for depth-first renderer
-struct DepthFirstResourceLayout {
-    let limits: RendererLimits
-    let maxGaussians: Int
-    let maxInstances: Int
-    let paddedGaussianCapacity: Int
-    let paddedInstanceCapacity: Int
-    let bufferAllocations: [(label: String, length: Int, options: MTLResourceOptions)]
-}
-
-/// Resources for a single view in DepthFirstRenderer's pipeline
+/// Resources for a single view in DepthFirstRenderer's pipeline.
+/// Allocates exactly what DepthFirstRenderer needs - direct allocations like LocalViewResources.
 final class DepthFirstViewResources {
     let device: MTLDevice
 
     // Per-gaussian buffers (sized to maxGaussians)
-    let renderData: MTLBuffer // GaussianRenderData for each gaussian
-    let bounds: MTLBuffer // int4 tile bounds per gaussian
-    let depthKeys: MTLBuffer // uint depth keys for sorting
-    let primitiveIndices: MTLBuffer // int indices (sorted by depth)
-    let nTouchedTiles: MTLBuffer // uint tile count per gaussian
-    let orderedTileCounts: MTLBuffer // uint reordered by depth sort
+    let renderData: MTLBuffer
+    let bounds: MTLBuffer
+    let depthKeys: MTLBuffer
+    let primitiveIndices: MTLBuffer
+    let nTouchedTiles: MTLBuffer
+    let orderedTileCounts: MTLBuffer
 
     // Counters (shared for CPU readback)
-    let visibleCount: MTLBuffer // atomic uint
-    let totalInstances: MTLBuffer // atomic uint
-    let activeTileCount: MTLBuffer // atomic uint
+    let visibleCount: MTLBuffer
+    let totalInstances: MTLBuffer
+    let activeTileCount: MTLBuffer
 
     // Header for dispatch computation
-    let header: MTLBuffer // DepthFirstHeader
-    let dispatchArgs: MTLBuffer // DispatchIndirectArgs array
+    let header: MTLBuffer
+    let dispatchArgs: MTLBuffer
 
     // Per-instance buffers (sized to maxInstances)
     let instanceTileIds: MTLBuffer
@@ -64,68 +55,251 @@ final class DepthFirstViewResources {
     let maxInstances: Int
     let tileCount: Int
 
-    init(device: MTLDevice, layout: DepthFirstResourceLayout) throws {
+    init(
+        device: MTLDevice,
+        maxGaussians: Int,
+        maxWidth: Int,
+        maxHeight: Int,
+        tileWidth: Int,
+        tileHeight: Int,
+        radixBlockSize: Int,
+        radixGrainSize: Int
+    ) throws {
         self.device = device
-        self.maxGaussians = layout.maxGaussians
-        self.maxInstances = layout.maxInstances
-        self.tileCount = layout.limits.maxTileCount
+        self.maxGaussians = maxGaussians
 
-        // Allocate buffers
-        var bufferMap: [String: MTLBuffer] = [:]
-        for req in layout.bufferAllocations {
-            guard let buf = device.makeBuffer(length: req.length, options: req.options) else {
-                throw RendererError.failedToAllocateBuffer(label: req.label, size: req.length)
-            }
-            buf.label = req.label
-            bufferMap[req.label] = buf
+        let priv: MTLResourceOptions = .storageModePrivate
+        let shared: MTLResourceOptions = .storageModeShared
+
+        // Calculate derived sizes
+        let tilesX = (maxWidth + tileWidth - 1) / tileWidth
+        let tilesY = (maxHeight + tileHeight - 1) / tileHeight
+        let tileCount = max(1, tilesX * tilesY)
+        self.tileCount = tileCount
+
+        let maxInstances = maxGaussians * 8
+        self.maxInstances = maxInstances
+
+        // Padded capacities for radix sort alignment
+        let radixAlignment = radixBlockSize * radixGrainSize
+        let paddedGaussianCapacity = ((maxGaussians + radixAlignment - 1) / radixAlignment) * radixAlignment
+        let paddedInstanceCapacity = ((maxInstances + radixAlignment - 1) / radixAlignment) * radixAlignment
+
+        // Radix sort histogram sizing
+        let radix = 256
+        let gaussianGridSize = max(1, (paddedGaussianCapacity + radixAlignment - 1) / radixAlignment)
+        let instanceGridSize = max(1, (paddedInstanceCapacity + radixAlignment - 1) / radixAlignment)
+
+        // Prefix sum block sums sizing
+        let prefixBlockSize = 256
+        let prefixNumBlocks = (maxGaussians + prefixBlockSize - 1) / prefixBlockSize
+        let prefixLevel2Blocks = (prefixNumBlocks + prefixBlockSize - 1) / prefixBlockSize
+        let prefixBlockSumsCount = prefixNumBlocks + 1 + prefixLevel2Blocks + 1
+
+        // Per-gaussian buffers
+        self.renderData = try device.makeBuffer(
+            count: maxGaussians,
+            type: GaussianRenderData.self,
+            options: priv,
+            label: "RenderData"
+        )
+
+        self.bounds = try device.makeBuffer(
+            count: maxGaussians,
+            type: SIMD4<Int32>.self,
+            options: priv,
+            label: "Bounds"
+        )
+
+        self.depthKeys = try device.makeBuffer(
+            count: paddedGaussianCapacity,
+            type: UInt32.self,
+            options: priv,
+            label: "DepthKeys"
+        )
+
+        self.primitiveIndices = try device.makeBuffer(
+            count: paddedGaussianCapacity,
+            type: Int32.self,
+            options: priv,
+            label: "PrimitiveIndices"
+        )
+
+        self.nTouchedTiles = try device.makeBuffer(
+            count: maxGaussians,
+            type: UInt32.self,
+            options: priv,
+            label: "NTouchedTiles"
+        )
+
+        self.orderedTileCounts = try device.makeBuffer(
+            count: maxGaussians,
+            type: UInt32.self,
+            options: priv,
+            label: "OrderedTileCounts"
+        )
+
+        // Counters (shared for CPU readback)
+        self.visibleCount = try device.makeBuffer(
+            count: 1,
+            type: UInt32.self,
+            options: shared,
+            label: "VisibleCount"
+        )
+
+        self.totalInstances = try device.makeBuffer(
+            count: 1,
+            type: UInt32.self,
+            options: shared,
+            label: "TotalInstances"
+        )
+
+        self.activeTileCount = try device.makeBuffer(
+            count: 1,
+            type: UInt32.self,
+            options: shared,
+            label: "ActiveTileCount"
+        )
+
+        // Header (32 bytes for DepthFirstHeader)
+        guard let header = device.makeBuffer(length: 32, options: shared) else {
+            throw RendererError.failedToAllocateBuffer(label: "Header", size: 32)
         }
+        header.label = "Header"
+        self.header = header
 
-        func buffer(_ label: String) throws -> MTLBuffer {
-            guard let buf = bufferMap[label] else {
-                throw RendererError.missingRequiredBuffer(label)
-            }
-            return buf
+        self.dispatchArgs = try device.makeBuffer(
+            count: DepthFirstDispatchSlot.count,
+            type: DispatchIndirectArgsSwift.self,
+            options: priv,
+            label: "DispatchArgs"
+        )
+
+        // Per-instance buffers (tile IDs are 16-bit)
+        guard let instanceTileIds = device.makeBuffer(
+            length: paddedInstanceCapacity * MemoryLayout<UInt16>.stride,
+            options: priv
+        ) else {
+            throw RendererError.failedToAllocateBuffer(
+                label: "InstanceTileIds",
+                size: paddedInstanceCapacity * MemoryLayout<UInt16>.stride
+            )
         }
+        instanceTileIds.label = "InstanceTileIds"
+        self.instanceTileIds = instanceTileIds
 
-        // Assign buffers
-        self.renderData = try buffer("RenderData")
-        self.bounds = try buffer("Bounds")
-        self.depthKeys = try buffer("DepthKeys")
-        self.primitiveIndices = try buffer("PrimitiveIndices")
-        self.nTouchedTiles = try buffer("NTouchedTiles")
-        self.orderedTileCounts = try buffer("OrderedTileCounts")
+        self.instanceGaussianIndices = try device.makeBuffer(
+            count: paddedInstanceCapacity,
+            type: Int32.self,
+            options: priv,
+            label: "InstanceGaussianIndices"
+        )
 
-        self.visibleCount = try buffer("VisibleCount")
-        self.totalInstances = try buffer("TotalInstances")
-        self.activeTileCount = try buffer("ActiveTileCount")
-        self.header = try buffer("Header")
-        self.dispatchArgs = try buffer("DispatchArgs")
+        // Tile headers
+        self.tileHeaders = try device.makeBuffer(
+            count: tileCount,
+            type: GaussianHeader.self,
+            options: priv,
+            label: "TileHeaders"
+        )
 
-        self.instanceTileIds = try buffer("InstanceTileIds")
-        self.instanceGaussianIndices = try buffer("InstanceGaussianIndices")
+        self.activeTiles = try device.makeBuffer(
+            count: tileCount,
+            type: UInt32.self,
+            options: priv,
+            label: "ActiveTiles"
+        )
 
-        self.tileHeaders = try buffer("TileHeaders")
-        self.activeTiles = try buffer("ActiveTiles")
+        // Depth sort buffers
+        self.depthSortHistogram = try device.makeBuffer(
+            count: gaussianGridSize * radix,
+            type: UInt32.self,
+            options: priv,
+            label: "DepthSortHistogram"
+        )
 
-        self.depthSortHistogram = try buffer("DepthSortHistogram")
-        self.depthSortBlockSums = try buffer("DepthSortBlockSums")
-        self.depthSortScannedHist = try buffer("DepthSortScannedHist")
-        self.depthSortScratchKeys = try buffer("DepthSortScratchKeys")
-        self.depthSortScratchPayload = try buffer("DepthSortScratchPayload")
+        self.depthSortBlockSums = try device.makeBuffer(
+            count: gaussianGridSize,
+            type: UInt32.self,
+            options: priv,
+            label: "DepthSortBlockSums"
+        )
 
-        self.tileSortHistogram = try buffer("TileSortHistogram")
-        self.tileSortBlockSums = try buffer("TileSortBlockSums")
-        self.tileSortScannedHist = try buffer("TileSortScannedHist")
-        self.tileSortScratchTileIds = try buffer("TileSortScratchTileIds")
-        self.tileSortScratchIndices = try buffer("TileSortScratchIndices")
+        self.depthSortScannedHist = try device.makeBuffer(
+            count: gaussianGridSize * radix,
+            type: UInt32.self,
+            options: priv,
+            label: "DepthSortScannedHist"
+        )
 
-        self.prefixSumBlockSums = try buffer("PrefixSumBlockSums")
+        self.depthSortScratchKeys = try device.makeBuffer(
+            count: paddedGaussianCapacity,
+            type: UInt32.self,
+            options: priv,
+            label: "DepthSortScratchKeys"
+        )
+
+        self.depthSortScratchPayload = try device.makeBuffer(
+            count: paddedGaussianCapacity,
+            type: Int32.self,
+            options: priv,
+            label: "DepthSortScratchPayload"
+        )
+
+        // Tile sort buffers
+        self.tileSortHistogram = try device.makeBuffer(
+            count: instanceGridSize * radix,
+            type: UInt32.self,
+            options: priv,
+            label: "TileSortHistogram"
+        )
+
+        self.tileSortBlockSums = try device.makeBuffer(
+            count: instanceGridSize,
+            type: UInt32.self,
+            options: priv,
+            label: "TileSortBlockSums"
+        )
+
+        self.tileSortScannedHist = try device.makeBuffer(
+            count: instanceGridSize * radix,
+            type: UInt32.self,
+            options: priv,
+            label: "TileSortScannedHist"
+        )
+
+        guard let tileSortScratchTileIds = device.makeBuffer(
+            length: paddedInstanceCapacity * MemoryLayout<UInt16>.stride,
+            options: priv
+        ) else {
+            throw RendererError.failedToAllocateBuffer(
+                label: "TileSortScratchTileIds",
+                size: paddedInstanceCapacity * MemoryLayout<UInt16>.stride
+            )
+        }
+        tileSortScratchTileIds.label = "TileSortScratchTileIds"
+        self.tileSortScratchTileIds = tileSortScratchTileIds
+
+        self.tileSortScratchIndices = try device.makeBuffer(
+            count: paddedInstanceCapacity,
+            type: Int32.self,
+            options: priv,
+            label: "TileSortScratchIndices"
+        )
+
+        // Prefix sum block sums
+        self.prefixSumBlockSums = try device.makeBuffer(
+            count: prefixBlockSumsCount,
+            type: UInt32.self,
+            options: priv,
+            label: "PrefixSumBlockSums"
+        )
 
         // Output textures
         let texDesc = MTLTextureDescriptor.texture2DDescriptor(
             pixelFormat: .rgba16Float,
-            width: layout.limits.maxWidth,
-            height: layout.limits.maxHeight,
+            width: maxWidth,
+            height: maxHeight,
             mipmapped: false
         )
         texDesc.usage = [.shaderWrite, .shaderRead]
@@ -133,16 +307,16 @@ final class DepthFirstViewResources {
         guard let colorTex = device.makeTexture(descriptor: texDesc) else {
             throw RendererError.failedToAllocateTexture(
                 label: "OutputColorTex",
-                width: layout.limits.maxWidth,
-                height: layout.limits.maxHeight
+                width: maxWidth,
+                height: maxHeight
             )
         }
         colorTex.label = "DepthFirstOutputColorTex"
 
         let depthDesc = MTLTextureDescriptor.texture2DDescriptor(
             pixelFormat: .r16Float,
-            width: layout.limits.maxWidth,
-            height: layout.limits.maxHeight,
+            width: maxWidth,
+            height: maxHeight,
             mipmapped: false
         )
         depthDesc.usage = [.shaderWrite, .shaderRead]
@@ -150,8 +324,8 @@ final class DepthFirstViewResources {
         guard let depthTex = device.makeTexture(descriptor: depthDesc) else {
             throw RendererError.failedToAllocateTexture(
                 label: "OutputDepthTex",
-                width: layout.limits.maxWidth,
-                height: layout.limits.maxHeight
+                width: maxWidth,
+                height: maxHeight
             )
         }
         depthTex.label = "DepthFirstOutputDepthTex"
@@ -160,15 +334,44 @@ final class DepthFirstViewResources {
     }
 }
 
-/// Stereo resources for DepthFirstRenderer
+/// Stereo resources for DepthFirstRenderer - left and right view buffer sets.
 final class DepthFirstMultiViewResources {
     let device: MTLDevice
     let left: DepthFirstViewResources
     let right: DepthFirstViewResources
 
-    init(device: MTLDevice, layout: DepthFirstResourceLayout) throws {
+    init(
+        device: MTLDevice,
+        maxGaussians: Int,
+        maxWidth: Int,
+        maxHeight: Int,
+        tileWidth: Int,
+        tileHeight: Int,
+        radixBlockSize: Int,
+        radixGrainSize: Int
+    ) throws {
         self.device = device
-        self.left = try DepthFirstViewResources(device: device, layout: layout)
-        self.right = try DepthFirstViewResources(device: device, layout: layout)
+
+        self.left = try DepthFirstViewResources(
+            device: device,
+            maxGaussians: maxGaussians,
+            maxWidth: maxWidth,
+            maxHeight: maxHeight,
+            tileWidth: tileWidth,
+            tileHeight: tileHeight,
+            radixBlockSize: radixBlockSize,
+            radixGrainSize: radixGrainSize
+        )
+
+        self.right = try DepthFirstViewResources(
+            device: device,
+            maxGaussians: maxGaussians,
+            maxWidth: maxWidth,
+            maxHeight: maxHeight,
+            tileWidth: tileWidth,
+            tileHeight: tileHeight,
+            radixBlockSize: radixBlockSize,
+            radixGrainSize: radixGrainSize
+        )
     }
 }

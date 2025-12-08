@@ -41,7 +41,6 @@ typedef struct {
     UINT32 tileHeight;
     UINT32 tilesX;
     UINT32 tilesY;
-    UINT32 maxPerTile;
     UINT32 activeTileCount;
     UINT32 gaussianCount;
 } RenderParams;

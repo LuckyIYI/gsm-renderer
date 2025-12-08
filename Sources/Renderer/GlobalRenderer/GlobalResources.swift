@@ -1,8 +1,12 @@
 import Metal
+import RendererTypes
 
 /// Resources for a single view in GlobalRenderer's pipeline.
+/// Allocates exactly what GlobalRenderer needs - direct allocations like LocalViewResources.
 final class GlobalViewResources {
-    // Tile Builder Buffers
+    let device: MTLDevice
+
+    // Tile assignment buffers
     let boundsBuffer: MTLBuffer
     let coverageBuffer: MTLBuffer
     let offsetsBuffer: MTLBuffer
@@ -11,10 +15,11 @@ final class GlobalViewResources {
     let tileAssignmentHeader: MTLBuffer
     let tileIndices: MTLBuffer
     let tileIds: MTLBuffer
+    let tileAssignBlockSums: MTLBuffer
     var tileAssignmentMaxAssignments: Int
     var tileAssignmentPaddedCapacity: Int
 
-    // Ordered Buffers
+    // Ordered/packed buffers
     let orderedHeaders: MTLBuffer
     let packedMeans: MTLBuffer
     let packedConics: MTLBuffer
@@ -24,132 +29,329 @@ final class GlobalViewResources {
     let activeTileIndices: MTLBuffer
     let activeTileCount: MTLBuffer
 
-    // Sort Buffers
+    // Sort buffers
     let sortKeys: MTLBuffer
     let sortedIndices: MTLBuffer
 
-    // Radix Sort Buffers
-    let radixHistogram: MTLBuffer?
-    let radixBlockSums: MTLBuffer?
-    let radixScannedHistogram: MTLBuffer?
-    let radixKeysScratch: MTLBuffer?
-    let radixPayloadScratch: MTLBuffer?
+    // Radix sort scratch buffers
+    let radixHistogram: MTLBuffer
+    let radixBlockSums: MTLBuffer
+    let radixScannedHistogram: MTLBuffer
+    let radixKeysScratch: MTLBuffer
+    let radixPayloadScratch: MTLBuffer
 
-    // Interleaved gaussian data for cache efficiency
-    let interleavedGaussians: MTLBuffer?
+    // Interleaved gaussian data
+    let interleavedGaussians: MTLBuffer
 
-    // Two-pass tile assignment scratch buffer (prefix sum block sums)
-    let tileAssignBlockSums: MTLBuffer?
+    // Indirect dispatch buffers
+    let visibleIndices: MTLBuffer
+    let visibleCount: MTLBuffer
+    let tileAssignDispatchArgs: MTLBuffer
 
-    // Indirect dispatch buffers (for compacted visible gaussians)
-    let visibleIndices: MTLBuffer // Compacted visible gaussian indices
-    let visibleCount: MTLBuffer // Atomic counter for visible count
-    let tileAssignDispatchArgs: MTLBuffer // Indirect dispatch args for tile count/scatter
-
-    // Dispatch Args (Per-frame to avoid race on indirect dispatch)
+    // Dispatch args
     let dispatchArgs: MTLBuffer
 
-    // Output Textures
+    // Output textures
     var outputTextures: RenderOutputTextures
 
-    let device: MTLDevice
-
-    init(device: MTLDevice, layout: GlobalResourceLayout) throws {
+    init(
+        device: MTLDevice,
+        maxGaussians: Int,
+        maxWidth: Int,
+        maxHeight: Int,
+        tileWidth: Int,
+        tileHeight: Int,
+        radixBlockSize: Int,
+        radixGrainSize: Int,
+        precision: Precision
+    ) throws {
         self.device = device
-        self.tileAssignmentMaxAssignments = layout.maxAssignmentCapacity
-        self.tileAssignmentPaddedCapacity = layout.paddedCapacity
 
-        guard let dispatchArgs = device.makeBuffer(length: 1024 * MemoryLayout<UInt32>.stride, options: .storageModePrivate) else {
-            throw RendererError.failedToAllocateBuffer(label: "FrameDispatchArgs", size: 1024 * MemoryLayout<UInt32>.stride)
-        }
-        dispatchArgs.label = "FrameDispatchArgs"
-        self.dispatchArgs = dispatchArgs
+        let priv: MTLResourceOptions = .storageModePrivate
+        let shared: MTLResourceOptions = .storageModeShared
 
-        // Buffer allocation helper
-        var bufferMap: [String: MTLBuffer] = [:]
-        for req in layout.bufferAllocations {
-            guard let buf = device.makeBuffer(length: req.length, options: req.options) else {
-                throw RendererError.failedToAllocateBuffer(label: req.label, size: req.length)
-            }
-            buf.label = req.label
-            bufferMap[req.label] = buf
-        }
+        // Calculate derived sizes
+        let tilesX = (maxWidth + tileWidth - 1) / tileWidth
+        let tilesY = (maxHeight + tileHeight - 1) / tileHeight
+        let tileCount = max(1, tilesX * tilesY)
 
-        func buffer(_ label: String) throws -> MTLBuffer {
-            guard let buf = bufferMap[label] else {
-                throw RendererError.missingRequiredBuffer(label)
-            }
-            return buf
-        }
+        let gaussianTileCapacity = maxGaussians * 8
+        let maxAssignmentCapacity = gaussianTileCapacity
+        self.tileAssignmentMaxAssignments = maxAssignmentCapacity
 
-        // Assign buffers
-        self.boundsBuffer = try buffer("Bounds")
-        self.coverageBuffer = try buffer("Coverage")
-        self.offsetsBuffer = try buffer("Offsets")
-        self.partialSumsBuffer = try buffer("PartialSums")
-        self.scatterDispatchBuffer = try buffer("ScatterDispatch")
-        self.tileAssignmentHeader = try buffer("TileHeader")
+        let radixBlock = radixBlockSize * radixGrainSize
+        let paddedCapacity = ((maxAssignmentCapacity + radixBlock - 1) / radixBlock) * radixBlock
+        self.tileAssignmentPaddedCapacity = paddedCapacity
 
-        // Initialize TileHeader constants ONCE at setup (not during render)
-        // TileHeader is .storageModeShared so this CPU write at init is allowed
-        let headerPtr = self.tileAssignmentHeader.contents().bindMemory(to: TileAssignmentHeaderSwift.self, capacity: 1)
-        headerPtr.pointee.maxCapacity = UInt32(layout.maxAssignmentCapacity)
-        headerPtr.pointee.paddedCount = UInt32(layout.paddedCapacity)
+        // Stride calculations for precision
+        let half2Stride = MemoryLayout<UInt16>.stride * 2
+        let half4Stride = MemoryLayout<UInt16>.stride * 4
+        let strideForMeans = precision == .float16 ? half2Stride : 8
+        let strideForConics = precision == .float16 ? half4Stride : 16
+        let strideForColors = precision == .float16 ? MemoryLayout<UInt16>.stride * 3 : 12
+        let strideForOpacities = precision == .float16 ? MemoryLayout<UInt16>.stride : 4
+        let strideForDepths = precision == .float16 ? MemoryLayout<UInt16>.stride : 4
+        let strideForInterleaved = precision == .float16 ? 32 : 48
+
+        // Prefix sum sizing
+        let prefixBlockSize = 256
+        let prefixGrainSize = 4
+        let elementsPerGroup = prefixBlockSize * prefixGrainSize
+        let groups = (maxGaussians + elementsPerGroup - 1) / elementsPerGroup
+
+        // Radix sort sizing
+        let valuesPerGroup = radixBlockSize * radixGrainSize
+        let gridCapacity = max(1, (maxAssignmentCapacity + valuesPerGroup - 1) / valuesPerGroup)
+        let histogramCapacity = gridCapacity * 256 // radix = 256
+
+        // Two-pass tile assignment sizing
+        let tileAssignBlockSize = 256
+        let tileAssignNumBlocks = (maxGaussians + tileAssignBlockSize - 1) / tileAssignBlockSize
+        let tileAssignLevel2Blocks = (tileAssignNumBlocks + tileAssignBlockSize - 1) / tileAssignBlockSize
+        let tileAssignBlockSumsCount = tileAssignNumBlocks + 1 + tileAssignLevel2Blocks + 1
+
+        // Dispatch args
+        self.dispatchArgs = try device.makeBuffer(
+            count: 256,
+            type: UInt32.self,
+            options: priv,
+            label: "FrameDispatchArgs"
+        )
+
+        // Shared allocations
+        self.tileAssignmentHeader = try device.makeBuffer(
+            count: 1,
+            type: TileAssignmentHeaderSwift.self,
+            options: shared,
+            label: "TileHeader"
+        )
+        // Initialize header
+        let headerPtr = tileAssignmentHeader.contents().bindMemory(to: TileAssignmentHeaderSwift.self, capacity: 1)
+        headerPtr.pointee.maxCapacity = UInt32(maxAssignmentCapacity)
+        headerPtr.pointee.paddedCount = UInt32(paddedCapacity)
         headerPtr.pointee.totalAssignments = 0
         headerPtr.pointee.overflow = 0
 
-        self.tileIndices = try buffer("TileIndices")
-        self.tileIds = try buffer("TileIds")
-        self.orderedHeaders = try buffer("OrderedHeaders")
-        self.packedMeans = try buffer("PackedMeans")
-        self.packedConics = try buffer("PackedConics")
-        self.packedColors = try buffer("PackedColors")
-        self.packedOpacities = try buffer("PackedOpacities")
-        self.packedDepths = try buffer("PackedDepths")
-        self.activeTileIndices = try buffer("ActiveTileIndices")
-        self.activeTileCount = try buffer("ActiveTileCount")
-        self.sortKeys = try buffer("SortKeys")
-        self.sortedIndices = try buffer("SortedIndices")
+        self.activeTileCount = try device.makeBuffer(
+            count: 1,
+            type: UInt32.self,
+            options: shared,
+            label: "ActiveTileCount"
+        )
 
-        // Conditionally allocate radix/fused buffers based on config
-        func optionalBuffer(_ label: String) -> MTLBuffer? {
-            bufferMap[label]
+        self.visibleCount = try device.makeBuffer(
+            count: 1,
+            type: UInt32.self,
+            options: shared,
+            label: "VisibleCount"
+        )
+
+        // Per-gaussian buffers
+        self.boundsBuffer = try device.makeBuffer(
+            count: maxGaussians,
+            type: SIMD4<Int32>.self,
+            options: priv,
+            label: "Bounds"
+        )
+
+        self.coverageBuffer = try device.makeBuffer(
+            count: maxGaussians,
+            type: UInt32.self,
+            options: priv,
+            label: "Coverage"
+        )
+
+        self.offsetsBuffer = try device.makeBuffer(
+            count: maxGaussians + 1,
+            type: UInt32.self,
+            options: priv,
+            label: "Offsets"
+        )
+
+        self.partialSumsBuffer = try device.makeBuffer(
+            count: max(groups, 1),
+            type: UInt32.self,
+            options: priv,
+            label: "PartialSums"
+        )
+
+        self.scatterDispatchBuffer = try device.makeBuffer(
+            count: 3,
+            type: UInt32.self,
+            options: priv,
+            label: "ScatterDispatch"
+        )
+
+        // Tile assignment buffers
+        self.tileIndices = try device.makeBuffer(
+            count: paddedCapacity,
+            type: Int32.self,
+            options: priv,
+            label: "TileIndices"
+        )
+
+        self.tileIds = try device.makeBuffer(
+            count: paddedCapacity,
+            type: Int32.self,
+            options: priv,
+            label: "TileIds"
+        )
+
+        self.tileAssignBlockSums = try device.makeBuffer(
+            count: tileAssignBlockSumsCount,
+            type: UInt32.self,
+            options: priv,
+            label: "TileAssignBlockSums"
+        )
+
+        // Ordered/packed buffers
+        self.orderedHeaders = try device.makeBuffer(
+            count: tileCount,
+            type: GaussianHeader.self,
+            options: priv,
+            label: "OrderedHeaders"
+        )
+
+        guard let packedMeans = device.makeBuffer(length: maxAssignmentCapacity * strideForMeans, options: priv) else {
+            throw RendererError.failedToAllocateBuffer(label: "PackedMeans", size: maxAssignmentCapacity * strideForMeans)
         }
-        self.radixHistogram = optionalBuffer("RadixHist")
-        self.radixBlockSums = optionalBuffer("RadixBlockSums")
-        self.radixScannedHistogram = optionalBuffer("RadixScanned")
-        self.radixKeysScratch = optionalBuffer("RadixScratch")
-        self.radixPayloadScratch = optionalBuffer("RadixPayload")
-        self.interleavedGaussians = optionalBuffer("InterleavedGaussians")
-        self.tileAssignBlockSums = optionalBuffer("TileAssignBlockSums")
+        packedMeans.label = "PackedMeans"
+        self.packedMeans = packedMeans
+
+        guard let packedConics = device.makeBuffer(length: maxAssignmentCapacity * strideForConics, options: priv) else {
+            throw RendererError.failedToAllocateBuffer(label: "PackedConics", size: maxAssignmentCapacity * strideForConics)
+        }
+        packedConics.label = "PackedConics"
+        self.packedConics = packedConics
+
+        guard let packedColors = device.makeBuffer(length: maxAssignmentCapacity * strideForColors, options: priv) else {
+            throw RendererError.failedToAllocateBuffer(label: "PackedColors", size: maxAssignmentCapacity * strideForColors)
+        }
+        packedColors.label = "PackedColors"
+        self.packedColors = packedColors
+
+        guard let packedOpacities = device.makeBuffer(length: maxAssignmentCapacity * strideForOpacities, options: priv) else {
+            throw RendererError.failedToAllocateBuffer(label: "PackedOpacities", size: maxAssignmentCapacity * strideForOpacities)
+        }
+        packedOpacities.label = "PackedOpacities"
+        self.packedOpacities = packedOpacities
+
+        guard let packedDepths = device.makeBuffer(length: maxAssignmentCapacity * strideForDepths, options: priv) else {
+            throw RendererError.failedToAllocateBuffer(label: "PackedDepths", size: maxAssignmentCapacity * strideForDepths)
+        }
+        packedDepths.label = "PackedDepths"
+        self.packedDepths = packedDepths
+
+        self.activeTileIndices = try device.makeBuffer(
+            count: tileCount,
+            type: UInt32.self,
+            options: priv,
+            label: "ActiveTileIndices"
+        )
+
+        // Sort buffers
+        self.sortKeys = try device.makeBuffer(
+            count: paddedCapacity,
+            type: UInt32.self,
+            options: priv,
+            label: "SortKeys"
+        )
+
+        self.sortedIndices = try device.makeBuffer(
+            count: paddedCapacity,
+            type: Int32.self,
+            options: priv,
+            label: "SortedIndices"
+        )
+
+        // Radix sort buffers
+        self.radixHistogram = try device.makeBuffer(
+            count: histogramCapacity,
+            type: UInt32.self,
+            options: priv,
+            label: "RadixHist"
+        )
+
+        self.radixBlockSums = try device.makeBuffer(
+            count: gridCapacity,
+            type: UInt32.self,
+            options: priv,
+            label: "RadixBlockSums"
+        )
+
+        self.radixScannedHistogram = try device.makeBuffer(
+            count: histogramCapacity,
+            type: UInt32.self,
+            options: priv,
+            label: "RadixScanned"
+        )
+
+        self.radixKeysScratch = try device.makeBuffer(
+            count: maxAssignmentCapacity,
+            type: UInt32.self,
+            options: priv,
+            label: "RadixScratch"
+        )
+
+        self.radixPayloadScratch = try device.makeBuffer(
+            count: maxAssignmentCapacity,
+            type: UInt32.self,
+            options: priv,
+            label: "RadixPayload"
+        )
+
+        // Interleaved gaussian data
+        guard let interleavedGaussians = device.makeBuffer(length: maxGaussians * strideForInterleaved, options: priv) else {
+            throw RendererError.failedToAllocateBuffer(label: "InterleavedGaussians", size: maxGaussians * strideForInterleaved)
+        }
+        interleavedGaussians.label = "InterleavedGaussians"
+        self.interleavedGaussians = interleavedGaussians
 
         // Indirect dispatch buffers
-        self.visibleIndices = try buffer("VisibleIndices")
-        self.visibleCount = try buffer("VisibleCount")
-        self.tileAssignDispatchArgs = try buffer("TileAssignDispatchArgs")
+        self.visibleIndices = try device.makeBuffer(
+            count: maxGaussians,
+            type: UInt32.self,
+            options: priv,
+            label: "VisibleIndices"
+        )
 
-        // Output textures sized to limits
-        let texDesc = MTLTextureDescriptor.texture2DDescriptor(pixelFormat: .rgba16Float, width: layout.limits.maxWidth, height: layout.limits.maxHeight, mipmapped: false)
+        self.tileAssignDispatchArgs = try device.makeBuffer(
+            count: 3,
+            type: UInt32.self,
+            options: priv,
+            label: "TileAssignDispatchArgs"
+        )
+
+        // Output textures
+        let texDesc = MTLTextureDescriptor.texture2DDescriptor(
+            pixelFormat: .rgba16Float,
+            width: maxWidth,
+            height: maxHeight,
+            mipmapped: false
+        )
         texDesc.usage = [.shaderWrite, .shaderRead]
         texDesc.storageMode = .private
         guard let colorTex = device.makeTexture(descriptor: texDesc) else {
-            throw RendererError.failedToAllocateTexture(label: "OutputColorTex", width: layout.limits.maxWidth, height: layout.limits.maxHeight)
+            throw RendererError.failedToAllocateTexture(label: "OutputColorTex", width: maxWidth, height: maxHeight)
         }
         colorTex.label = "OutputColorTex"
 
-        // Depth texture uses half precision like Local
-        let depthDesc = MTLTextureDescriptor.texture2DDescriptor(pixelFormat: .r16Float, width: layout.limits.maxWidth, height: layout.limits.maxHeight, mipmapped: false)
+        let depthDesc = MTLTextureDescriptor.texture2DDescriptor(
+            pixelFormat: .r16Float,
+            width: maxWidth,
+            height: maxHeight,
+            mipmapped: false
+        )
         depthDesc.usage = [.shaderWrite, .shaderRead]
         depthDesc.storageMode = .private
         guard let depthTex = device.makeTexture(descriptor: depthDesc) else {
-            throw RendererError.failedToAllocateTexture(label: "OutputDepthTex", width: layout.limits.maxWidth, height: layout.limits.maxHeight)
+            throw RendererError.failedToAllocateTexture(label: "OutputDepthTex", width: maxWidth, height: maxHeight)
         }
         depthTex.label = "OutputDepthTex"
+
         self.outputTextures = RenderOutputTextures(color: colorTex, depth: depthTex)
     }
 }
-
-// MARK: - GlobalRenderer Stereo Resources
 
 /// Stereo resources for GlobalRenderer - left and right view buffer sets.
 final class GlobalMultiViewResources {
@@ -157,9 +359,41 @@ final class GlobalMultiViewResources {
     let left: GlobalViewResources
     let right: GlobalViewResources
 
-    init(device: MTLDevice, layout: GlobalResourceLayout) throws {
+    init(
+        device: MTLDevice,
+        maxGaussians: Int,
+        maxWidth: Int,
+        maxHeight: Int,
+        tileWidth: Int,
+        tileHeight: Int,
+        radixBlockSize: Int,
+        radixGrainSize: Int,
+        precision: Precision
+    ) throws {
         self.device = device
-        self.left = try GlobalViewResources(device: device, layout: layout)
-        self.right = try GlobalViewResources(device: device, layout: layout)
+
+        self.left = try GlobalViewResources(
+            device: device,
+            maxGaussians: maxGaussians,
+            maxWidth: maxWidth,
+            maxHeight: maxHeight,
+            tileWidth: tileWidth,
+            tileHeight: tileHeight,
+            radixBlockSize: radixBlockSize,
+            radixGrainSize: radixGrainSize,
+            precision: precision
+        )
+
+        self.right = try GlobalViewResources(
+            device: device,
+            maxGaussians: maxGaussians,
+            maxWidth: maxWidth,
+            maxHeight: maxHeight,
+            tileWidth: tileWidth,
+            tileHeight: tileHeight,
+            radixBlockSize: radixBlockSize,
+            radixGrainSize: radixGrainSize,
+            precision: precision
+        )
     }
 }

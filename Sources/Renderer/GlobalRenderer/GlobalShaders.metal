@@ -98,7 +98,7 @@ kernel void projectGaussiansFused(
 
     float det = conic.x * conic.z - conic.y * conic.y;
     float totalInk = opacity * 6.283185f / sqrt(max(det, 1e-6f));
-    float depthFactor = 1.0 - pow(saturate((camera.farPlane - depth) / (camera.farPlane - camera.nearPlane)), 4.0);
+    float depthFactor = 1.0 - pow(saturate((camera.farPlane - depth) / (camera.farPlane - camera.nearPlane)), 2.0);
     float adjustedThreshold = depthFactor * params.totalInkThreshold;
     if (totalInk < adjustedThreshold) {
         outMask[gid] = 0;

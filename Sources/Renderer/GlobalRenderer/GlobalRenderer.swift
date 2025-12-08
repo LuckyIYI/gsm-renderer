@@ -46,7 +46,7 @@ struct RendererLimits: Sendable {
             surfaceHeight: UInt32(self.maxHeight),
             maxCapacity: UInt32(gaussianCount),
             alphaThreshold: 0.005,
-            totalInkThreshold: 3.0
+            totalInkThreshold: 2.0
         )
     }
 }

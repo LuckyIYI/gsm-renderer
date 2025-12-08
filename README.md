@@ -82,47 +82,55 @@ Uses a global radix sort to order all tile-gaussian assignments by (tile, depth)
 
 **Pipeline:**
 1. **Project** - Transform 3D gaussians to 2D screen space, compute conic matrices and colors from SH
-2. **Tile Assignment** - Each gaussian writes to all tiles it overlaps, creating (tileId, depth, gaussianId) tuples
-3. **Radix Sort** - Sort all assignments globally by (tileId << 32 | depth) using GPU radix sort
-4. **Build Headers** - Scan sorted assignments to find offset/count for each tile
-5. **Render** - Each tile blends its gaussians front-to-back using sorted order
+2. **Tile Assignment** - Two-pass: count tiles per gaussian, prefix sum, then write (tileId, gaussianId) tuples
+3. **Generate Sort Keys** - Build 64-bit keys as (tileId << 32 | depth) for each assignment
+4. **Radix Sort** - Sort all assignments globally by sort key using 8-pass radix sort
+5. **Build Headers** - Scan sorted keys to find offset/count for each tile, build active tile list
+6. **Render** - Each active tile blends its gaussians front-to-back using indirect dispatch
 
 **Characteristics:**
 - Single global sort handles all tiles at once
 - Best for scenes with many overlapping gaussians
 - Memory: O(total tile assignments)
+- Supports up to ~16M tile assignments per frame
 
 ### LocalRenderer
 
 Sorts gaussians independently per tile using threadgroup memory.
 
 **Pipeline:**
-1. **Project** - Transform 3D gaussians to 2D screen space, compute conic matrices and colors from SH
-2. **Compact** - Stream compact visible gaussians, removing culled ones
-3. **Scatter** - Each gaussian atomically increments tile counters and writes its index to tile lists
-4. **Per-Tile Sort** - Each tile sorts its own gaussian list by depth using bitonic sort in threadgroup memory
-5. **Render** - Each tile blends its sorted gaussians front-to-back
+1. **Project + Compact** - Transform 3D to 2D, compute conics/colors, stream compact visible gaussians
+2. **Scatter** - Each gaussian atomically increments tile counters, writes depth key and index to tile slots
+3. **Prefix Scan** - Compute tile offsets from counts, build active tile list
+4. **Per-Tile Sort** - Bitonic sort within each tile's slot range (16-bit depth keys, threadgroup memory)
+5. **Render** - Each active tile blends its sorted gaussians front-to-back using indirect dispatch
 
 **Characteristics:**
 - Per-tile sorting is cache-friendly
-- Efficient for moderate gaussian counts per tile
+- Fixed capacity per tile (maxPerTile limit)
 - Memory: O(tiles × maxPerTile)
+- No global radix sort overhead
 
 ### DepthFirstRenderer
 
-Hybrid approach that projects and packs data, then renders with per-tile sorting.
+Sorts gaussians by depth first (globally), then by tile. This ensures correct back-to-front ordering is established before tile assignment, using a stable tile sort to preserve depth order within each tile.
 
 **Pipeline:**
-1. **Project** - Transform 3D gaussians to 2D screen space, compute conic matrices and colors from SH
-2. **Tile Assignment** - Assign gaussians to tiles with atomic counters
-3. **Fuse Keys** - Build (tileId, depth) sort keys for each assignment
-4. **Radix Sort** - Sort all assignments globally
-5. **Unpack** - Extract sorted gaussian indices per tile
-6. **Render** - Each tile blends gaussians front-to-back, 2×2 pixels per thread
+1. **Preprocess** - Project 3D to 2D, compute conics/colors, depth keys, and tile touch counts per gaussian
+2. **Depth Sort** - Radix sort all visible gaussians globally by depth (back-to-front)
+3. **Apply Depth Order** - Reorder tile counts according to depth-sorted gaussian order
+4. **Prefix Sum** - Compute instance offsets from ordered tile counts
+5. **Instance Expansion** - Expand depth-sorted gaussians into per-tile instances (one instance per tile touched)
+6. **Tile Sort** - Stable radix sort instances by tile ID (preserves depth order within each tile)
+7. **Extract Tile Ranges** - Scan sorted tile IDs to find offset/count for each tile
+8. **Render** - Each active tile blends its gaussians front-to-back, 2×2 pixels per thread
 
 **Characteristics:**
-- Combines global sorting with efficient packed render data
-- 16×16 pixel tiles, 8×8 threadgroup
+- Depth-first sorting ensures correct ordering before tile expansion
+- Stable tile sort preserves depth order within tiles
+- 16×16 pixel tiles, 8×8 threadgroup (each thread renders 2×2 pixels)
+- Memory: O(total instances) where instances = gaussians × avg tiles touched
+- Supports up to ~16M instances per frame
 
 ## Data Formats
 
@@ -196,7 +204,7 @@ Sources/
 ## TODO
 
 - [ ] Release viewer app
-- [ ] Fix numeric precision bugs
+- [x] Fix radix sort scan grain limitation (was capped at ~8M instances, now supports ~16M)
 - [ ] Efficient stereo rendering
 - [ ] Cleanup memory allocation
 - [ ] Proper LOD and culling

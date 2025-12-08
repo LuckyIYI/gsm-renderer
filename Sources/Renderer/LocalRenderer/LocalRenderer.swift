@@ -190,7 +190,7 @@ public final class LocalRenderer: GaussianRenderer, @unchecked Sendable {
             surfaceHeight: UInt32(height),
             maxCapacity: UInt32(gaussianCount),
             alphaThreshold: 0.005,
-            totalInkThreshold: 3.0
+            totalInkThreshold: 2.0
         )
 
         clearEncoder.encode(

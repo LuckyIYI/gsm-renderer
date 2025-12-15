@@ -17,14 +17,22 @@ case "$PLATFORM" in
         SDK="iphonesimulator"
         MIN_VERSION="-mios-simulator-version-min=17.0"
         ;;
+    xros)
+        SDK="xros"
+        MIN_VERSION=""
+        ;;
+    xros-sim)
+        SDK="xrsimulator"
+        MIN_VERSION=""
+        ;;
     *)
-        echo "Usage: $0 [macos|ios|ios-sim]"
+        echo "Usage: $0 [macos|ios|ios-sim|xros|xros-sim]"
         exit 1
         ;;
 esac
 
 RENDERER_DIR="Sources/Renderer"
-INCLUDE="-I Sources/RendererTypes/include -I $RENDERER_DIR/Shared"
+INCLUDE="-I Sources/RendererTypes/include -I $RENDERER_DIR -I $RENDERER_DIR/Shared"
 
 compile_shader() {
     local NAME=$1
@@ -54,6 +62,8 @@ compile_shader() {
 compile_shader "GlobalShaders" "GlobalRenderer"
 compile_shader "LocalShaders" "LocalRenderer"
 compile_shader "DepthFirstShaders" "DepthFirstRenderer"
+
+compile_shader "HardwareGaussianShaders" "HardwareRenderer"
 
 echo ""
 echo "Metal shaders compiled successfully for $PLATFORM"

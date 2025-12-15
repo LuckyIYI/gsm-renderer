@@ -7,12 +7,12 @@
 using namespace metal;
 
 inline half2 getMean(const device GaussianRenderData& g) { return half2(g.meanX, g.meanY); }
-inline half4 getConic(const device GaussianRenderData& g) { return half4(g.conicA, g.conicB, g.conicC, g.conicD); }
-inline half3 getColor(const device GaussianRenderData& g) { return half3(g.colorR, g.colorG, g.colorB); }
+inline half3 getColor(const device GaussianRenderData& g) { return half3(half(g.colorR) / 255.0h, half(g.colorG) / 255.0h, half(g.colorB) / 255.0h); }
+inline half getOpacity(const device GaussianRenderData& g) { return half(g.opacity) / 255.0h; }
 
 inline half2 getMean(const thread GaussianRenderData& g) { return half2(g.meanX, g.meanY); }
-inline half4 getConic(const thread GaussianRenderData& g) { return half4(g.conicA, g.conicB, g.conicC, g.conicD); }
-inline half3 getColor(const thread GaussianRenderData& g) { return half3(g.colorR, g.colorG, g.colorB); }
+inline half3 getColor(const thread GaussianRenderData& g) { return half3(half(g.colorR) / 255.0h, half(g.colorG) / 255.0h, half(g.colorB) / 255.0h); }
+inline half getOpacity(const thread GaussianRenderData& g) { return half(g.opacity) / 255.0h; }
 
 constant bool USE_CLUSTER_CULL [[function_constant(1)]];
 
@@ -29,48 +29,32 @@ kernel void projectGaussiansFused(
 ) {
     if (gid >= camera.gaussianCount) { return; }
 
-    // SINGLE coalesced read for all core gaussian data
     PackedWorldT g = worldGaussians[gid];
 
-    // Early cull: skip tiny gaussians (scale < 0.001)
+    // Early cull: skip tiny gaussians
     float3 scale = float3(g.sx, g.sy, g.sz);
-    float maxScale = max(scale.x, max(scale.y, scale.z));
-    if (maxScale < 0.0005f) {
+    if (cullByScale(scale)) {
         outMask[gid] = 0;
         outBounds[gid] = int4(0, -1, 0, -1);
         return;
     }
 
-    // Extract and promote to float for computation accuracy
     float3 position = float3(g.px, g.py, g.pz);
     float4 viewPos4 = camera.viewMatrix * float4(position, 1.0f);
-    float depth = safeDepthComponent(viewPos4.z);
+    float4 clip = camera.projectionMatrix * viewPos4;
 
-    if (depth <= camera.nearPlane) {
+    // Z-sign agnostic near plane culling
+    float depth = clip.w;
+    if (!isInFrontOfCameraClipW(clip.w, camera.nearPlane)) {
         outMask[gid] = 0;
         outBounds[gid] = int4(0, -1, 0, -1);
         return;
     }
 
-    float4 clip = camera.projectionMatrix * viewPos4;
-    if (fabs(clip.w) < 1e-6f) {
-        outMask[gid] = 2;
-        outBounds[gid] = int4(0, -1, 0, -1);
-        return;
-    }
-
-    float ndcX = clip.x / clip.w;
-    float ndcY = clip.y / clip.w;
-    float px = ((ndcX + 1.0f) * camera.width - 1.0f) * 0.5f;
-    float py = ((ndcY + 1.0f) * camera.height - 1.0f) * 0.5f;
+    float2 ndc = clip.xy / clip.w;
+    float2 screenPos = ndcToScreenCentered(ndc, camera.width, camera.height);
 
     float opacity = float(g.opacity);
-    if (opacity < 1e-4f) {
-        outMask[gid] = 0;
-        outBounds[gid] = int4(0, -1, 0, -1);
-        return;
-    }
-
     if (opacity < params.alphaThreshold) {
         outMask[gid] = 0;
         outBounds[gid] = int4(0, -1, 0, -1);
@@ -80,27 +64,26 @@ kernel void projectGaussiansFused(
     float4 quat = normalizeQuaternion(getRotation(g));
     float3x3 cov3d = buildCovariance3D(scale, quat);
 
-    float3 viewRow0 = float3(camera.viewMatrix[0][0], camera.viewMatrix[1][0], camera.viewMatrix[2][0]);
-    float3 viewRow1 = float3(camera.viewMatrix[0][1], camera.viewMatrix[1][1], camera.viewMatrix[2][1]);
-    float3 viewRow2 = float3(camera.viewMatrix[0][2], camera.viewMatrix[1][2], camera.viewMatrix[2][2]);
-    float3x3 viewRot = matrixFromRows(viewRow0, viewRow1, viewRow2);
+    float2x2 cov2d = projectCovariance2D(cov3d, viewPos4.xyz, camera.viewMatrix,
+                                          camera.projectionMatrix,
+                                          float2(camera.width, camera.height));
+    cov2d = stabilizeCovariance2D(cov2d, float2(camera.width, camera.height));
 
-    float2x2 cov2d = projectCovariance(cov3d, viewPos4.xyz, viewRot, camera.focalX, camera.focalY, camera.width, camera.height);
-    float4 conic;
-    float radius;
-    computeConicAndRadius(cov2d, conic, radius);
+    float theta, sigma1, sigma2;
+    if (!covarianceToThetaSigmas(cov2d, theta, sigma1, sigma2)) {
+        outMask[gid] = 0;
+        outBounds[gid] = int4(0, -1, 0, -1);
+        return;
+    }
+    float radius = 3.0f * max(sigma1, sigma2);
 
-    if (radius < 0.5f) {
+    if (cullByRadius(radius)) {
         outMask[gid] = 0;
         outBounds[gid] = int4(0, -1, 0, -1);
         return;
     }
 
-    float det = conic.x * conic.z - conic.y * conic.y;
-    float totalInk = opacity * 6.283185f / sqrt(max(det, 1e-6f));
-    float depthFactor = 1.0 - pow(saturate((camera.farPlane - depth) / (camera.farPlane - camera.nearPlane)), 2.0);
-    float adjustedThreshold = depthFactor * params.totalInkThreshold;
-    if (totalInk < adjustedThreshold) {
+    if (cullByTotalInkFromCov(opacity, cov2d, depth, camera.nearPlane, camera.farPlane, params.totalInkThreshold)) {
         outMask[gid] = 0;
         outBounds[gid] = int4(0, -1, 0, -1);
         return;
@@ -108,9 +91,7 @@ kernel void projectGaussiansFused(
 
     float2 obbExtents = computeOBBExtents(cov2d, 3.0f);
 
-    // Off-screen culling using OBB extents (tighter than radius-based)
-    if (px + obbExtents.x < 0.0f || px - obbExtents.x > camera.width ||
-        py + obbExtents.y < 0.0f || py - obbExtents.y > camera.height) {
+    if (cullByScreenBounds(screenPos, obbExtents, camera.width, camera.height)) {
         outMask[gid] = 0;
         outBounds[gid] = int4(0, -1, 0, -1);
         return;
@@ -119,46 +100,25 @@ kernel void projectGaussiansFused(
     // Compute SH color
     float3 color = computeSHColor(harmonics, gid, position, camera.cameraCenter, camera.shComponents);
     color = max(color + float3(0.5f), float3(0.0f));
+    color = maybeDecodeSRGBToLinear(color, camera.inputIsSRGB);
 
-    // Write AoS output - single struct write
+    // Write render data
     RenderDataT renderData;
-    renderData.meanX = half(px);
-    renderData.meanY = half(py);
-    renderData.conicA = half(conic.x);
-    renderData.conicB = half(conic.y);
-    renderData.conicC = half(conic.z);
-    renderData.conicD = half(conic.w);
-    renderData.colorR = half(color.x);
-    renderData.colorG = half(color.y);
-    renderData.colorB = half(color.z);
-    renderData.opacity = half(opacity);
+    renderData.meanX = half(screenPos.x);
+    renderData.meanY = half(screenPos.y);
+    renderData.theta = packThetaPi(theta);
+    renderData.sigma1 = half(sigma1);
+    renderData.sigma2 = half(sigma2);
     renderData.depth = half(depth);
+    renderData.colorR = uchar(clamp(color.x * 255.0f, 0.0f, 255.0f));
+    renderData.colorG = uchar(clamp(color.y * 255.0f, 0.0f, 255.0f));
+    renderData.colorB = uchar(clamp(color.z * 255.0f, 0.0f, 255.0f));
+    renderData.opacity = uchar(clamp(opacity * 255.0f, 0.0f, 255.0f));
     outRenderData[gid] = renderData;
 
-    float xmin = px - obbExtents.x;
-    float xmax = px + obbExtents.x;
-    float ymin = py - obbExtents.y;
-    float ymax = py + obbExtents.y;
-
-    float maxW = camera.width - 1.0f;
-    float maxH = camera.height - 1.0f;
-
-    xmin = clamp(xmin, 0.0f, maxW);
-    xmax = clamp(xmax, 0.0f, maxW);
-    ymin = clamp(ymin, 0.0f, maxH);
-    ymax = clamp(ymax, 0.0f, maxH);
-
-    int minTileX = int(floor(xmin / float(params.tileWidth)));
-    int maxTileX = int(ceil(xmax / float(params.tileWidth))) - 1;
-    int minTileY = int(floor(ymin / float(params.tileHeight)));
-    int maxTileY = int(ceil(ymax / float(params.tileHeight))) - 1;
-
-    minTileX = max(minTileX, 0);
-    minTileY = max(minTileY, 0);
-    maxTileX = min(maxTileX, int(params.tilesX) - 1);
-    maxTileY = min(maxTileY, int(params.tilesY) - 1);
-
-    outBounds[gid] = int4(minTileX, maxTileX, minTileY, maxTileY);
+    TileBounds tb = computeTileBounds(screenPos, obbExtents, camera.width, camera.height,
+                                       params.tileWidth, params.tileHeight, params.tilesX, params.tilesY);
+    outBounds[gid] = int4(tb.minTileX, tb.maxTileX, tb.minTileY, tb.maxTileY);
     outMask[gid] = 1;
 }
 
@@ -261,6 +221,46 @@ kernel void prepareIndirectDispatchKernel(
     dispatchArgs->threadgroupsPerGridX = groups;
     dispatchArgs->threadgroupsPerGridY = 1u;
     dispatchArgs->threadgroupsPerGridZ = 1u;
+}
+
+kernel void prepareIndirectDispatchAndCopyCountKernel(
+    const device uint* countBuffer [[buffer(0)]],
+    device DispatchIndirectArgs* dispatchArgs [[buffer(1)]],
+    device uint* outCount [[buffer(2)]],
+    constant uint& threadgroupSize [[buffer(3)]],
+    uint gid [[thread_position_in_grid]]
+) {
+    if (gid != 0) return;
+
+    uint count = countBuffer[0];
+    outCount[0] = count;
+
+    uint groups = (count + threadgroupSize - 1u) / threadgroupSize;
+    dispatchArgs->threadgroupsPerGridX = groups;
+    dispatchArgs->threadgroupsPerGridY = 1u;
+    dispatchArgs->threadgroupsPerGridZ = 1u;
+}
+
+kernel void writeTotalUIntIndirectKernel(
+    const device uint* blockSums [[buffer(0)]],
+    device uint* outTotal [[buffer(1)]],
+    const device uint* blockCountBuffer [[buffer(2)]],
+    uint tid [[thread_position_in_grid]]
+) {
+    if (tid != 0u) return;
+    uint blockCount = blockCountBuffer[0];
+    outTotal[0] = blockSums[blockCount];
+}
+
+kernel void clampCountKernel(
+    const device uint* inCount [[buffer(0)]],
+    device uint* outCount [[buffer(1)]],
+    constant uint& maxCount [[buffer(2)]],
+    uint tid [[thread_position_in_grid]]
+) {
+    if (tid != 0u) return;
+    uint v = inCount[0];
+    outCount[0] = min(v, maxCount);
 }
 
 // Sort key: [tile:16][depth:16] - radix processes LSB first so depth in low bits
@@ -454,6 +454,100 @@ kernel void singleBlockScanKernel(
     }
 }
 
+kernel void preparePrefixSumDispatchKernel(
+    const device uint* countBuffer [[buffer(0)]],
+    device DispatchIndirectArgs* dispatchArgs [[buffer(1)]],
+    device uint* blockCounts [[buffer(2)]],
+    uint tid [[thread_position_in_grid]]
+) {
+    if (tid != 0u) return;
+
+    uint count = countBuffer[0];
+    uint level1Blocks = (count + SCAN_BLOCK_SIZE - 1u) / SCAN_BLOCK_SIZE;
+    uint level2Blocks = (level1Blocks + SCAN_BLOCK_SIZE - 1u) / SCAN_BLOCK_SIZE;
+
+    dispatchArgs[0].threadgroupsPerGridX = max(level1Blocks, 1u);
+    dispatchArgs[0].threadgroupsPerGridY = 1u;
+    dispatchArgs[0].threadgroupsPerGridZ = 1u;
+
+    dispatchArgs[1].threadgroupsPerGridX = max(level2Blocks, 1u);
+    dispatchArgs[1].threadgroupsPerGridY = 1u;
+    dispatchArgs[1].threadgroupsPerGridZ = 1u;
+
+    blockCounts[0] = level1Blocks;
+    blockCounts[1] = level2Blocks;
+}
+
+kernel void blockReduceIndirectKernel(
+    const device uint* input [[buffer(0)]],
+    device uint* blockSums [[buffer(1)]],
+    const device uint* countBuffer [[buffer(2)]],
+    uint gid [[thread_position_in_grid]],
+    uint lid [[thread_position_in_threadgroup]],
+    uint groupId [[threadgroup_position_in_grid]]
+) {
+    threadgroup uint shared[SCAN_BLOCK_SIZE];
+    uint count = countBuffer[0];
+    uint value = (gid < count) ? input[gid] : 0u;
+
+    uint blockSum = threadgroup_cooperative_reduce_sum<SCAN_BLOCK_SIZE>(value, shared, ushort(lid));
+    if (lid == 0u) {
+        blockSums[groupId] = blockSum;
+    }
+}
+
+kernel void blockScanIndirectKernel(
+    const device uint* input [[buffer(0)]],
+    device uint* output [[buffer(1)]],
+    const device uint* blockOffsets [[buffer(2)]],
+    const device uint* countBuffer [[buffer(3)]],
+    uint gid [[thread_position_in_grid]],
+    uint lid [[thread_position_in_threadgroup]],
+    uint groupId [[threadgroup_position_in_grid]]
+) {
+    threadgroup uint shared[SCAN_BLOCK_SIZE];
+
+    uint count = countBuffer[0];
+    uint value = (gid < count) ? input[gid] : 0u;
+    uint exclusive = threadgroup_raking_prefix_exclusive_sum<SCAN_BLOCK_SIZE>(value, shared, ushort(lid));
+
+    if (gid < count) {
+        output[gid] = exclusive + blockOffsets[groupId];
+    }
+}
+
+kernel void singleBlockScanIndirectKernel(
+    device uint* blockSums [[buffer(0)]],
+    const device uint* blockCountBuffer [[buffer(1)]],
+    uint lid [[thread_position_in_threadgroup]]
+) {
+    threadgroup uint shared[SCAN_BLOCK_SIZE];
+
+    uint blockCount = blockCountBuffer[0];
+    uint value = (lid < blockCount) ? blockSums[lid] : 0u;
+
+    uint total = threadgroup_cooperative_reduce_sum<SCAN_BLOCK_SIZE>(value, shared, ushort(lid));
+    uint exclusive = threadgroup_raking_prefix_exclusive_sum<SCAN_BLOCK_SIZE>(value, shared, ushort(lid));
+
+    if (lid < blockCount) {
+        blockSums[lid] = exclusive;
+    }
+    if (lid == 0u) {
+        blockSums[blockCount] = total;
+    }
+}
+
+kernel void writeTotalCountIndirectKernel(
+    const device uint* blockSums [[buffer(0)]],
+    device TileAssignmentHeader* header [[buffer(1)]],
+    const device uint* blockCountBuffer [[buffer(2)]],
+    uint tid [[thread_position_in_grid]]
+) {
+    if (tid != 0u) return;
+    uint blockCount = blockCountBuffer[0];
+    header->totalAssignments = blockSums[blockCount];
+}
+
 kernel void writeTotalCountKernel(
     const device uint* blockSums [[buffer(0)]],
     device TileAssignmentHeader* header [[buffer(1)]],
@@ -472,10 +566,12 @@ kernel void tileCountIndirectKernel(
     const device RenderDataT* renderData [[buffer(1)]],
     device uint* tileCounts [[buffer(2)]],
     const device uint* visibleIndices [[buffer(3)]],
-    constant TileAssignParams& params [[buffer(4)]],
+    const device uint* visibleCount [[buffer(4)]],
+    constant TileAssignParams& params [[buffer(5)]],
     uint gid [[thread_position_in_grid]]
 ) {
-    if (gid >= params.gaussianCount) return;
+    uint count = visibleCount[0];
+    if (gid >= count) return;
 
     uint originalIdx = visibleIndices[gid];
     const int4 rect = bounds[originalIdx];
@@ -498,10 +594,10 @@ kernel void tileCountIndirectKernel(
 
     // Extract gaussian properties for intersection test
     float2 center = float2(g.meanX, g.meanY);
-    float3 conic = float3(g.conicA, g.conicB, g.conicC);
-    float radius = float(g.conicD);  // conicD stores radius
+    float theta = unpackThetaPi(g.theta);
+    float3 conic = conicFromThetaSigmas(theta, float(g.sigma1), float(g.sigma2));
 
-    uint count = 0;
+    uint tileCount = 0;
     const int tileW = int(params.tileWidth);
     const int tileH = int(params.tileHeight);
 
@@ -510,19 +606,19 @@ kernel void tileCountIndirectKernel(
             int2 pixMin = int2(tx * tileW, ty * tileH);
             int2 pixMax = int2(pixMin.x + tileW - 1, pixMin.y + tileH - 1);
 
-            if (intersectsTile(pixMin, pixMax, center, conic, alpha, radius, float2(0.0f))) {
-                count++;
+            if (intersectsTile(pixMin, pixMax, center, conic, alpha, float2(0.0f))) {
+                tileCount++;
             }
         }
     }
 
-    tileCounts[gid] = count;
+    tileCounts[gid] = tileCount;
 }
 
 template [[host_name("tileCountIndirectKernel")]]
 kernel void tileCountIndirectKernel<GaussianRenderData>(
     const device int4*, const device GaussianRenderData*, device uint*,
-    const device uint*, constant TileAssignParams&, uint);
+    const device uint*, const device uint*, constant TileAssignParams&, uint);
 
 template <typename RenderDataT>
 kernel void tileScatterIndirectKernel(
@@ -530,12 +626,14 @@ kernel void tileScatterIndirectKernel(
     const device RenderDataT* renderData [[buffer(1)]],
     const device uint* offsets [[buffer(2)]],
     const device uint* visibleIndices [[buffer(3)]],
-    device int* tileIndices [[buffer(4)]],
-    device int* tileIds [[buffer(5)]],
-    constant TileAssignParams& params [[buffer(6)]],
+    const device uint* visibleCount [[buffer(4)]],
+    device int* tileIndices [[buffer(5)]],
+    device int* tileIds [[buffer(6)]],
+    constant TileAssignParams& params [[buffer(7)]],
     uint gid [[thread_position_in_grid]]
 ) {
-    if (gid >= params.gaussianCount) return;
+    uint count = visibleCount[0];
+    if (gid >= count) return;
 
     uint originalIdx = visibleIndices[gid];
     const int4 rect = bounds[originalIdx];
@@ -552,8 +650,8 @@ kernel void tileScatterIndirectKernel(
 
     // Extract gaussian properties for intersection test
     float2 center = float2(g.meanX, g.meanY);
-    float3 conic = float3(g.conicA, g.conicB, g.conicC);
-    float radius = float(g.conicD);  // conicD stores radius
+    float theta = unpackThetaPi(g.theta);
+    float3 conic = conicFromThetaSigmas(theta, float(g.sigma1), float(g.sigma2));
 
     const uint tilesX = params.tilesX;
     const uint maxAssignments = params.maxAssignments;
@@ -568,7 +666,7 @@ kernel void tileScatterIndirectKernel(
             int2 pixMin = int2(tx * tileW, ty * tileH);
             int2 pixMax = int2(pixMin.x + tileW - 1, pixMin.y + tileH - 1);
 
-            if (intersectsTile(pixMin, pixMax, center, conic, alpha, radius, float2(0.0f))) {
+            if (intersectsTile(pixMin, pixMax, center, conic, alpha, float2(0.0f))) {
                 if (writePos < maxAssignments) {
                     tileIds[writePos] = ty * int(tilesX) + tx;
                     tileIndices[writePos] = gaussianIdx;
@@ -582,7 +680,7 @@ kernel void tileScatterIndirectKernel(
 template [[host_name("tileScatterIndirectKernel")]]
 kernel void tileScatterIndirectKernel<GaussianRenderData>(
     const device int4*, const device GaussianRenderData*, const device uint*,
-    const device uint*, device int*, device int*, constant TileAssignParams&, uint);
+    const device uint*, const device uint*, device int*, device int*, constant TileAssignParams&, uint);
 
 kernel void prepareAssignmentDispatchKernel(
     device TileAssignmentHeader* header [[buffer(0)]],
@@ -912,9 +1010,14 @@ kernel void radixScatterKernel(
         bool isValid = (kp.payload != UINT_MAX);
         if (isValid) {
             uint dst = globalBinBase[myBin] + localOffset;
-            outputKeys[dst] = kp.key;
-            outputPayload[dst] = kp.payload;
+            if (dst < totalAssignments) {
+                outputKeys[dst] = kp.key;
+                outputPayload[dst] = kp.payload;
+            }
         }
+
+        // Ensure all lanes have computed/consumed the current bin bases
+        threadgroup_barrier(mem_flags::mem_threadgroup);
 
         // Update global offsets at run boundaries
         if (tailFlag && isValid) {
@@ -988,11 +1091,14 @@ kernel void globalRender(
         if (gaussianIdx < 0) continue;
         GaussianRenderData g = gaussians[gaussianIdx];
 
-        half4 gConic = getConic(g);
-        half cxx = gConic.x;
-        half cyy = gConic.z;
-        half cxy2 = 2.0h * gConic.y;
-        half opacity = g.opacity;
+        float theta = unpackThetaPi(g.theta);
+        float sig1 = float(g.sigma1);
+        float sig2 = float(g.sigma2);
+        float3 conicF = conicFromThetaSigmas(theta, sig1, sig2);
+        half cxx = half(conicF.x);
+        half cyy = half(conicF.z);
+        half cxy2 = half(2.0f * conicF.y);
+        half opacity = getOpacity(g);
         half3 gColor = getColor(g);
         half gDepth = g.depth;
 

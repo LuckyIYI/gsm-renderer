@@ -1,7 +1,5 @@
 import Metal
 
-/// Radix sort encoder for 32-bit keys (single uint)
-/// Key format: [tile:16][depth:16] - tile in high bits for primary sort
 final class RadixSortEncoder {
     let histogramPipeline: MTLComputePipelineState
     let scanBlocksPipeline: MTLComputePipelineState

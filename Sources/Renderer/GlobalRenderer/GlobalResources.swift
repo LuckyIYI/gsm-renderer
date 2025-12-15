@@ -12,6 +12,7 @@ final class GlobalViewResources {
     let offsetsBuffer: MTLBuffer
     let partialSumsBuffer: MTLBuffer
     let scatterDispatchBuffer: MTLBuffer
+    let prefixSumBlockCountBuffer: MTLBuffer
     let tileAssignmentHeader: MTLBuffer
     let tileIndices: MTLBuffer
     let tileIds: MTLBuffer
@@ -176,10 +177,17 @@ final class GlobalViewResources {
         )
 
         self.scatterDispatchBuffer = try device.makeBuffer(
-            count: 3,
+            count: 6,
             type: UInt32.self,
             options: priv,
             label: "ScatterDispatch"
+        )
+
+        self.prefixSumBlockCountBuffer = try device.makeBuffer(
+            count: 2,
+            type: UInt32.self,
+            options: priv,
+            label: "PrefixSumBlockCount"
         )
 
         // Tile assignment buffers

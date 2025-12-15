@@ -1,9 +1,9 @@
 import Metal
 import RendererTypes
 
-/// Encoder for the depth-first preprocess kernel
-/// Projects gaussians, computes depth keys, and counts touched tiles
-final class DepthFirstPreprocessEncoder {
+/// Encoder for unified stereo preprocess kernel.
+/// Projects both eyes in one pass, outputs single StereoTiledRenderData with union bounds.
+final class DepthFirstStereoUnifiedPreprocessEncoder {
     /// Map shComponents count to SH degree (0-3)
     static func shDegree(from shComponents: Int) -> UInt32 {
         switch shComponents {
@@ -21,18 +21,17 @@ final class DepthFirstPreprocessEncoder {
     init(device: MTLDevice, library: MTLLibrary) throws {
         var maxThreads = 256
 
-        // Create pipelines for each SH degree (0-3)
         for degree: UInt32 in 0 ... 3 {
             let constants = MTLFunctionConstantValues()
             var shDegree = degree
             constants.setConstantValue(&shDegree, type: .uint, index: 0)
 
-            if let fn = try? library.makeFunction(name: "depthFirstPreprocessKernel", constantValues: constants) {
+            if let fn = try? library.makeFunction(name: "depthFirstStereoUnifiedPreprocessKernel", constantValues: constants) {
                 let pipeline = try device.makeComputePipelineState(function: fn)
                 self.floatPipelines[degree] = pipeline
                 maxThreads = min(maxThreads, pipeline.maxTotalThreadsPerThreadgroup)
             }
-            if let fn = try? library.makeFunction(name: "depthFirstPreprocessKernelHalf", constantValues: constants) {
+            if let fn = try? library.makeFunction(name: "depthFirstStereoUnifiedPreprocessKernelHalf", constantValues: constants) {
                 let pipeline = try device.makeComputePipelineState(function: fn)
                 self.halfPipelines[degree] = pipeline
                 maxThreads = min(maxThreads, pipeline.maxTotalThreadsPerThreadgroup)
@@ -40,7 +39,7 @@ final class DepthFirstPreprocessEncoder {
         }
 
         guard !floatPipelines.isEmpty else {
-            throw RendererError.failedToCreatePipeline("depthFirstPreprocessKernel not found")
+            throw RendererError.failedToCreatePipeline("depthFirstStereoUnifiedPreprocessKernel not found")
         }
 
         self.threadgroupSize = maxThreads
@@ -50,32 +49,39 @@ final class DepthFirstPreprocessEncoder {
         commandBuffer: MTLCommandBuffer,
         gaussianCount: Int,
         packedWorldBuffers: PackedWorldBuffers,
-        cameraUniforms: CameraUniformsSwift,
-        renderData: MTLBuffer,
-        bounds: MTLBuffer,
+        stereoCamera: StereoCameraUniforms,
+        // Unified outputs
+        renderData: MTLBuffer,       // StereoTiledRenderData
+        bounds: MTLBuffer,           // int4 union bounds
         preDepthKeys: MTLBuffer,
         nTouchedTiles: MTLBuffer,
         totalInstances: MTLBuffer,
+        // Params
         binningParams: TileBinningParams,
         useHalfWorld: Bool,
         shDegree: UInt32
     ) {
         guard let encoder = commandBuffer.makeComputeCommandEncoder() else { return }
-        encoder.label = "DepthFirstPreprocess"
+        encoder.label = "DepthFirstStereoUnifiedPreprocess"
 
         let pipelines = useHalfWorld ? halfPipelines : floatPipelines
         guard let pipeline = pipelines[shDegree] ?? pipelines[0] else { return }
         encoder.setComputePipelineState(pipeline)
+
+        // Input buffers
         encoder.setBuffer(packedWorldBuffers.packedGaussians, offset: 0, index: 0)
         encoder.setBuffer(packedWorldBuffers.harmonics, offset: 0, index: 1)
+
+        // Unified outputs
         encoder.setBuffer(renderData, offset: 0, index: 2)
         encoder.setBuffer(bounds, offset: 0, index: 3)
         encoder.setBuffer(preDepthKeys, offset: 0, index: 4)
         encoder.setBuffer(nTouchedTiles, offset: 0, index: 5)
         encoder.setBuffer(totalInstances, offset: 0, index: 6)
 
-        var camera = cameraUniforms
-        encoder.setBytes(&camera, length: MemoryLayout<CameraUniforms>.stride, index: 7)
+        // Uniforms
+        var camera = stereoCamera
+        encoder.setBytes(&camera, length: MemoryLayout<StereoCameraUniforms>.stride, index: 7)
 
         var params = binningParams
         encoder.setBytes(&params, length: MemoryLayout<TileBinningParams>.stride, index: 8)

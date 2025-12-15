@@ -7,12 +7,12 @@
 using namespace metal;
 
 inline half2 getMean(const device GaussianRenderData& g) { return half2(g.meanX, g.meanY); }
-inline half4 getConic(const device GaussianRenderData& g) { return half4(g.conicA, g.conicB, g.conicC, g.conicD); }
-inline half3 getColor(const device GaussianRenderData& g) { return half3(g.colorR, g.colorG, g.colorB); }
+inline half3 getColor(const device GaussianRenderData& g) { return half3(half(g.colorR) / 255.0h, half(g.colorG) / 255.0h, half(g.colorB) / 255.0h); }
+inline half getOpacity(const device GaussianRenderData& g) { return half(g.opacity) / 255.0h; }
 
 inline half2 getMean(const thread GaussianRenderData& g) { return half2(g.meanX, g.meanY); }
-inline half4 getConic(const thread GaussianRenderData& g) { return half4(g.conicA, g.conicB, g.conicC, g.conicD); }
-inline half3 getColor(const thread GaussianRenderData& g) { return half3(g.colorR, g.colorG, g.colorB); }
+inline half3 getColor(const thread GaussianRenderData& g) { return half3(half(g.colorR) / 255.0h, half(g.colorG) / 255.0h, half(g.colorB) / 255.0h); }
+inline half getOpacity(const thread GaussianRenderData& g) { return half(g.opacity) / 255.0h; }
 
 
 struct DepthFirstParams {
@@ -23,205 +23,602 @@ struct DepthFirstParams {
     uint tileWidth;
     uint tileHeight;
     uint maxAssignments;
-    uint padding;
+    float alphaThreshold;
 };
 
-struct DepthFirstHeader {
-    uint visibleCount;
-    uint totalInstances;
-    uint paddedVisibleCount;
-    uint paddedInstanceCount;
-    uint overflow;
-    uint padding0;
-    uint padding1;
-    uint padding2;
-};
+// DepthFirstHeader is now defined in BridgingTypes.h
+
+constant bool DF_DEPTH_KEY_16 [[function_constant(2)]]; // default = false
+
+inline uint float_to_sortable_uint(float v) {
+    uint bits = as_type<uint>(v);
+    uint mask = (bits & 0x80000000u) ? 0xFFFFFFFFu : 0x80000000u;
+    return bits ^ mask;
+}
+
+inline float sortable_uint_to_float(uint v) {
+    // Inverse of float_to_sortable_uint (reversible mapping).
+    uint bits = (v & 0x80000000u) ? (v ^ 0x80000000u) : ~v;
+    return as_type<float>(bits);
+}
 
 
 template <typename PackedWorldT, typename HarmonicT, typename RenderDataT>
-kernel void depthFirstPreprocessKernel(
-    const device PackedWorldT* worldGaussians [[buffer(0)]],
-    const device HarmonicT* harmonics [[buffer(1)]],
-    device RenderDataT* outRenderData [[buffer(2)]],
-    device int4* outBounds [[buffer(3)]],
-    device uint* depthKeys [[buffer(4)]],
-    device int* primitiveIndices [[buffer(5)]],
-    device uint* nTouchedTiles [[buffer(6)]],
-    device atomic_uint* visibleCount [[buffer(7)]],
-    device atomic_uint* totalInstances [[buffer(8)]],
-    constant CameraUniforms& camera [[buffer(9)]],
-    constant TileBinningParams& params [[buffer(10)]],
-    uint gid [[thread_position_in_grid]]
+	kernel void depthFirstPreprocessKernel(
+	    const device PackedWorldT* worldGaussians [[buffer(0)]],
+	    const device HarmonicT* harmonics [[buffer(1)]],
+	    device RenderDataT* outRenderData [[buffer(2)]],
+	    device int4* outBounds [[buffer(3)]],
+	    device uint* preDepthKeys [[buffer(4)]],
+	    device uint* nTouchedTiles [[buffer(5)]],
+	    device atomic_uint* totalInstances [[buffer(6)]],
+	    constant CameraUniforms& camera [[buffer(7)]],
+	    constant TileBinningParams& params [[buffer(8)]],
+	    uint gid [[thread_position_in_grid]]
+	) {
+    if (gid >= camera.gaussianCount) { return; }
+
+    PackedWorldT g = worldGaussians[gid];
+
+	float3 scale = float3(g.sx, g.sy, g.sz);
+	if (cullByScale(scale)) {
+	    nTouchedTiles[gid] = 0;
+	    outBounds[gid] = int4(0, -1, 0, -1);
+	    preDepthKeys[gid] = 0xFFFFFFFFu;
+	    return;
+	}
+
+    float3 position = float3(g.px, g.py, g.pz);
+    float4 viewPos4 = camera.viewMatrix * float4(position, 1.0f);
+    float4 clip = camera.projectionMatrix * viewPos4;
+
+    float depth = clip.w;
+	if (!isInFrontOfCameraClipW(clip.w, camera.nearPlane)) {
+	    nTouchedTiles[gid] = 0;
+	    outBounds[gid] = int4(0, -1, 0, -1);
+	    preDepthKeys[gid] = 0xFFFFFFFFu;
+	    return;
+	}
+	if (cullByFarPlane(depth, camera.farPlane)) {
+	    nTouchedTiles[gid] = 0;
+	    outBounds[gid] = int4(0, -1, 0, -1);
+	    preDepthKeys[gid] = 0xFFFFFFFFu;
+	    return;
+	}
+
+    float ndcX = clip.x / clip.w;
+    float ndcY = clip.y / clip.w;
+    float2 screenPos = ndcToScreen(float2(ndcX, ndcY), camera.width, camera.height);
+
+	float opacity = float(g.opacity);
+	if (opacity < params.alphaThreshold) {
+	    nTouchedTiles[gid] = 0;
+	    outBounds[gid] = int4(0, -1, 0, -1);
+	    preDepthKeys[gid] = 0xFFFFFFFFu;
+	    return;
+	}
+
+    float4 quat = normalizeQuaternion(getRotation(g));
+    float3x3 cov3d = buildCovariance3D(scale, quat);
+
+    float2x2 cov2d = projectCovariance2D(cov3d, viewPos4.xyz, camera.viewMatrix,
+                                          camera.projectionMatrix,
+                                          float2(camera.width, camera.height));
+
+    cov2d = stabilizeCovariance2D(cov2d, float2(camera.width, camera.height));
+
+    float theta, sigma1, sigma2;
+    if (!covarianceToThetaSigmas(cov2d, theta, sigma1, sigma2)) {
+        nTouchedTiles[gid] = 0;
+        outBounds[gid] = int4(0, -1, 0, -1);
+        return;
+    }
+    float radius = 3.0f * max(sigma1, sigma2);
+
+    if (cullByRadius(radius)) {
+        nTouchedTiles[gid] = 0;
+        outBounds[gid] = int4(0, -1, 0, -1);
+        return;
+    }
+
+    if (cullByTotalInkFromCov(opacity, cov2d, depth, camera.nearPlane, camera.farPlane, params.totalInkThreshold)) {
+        nTouchedTiles[gid] = 0;
+        outBounds[gid] = int4(0, -1, 0, -1);
+        preDepthKeys[gid] = 0xFFFFFFFFu;
+        return;
+    }
+
+    float2 obbExtents = computeOBBExtents(cov2d, 3.0f);
+
+    if (cullByScreenBounds(screenPos, obbExtents, camera.width, camera.height)) {
+        nTouchedTiles[gid] = 0;
+        outBounds[gid] = int4(0, -1, 0, -1);
+        return;
+    }
+
+    float3 color = computeSHColor(harmonics, gid, position, camera.cameraCenter, camera.shComponents);
+    color = max(color + float3(0.5f), float3(0.0f));
+    color = maybeDecodeSRGBToLinear(color, camera.inputIsSRGB);
+
+    RenderDataT renderData;
+    renderData.meanX = half(screenPos.x);
+    renderData.meanY = half(screenPos.y);
+    renderData.theta = packThetaPi(theta);
+    renderData.sigma1 = half(sigma1);
+    renderData.sigma2 = half(sigma2);
+    renderData.depth = half(depth);
+    renderData.colorR = uchar(clamp(color.x * 255.0f, 0.0f, 255.0f));
+    renderData.colorG = uchar(clamp(color.y * 255.0f, 0.0f, 255.0f));
+    renderData.colorB = uchar(clamp(color.z * 255.0f, 0.0f, 255.0f));
+    renderData.opacity = uchar(clamp(opacity * 255.0f, 0.0f, 255.0f));
+    outRenderData[gid] = renderData;
+
+    // Compute tile bounds using unified helper
+    TileBounds tb = computeTileBounds(
+        screenPos, obbExtents,
+        camera.width, camera.height,
+        int(params.tileWidth), int(params.tileHeight),
+        int(params.tilesX), int(params.tilesY)
+    );
+
+    outBounds[gid] = int4(tb.minTileX, tb.maxTileX, tb.minTileY, tb.maxTileY);
+
+    float meanX_q = float(renderData.meanX);
+    float meanY_q = float(renderData.meanY);
+    float theta_q = unpackThetaPi(renderData.theta);
+    float sigma1_q = float(renderData.sigma1);
+    float sigma2_q = float(renderData.sigma2);
+    float opacity_q = float(renderData.opacity) * (1.0f / 255.0f);
+
+    float3 conic = conicFromSigmaTheta(sigma1_q, sigma2_q, theta_q);
+    float conic_a = conic.x;
+    float conic_b = conic.y;
+    float conic_c = conic.z;
+
+    float tau = max(params.alphaThreshold, 1e-12f);
+    float d2Cutoff = computeD2Cutoff(opacity_q, tau);
+
+    uint touchedCount = 0;
+    if (d2Cutoff >= 0.0f) {
+        float tileW = float(params.tileWidth);
+        float tileH = float(params.tileHeight);
+
+        for (int ty = tb.minTileY; ty <= tb.maxTileY; ++ty) {
+            float tileMinY = float(ty) * tileH;
+            float tileMaxY = tileMinY + tileH;
+            float tile_ymin = tileMinY - meanY_q;
+            float tile_ymax = tileMaxY - meanY_q;
+
+            for (int tx = tb.minTileX; tx <= tb.maxTileX; ++tx) {
+                float tileMinX = float(tx) * tileW;
+                float tileMaxX = tileMinX + tileW;
+                float tile_xmin = tileMinX - meanX_q;
+                float tile_xmax = tileMaxX - meanX_q;
+
+                float d2min = minQuadRect(tile_xmin, tile_xmax, tile_ymin, tile_ymax,
+                                          conic_a, conic_b, conic_c);
+                if (d2min <= d2Cutoff) {
+                    touchedCount++;
+                }
+            }
+        }
+    }
+
+    if (touchedCount == 0) {
+        nTouchedTiles[gid] = 0;
+        outBounds[gid] = int4(0, -1, 0, -1);
+        preDepthKeys[gid] = 0xFFFFFFFFu;
+        return;
+    }
+
+    preDepthKeys[gid] = float_to_sortable_uint(depth);
+
+    nTouchedTiles[gid] = touchedCount;
+
+    atomic_fetch_add_explicit(totalInstances, touchedCount, memory_order_relaxed);
+}
+
+template [[host_name("depthFirstPreprocessKernel")]]
+kernel void depthFirstPreprocessKernel<PackedWorldGaussian, float, GaussianRenderData>(
+    const device PackedWorldGaussian*, const device float*,
+    device GaussianRenderData*, device int4*, device uint*,
+    device uint*, device atomic_uint*,
+    constant CameraUniforms&, constant TileBinningParams&, uint);
+
+template [[host_name("depthFirstPreprocessKernelHalf")]]
+kernel void depthFirstPreprocessKernel<PackedWorldGaussianHalf, half, GaussianRenderData>(
+    const device PackedWorldGaussianHalf*, const device half*,
+    device GaussianRenderData*, device int4*, device uint*,
+    device uint*, device atomic_uint*,
+    constant CameraUniforms&, constant TileBinningParams&, uint);
+
+
+struct EyeProjectionResult {
+    float2 screenPos;      // px, py in screen coordinates
+    float theta;           // ellipse angle in [0, pi)
+    float sigma1;          // major axis sigma in pixels
+    float sigma2;          // minor axis sigma in pixels
+    float detCov;          // determinant of covariance (pixel^4)
+    float2 obbExtents;     // OBB half-extents for tight bounds
+    float depth;           // positive depth for sorting
+    int4 tileBounds;       // minTileX, maxTileX, minTileY, maxTileY
+    uint touchedTiles;     // number of tiles touched
+    bool visible;          // whether visible in this eye
+};
+
+inline EyeProjectionResult projectToEye(
+    float3 scenePos,       // gaussian position in scene space
+    float3 scale,          // gaussian scale (sx, sy, sz)
+    float4 quat,           // gaussian rotation quaternion
+    float4x4 sceneTransform, // scene → world transform
+    float4x4 viewMatrix,   // world → eye transform
+    float4x4 projMatrix,
+    float focalX,
+    float focalY,
+    float width,
+    float height,
+    float nearPlane,
+    float farPlane,
+    uint tileWidth,
+    uint tileHeight,
+    uint tilesX,
+    uint tilesY
+) {
+    EyeProjectionResult result;
+    result.visible = false;
+    result.touchedTiles = 0;
+    result.tileBounds = int4(0, -1, 0, -1);
+    result.theta = 0.0f;
+    result.sigma1 = 0.0f;
+    result.sigma2 = 0.0f;
+    result.detCov = 0.0f;
+
+    float4 worldPos4 = sceneTransform * float4(scenePos, 1.0f);
+    float4 viewPos4 = viewMatrix * worldPos4;
+    float4 clip = projMatrix * viewPos4;
+    float depth = clip.w;
+    result.depth = depth;
+
+    if (!isInFrontOfCameraClipW(clip.w, nearPlane)) {
+        return result;
+    }
+    if (cullByFarPlane(depth, farPlane)) {
+        return result;
+    }
+
+    float ndcX = clip.x / clip.w;
+    float ndcY = clip.y / clip.w;
+    result.screenPos = ndcToScreen(float2(ndcX, ndcY), width, height);
+
+    float sceneScale = length(float3(sceneTransform[0][0], sceneTransform[0][1], sceneTransform[0][2]));
+    float3 scaledGaussianScale = scale * sceneScale;
+    float3x3 cov3d = buildCovariance3D(scaledGaussianScale, quat);
+
+    float2x2 cov2d = projectCovariance2D(cov3d, viewPos4.xyz, viewMatrix, projMatrix, float2(width, height));
+
+    cov2d = stabilizeCovariance2D(cov2d, float2(width, height));
+
+    float theta, sigma1, sigma2;
+    if (!covarianceToThetaSigmas(cov2d, theta, sigma1, sigma2)) {
+        return result;
+    }
+    result.theta = theta;
+    result.sigma1 = sigma1;
+    result.sigma2 = sigma2;
+    float a = cov2d[0][0];
+    float b = 0.5f * (cov2d[0][1] + cov2d[1][0]);
+    float d = cov2d[1][1];
+    result.detCov = max(a * d - b * b, 0.0f);
+    float radius = 3.0f * max(sigma1, sigma2);
+
+    if (cullByRadius(radius)) {
+        return result;
+    }
+
+    result.obbExtents = computeOBBExtents(cov2d, 3.0f);
+
+    if (cullByScreenBounds(result.screenPos, result.obbExtents, width, height)) {
+        return result;
+    }
+
+    TileBounds tb = computeTileBounds(
+        result.screenPos, result.obbExtents,
+        width, height,
+        int(tileWidth), int(tileHeight),
+        int(tilesX), int(tilesY)
+    );
+
+    result.tileBounds = int4(tb.minTileX, tb.maxTileX, tb.minTileY, tb.maxTileY);
+
+    uint tilesX_count = tb.valid ? uint(tb.maxTileX - tb.minTileX + 1) : 0;
+    uint tilesY_count = tb.valid ? uint(tb.maxTileY - tb.minTileY + 1) : 0;
+    result.touchedTiles = tilesX_count * tilesY_count;
+
+    result.visible = true;
+    return result;
+}
+
+template <typename PackedWorldT, typename HarmonicT>
+	kernel void depthFirstStereoUnifiedPreprocessKernel(
+	    const device PackedWorldT* worldGaussians [[buffer(0)]],
+	    const device HarmonicT* harmonics [[buffer(1)]],
+	    device StereoTiledRenderData* outRenderData [[buffer(2)]],
+	    device int4* outBounds [[buffer(3)]],
+	    device uint* preDepthKeys [[buffer(4)]],
+	    device uint* nTouchedTiles [[buffer(5)]],
+	    device atomic_uint* totalInstances [[buffer(6)]],
+	    constant StereoCameraUniforms& camera [[buffer(7)]],
+	    constant TileBinningParams& params [[buffer(8)]],
+	    uint gid [[thread_position_in_grid]]
 ) {
     if (gid >= camera.gaussianCount) { return; }
 
     PackedWorldT g = worldGaussians[gid];
 
     // Early cull: skip tiny gaussians
-    float3 scale = float3(g.sx, g.sy, g.sz);
-    float maxScale = max(scale.x, max(scale.y, scale.z));
-    if (maxScale < 0.0005f) {
-        // NOTE: Do NOT write to depthKeys/primitiveIndices here!
-        // Those buffers use compacted indexing (0..visibleCount-1)
-        // Writing at gid would race with compacted writes from visible gaussians
-        nTouchedTiles[gid] = 0;
-        outBounds[gid] = int4(0, -1, 0, -1);
-        return;
-    }
+	float3 scale = float3(g.sx, g.sy, g.sz);
+	if (cullByScale(scale)) {
+	    nTouchedTiles[gid] = 0;
+	    outBounds[gid] = int4(0, -1, 0, -1);
+	    preDepthKeys[gid] = 0xFFFFFFFFu;
+	    return;
+	}
 
     float3 position = float3(g.px, g.py, g.pz);
-    float4 viewPos4 = camera.viewMatrix * float4(position, 1.0f);
-    float depth = safeDepthComponent(viewPos4.z);
 
-    if (depth <= camera.nearPlane) {
-        nTouchedTiles[gid] = 0;
-        outBounds[gid] = int4(0, -1, 0, -1);
-        return;
-    }
-
-    float4 clip = camera.projectionMatrix * viewPos4;
-    if (fabs(clip.w) < 1e-6f) {
-        nTouchedTiles[gid] = 0;
-        outBounds[gid] = int4(0, -1, 0, -1);
-        return;
-    }
-
-    float ndcX = clip.x / clip.w;
-    float ndcY = clip.y / clip.w;
-    float px = ((ndcX + 1.0f) * camera.width - 1.0f) * 0.5f;
-    float py = ((ndcY + 1.0f) * camera.height - 1.0f) * 0.5f;
-
-    float opacity = float(g.opacity);
-    if (opacity < params.alphaThreshold) {
-        nTouchedTiles[gid] = 0;
-        outBounds[gid] = int4(0, -1, 0, -1);
-        return;
-    }
+	float opacity = float(g.opacity);
+	if (opacity < params.alphaThreshold) {
+	    nTouchedTiles[gid] = 0;
+	    outBounds[gid] = int4(0, -1, 0, -1);
+	    preDepthKeys[gid] = 0xFFFFFFFFu;
+	    return;
+	}
 
     float4 quat = normalizeQuaternion(getRotation(g));
-    float3x3 cov3d = buildCovariance3D(scale, quat);
 
-    float3 viewRow0 = float3(camera.viewMatrix[0][0], camera.viewMatrix[1][0], camera.viewMatrix[2][0]);
-    float3 viewRow1 = float3(camera.viewMatrix[0][1], camera.viewMatrix[1][1], camera.viewMatrix[2][1]);
-    float3 viewRow2 = float3(camera.viewMatrix[0][2], camera.viewMatrix[1][2], camera.viewMatrix[2][2]);
-    float3x3 viewRot = matrixFromRows(viewRow0, viewRow1, viewRow2);
+    EyeProjectionResult leftResult = projectToEye(
+        position, scale, quat,
+        camera.sceneTransform,
+        camera.leftViewMatrix, camera.leftProjectionMatrix,
+        camera.leftFocalX, camera.leftFocalY,
+        camera.width, camera.height, camera.nearPlane, camera.farPlane,
+        params.tileWidth, params.tileHeight, params.tilesX, params.tilesY
+    );
 
-    float2x2 cov2d = projectCovariance(cov3d, viewPos4.xyz, viewRot, camera.focalX, camera.focalY, camera.width, camera.height);
-    float4 conic;
-    float radius;
-    computeConicAndRadius(cov2d, conic, radius);
+    EyeProjectionResult rightResult = projectToEye(
+        position, scale, quat,
+        camera.sceneTransform,
+        camera.rightViewMatrix, camera.rightProjectionMatrix,
+        camera.rightFocalX, camera.rightFocalY,
+        camera.width, camera.height, camera.nearPlane, camera.farPlane,
+        params.tileWidth, params.tileHeight, params.tilesX, params.tilesY
+    );
 
-    if (radius < 0.5f) {
-        nTouchedTiles[gid] = 0;
-        outBounds[gid] = int4(0, -1, 0, -1);
-        return;
+	if (!leftResult.visible && !rightResult.visible) {
+	    nTouchedTiles[gid] = 0;
+	    outBounds[gid] = int4(0, -1, 0, -1);
+	    preDepthKeys[gid] = 0xFFFFFFFFu;
+	    return;
+	}
+
+    float checkDepth = leftResult.visible ? leftResult.depth : rightResult.depth;
+    if (leftResult.visible && rightResult.visible) {
+        checkDepth = (leftResult.depth + rightResult.depth) * 0.5f;
     }
-
-    // Total ink filter
-    float det = conic.x * conic.z - conic.y * conic.y;
-    float totalInk = opacity * 6.283185f / sqrt(max(det, 1e-6f));
-    float depthFactor = 1.0 - pow(saturate((camera.farPlane - depth) / (camera.farPlane - camera.nearPlane)), 2.0);
-    float adjustedThreshold = depthFactor * params.totalInkThreshold;
-    if (totalInk < adjustedThreshold) {
-        nTouchedTiles[gid] = 0;
-        outBounds[gid] = int4(0, -1, 0, -1);
-        return;
+    float detCov = leftResult.visible ? leftResult.detCov : rightResult.detCov;
+    if (leftResult.visible && rightResult.visible) {
+        detCov = max(leftResult.detCov, rightResult.detCov);
     }
+	if (cullByTotalInk(opacity, detCov, checkDepth, camera.nearPlane, camera.farPlane, params.totalInkThreshold)) {
+	    nTouchedTiles[gid] = 0;
+	    outBounds[gid] = int4(0, -1, 0, -1);
+	    preDepthKeys[gid] = 0xFFFFFFFFu;
+	    return;
+	}
 
-    // OBB extents for tighter bounds
-    float2 obbExtents = computeOBBExtents(cov2d, 3.0f);
-
-    // Off-screen culling
-    if (px + obbExtents.x < 0.0f || px - obbExtents.x > camera.width ||
-        py + obbExtents.y < 0.0f || py - obbExtents.y > camera.height) {
-        nTouchedTiles[gid] = 0;
-        outBounds[gid] = int4(0, -1, 0, -1);
-        return;
-    }
-
-    // Compute SH color
-    float3 color = computeSHColor(harmonics, gid, position, camera.cameraCenter, camera.shComponents);
+    float3 leftCameraCenter = float3(camera.leftCameraCenterX, camera.leftCameraCenterY, camera.leftCameraCenterZ);
+    float3 rightCameraCenter = float3(camera.rightCameraCenterX, camera.rightCameraCenterY, camera.rightCameraCenterZ);
+    float3 midCamera = (leftCameraCenter + rightCameraCenter) * 0.5f;
+    float3 color = computeSHColor(harmonics, gid, position, midCamera, camera.shComponents);
     color = max(color + float3(0.5f), float3(0.0f));
+    color = maybeDecodeSRGBToLinear(color, camera.inputIsSRGB);
 
-    // Write render data
-    RenderDataT renderData;
-    renderData.meanX = half(px);
-    renderData.meanY = half(py);
-    renderData.conicA = half(conic.x);
-    renderData.conicB = half(conic.y);
-    renderData.conicC = half(conic.z);
-    renderData.conicD = half(conic.w);
-    renderData.colorR = half(color.x);
-    renderData.colorG = half(color.y);
-    renderData.colorB = half(color.z);
-    renderData.opacity = half(opacity);
-    renderData.depth = half(depth);
+    int4 unionBounds;
+    if (leftResult.visible && rightResult.visible) {
+        unionBounds = int4(
+            min(leftResult.tileBounds.x, rightResult.tileBounds.x),
+            max(leftResult.tileBounds.y, rightResult.tileBounds.y),
+            min(leftResult.tileBounds.z, rightResult.tileBounds.z),
+            max(leftResult.tileBounds.w, rightResult.tileBounds.w)
+        );
+    } else if (leftResult.visible) {
+        unionBounds = leftResult.tileBounds;
+    } else {
+        unionBounds = rightResult.tileBounds;
+    }
+
+    int unionTilesX = max(unionBounds.y - unionBounds.x + 1, 0);
+    int unionTilesY = max(unionBounds.w - unionBounds.z + 1, 0);
+    uint touchedCount = uint(unionTilesX * unionTilesY);
+
+    if (touchedCount == 0) {
+        nTouchedTiles[gid] = 0;
+        outBounds[gid] = int4(0, -1, 0, -1);
+        preDepthKeys[gid] = 0xFFFFFFFFu;
+        return;
+    }
+
+    StereoTiledRenderData renderData;
+    if (leftResult.visible) {
+        renderData.leftMeanX = half(leftResult.screenPos.x);
+        renderData.leftMeanY = half(leftResult.screenPos.y);
+        float3 conicLF = conicFromThetaSigmas(leftResult.theta, leftResult.sigma1, leftResult.sigma2);
+        renderData.leftCxx = half(conicLF.x);
+        renderData.leftCyy = half(conicLF.z);
+        renderData.leftCxy2 = half(2.0f * conicLF.y);
+        renderData.leftDepth = half(leftResult.depth);
+    } else {
+        renderData.leftMeanX = half(-1e10f);
+        renderData.leftMeanY = half(-1e10f);
+        renderData.leftCxx = half(0);
+        renderData.leftCyy = half(0);
+        renderData.leftCxy2 = half(0);
+        renderData.leftDepth = half(0);
+    }
+    if (rightResult.visible) {
+        renderData.rightMeanX = half(rightResult.screenPos.x);
+        renderData.rightMeanY = half(rightResult.screenPos.y);
+        float3 conicRF = conicFromThetaSigmas(rightResult.theta, rightResult.sigma1, rightResult.sigma2);
+        renderData.rightCxx = half(conicRF.x);
+        renderData.rightCyy = half(conicRF.z);
+        renderData.rightCxy2 = half(2.0f * conicRF.y);
+        renderData.rightDepth = half(rightResult.depth);
+    } else {
+        renderData.rightMeanX = half(-1e10f);
+        renderData.rightMeanY = half(-1e10f);
+        renderData.rightCxx = half(0);
+        renderData.rightCyy = half(0);
+        renderData.rightCxy2 = half(0);
+        renderData.rightDepth = half(0);
+    }
+
+    renderData.colorR = uchar(clamp(color.x * 255.0f, 0.0f, 255.0f));
+    renderData.colorG = uchar(clamp(color.y * 255.0f, 0.0f, 255.0f));
+    renderData.colorB = uchar(clamp(color.z * 255.0f, 0.0f, 255.0f));
+    renderData.opacity = uchar(clamp(opacity * 255.0f, 0.0f, 255.0f));
+    renderData.centerDepth = half(checkDepth);
+    renderData._pad0 = 0;
+
     outRenderData[gid] = renderData;
-
-    // Compute tile bounds
-    float xmin = px - obbExtents.x;
-    float xmax = px + obbExtents.x;
-    float ymin = py - obbExtents.y;
-    float ymax = py + obbExtents.y;
-
-    float maxW = camera.width - 1.0f;
-    float maxH = camera.height - 1.0f;
-
-    xmin = clamp(xmin, 0.0f, maxW);
-    xmax = clamp(xmax, 0.0f, maxW);
-    ymin = clamp(ymin, 0.0f, maxH);
-    ymax = clamp(ymax, 0.0f, maxH);
-
-    int minTileX = int(floor(xmin / float(params.tileWidth)));
-    int maxTileX = int(ceil(xmax / float(params.tileWidth))) - 1;
-    int minTileY = int(floor(ymin / float(params.tileHeight)));
-    int maxTileY = int(ceil(ymax / float(params.tileHeight))) - 1;
-
-    minTileX = max(minTileX, 0);
-    minTileY = max(minTileY, 0);
-    maxTileX = min(maxTileX, int(params.tilesX) - 1);
-    maxTileY = min(maxTileY, int(params.tilesY) - 1);
-
-    outBounds[gid] = int4(minTileX, maxTileX, minTileY, maxTileY);
-
-    // Count touched tiles from AABB (fast)
-    // Note: Could add intersection testing but it's expensive in preprocess
-    // since this runs for ALL gaussians, not just visible ones
-    uint tilesX_count = (minTileX <= maxTileX) ? uint(maxTileX - minTileX + 1) : 0;
-    uint tilesY_count = (minTileY <= maxTileY) ? uint(maxTileY - minTileY + 1) : 0;
-    uint touchedCount = tilesX_count * tilesY_count;
-
-    // Atomic compaction: get compacted write position for depth sort buffers
-    // This ensures visible gaussians are contiguous in the first visibleCount positions
-    uint compactIdx = atomic_fetch_add_explicit(visibleCount, 1u, memory_order_relaxed);
-
-    // Write depth key and primitive index to COMPACTED positions (for depth sort)
-    half depthHalf = half(depth);
-    uint depthBits = uint(as_type<ushort>(depthHalf)) ^ 0x8000u;  // XOR sign bit for unsigned ordering
-    depthKeys[compactIdx] = depthBits;
-    primitiveIndices[compactIdx] = int(gid);  // Store original gaussian index
-
-    // Write nTouchedTiles to ORIGINAL position (indexed by original gid for applyDepthOrdering)
+    outBounds[gid] = unionBounds;
     nTouchedTiles[gid] = touchedCount;
 
-    // Count total instances
+    preDepthKeys[gid] = float_to_sortable_uint(checkDepth);
+
     atomic_fetch_add_explicit(totalInstances, touchedCount, memory_order_relaxed);
 }
 
-// Template instantiations
-template [[host_name("depthFirstPreprocessKernel")]]
-kernel void depthFirstPreprocessKernel<PackedWorldGaussian, float, GaussianRenderData>(
+template [[host_name("depthFirstStereoUnifiedPreprocessKernel")]]
+kernel void depthFirstStereoUnifiedPreprocessKernel<PackedWorldGaussian, float>(
     const device PackedWorldGaussian*, const device float*,
-    device GaussianRenderData*, device int4*, device uint*, device int*,
-    device uint*, device atomic_uint*, device atomic_uint*,
-    constant CameraUniforms&, constant TileBinningParams&, uint);
+    device StereoTiledRenderData*, device int4*, device uint*,
+    device uint*, device atomic_uint*,
+    constant StereoCameraUniforms&, constant TileBinningParams&, uint);
 
-template [[host_name("depthFirstPreprocessKernelHalf")]]
-kernel void depthFirstPreprocessKernel<PackedWorldGaussianHalf, half, GaussianRenderData>(
+template [[host_name("depthFirstStereoUnifiedPreprocessKernelHalf")]]
+kernel void depthFirstStereoUnifiedPreprocessKernel<PackedWorldGaussianHalf, half>(
     const device PackedWorldGaussianHalf*, const device half*,
-    device GaussianRenderData*, device int4*, device uint*, device int*,
-    device uint*, device atomic_uint*, device atomic_uint*,
-    constant CameraUniforms&, constant TileBinningParams&, uint);
+    device StereoTiledRenderData*, device int4*, device uint*,
+    device uint*, device atomic_uint*,
+    constant StereoCameraUniforms&, constant TileBinningParams&, uint);
+
+
+#define DF_SCAN_BLOCK_SIZE 256u
+
+kernel void visibilityBlockReduceKernel(
+    const device uint* nTouchedTiles [[buffer(0)]],
+    device uint* blockSums [[buffer(1)]],
+    constant uint& count [[buffer(2)]],
+    uint gid [[thread_position_in_grid]],
+    uint lid [[thread_position_in_threadgroup]],
+    uint groupId [[threadgroup_position_in_grid]]
+) {
+    threadgroup uint shared[DF_SCAN_BLOCK_SIZE];
+    uint value = (gid < count && nTouchedTiles[gid] > 0u) ? 1u : 0u;
+    uint blockSum = threadgroup_cooperative_reduce_sum<DF_SCAN_BLOCK_SIZE>(value, shared, ushort(lid));
+    if (lid == 0u) { blockSums[groupId] = blockSum; }
+}
+
+kernel void scanBlockReduceKernel(
+    const device uint* input [[buffer(0)]],
+    device uint* blockSums [[buffer(1)]],
+    constant uint& count [[buffer(2)]],
+    uint gid [[thread_position_in_grid]],
+    uint lid [[thread_position_in_threadgroup]],
+    uint groupId [[threadgroup_position_in_grid]]
+) {
+    threadgroup uint shared[DF_SCAN_BLOCK_SIZE];
+    uint value = (gid < count) ? input[gid] : 0u;
+    uint blockSum = threadgroup_cooperative_reduce_sum<DF_SCAN_BLOCK_SIZE>(value, shared, ushort(lid));
+    if (lid == 0u) { blockSums[groupId] = blockSum; }
+}
+
+kernel void scanBlockScanKernel(
+    const device uint* input [[buffer(0)]],
+    device uint* output [[buffer(1)]],
+    const device uint* blockOffsets [[buffer(2)]],
+    constant uint& count [[buffer(3)]],
+    uint gid [[thread_position_in_grid]],
+    uint lid [[thread_position_in_threadgroup]],
+    uint groupId [[threadgroup_position_in_grid]]
+) {
+    threadgroup uint shared[DF_SCAN_BLOCK_SIZE];
+    uint value = (gid < count) ? input[gid] : 0u;
+    uint exclusive = threadgroup_raking_prefix_exclusive_sum<DF_SCAN_BLOCK_SIZE>(value, shared, ushort(lid));
+    if (gid < count) { output[gid] = exclusive + blockOffsets[groupId]; }
+}
+
+kernel void visibilityBlockScanKernel(
+    const device uint* nTouchedTiles [[buffer(0)]],
+    device uint* outputOffsets [[buffer(1)]],
+    const device uint* blockOffsets [[buffer(2)]],
+    constant uint& count [[buffer(3)]],
+    uint gid [[thread_position_in_grid]],
+    uint lid [[thread_position_in_threadgroup]],
+    uint groupId [[threadgroup_position_in_grid]]
+) {
+    threadgroup uint shared[DF_SCAN_BLOCK_SIZE];
+    uint value = (gid < count && nTouchedTiles[gid] > 0u) ? 1u : 0u;
+    uint exclusive = threadgroup_raking_prefix_exclusive_sum<DF_SCAN_BLOCK_SIZE>(value, shared, ushort(lid));
+    if (gid < count) { outputOffsets[gid] = exclusive + blockOffsets[groupId]; }
+}
+
+kernel void singleBlockScanKernel(
+    device uint* blockSums [[buffer(0)]],
+    constant uint& blockCount [[buffer(1)]],
+    uint lid [[thread_position_in_threadgroup]]
+) {
+    threadgroup uint shared[DF_SCAN_BLOCK_SIZE];
+    uint value = (lid < blockCount) ? blockSums[lid] : 0u;
+    uint total = threadgroup_cooperative_reduce_sum<DF_SCAN_BLOCK_SIZE>(value, shared, ushort(lid));
+    uint exclusive = threadgroup_raking_prefix_exclusive_sum<DF_SCAN_BLOCK_SIZE>(value, shared, ushort(lid));
+    if (lid < blockCount) { blockSums[lid] = exclusive; }
+    if (lid == 0u) { blockSums[blockCount] = total; }
+}
+
+kernel void visibilityScatterCompactKernel(
+    const device uint* nTouchedTiles [[buffer(0)]],
+    const device uint* prefixOffsets [[buffer(1)]],
+    const device uint* preDepthKeys [[buffer(2)]],
+    device uint* depthKeys [[buffer(3)]],
+    device int* primitiveIndices [[buffer(4)]],
+    device uint* visibleCount [[buffer(5)]],
+    constant uint& count [[buffer(6)]],
+    constant uint& maxOutCount [[buffer(7)]],
+    uint gid [[thread_position_in_grid]]
+) {
+    if (gid >= count) { return; }
+
+    bool isVisible = (nTouchedTiles[gid] > 0u);
+    if (isVisible) {
+        uint outIdx = prefixOffsets[gid];
+        if (outIdx < maxOutCount) {
+            uint key = preDepthKeys[gid];
+            if (DF_DEPTH_KEY_16) {
+                float depth = sortable_uint_to_float(key);
+                half depthHalf = half(depth);
+                ushort depthBits = as_type<ushort>(depthHalf) ^ 0x8000u;
+                key = uint(depthBits);
+            }
+            depthKeys[outIdx] = key;
+            primitiveIndices[outIdx] = int(gid);
+        }
+    }
+
+    if (gid == count - 1u) {
+        visibleCount[0] = prefixOffsets[gid] + (isVisible ? 1u : 0u);
+    }
+}
 
 kernel void applyDepthOrderingKernel(
     const device int* sortedPrimitiveIndices [[buffer(0)]],
@@ -267,10 +664,83 @@ kernel void createInstancesKernel(
 
     if (minTX > maxTX || minTY > maxTY) { return; }
 
+    // Read quantized gaussian data (same values used in preprocess counting)
+    GaussianRenderData g = renderData[originalIdx];
+    float meanX_q = float(g.meanX);
+    float meanY_q = float(g.meanY);
+    float theta_q = unpackThetaPi(g.theta);
+    float sigma1_q = float(g.sigma1);
+    float sigma2_q = float(g.sigma2);
+    float opacity_q = float(g.opacity) * (1.0f / 255.0f);
+
+    // Build conic from quantized ellipse params
+    float3 conic = conicFromSigmaTheta(sigma1_q, sigma2_q, theta_q);
+    float conic_a = conic.x;
+    float conic_b = conic.y;
+    float conic_c = conic.z;
+
+    // Compute d² cutoff: if minQuadRect <= d2Cutoff, tile passes
+    float tau = max(params.alphaThreshold, 1e-12f);
+    float d2Cutoff = computeD2Cutoff(opacity_q, tau);
+
     // Get the write offset for this gaussian (from prefix sum)
     uint writeOffset = instanceOffsets[gid];
 
-    // Write instances for all tiles in bounding box (must match nTouchedTiles count)
+    float tileW = float(params.tileWidth);
+    float tileH = float(params.tileHeight);
+
+    if (d2Cutoff >= 0.0f) {
+        for (int ty = minTY; ty <= maxTY; ty++) {
+            float tileMinY = float(ty) * tileH;
+            float tileMaxY = tileMinY + tileH;
+            float tile_ymin = tileMinY - meanY_q;
+            float tile_ymax = tileMaxY - meanY_q;
+
+            for (int tx = minTX; tx <= maxTX; tx++) {
+                float tileMinX = float(tx) * tileW;
+                float tileMaxX = tileMinX + tileW;
+                float tile_xmin = tileMinX - meanX_q;
+                float tile_xmax = tileMaxX - meanX_q;
+
+                float d2min = minQuadRect(tile_xmin, tile_xmax, tile_ymin, tile_ymax,
+                                          conic_a, conic_b, conic_c);
+                if (d2min <= d2Cutoff && writeOffset < params.maxAssignments) {
+                    ushort tileId = ushort(ty * int(params.tilesX) + tx);
+                    instanceTileIds[writeOffset] = tileId;
+                    instanceGaussianIndices[writeOffset] = originalIdx;
+                    writeOffset++;
+                }
+            }
+        }
+    }
+}
+
+kernel void createInstancesStereoKernel(
+    const device int* sortedPrimitiveIndices [[buffer(0)]],
+    const device uint* instanceOffsets [[buffer(1)]],
+    const device int4* tileBounds [[buffer(2)]],
+    device ushort* instanceTileIds [[buffer(3)]],
+    device int* instanceGaussianIndices [[buffer(4)]],
+    constant DepthFirstParams& params [[buffer(5)]],
+    constant DepthFirstHeader& header [[buffer(6)]],
+    uint gid [[thread_position_in_grid]]
+) {
+    uint visibleCount = header.visibleCount;
+    if (gid >= visibleCount) { return; }
+
+    int originalIdx = sortedPrimitiveIndices[gid];
+    if (originalIdx < 0) { return; }
+
+    int4 bounds = tileBounds[originalIdx];
+    int minTX = bounds.x;
+    int maxTX = bounds.y;
+    int minTY = bounds.z;
+    int maxTY = bounds.w;
+
+    if (minTX > maxTX || minTY > maxTY) { return; }
+
+    uint writeOffset = instanceOffsets[gid];
+
     for (int ty = minTY; ty <= maxTY; ty++) {
         for (int tx = minTX; tx <= maxTX; tx++) {
             if (writeOffset < params.maxAssignments) {
@@ -287,7 +757,7 @@ kernel void tileRadixHistogramKernel(
     device const ushort* inputTileIds [[buffer(0)]],
     device uint* histFlat [[buffer(1)]],
     constant DepthFirstHeader& header [[buffer(2)]],
-    constant uint& currentDigit [[buffer(3)]],  // 0 or 8 for 16-bit keys
+    constant uint& currentDigit [[buffer(3)]],
     uint gridSize [[threadgroups_per_grid]],
     uint groupId [[threadgroup_position_in_grid]],
     ushort localId [[thread_position_in_threadgroup]]
@@ -302,12 +772,12 @@ kernel void tileRadixHistogramKernel(
     uint assignmentsRemain = (baseId < count) ? (count - baseId) : 0;
     uint available = min(bufferRemaining, assignmentsRemain);
 
-    threadgroup uint localHist[RADIX_BUCKETS];
+    threadgroup atomic_uint localHist[RADIX_BUCKETS];
 
     for (uint i = 0; i < (RADIX_BUCKETS + RADIX_BLOCK_SIZE - 1u) / RADIX_BLOCK_SIZE; ++i) {
         uint bin = localId + i * RADIX_BLOCK_SIZE;
         if (bin < RADIX_BUCKETS) {
-            localHist[bin] = 0u;
+            atomic_store_explicit(&localHist[bin], 0u, memory_order_relaxed);
         }
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -322,30 +792,25 @@ kernel void tileRadixHistogramKernel(
         available,
         sentinelKey);
 
-    volatile threadgroup atomic_uint* atomicHist =
-        reinterpret_cast<volatile threadgroup atomic_uint*>(localHist);
-
     for (ushort i = 0; i < RADIX_GRAIN_SIZE; ++i) {
         uint offsetInBlock = localId * RADIX_GRAIN_SIZE + i;
         uint globalIdx = baseId + offsetInBlock;
 
-        if (globalIdx < count) {
+        if (globalIdx < count && keys[i] != sentinelKey) {
             uchar bin = (uchar)((keys[i] >> currentDigit) & 0xFFu);
-            atomic_fetch_add_explicit(&atomicHist[bin], 1u, memory_order_relaxed);
+            atomic_fetch_add_explicit(&localHist[bin], 1u, memory_order_relaxed);
         }
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
-    // Write histogram in TRANSPOSED layout
     for (uint i = 0; i < (RADIX_BUCKETS + RADIX_BLOCK_SIZE - 1u) / RADIX_BLOCK_SIZE; ++i) {
         uint bin = localId + i * RADIX_BLOCK_SIZE;
         if (bin < RADIX_BUCKETS) {
-            histFlat[bin * gridSize + groupId] = localHist[bin];
+            histFlat[bin * gridSize + groupId] = atomic_load_explicit(&localHist[bin], memory_order_relaxed);
         }
     }
 }
 
-// Tile scan blocks kernel
 kernel void tileRadixScanBlocksKernel(
     device uint* histFlat [[buffer(0)]],
     device uint* blockSums [[buffer(1)]],
@@ -414,7 +879,6 @@ kernel void tileRadixExclusiveScanKernel(
     }
 }
 
-// Tile apply offsets kernel
 kernel void tileRadixApplyOffsetsKernel(
     device const uint* histFlat [[buffer(0)]],
     device const uint* blockSums [[buffer(1)]],
@@ -436,7 +900,6 @@ kernel void tileRadixApplyOffsetsKernel(
     }
 }
 
-// Tile scatter kernel - stable scatter preserving depth order (16-bit tile IDs)
 kernel void tileRadixScatterKernel(
     device const ushort* inputTileIds [[buffer(0)]],
     device const int* inputIndices [[buffer(1)]],
@@ -461,11 +924,9 @@ kernel void tileRadixScatterKernel(
 
     uint keySentinel = 0xFFFFu;  // 16-bit sentinel
 
-    // Load as uint for sorting (ushort zero-extended)
     uint keys[RADIX_GRAIN_SIZE];
     int payloads[RADIX_GRAIN_SIZE];
 
-    // Manual load for ushort -> uint conversion
     for (ushort i = 0; i < RADIX_GRAIN_SIZE; ++i) {
         uint idx = baseId + localId + i * RADIX_BLOCK_SIZE;
         if (idx < available + baseId && idx < count) {
@@ -481,7 +942,6 @@ kernel void tileRadixScatterKernel(
     threadgroup RadixKeyPayload tgKp[RADIX_BLOCK_SIZE];
     threadgroup ushort tgShort[RADIX_BLOCK_SIZE];
 
-    // Read from TRANSPOSED histogram layout
     for (uint i = 0; i < (RADIX_BUCKETS + RADIX_BLOCK_SIZE - 1u) / RADIX_BLOCK_SIZE; ++i) {
         uint bin = localId + i * RADIX_BLOCK_SIZE;
         if (bin < RADIX_BUCKETS) {
@@ -490,38 +950,51 @@ kernel void tileRadixScatterKernel(
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
-    for (ushort chunk = 0; chunk < RADIX_GRAIN_SIZE; ++chunk) {
-        RadixKeyPayload kp;
-        kp.key = keys[chunk];
-        kp.payload = uint(payloads[chunk]);
+	    for (ushort chunk = 0; chunk < RADIX_GRAIN_SIZE; ++chunk) {
+	        RadixKeyPayload kp;
+	        kp.key = keys[chunk];
+	        kp.payload = uint(payloads[chunk]);
 
-        // Use the existing radix_partial_sort with digit extraction
-        // Note: currentDigit is in bits (0 or 8), convert to digit index (0 or 1)
         ushort digitIndex = (ushort)(currentDigit / 8);
         kp = radix_partial_sort(kp, tgKp, localId, digitIndex);
 
-        ushort myBin = (ushort)((kp.key >> currentDigit) & 0xFFu);
+	        ushort myBin = (ushort)((kp.key >> currentDigit) & 0xFFu);
 
-        uchar headFlag = flag_head_discontinuity<RADIX_BLOCK_SIZE>(myBin, tgShort, localId);
+	        bool isValid = (kp.key != keySentinel);
+
+	        // Invalid lanes must not participate in run detection.
+	        // Use a bin value that can't match any valid bin (0..255) so adjacent valid lanes
+	        // next to invalid lanes still correctly see discontinuities.
+	        ushort headBin = isValid ? myBin : (ushort)0xFFFF;
+	        uchar headFlag = flag_head_discontinuity<RADIX_BLOCK_SIZE>(headBin, tgShort, localId);
+	        if (!isValid) headFlag = 0;
+
         ushort runStart = radix_threadgroup_prefix_scan<RADIX_SCAN_TYPE_INCLUSIVE>(
             headFlag ? localId : (ushort)0, tgShort, localId, radix_max_op<ushort>());
         ushort localOffset = localId - runStart;
 
-        uchar tailFlag = flag_tail_discontinuity<RADIX_BLOCK_SIZE>(myBin, tgShort, localId);
+	        ushort tailBin = isValid ? myBin : (ushort)0xFFFF;
+	        uchar tailFlag = flag_tail_discontinuity<RADIX_BLOCK_SIZE>(tailBin, tgShort, localId);
+	        if (!isValid) tailFlag = 0;
 
-        bool isValid = (kp.key != keySentinel);
-        if (isValid) {
-            uint dst = globalBinBase[myBin] + localOffset;
-            outputTileIds[dst] = ushort(kp.key);
-            outputIndices[dst] = int(kp.payload);
-        }
+	        if (isValid) {
+	            uint dst = globalBinBase[myBin] + localOffset;
+	            if (dst < count) {
+	                outputTileIds[dst] = ushort(kp.key);
+	                outputIndices[dst] = int(kp.payload);
+	            }
+	        }
 
-        if (tailFlag && isValid) {
-            globalBinBase[myBin] += localOffset + 1;
-        }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-    }
-}
+	        // Prevent any SIMD-group from updating the shared bin base while others are still
+	        // reading it to compute `dst` for this chunk.
+	        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+	        if (tailFlag && isValid) {
+	            globalBinBase[myBin] += localOffset + 1;
+	        }
+	        threadgroup_barrier(mem_flags::mem_threadgroup);
+	    }
+	}
 
 kernel void extractTileRangesKernel(
     const device ushort* sortedTileIds [[buffer(0)]],  // 16-bit tile IDs
@@ -543,7 +1016,6 @@ kernel void extractTileRangesKernel(
         return;
     }
 
-    // Binary search for start of tile
     uint left = 0;
     uint right = totalInstances;
     while (left < right) {
@@ -557,7 +1029,6 @@ kernel void extractTileRangesKernel(
     }
     uint start = left;
 
-    // Binary search for end of tile
     left = start;
     right = totalInstances;
     while (left < right) {
@@ -576,7 +1047,6 @@ kernel void extractTileRangesKernel(
     tileHeader.count = end > start ? (end - start) : 0;
     tileHeaders[tile] = tileHeader;
 
-    // Compact active tiles
     if (tileHeader.count > 0) {
         uint index = atomic_fetch_add_explicit(activeTileCount, 1u, memory_order_relaxed);
         activeTiles[index] = tile;
@@ -598,70 +1068,94 @@ kernel void resetDepthFirstStateKernel(
     }
 }
 
-kernel void depthSortHistogramKernel(
-    device const RadixKeyType* inputKeys [[buffer(0)]],
-    device uint* histFlat [[buffer(1)]],
-    constant uint& currentDigit [[buffer(3)]],
-    constant DepthFirstHeader& header [[buffer(4)]],
-    uint gridSize [[threadgroups_per_grid]],
-    uint groupId [[threadgroup_position_in_grid]],
-    ushort localId [[thread_position_in_threadgroup]]
+template <typename KeyT>
+void depthSortHistogramImpl(
+    device const KeyT* inputKeys,
+    device uint* histFlat,
+    threadgroup atomic_uint* localHist,
+    uint currentDigit,
+    uint paddedCount,
+    uint count,
+    uint gridSize,
+    uint groupId,
+    ushort localId,
+    KeyT sentinelKey
 ) {
     const uint elementsPerBlock = RADIX_BLOCK_SIZE * RADIX_GRAIN_SIZE;
     uint baseId = groupId * elementsPerBlock;
-
-    uint paddedCount = header.paddedVisibleCount;  // For depth sort
-    uint count = header.visibleCount;              // For depth sort
 
     uint bufferRemaining = (baseId < paddedCount) ? (paddedCount - baseId) : 0;
     uint assignmentsRemain = (baseId < count) ? (count - baseId) : 0;
     uint available = min(bufferRemaining, assignmentsRemain);
 
-    threadgroup uint localHist[RADIX_BUCKETS];
-
     for (uint i = 0; i < (RADIX_BUCKETS + RADIX_BLOCK_SIZE - 1u) / RADIX_BLOCK_SIZE; ++i) {
         uint bin = localId + i * RADIX_BLOCK_SIZE;
-        if (bin < RADIX_BUCKETS) {
-            localHist[bin] = 0u;
-        }
+        if (bin < RADIX_BUCKETS) { atomic_store_explicit(&localHist[bin], 0u, memory_order_relaxed); }
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
-    RadixKeyType keys[RADIX_GRAIN_SIZE];
-    RadixKeyType sentinelKey = (RadixKeyType)0xFFFFFFFFu;
-
-    load_blocked_local_from_global<RADIX_GRAIN_SIZE>(
-        keys,
-        &inputKeys[baseId],
-        localId,
-        available,
-        sentinelKey);
-
-    volatile threadgroup atomic_uint* atomicHist =
-        reinterpret_cast<volatile threadgroup atomic_uint*>(localHist);
+    KeyT keys[RADIX_GRAIN_SIZE];
+    load_blocked_local_from_global<RADIX_GRAIN_SIZE>(keys, &inputKeys[baseId], localId, available, sentinelKey);
 
     for (ushort i = 0; i < RADIX_GRAIN_SIZE; ++i) {
         uint offsetInBlock = localId * RADIX_GRAIN_SIZE + i;
         uint globalIdx = baseId + offsetInBlock;
 
-        if (globalIdx < count) {
-            uchar bin = (uchar)value_to_key_at_digit(keys[i], (ushort)currentDigit);
-            atomic_fetch_add_explicit(&atomicHist[bin], 1u, memory_order_relaxed);
+        if (globalIdx < count && keys[i] != sentinelKey) {
+            uchar bin = (uchar)value_to_key_at_digit_t(keys[i], (ushort)currentDigit);
+            atomic_fetch_add_explicit(&localHist[bin], 1u, memory_order_relaxed);
         }
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
-    // Write histogram in TRANSPOSED layout: [bin0_groups..., bin1_groups..., ...]
-    // This allows linear scan to produce correct global offsets for multi-block radix sort
     for (uint i = 0; i < (RADIX_BUCKETS + RADIX_BLOCK_SIZE - 1u) / RADIX_BLOCK_SIZE; ++i) {
         uint bin = localId + i * RADIX_BLOCK_SIZE;
-        if (bin < RADIX_BUCKETS) {
-            histFlat[bin * gridSize + groupId] = localHist[bin];
-        }
+        if (bin < RADIX_BUCKETS) { histFlat[bin * gridSize + groupId] = atomic_load_explicit(&localHist[bin], memory_order_relaxed); }
     }
 }
 
-// Depth-sort-specific scan blocks kernel (reads visibleCount/paddedVisibleCount from DepthFirstHeader)
+kernel void depthSortHistogramKernel16(
+    device const ushort* inputKeys [[buffer(0)]],
+    device uint* histFlat [[buffer(1)]],
+    constant uint& currentDigit [[buffer(3)]],
+    constant DepthFirstHeader& header [[buffer(4)]],
+    uint groupId [[threadgroup_position_in_grid]],
+    ushort localId [[thread_position_in_threadgroup]]
+) {
+    const uint valuesPerGroup = RADIX_BLOCK_SIZE * RADIX_GRAIN_SIZE;
+    uint gridSize = (header.paddedVisibleCount + valuesPerGroup - 1u) / valuesPerGroup;
+
+    if (groupId >= gridSize) return;
+
+    threadgroup atomic_uint localHist[RADIX_BUCKETS];
+    depthSortHistogramImpl<ushort>(
+        inputKeys, histFlat, localHist, currentDigit,
+        header.paddedVisibleCount, header.visibleCount,
+        gridSize, groupId, localId, (ushort)0xFFFFu
+    );
+}
+
+kernel void depthSortHistogramKernel32(
+    device const uint* inputKeys [[buffer(0)]],
+    device uint* histFlat [[buffer(1)]],
+    constant uint& currentDigit [[buffer(3)]],
+    constant DepthFirstHeader& header [[buffer(4)]],
+    uint groupId [[threadgroup_position_in_grid]],
+    ushort localId [[thread_position_in_threadgroup]]
+) {
+    const uint valuesPerGroup = RADIX_BLOCK_SIZE * RADIX_GRAIN_SIZE;
+    uint gridSize = (header.paddedVisibleCount + valuesPerGroup - 1u) / valuesPerGroup;
+
+    if (groupId >= gridSize) return;
+
+    threadgroup atomic_uint localHist[RADIX_BUCKETS];
+    depthSortHistogramImpl<uint>(
+        inputKeys, histFlat, localHist, currentDigit,
+        header.paddedVisibleCount, header.visibleCount,
+        gridSize, groupId, localId, 0xFFFFFFFFu
+    );
+}
+
 kernel void depthSortScanBlocksKernel(
     device uint* histFlat [[buffer(0)]],
     device uint* blockSums [[buffer(1)]],
@@ -673,6 +1167,9 @@ kernel void depthSortScanBlocksKernel(
     const uint valuesPerGroup = RADIX_BLOCK_SIZE * RADIX_GRAIN_SIZE;
     uint gridSize = (paddedCount + valuesPerGroup - 1u) / valuesPerGroup;
     uint histLength = gridSize * RADIX_BUCKETS;
+    uint numBlocks = (histLength + RADIX_BLOCK_SIZE - 1u) / RADIX_BLOCK_SIZE;
+
+    if (groupId >= numBlocks) return;
 
     uint baseIndex = groupId * RADIX_BLOCK_SIZE;
     threadgroup uint shared[RADIX_BLOCK_SIZE];
@@ -688,9 +1185,7 @@ kernel void depthSortScanBlocksKernel(
     }
 }
 
-// Depth-sort-specific exclusive scan kernel (handles up to 8192 block sums)
 #define RADIX_SCAN_GRAIN 32
-
 kernel void depthSortExclusiveScanKernel(
     device uint* blockSums [[buffer(0)]],
     constant DepthFirstHeader& header [[buffer(1)]],
@@ -702,11 +1197,9 @@ kernel void depthSortExclusiveScanKernel(
     uint gridSize = (paddedCount + valuesPerGroup - 1u) / valuesPerGroup;
     uint numBlockSums = (gridSize * RADIX_BUCKETS + RADIX_BLOCK_SIZE - 1u) / RADIX_BLOCK_SIZE;
 
-    // Calculate elements per thread (up to RADIX_SCAN_GRAIN)
     uint elemsPerThread = (numBlockSums + RADIX_BLOCK_SIZE - 1u) / RADIX_BLOCK_SIZE;
     elemsPerThread = min(elemsPerThread, (uint)RADIX_SCAN_GRAIN);
 
-    // Load multiple elements and compute local sum
     uint localVals[RADIX_SCAN_GRAIN];
     uint localSum = 0u;
     uint threadBase = localId * elemsPerThread;
@@ -718,10 +1211,8 @@ kernel void depthSortExclusiveScanKernel(
         localSum += val;
     }
 
-    // Scan the per-thread sums using helper (exclusive scan of 256 values)
     uint scannedSum = radix_threadgroup_prefix_scan<RADIX_SCAN_TYPE_EXCLUSIVE>(localSum, shared, localId, radix_sum_op<uint>());
 
-    // Write back: each element gets scannedSum + prefix of local values
     uint running = scannedSum;
     for (uint i = 0u; i < elemsPerThread; ++i) {
         uint idx = threadBase + i;
@@ -732,7 +1223,6 @@ kernel void depthSortExclusiveScanKernel(
     }
 }
 
-// Depth-sort-specific apply offsets kernel
 kernel void depthSortApplyOffsetsKernel(
     device const uint* histFlat [[buffer(0)]],
     device const uint* blockSums [[buffer(1)]],
@@ -746,6 +1236,9 @@ kernel void depthSortApplyOffsetsKernel(
     const uint valuesPerGroup = RADIX_BLOCK_SIZE * RADIX_GRAIN_SIZE;
     uint gridSize = (paddedCount + valuesPerGroup - 1u) / valuesPerGroup;
     uint histLength = gridSize * RADIX_BUCKETS;
+    uint numBlocks = (histLength + RADIX_BLOCK_SIZE - 1u) / RADIX_BLOCK_SIZE;
+
+    if (groupId >= numBlocks) return;
 
     uint baseIndex = groupId * RADIX_BLOCK_SIZE;
     uint blockOffset = blockSums[groupId];
@@ -755,79 +1248,135 @@ kernel void depthSortApplyOffsetsKernel(
     }
 }
 
-// Depth-sort-specific scatter kernel
-kernel void depthSortScatterKernel(
-    device RadixKeyType* outputKeys [[buffer(0)]],
-    device const RadixKeyType* inputKeys [[buffer(1)]],
+template <typename KeyT, typename KpT>
+void depthSortScatterImpl(
+    device KeyT* outputKeys,
+    device const KeyT* inputKeys,
+    device int* outputPayload,
+    device const int* inputPayload,
+    device const uint* offsetsFlat,
+    threadgroup uint* globalBinBase,
+    threadgroup KpT* tgKp,
+    threadgroup ushort* tgShort,
+    uint currentDigit,
+    uint paddedCount,
+    uint count,
+    uint groupId,
+    uint gridSize,
+    ushort localId,
+    KeyT keySentinel
+) {
+    const uint elementsPerBlock = RADIX_BLOCK_SIZE * RADIX_GRAIN_SIZE;
+    uint baseId = groupId * elementsPerBlock;
+
+    uint bufferRemaining = (baseId < paddedCount) ? (paddedCount - baseId) : 0;
+    uint assignmentsRemain = (baseId < count) ? (count - baseId) : 0;
+    uint available = min(bufferRemaining, assignmentsRemain);
+
+    KeyT keys[RADIX_GRAIN_SIZE];
+    int payloads[RADIX_GRAIN_SIZE];
+    load_striped_local_from_global<RADIX_GRAIN_SIZE, RADIX_BLOCK_SIZE>(keys, &inputKeys[baseId], localId, available, keySentinel);
+    load_striped_local_from_global<RADIX_GRAIN_SIZE, RADIX_BLOCK_SIZE>(payloads, &inputPayload[baseId], localId, available, -1);
+
+    for (uint i = 0; i < (RADIX_BUCKETS + RADIX_BLOCK_SIZE - 1u) / RADIX_BLOCK_SIZE; ++i) {
+        uint bin = localId + i * RADIX_BLOCK_SIZE;
+        if (bin < RADIX_BUCKETS) { globalBinBase[bin] = offsetsFlat[bin * gridSize + groupId]; }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    for (ushort chunk = 0; chunk < RADIX_GRAIN_SIZE; ++chunk) {
+        KpT kp;
+        kp.key = keys[chunk];
+        kp.payload = uint(payloads[chunk]);
+
+        ushort myBin = value_to_key_at_digit_t(kp.key, (ushort)currentDigit);
+        kp = radix_partial_sort_t<KeyT>(kp, tgKp, localId, (ushort)currentDigit);
+        myBin = value_to_key_at_digit_t(kp.key, (ushort)currentDigit);
+
+        bool isValid = (kp.key != keySentinel);
+
+        ushort headBin = isValid ? myBin : (ushort)0xFFFF;
+        uchar headFlag = flag_head_discontinuity<RADIX_BLOCK_SIZE>(headBin, tgShort, localId);
+        if (!isValid) headFlag = 0;
+
+        ushort runStart = radix_threadgroup_prefix_scan<RADIX_SCAN_TYPE_INCLUSIVE>(
+            headFlag ? localId : (ushort)0, tgShort, localId, radix_max_op<ushort>());
+        ushort localOffset = localId - runStart;
+
+        ushort tailBin = isValid ? myBin : (ushort)0xFFFF;
+        uchar tailFlag = flag_tail_discontinuity<RADIX_BLOCK_SIZE>(tailBin, tgShort, localId);
+        if (!isValid) tailFlag = 0;
+
+        if (isValid) {
+            uint dst = globalBinBase[myBin] + localOffset;
+            if (dst < count) {
+                outputKeys[dst] = kp.key;
+                outputPayload[dst] = int(kp.payload);
+            }
+        }
+
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        if (tailFlag && isValid) { globalBinBase[myBin] += localOffset + 1; }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+}
+
+// 16-bit key scatter kernel
+kernel void depthSortScatterKernel16(
+    device ushort* outputKeys [[buffer(0)]],
+    device const ushort* inputKeys [[buffer(1)]],
     device int* outputPayload [[buffer(2)]],
     device const int* inputPayload [[buffer(3)]],
     device const uint* offsetsFlat [[buffer(5)]],
     constant uint& currentDigit [[buffer(6)]],
     constant DepthFirstHeader& header [[buffer(7)]],
     uint groupId [[threadgroup_position_in_grid]],
-    uint gridSize [[threadgroups_per_grid]],
     ushort localId [[thread_position_in_threadgroup]]
 ) {
-    const uint elementsPerBlock = RADIX_BLOCK_SIZE * RADIX_GRAIN_SIZE;
-    uint baseId = groupId * elementsPerBlock;
+    const uint valuesPerGroup = RADIX_BLOCK_SIZE * RADIX_GRAIN_SIZE;
+    uint gridSize = (header.paddedVisibleCount + valuesPerGroup - 1u) / valuesPerGroup;
 
-    uint paddedCount = header.paddedVisibleCount;  // For depth sort
-    uint count = header.visibleCount;              // For depth sort
-
-    uint bufferRemaining = (baseId < paddedCount) ? (paddedCount - baseId) : 0;
-    uint assignmentsRemain = (baseId < count) ? (count - baseId) : 0;
-    uint available = min(bufferRemaining, assignmentsRemain);
-
-    RadixKeyType keySentinel = (RadixKeyType)0xFFFFFFFFu;
-
-    RadixKeyType keys[RADIX_GRAIN_SIZE];
-    int payloads[RADIX_GRAIN_SIZE];
-    load_striped_local_from_global<RADIX_GRAIN_SIZE, RADIX_BLOCK_SIZE>(keys, &inputKeys[baseId], localId, available, keySentinel);
-    load_striped_local_from_global<RADIX_GRAIN_SIZE, RADIX_BLOCK_SIZE>(payloads, &inputPayload[baseId], localId, available, -1);
+    if (groupId >= gridSize) return;
 
     threadgroup uint globalBinBase[RADIX_BUCKETS];
-    threadgroup RadixKeyPayload tgKp[RADIX_BLOCK_SIZE];
+    threadgroup RadixKeyPayloadT<ushort> tgKp[RADIX_BLOCK_SIZE];
     threadgroup ushort tgShort[RADIX_BLOCK_SIZE];
 
-    // Read from TRANSPOSED histogram layout: [bin0_groups..., bin1_groups..., ...]
-    for (uint i = 0; i < (RADIX_BUCKETS + RADIX_BLOCK_SIZE - 1u) / RADIX_BLOCK_SIZE; ++i) {
-        uint bin = localId + i * RADIX_BLOCK_SIZE;
-        if (bin < RADIX_BUCKETS) {
-            globalBinBase[bin] = offsetsFlat[bin * gridSize + groupId];
-        }
-    }
-    threadgroup_barrier(mem_flags::mem_threadgroup);
+    depthSortScatterImpl<ushort, RadixKeyPayloadT<ushort>>(
+        outputKeys, inputKeys, outputPayload, inputPayload, offsetsFlat,
+        globalBinBase, tgKp, tgShort,
+        currentDigit, header.paddedVisibleCount, header.visibleCount,
+        groupId, gridSize, localId, (ushort)0xFFFFu
+    );
+}
 
-    for (ushort chunk = 0; chunk < RADIX_GRAIN_SIZE; ++chunk) {
-        RadixKeyPayload kp;
-        kp.key = keys[chunk];
-        kp.payload = uint(payloads[chunk]);
+kernel void depthSortScatterKernel32(
+    device uint* outputKeys [[buffer(0)]],
+    device const uint* inputKeys [[buffer(1)]],
+    device int* outputPayload [[buffer(2)]],
+    device const int* inputPayload [[buffer(3)]],
+    device const uint* offsetsFlat [[buffer(5)]],
+    constant uint& currentDigit [[buffer(6)]],
+    constant DepthFirstHeader& header [[buffer(7)]],
+    uint groupId [[threadgroup_position_in_grid]],
+    ushort localId [[thread_position_in_threadgroup]]
+) {
+    const uint valuesPerGroup = RADIX_BLOCK_SIZE * RADIX_GRAIN_SIZE;
+    uint gridSize = (header.paddedVisibleCount + valuesPerGroup - 1u) / valuesPerGroup;
 
-        ushort myBin = value_to_key_at_digit(kp.key, (ushort)currentDigit);
+    if (groupId >= gridSize) return;
 
-        kp = radix_partial_sort(kp, tgKp, localId, (ushort)currentDigit);
+    threadgroup uint globalBinBase[RADIX_BUCKETS];
+    threadgroup RadixKeyPayloadT<uint> tgKp[RADIX_BLOCK_SIZE];
+    threadgroup ushort tgShort[RADIX_BLOCK_SIZE];
 
-        myBin = value_to_key_at_digit(kp.key, (ushort)currentDigit);
-
-        uchar headFlag = flag_head_discontinuity<RADIX_BLOCK_SIZE>(myBin, tgShort, localId);
-        ushort runStart = radix_threadgroup_prefix_scan<RADIX_SCAN_TYPE_INCLUSIVE>(
-            headFlag ? localId : (ushort)0, tgShort, localId, radix_max_op<ushort>());
-        ushort localOffset = localId - runStart;
-
-        uchar tailFlag = flag_tail_discontinuity<RADIX_BLOCK_SIZE>(myBin, tgShort, localId);
-
-        bool isValid = (kp.key != keySentinel);
-        if (isValid) {
-            uint dst = globalBinBase[myBin] + localOffset;
-            outputKeys[dst] = kp.key;
-            outputPayload[dst] = int(kp.payload);
-        }
-
-        if (tailFlag && isValid) {
-            globalBinBase[myBin] += localOffset + 1;
-        }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-    }
+    depthSortScatterImpl<uint, RadixKeyPayloadT<uint>>(
+        outputKeys, inputKeys, outputPayload, inputPayload, offsetsFlat,
+        globalBinBase, tgKp, tgShort,
+        currentDigit, header.paddedVisibleCount, header.visibleCount,
+        groupId, gridSize, localId, 0xFFFFFFFFu
+    );
 }
 
 #define RENDER_DF_TG_WIDTH 8
@@ -885,11 +1434,14 @@ kernel void depthFirstRender(
         if (gaussianIdx < 0) continue;
         GaussianRenderData g = gaussians[gaussianIdx];
 
-        half4 gConic = getConic(g);
-        half cxx = gConic.x;
-        half cyy = gConic.z;
-        half cxy2 = 2.0h * gConic.y;
-        half opacity = g.opacity;
+        float theta = unpackThetaPi(g.theta);
+        float sig1 = float(g.sigma1);
+        float sig2 = float(g.sigma2);
+        float3 conicF = conicFromThetaSigmas(theta, sig1, sig2);
+        half cxx = half(conicF.x);
+        half cyy = half(conicF.z);
+        half cxy2 = half(2.0f * conicF.y);
+        half opacity = getOpacity(g);
         half3 gColor = getColor(g);
         half gDepth = g.depth;
 
@@ -940,6 +1492,213 @@ kernel void depthFirstRender(
         colorOut.write(half4(color11, 1.0h - trans11), uint2(baseX + 1, baseY + 1));
         if (hasDepth) depthOut.write(half4(depth11, 0, 0, 0), uint2(baseX + 1, baseY + 1));
     }
+}
+
+kernel void clearStereoRenderTextureKernel(
+    texture2d_array<half, access::write> colorTex [[texture(0)]],
+    constant ClearTextureParams& params [[buffer(0)]],
+    uint3 gid [[thread_position_in_grid]]
+) {
+    if (gid.x >= params.width || gid.y >= params.height || gid.z >= 2) {
+        return;
+    }
+    half bg = 0.0h;
+    colorTex.write(half4(bg, bg, bg, 1.0h), uint2(gid.xy), gid.z);
+}
+
+kernel void depthFirstStereoRender(
+    const device GaussianHeader* headers [[buffer(0)]],
+    const device StereoTiledRenderData* gaussians [[buffer(1)]],
+    const device int* sortedGaussianIndices [[buffer(2)]],
+    const device uint* activeTiles [[buffer(3)]],
+    const device uint* activeTileCount [[buffer(4)]],
+    texture2d_array<half, access::write> colorOut [[texture(0)]],
+    constant RenderParams& params [[buffer(5)]],
+    uint2 groupId [[threadgroup_position_in_grid]],
+    uint2 localId [[thread_position_in_threadgroup]]
+) {
+    uint tileIdx = groupId.x;
+    if (tileIdx >= *activeTileCount) return;
+
+    uint tile = activeTiles[tileIdx];
+    GaussianHeader hdr = headers[tile];
+
+    uint tileX = tile % params.tilesX;
+    uint tileY = tile / params.tilesX;
+
+    // 16x16 tile, 8x8 threads, 2x2 pixels per thread
+    uint baseX = tileX * 16 + localId.x * RENDER_DF_PIXELS_X;
+    uint baseY = tileY * 16 + localId.y * RENDER_DF_PIXELS_Y;
+
+    half2 pos00 = half2(half(baseX + 0), half(baseY + 0));
+    half2 pos10 = half2(half(baseX + 1), half(baseY + 0));
+    half2 pos01 = half2(half(baseX + 0), half(baseY + 1));
+    half2 pos11 = half2(half(baseX + 1), half(baseY + 1));
+
+    half transL00 = 1.0h, transL10 = 1.0h;
+    half transL01 = 1.0h, transL11 = 1.0h;
+    half transR00 = 1.0h, transR10 = 1.0h;
+    half transR01 = 1.0h, transR11 = 1.0h;
+
+    half3 colorL00 = 0, colorL10 = 0;
+    half3 colorL01 = 0, colorL11 = 0;
+    half3 colorR00 = 0, colorR10 = 0;
+    half3 colorR01 = 0, colorR11 = 0;
+
+    uint start = hdr.offset;
+    uint count = hdr.count;
+
+    for (uint i = 0; i < count; i++) {
+        half maxTransL = max(max(transL00, transL10), max(transL01, transL11));
+        half maxTransR = max(max(transR00, transR10), max(transR01, transR11));
+        half maxTrans = max(maxTransL, maxTransR);
+        if (maxTrans < half(1.0h/255.0h)) break;
+
+        int gaussianIdx = sortedGaussianIndices[start + i];
+        if (gaussianIdx < 0) continue;
+
+        StereoTiledRenderData g = gaussians[gaussianIdx];
+
+        half opacity = half(g.opacity) / 255.0h;
+        half3 gColor = half3(half(g.colorR), half(g.colorG), half(g.colorB)) / 255.0h;
+
+        if (maxTransL >= half(1.0h/255.0h)) {
+            half2 gMeanL = half2(g.leftMeanX, g.leftMeanY);
+            if (gMeanL.x >= -60000.0h) {
+                half cxxL = g.leftCxx;
+                half cyyL = g.leftCyy;
+                half cxy2L = g.leftCxy2;
+
+                half2 dL00 = pos00 - gMeanL;
+                half2 dL10 = pos10 - gMeanL;
+                half2 dL01 = pos01 - gMeanL;
+                half2 dL11 = pos11 - gMeanL;
+
+                half pL00 = dL00.x*dL00.x*cxxL + dL00.y*dL00.y*cyyL + dL00.x*dL00.y*cxy2L;
+                half pL10 = dL10.x*dL10.x*cxxL + dL10.y*dL10.y*cyyL + dL10.x*dL10.y*cxy2L;
+                half pL01 = dL01.x*dL01.x*cxxL + dL01.y*dL01.y*cyyL + dL01.x*dL01.y*cxy2L;
+                half pL11 = dL11.x*dL11.x*cxxL + dL11.y*dL11.y*cyyL + dL11.x*dL11.y*cxy2L;
+
+                const half r2Max = half(9.0f);
+                half aL00 = 0.0h, aL10 = 0.0h, aL01 = 0.0h, aL11 = 0.0h;
+                if (!(pL00 > r2Max && pL10 > r2Max && pL01 > r2Max && pL11 > r2Max)) {
+                    aL00 = (pL00 > r2Max) ? 0.0h : min(opacity * exp(-0.5h * pL00), 0.99h);
+                    aL10 = (pL10 > r2Max) ? 0.0h : min(opacity * exp(-0.5h * pL10), 0.99h);
+                    aL01 = (pL01 > r2Max) ? 0.0h : min(opacity * exp(-0.5h * pL01), 0.99h);
+                    aL11 = (pL11 > r2Max) ? 0.0h : min(opacity * exp(-0.5h * pL11), 0.99h);
+                }
+
+                half4 alphasL = half4(aL00, aL10, aL01, aL11);
+                if (!all(alphasL == 0.0h)) {
+                    colorL00 += gColor * (aL00 * transL00);
+                    colorL10 += gColor * (aL10 * transL10);
+                    colorL01 += gColor * (aL01 * transL01);
+                    colorL11 += gColor * (aL11 * transL11);
+
+                    transL00 *= (1.0h - aL00);
+                    transL10 *= (1.0h - aL10);
+                    transL01 *= (1.0h - aL01);
+                    transL11 *= (1.0h - aL11);
+                }
+            }
+        }
+
+        if (maxTransR >= half(1.0h/255.0h)) {
+            half2 gMeanR = half2(g.rightMeanX, g.rightMeanY);
+            if (gMeanR.x >= -60000.0h) {
+                half cxxR = g.rightCxx;
+                half cyyR = g.rightCyy;
+                half cxy2R = g.rightCxy2;
+
+                half2 dR00 = pos00 - gMeanR;
+                half2 dR10 = pos10 - gMeanR;
+                half2 dR01 = pos01 - gMeanR;
+                half2 dR11 = pos11 - gMeanR;
+
+                half pR00 = dR00.x*dR00.x*cxxR + dR00.y*dR00.y*cyyR + dR00.x*dR00.y*cxy2R;
+                half pR10 = dR10.x*dR10.x*cxxR + dR10.y*dR10.y*cyyR + dR10.x*dR10.y*cxy2R;
+                half pR01 = dR01.x*dR01.x*cxxR + dR01.y*dR01.y*cyyR + dR01.x*dR01.y*cxy2R;
+                half pR11 = dR11.x*dR11.x*cxxR + dR11.y*dR11.y*cyyR + dR11.x*dR11.y*cxy2R;
+
+                const half r2Max = half(9.0f);
+                half aR00 = 0.0h, aR10 = 0.0h, aR01 = 0.0h, aR11 = 0.0h;
+                if (!(pR00 > r2Max && pR10 > r2Max && pR01 > r2Max && pR11 > r2Max)) {
+                    aR00 = (pR00 > r2Max) ? 0.0h : min(opacity * exp(-0.5h * pR00), 0.99h);
+                    aR10 = (pR10 > r2Max) ? 0.0h : min(opacity * exp(-0.5h * pR10), 0.99h);
+                    aR01 = (pR01 > r2Max) ? 0.0h : min(opacity * exp(-0.5h * pR01), 0.99h);
+                    aR11 = (pR11 > r2Max) ? 0.0h : min(opacity * exp(-0.5h * pR11), 0.99h);
+                }
+
+                half4 alphasR = half4(aR00, aR10, aR01, aR11);
+                if (!all(alphasR == 0.0h)) {
+                    colorR00 += gColor * (aR00 * transR00);
+                    colorR10 += gColor * (aR10 * transR10);
+                    colorR01 += gColor * (aR01 * transR01);
+                    colorR11 += gColor * (aR11 * transR11);
+
+                    transR00 *= (1.0h - aR00);
+                    transR10 *= (1.0h - aR10);
+                    transR01 *= (1.0h - aR01);
+                    transR11 *= (1.0h - aR11);
+                }
+            }
+        }
+    }
+
+    uint w = params.width, h = params.height;
+
+    if (baseX + 0 < w && baseY + 0 < h) {
+        colorOut.write(half4(colorL00, 1.0h - transL00), uint2(baseX + 0, baseY + 0), 0);
+        colorOut.write(half4(colorR00, 1.0h - transR00), uint2(baseX + 0, baseY + 0), 1);
+    }
+    if (baseX + 1 < w && baseY + 0 < h) {
+        colorOut.write(half4(colorL10, 1.0h - transL10), uint2(baseX + 1, baseY + 0), 0);
+        colorOut.write(half4(colorR10, 1.0h - transR10), uint2(baseX + 1, baseY + 0), 1);
+    }
+    if (baseX + 0 < w && baseY + 1 < h) {
+        colorOut.write(half4(colorL01, 1.0h - transL01), uint2(baseX + 0, baseY + 1), 0);
+        colorOut.write(half4(colorR01, 1.0h - transR01), uint2(baseX + 0, baseY + 1), 1);
+    }
+    if (baseX + 1 < w && baseY + 1 < h) {
+        colorOut.write(half4(colorL11, 1.0h - transL11), uint2(baseX + 1, baseY + 1), 0);
+        colorOut.write(half4(colorR11, 1.0h - transR11), uint2(baseX + 1, baseY + 1), 1);
+    }
+}
+
+struct StereoCopyVertexOut {
+    float4 position [[position]];
+    float2 uv;
+    uint eyeIndex [[flat]];
+};
+
+vertex StereoCopyVertexOut stereoCopyVertex(
+    uint vertexId [[vertex_id]],
+    ushort ampId [[amplification_id]]
+) {
+    const float2 positions[3] = {
+        float2(-1.0f, -1.0f),
+        float2( 3.0f, -1.0f),
+        float2(-1.0f,  3.0f)
+    };
+    const float2 uvs[3] = {
+        float2(0.0f, 0.0f),
+        float2(2.0f, 0.0f),
+        float2(0.0f, 2.0f)
+    };
+    StereoCopyVertexOut out;
+    out.position = float4(positions[vertexId], 0.0f, 1.0f);
+    out.uv = uvs[vertexId];
+    out.eyeIndex = uint(ampId);
+    return out;
+}
+
+fragment half4 stereoCopyFragment(
+    StereoCopyVertexOut in [[stage_in]],
+    texture2d_array<half, access::sample> src [[texture(0)]]
+) {
+    constexpr sampler s(address::clamp_to_edge, filter::linear);
+    float2 uv = clamp(in.uv, 0.0f, 1.0f);
+    return src.sample(s, uv, in.eyeIndex);
 }
 
 kernel void clearRenderTexturesKernel(
@@ -1000,7 +1759,6 @@ kernel void level2ReduceKernel(
     }
 }
 
-// Level 2 scan: exclusive scan of super-block sums (fits in single block for up to 256 super-blocks = 65536 blocks = 16M elements)
 kernel void level2ScanKernel(
     device uint* level2Sums [[buffer(0)]],
     constant DepthFirstHeader& header [[buffer(1)]],
@@ -1110,7 +1868,6 @@ kernel void prepareDepthFirstDispatchKernel(
     uint visibleCount = visibleCountAtomic[0];
     uint totalInstances = totalInstancesAtomic[0];
 
-    // Clamp to max
     if (visibleCount > config.maxGaussians) {
         visibleCount = config.maxGaussians;
         header->overflow = 1u;
@@ -1120,12 +1877,10 @@ kernel void prepareDepthFirstDispatchKernel(
         header->overflow = 1u;
     }
 
-    // Compute padded counts for radix alignment
     uint radixAlignment = config.radixBlockSize * config.radixGrainSize;
     uint paddedVisibleCount = ((visibleCount + radixAlignment - 1u) / radixAlignment) * radixAlignment;
     uint paddedInstanceCount = ((totalInstances + radixAlignment - 1u) / radixAlignment) * radixAlignment;
 
-    // Store in header
     header->visibleCount = visibleCount;
     header->totalInstances = totalInstances;
     header->paddedVisibleCount = paddedVisibleCount;
@@ -1236,8 +1991,6 @@ kernel void prepareDepthFirstDispatchKernel(
     dispatchArgs[DF_SLOT_RENDER].threadgroupsPerGridZ = 1u;
 }
 
-// Prepare render dispatch based on actual active tile count
-// Must run AFTER extractTileRangesKernel which populates activeTileCount
 kernel void prepareRenderDispatchKernel(
     device const uint* activeTileCount [[buffer(0)]],
     device DispatchIndirectArgs* dispatchArgs [[buffer(1)]],

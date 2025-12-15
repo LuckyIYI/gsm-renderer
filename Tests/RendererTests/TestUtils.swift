@@ -12,6 +12,14 @@ enum TestCameraDefaults {
     static let fovDegrees: Float = 60.0
 }
 
+/// Coordinate convention for camera/projection setup
+enum CoordinateConvention {
+    /// OpenCV convention: +X right, +Y down, +Z forward (objects in front have positive Z)
+    case openCV
+    /// OpenGL convention: +X right, +Y up, -Z forward (objects in front have negative Z)
+    case openGL
+}
+
 /// Creates a standard perspective projection matrix for tests.
 /// Uses OpenCV convention: +X right, +Y down, +Z forward.
 func makeProjectionMatrix(
@@ -21,17 +29,44 @@ func makeProjectionMatrix(
     far: Float = TestCameraDefaults.far,
     fovDegrees: Float = TestCameraDefaults.fovDegrees
 ) -> simd_float4x4 {
+    // Default to OpenCV convention for backward compatibility
+    return makeProjectionMatrix(width: width, height: height, near: near, far: far, fovDegrees: fovDegrees, convention: .openCV)
+}
+
+/// Creates a perspective projection matrix for tests with explicit convention.
+func makeProjectionMatrix(
+    width: Int,
+    height: Int,
+    near: Float = TestCameraDefaults.near,
+    far: Float = TestCameraDefaults.far,
+    fovDegrees: Float = TestCameraDefaults.fovDegrees,
+    convention: CoordinateConvention
+) -> simd_float4x4 {
     let aspect = Float(width) / Float(height)
     let fov = fovDegrees * .pi / 180.0
     let f = 1.0 / tan(fov / 2.0)
 
-    // OpenCV projection matrix (Metal NDC: z in [0, 1])
-    // No Y-flip here - the view matrix uses "down" vector which handles orientation
     var proj = matrix_identity_float4x4
-    proj.columns.0 = SIMD4(f / aspect, 0, 0, 0)
-    proj.columns.1 = SIMD4(0, f, 0, 0)
-    proj.columns.2 = SIMD4(0, 0, far / (far - near), 1)
-    proj.columns.3 = SIMD4(0, 0, -(far * near) / (far - near), 0)
+
+    switch convention {
+    case .openCV:
+        // OpenCV projection matrix (Metal NDC: z in [0, 1])
+        // +Z forward: objects in front have positive Z
+        proj.columns.0 = SIMD4(f / aspect, 0, 0, 0)
+        proj.columns.1 = SIMD4(0, f, 0, 0)
+        proj.columns.2 = SIMD4(0, 0, far / (far - near), 1)
+        proj.columns.3 = SIMD4(0, 0, -(far * near) / (far - near), 0)
+
+    case .openGL:
+        // OpenGL projection matrix (Metal NDC: z in [0, 1])
+        // -Z forward: objects in front have negative Z
+        // Note: Metal uses [0,1] depth range unlike OpenGL's [-1,1]
+        proj.columns.0 = SIMD4(f / aspect, 0, 0, 0)
+        proj.columns.1 = SIMD4(0, f, 0, 0)
+        proj.columns.2 = SIMD4(0, 0, far / (near - far), -1)
+        proj.columns.3 = SIMD4(0, 0, (far * near) / (near - far), 0)
+    }
+
     return proj
 }
 
@@ -86,7 +121,8 @@ func makeCameraUniforms(
         nearPlane: near,
         farPlane: far,
         shComponents: UInt32(shComponents),
-        gaussianCount: UInt32(gaussianCount)
+        gaussianCount: UInt32(gaussianCount),
+        inputIsSRGB: false
     )
 }
 

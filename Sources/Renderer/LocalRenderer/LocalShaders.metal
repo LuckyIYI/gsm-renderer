@@ -67,10 +67,9 @@ kernel void localProjectStore(
 
     PackedWorldT g = worldGaussians[gid];
 
-    // Early cull: tiny gaussians
+    // Early cull: tiny gaussians using unified helper
     float3 scale = float3(g.sx, g.sy, g.sz);
-    float maxScale = max(scale.x, max(scale.y, scale.z));
-    if (maxScale < 0.0005f) {
+    if (cullByScale(scale)) {
         tempBuffer[gid].minTile = zeroTile;
         tempBuffer[gid].maxTile = zeroTile;
         visibilityMarks[gid] = 0;
@@ -79,11 +78,17 @@ kernel void localProjectStore(
 
     float3 pos = float3(g.px, g.py, g.pz);
     float4 viewPos = camera.viewMatrix * float4(pos, 1.0f);
+    float4 clip = camera.projectionMatrix * viewPos;
 
-    float depth = safeDepthComponent(viewPos.z);
-    if (fabs(depth) < 1e-4f) depth = (depth >= 0) ? 1e-4f : -1e-4f;
-
-    if (depth <= camera.nearPlane) {
+    // Z-sign agnostic culling using clip.w
+    float depth = clip.w;
+    if (!isInFrontOfCameraClipW(clip.w, camera.nearPlane)) {
+        tempBuffer[gid].minTile = zeroTile;
+        tempBuffer[gid].maxTile = zeroTile;
+        visibilityMarks[gid] = 0;
+        return;
+    }
+    if (cullByFarPlane(depth, camera.farPlane)) {
         tempBuffer[gid].minTile = zeroTile;
         tempBuffer[gid].maxTile = zeroTile;
         visibilityMarks[gid] = 0;
@@ -98,50 +103,36 @@ kernel void localProjectStore(
         return;
     }
 
-    float4 clip = camera.projectionMatrix * viewPos;
-    if (fabs(clip.w) < 1e-6f) {
-        tempBuffer[gid].minTile = zeroTile;
-        tempBuffer[gid].maxTile = zeroTile;
-        visibilityMarks[gid] = 0;
-        return;
-    }
-
     float ndcX = clip.x / clip.w;
     float ndcY = clip.y / clip.w;
-    float px = ((ndcX + 1.0f) * camera.width - 1.0f) * 0.5f;
-    float py = ((ndcY + 1.0f) * camera.height - 1.0f) * 0.5f;
+    // Use pixel-centered conversion for tiled rendering
+    float2 screenPos = ndcToScreenCentered(float2(ndcX, ndcY), camera.width, camera.height);
 
     float4 quat = normalizeQuaternion(getRotation(g));
     float3x3 cov3d = buildCovariance3D(scale, quat);
 
-    float3 vr0 = float3(camera.viewMatrix[0][0], camera.viewMatrix[1][0], camera.viewMatrix[2][0]);
-    float3 vr1 = float3(camera.viewMatrix[0][1], camera.viewMatrix[1][1], camera.viewMatrix[2][1]);
-    float3 vr2 = float3(camera.viewMatrix[0][2], camera.viewMatrix[1][2], camera.viewMatrix[2][2]);
-    float3x3 viewRot = matrixFromRows(vr0, vr1, vr2);
+    // Use unified projection (Z-sign agnostic, derives focal from projection matrix)
+    float2x2 cov2d = projectCovariance2D(cov3d, viewPos.xyz, camera.viewMatrix,
+                                          camera.projectionMatrix,
+                                          float2(camera.width, camera.height));
 
-    float2x2 cov2d = projectCovariance(cov3d, viewPos.xyz, viewRot,
-                                       camera.focalX, camera.focalY,
-                                       camera.width, camera.height);
+    // Stabilize covariance for half-precision packing
+    cov2d = stabilizeCovariance2D(cov2d, float2(camera.width, camera.height));
 
     float4 conic4;
     float radius;
     computeConicAndRadius(cov2d, conic4, radius);
     float3 conic = conic4.xyz;
 
-    if (radius < 0.5f) {
+    if (cullByRadius(radius)) {
         tempBuffer[gid].minTile = zeroTile;
         tempBuffer[gid].maxTile = zeroTile;
         visibilityMarks[gid] = 0;
         return;
     }
 
-    // Total ink filter with depth-adaptive threshold
-    // Close gaussians need more ink (higher threshold), far ones can be tiny
-    float det = conic.x * conic.z - conic.y * conic.y;
-    float totalInk = opacity * 6.283185f / sqrt(max(det, 1e-6f));
-    float depthFactor = 1.0 - pow(saturate((camera.farPlane - depth) / (camera.farPlane - camera.nearPlane)), 2.0);
-    float adjustedThreshold = depthFactor * params.totalInkThreshold;
-    if (totalInk < adjustedThreshold) {
+    // Total ink filter with unified helper (uses cov2d directly)
+    if (cullByTotalInkFromCov(opacity, cov2d, depth, camera.nearPlane, camera.farPlane, params.totalInkThreshold)) {
         tempBuffer[gid].minTile = zeroTile;
         tempBuffer[gid].maxTile = zeroTile;
         visibilityMarks[gid] = 0;
@@ -150,21 +141,15 @@ kernel void localProjectStore(
 
     float2 obbExtents = computeOBBExtents(cov2d, 3.0f);
 
-    float maxW = float(params.surfaceWidth - 1);
-    float maxH = float(params.surfaceHeight - 1);
-    float xmin = clamp(px - obbExtents.x, 0.0f, maxW);
-    float xmax = clamp(px + obbExtents.x, 0.0f, maxW);
-    float ymin = clamp(py - obbExtents.y, 0.0f, maxH);
-    float ymax = clamp(py + obbExtents.y, 0.0f, maxH);
+    // Use unified tile bounds computation
+    TileBounds tb = computeTileBounds(
+        screenPos, obbExtents,
+        float(params.surfaceWidth), float(params.surfaceHeight),
+        int(params.tileWidth), int(params.tileHeight),
+        int(params.tilesX), int(params.tilesY)
+    );
 
-    int tileW = int(params.tileWidth);
-    int tileH = int(params.tileHeight);
-    int minTileX = max(0, int(floor(xmin / float(tileW))));
-    int minTileY = max(0, int(floor(ymin / float(tileH))));
-    int maxTileX = min(int(params.tilesX), int(ceil(xmax / float(tileW))));
-    int maxTileY = min(int(params.tilesY), int(ceil(ymax / float(tileH))));
-
-    if (minTileX >= maxTileX || minTileY >= maxTileY) {
+    if (!tb.valid) {
         tempBuffer[gid].minTile = zeroTile;
         tempBuffer[gid].maxTile = zeroTile;
         visibilityMarks[gid] = 0;
@@ -174,9 +159,10 @@ kernel void localProjectStore(
     // Compute color
     float3 color = computeSHColor(harmonics, gid, pos, camera.cameraCenter, camera.shComponents);
     color = max(color + 0.5f, float3(0.0f));
+    color = maybeDecodeSRGBToLinear(color, camera.inputIsSRGB);
 
-    tempBuffer[gid].posX = px;
-    tempBuffer[gid].posY = py;
+    tempBuffer[gid].posX = screenPos.x;
+    tempBuffer[gid].posY = screenPos.y;
     tempBuffer[gid].conicA = conic.x;
     tempBuffer[gid].conicB = conic.y;
     tempBuffer[gid].conicC = conic.z;
@@ -186,8 +172,10 @@ kernel void localProjectStore(
     tempBuffer[gid].colorB = half(color.z);
     tempBuffer[gid].opacity = half(opacity);
 
-    tempBuffer[gid].minTile = ushort2(minTileX, minTileY);
-    tempBuffer[gid].maxTile = ushort2(maxTileX, maxTileY);
+    // Note: TileBounds uses [min, max] inclusive, but ProjectedGaussian expects
+    // minTile inclusive and maxTile exclusive for scatter loops
+    tempBuffer[gid].minTile = ushort2(tb.minTileX, tb.minTileY);
+    tempBuffer[gid].maxTile = ushort2(tb.maxTileX + 1, tb.maxTileY + 1);
     tempBuffer[gid].obbExtentX = half(obbExtents.x);
     tempBuffer[gid].obbExtentY = half(obbExtents.y);
 
@@ -467,9 +455,9 @@ kernel void localRender16(
     // Get tile ID from indirect dispatch (1D grid, active tiles only)
     uint groupIdx = groupId.x;
 
-    threadgroup uint tileId;
-    threadgroup uint tileGaussianCount;
-    threadgroup uint tileDataOffset;
+    threadgroup uint tileId = 0;
+    threadgroup uint tileGaussianCount = 0;
+    threadgroup uint tileDataOffset = 0;
 
     if (localIdx == 0) {
         tileId = activeTileIndices[groupIdx];
@@ -610,7 +598,6 @@ kernel void localScatterSimd16(
     float2 center = 0;
     float opacity = 0;
     float2 obbExtents = 0;
-    float radius = 0;
     ushort depth16 = 0;
     int minTX = 0, minTY = 0, maxTX = 0, maxTY = 0;
 
@@ -621,7 +608,6 @@ kernel void localScatterSimd16(
         opacity = float(g.opacity);
         // Read pre-computed OBB extents
         obbExtents = float2(g.obbExtentX, g.obbExtentY);
-        radius = max(obbExtents.x, obbExtents.y);
         // 16-bit depth key: reinterpret half bits, XOR sign for correct unsigned sort order
         // (matches GlobalShaders.metal approach)
         depth16 = as_type<ushort>(g.depth) ^ 0x8000u;
@@ -640,7 +626,6 @@ kernel void localScatterSimd16(
     opacity = simd_shuffle(opacity, 0);
     obbExtents.x = simd_shuffle(obbExtents.x, 0);
     obbExtents.y = simd_shuffle(obbExtents.y, 0);
-    radius = simd_shuffle(radius, 0);
     depth16 = simd_shuffle(depth16, 0);
     minTX = simd_shuffle(minTX, 0);
     minTY = simd_shuffle(minTY, 0);
@@ -661,7 +646,7 @@ kernel void localScatterSimd16(
         int2 pixMin = int2(tx * tileWidth, ty * tileHeight);
         int2 pixMax = int2(pixMin.x + tileWidth - 1, pixMin.y + tileHeight - 1);
 
-        bool valid = intersectsTile(pixMin, pixMax, center, conic, opacity, radius, obbExtents);
+        bool valid = intersectsTile(pixMin, pixMax, center, conic, opacity, obbExtents);
 
         // SIMD early-out: skip iteration if no lanes are valid
         simd_vote ballot = simd_ballot(valid);

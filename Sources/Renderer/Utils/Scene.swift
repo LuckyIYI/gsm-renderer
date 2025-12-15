@@ -140,7 +140,7 @@ public extension GaussianSceneBuilder {
 
 public struct GaussianDataset {
     public var records: [GaussianRecord]
-    public let harmonics: [Float]
+    public var harmonics: [Float]
     public let shComponents: Int
     public var cameraPoses: [CameraPose]
     public var cameraNames: [String]

@@ -13,6 +13,13 @@ final class TwoPassTileAssignEncoder {
     private let countPipeline: MTLComputePipelineState
     private let scatterPipeline: MTLComputePipelineState
 
+    // Indirect prefix sum pipelines (count read from buffer)
+    private let preparePrefixSumDispatchPipeline: MTLComputePipelineState
+    private let blockReduceIndirectPipeline: MTLComputePipelineState
+    private let singleBlockScanIndirectPipeline: MTLComputePipelineState
+    private let blockScanIndirectPipeline: MTLComputePipelineState
+    private let writeTotalIndirectPipeline: MTLComputePipelineState
+
     // Prefix sum pipelines
     private let blockReducePipeline: MTLComputePipelineState
     private let singleBlockScanPipeline: MTLComputePipelineState
@@ -49,6 +56,16 @@ final class TwoPassTileAssignEncoder {
             throw RendererError.failedToCreatePipeline("Prefix sum kernels not found in library")
         }
 
+        // Indirect prefix sum kernels
+        guard let prepPrefixFn = library.makeFunction(name: "preparePrefixSumDispatchKernel"),
+              let reduceIndirectFn = library.makeFunction(name: "blockReduceIndirectKernel"),
+              let singleScanIndirectFn = library.makeFunction(name: "singleBlockScanIndirectKernel"),
+              let blockScanIndirectFn = library.makeFunction(name: "blockScanIndirectKernel"),
+              let writeTotalIndirectFn = library.makeFunction(name: "writeTotalCountIndirectKernel")
+        else {
+            throw RendererError.failedToCreatePipeline("Indirect prefix sum kernels not found in library")
+        }
+
         self.markVisibilityPipeline = try device.makeComputePipelineState(function: markFn)
         self.scatterCompactPipeline = try device.makeComputePipelineState(function: scatterCompactFn)
         self.prepareIndirectPipeline = try device.makeComputePipelineState(function: prepareIndirectFn)
@@ -59,6 +76,12 @@ final class TwoPassTileAssignEncoder {
         self.singleBlockScanPipeline = try device.makeComputePipelineState(function: singleScanFn)
         self.blockScanPipeline = try device.makeComputePipelineState(function: blockScanFn)
         self.writeTotalPipeline = try device.makeComputePipelineState(function: writeTotalFn)
+
+        self.preparePrefixSumDispatchPipeline = try device.makeComputePipelineState(function: prepPrefixFn)
+        self.blockReduceIndirectPipeline = try device.makeComputePipelineState(function: reduceIndirectFn)
+        self.singleBlockScanIndirectPipeline = try device.makeComputePipelineState(function: singleScanIndirectFn)
+        self.blockScanIndirectPipeline = try device.makeComputePipelineState(function: blockScanIndirectFn)
+        self.writeTotalIndirectPipeline = try device.makeComputePipelineState(function: writeTotalIndirectFn)
 
         self.threadgroupSize = min(self.countPipeline.maxTotalThreadsPerThreadgroup, 256)
     }
@@ -269,7 +292,8 @@ final class TwoPassTileAssignEncoder {
             encoder.setBuffer(renderData, offset: 0, index: 1)
             encoder.setBuffer(coverageBuffer, offset: 0, index: 2)
             encoder.setBuffer(indirectBuffers.visibleIndices, offset: 0, index: 3)
-            encoder.setBytes(&params, length: MemoryLayout<TileAssignParams>.stride, index: 4)
+            encoder.setBuffer(indirectBuffers.visibleCount, offset: 0, index: 4)
+            encoder.setBytes(&params, length: MemoryLayout<TileAssignParams>.stride, index: 5)
 
             let tg = MTLSize(width: threadgroupSize, height: 1, depth: 1)
             encoder.dispatchThreadgroups(indirectBuffer: indirectBuffers.indirectDispatchArgs,
@@ -307,9 +331,178 @@ final class TwoPassTileAssignEncoder {
             encoder.setBuffer(renderData, offset: 0, index: 1)
             encoder.setBuffer(coverageBuffer, offset: 0, index: 2)
             encoder.setBuffer(indirectBuffers.visibleIndices, offset: 0, index: 3)
-            encoder.setBuffer(tileIndicesBuffer, offset: 0, index: 4)
-            encoder.setBuffer(tileIdsBuffer, offset: 0, index: 5)
-            encoder.setBytes(&params, length: MemoryLayout<TileAssignParams>.stride, index: 6)
+            encoder.setBuffer(indirectBuffers.visibleCount, offset: 0, index: 4)
+            encoder.setBuffer(tileIndicesBuffer, offset: 0, index: 5)
+            encoder.setBuffer(tileIdsBuffer, offset: 0, index: 6)
+            encoder.setBytes(&params, length: MemoryLayout<TileAssignParams>.stride, index: 7)
+
+            let tg = MTLSize(width: threadgroupSize, height: 1, depth: 1)
+            encoder.dispatchThreadgroups(indirectBuffer: indirectBuffers.indirectDispatchArgs,
+                                         indirectBufferOffset: 0,
+                                         threadsPerThreadgroup: tg)
+            encoder.endEncoding()
+        }
+    }
+
+    /// Encode tile assignment when `visibleIndices/visibleCount` are already populated.
+    /// Flow: PrepareDispatch → IndirectCount → PrefixSum(count=visibleCount) → WriteTotal → IndirectScatter
+    func encodeFromVisibleList(
+        commandBuffer: MTLCommandBuffer,
+        tileWidth: Int,
+        tileHeight: Int,
+        tilesX: Int,
+        maxAssignments: Int,
+        boundsBuffer: MTLBuffer,
+        coverageBuffer: MTLBuffer, // Used as tileCounts, then overwritten with offsets
+        renderData: MTLBuffer,
+        tileIndicesBuffer: MTLBuffer,
+        tileIdsBuffer: MTLBuffer,
+        tileAssignmentHeader: MTLBuffer,
+        blockSumsBuffer: MTLBuffer,
+        blockSumsLevel2OffsetBytes: Int,
+        prefixSumDispatchArgs: MTLBuffer,
+        prefixSumBlockCountBuffer: MTLBuffer,
+        indirectBuffers: IndirectBuffers
+    ) {
+        // 0) Prepare indirect dispatch args based on visible count
+        if let encoder = commandBuffer.makeComputeCommandEncoder() {
+            encoder.label = "PrepareIndirectDispatch(Visible)"
+            encoder.setComputePipelineState(self.prepareIndirectPipeline)
+            encoder.setBuffer(indirectBuffers.visibleCount, offset: 0, index: 0)
+            encoder.setBuffer(indirectBuffers.indirectDispatchArgs, offset: 0, index: 1)
+            var tgSize = UInt32(threadgroupSize)
+            encoder.setBytes(&tgSize, length: 4, index: 2)
+
+            encoder.dispatchThreads(MTLSize(width: 1, height: 1, depth: 1),
+                                    threadsPerThreadgroup: MTLSize(width: 1, height: 1, depth: 1))
+            encoder.endEncoding()
+        }
+
+        // 1) TileCountIndirect: coverageBuffer[0..visibleCount) = tileCounts
+        var params = TileAssignParams(
+            gaussianCount: 0,
+            tileWidth: UInt32(tileWidth),
+            tileHeight: UInt32(tileHeight),
+            tilesX: UInt32(tilesX),
+            maxAssignments: UInt32(maxAssignments)
+        )
+
+        if let encoder = commandBuffer.makeComputeCommandEncoder() {
+            encoder.label = "TileCountIndirect(Visible)"
+            encoder.setComputePipelineState(self.countPipeline)
+            encoder.setBuffer(boundsBuffer, offset: 0, index: 0)
+            encoder.setBuffer(renderData, offset: 0, index: 1)
+            encoder.setBuffer(coverageBuffer, offset: 0, index: 2)
+            encoder.setBuffer(indirectBuffers.visibleIndices, offset: 0, index: 3)
+            encoder.setBuffer(indirectBuffers.visibleCount, offset: 0, index: 4)
+            encoder.setBytes(&params, length: MemoryLayout<TileAssignParams>.stride, index: 5)
+
+            let tg = MTLSize(width: threadgroupSize, height: 1, depth: 1)
+            encoder.dispatchThreadgroups(indirectBuffer: indirectBuffers.indirectDispatchArgs,
+                                         indirectBufferOffset: 0,
+                                         threadsPerThreadgroup: tg)
+            encoder.endEncoding()
+        }
+
+        // 2) Prefix sum on coverageBuffer with count = visibleCount (GPU-only, no clears)
+        if let encoder = commandBuffer.makeComputeCommandEncoder() {
+            encoder.label = "PreparePrefixSumDispatch(Visible)"
+            encoder.setComputePipelineState(self.preparePrefixSumDispatchPipeline)
+            encoder.setBuffer(indirectBuffers.visibleCount, offset: 0, index: 0)
+            encoder.setBuffer(prefixSumDispatchArgs, offset: 0, index: 1)
+            encoder.setBuffer(prefixSumBlockCountBuffer, offset: 0, index: 2)
+            encoder.dispatchThreads(MTLSize(width: 1, height: 1, depth: 1),
+                                    threadsPerThreadgroup: MTLSize(width: 1, height: 1, depth: 1))
+            encoder.endEncoding()
+        }
+
+        let prefixBlockSize = 256
+        let prefixTG = MTLSize(width: prefixBlockSize, height: 1, depth: 1)
+
+        if let encoder = commandBuffer.makeComputeCommandEncoder() {
+            encoder.label = "PrefixBlockReduce(Visible)"
+            encoder.setComputePipelineState(self.blockReduceIndirectPipeline)
+            encoder.setBuffer(coverageBuffer, offset: 0, index: 0)
+            encoder.setBuffer(blockSumsBuffer, offset: 0, index: 1)
+            encoder.setBuffer(indirectBuffers.visibleCount, offset: 0, index: 2)
+            encoder.dispatchThreadgroups(indirectBuffer: prefixSumDispatchArgs, indirectBufferOffset: 0, threadsPerThreadgroup: prefixTG)
+            encoder.endEncoding()
+        }
+
+        // Reduce level-1 block sums into level-2 block sums (always, even if level2Blocks == 1).
+        if let encoder = commandBuffer.makeComputeCommandEncoder() {
+            encoder.label = "PrefixBlockReduce(Level2)"
+            encoder.setComputePipelineState(self.blockReduceIndirectPipeline)
+            encoder.setBuffer(blockSumsBuffer, offset: 0, index: 0)
+            encoder.setBuffer(blockSumsBuffer, offset: blockSumsLevel2OffsetBytes, index: 1)
+            encoder.setBuffer(prefixSumBlockCountBuffer, offset: 0, index: 2) // level1Blocks
+            encoder.dispatchThreadgroups(indirectBuffer: prefixSumDispatchArgs,
+                                         indirectBufferOffset: MemoryLayout<DispatchIndirectArgsSwift>.stride,
+                                         threadsPerThreadgroup: prefixTG)
+            encoder.endEncoding()
+        }
+
+        // Scan level-2 block sums in a single threadgroup (level2Blocks <= 256 for our maxGaussians).
+        if let encoder = commandBuffer.makeComputeCommandEncoder() {
+            encoder.label = "PrefixSingleBlockScan(Level2)"
+            encoder.setComputePipelineState(self.singleBlockScanIndirectPipeline)
+            encoder.setBuffer(blockSumsBuffer, offset: blockSumsLevel2OffsetBytes, index: 0)
+            encoder.setBuffer(prefixSumBlockCountBuffer, offset: MemoryLayout<UInt32>.stride, index: 1) // level2Blocks
+            encoder.dispatchThreads(MTLSize(width: prefixBlockSize, height: 1, depth: 1),
+                                    threadsPerThreadgroup: prefixTG)
+            encoder.endEncoding()
+        }
+
+        // Convert level-1 block sums to exclusive offsets using scanned level-2 offsets.
+        if let encoder = commandBuffer.makeComputeCommandEncoder() {
+            encoder.label = "PrefixBlockScan(Level1)"
+            encoder.setComputePipelineState(self.blockScanIndirectPipeline)
+            encoder.setBuffer(blockSumsBuffer, offset: 0, index: 0)
+            encoder.setBuffer(blockSumsBuffer, offset: 0, index: 1)
+            encoder.setBuffer(blockSumsBuffer, offset: blockSumsLevel2OffsetBytes, index: 2)
+            encoder.setBuffer(prefixSumBlockCountBuffer, offset: 0, index: 3) // level1Blocks
+            encoder.dispatchThreadgroups(indirectBuffer: prefixSumDispatchArgs,
+                                         indirectBufferOffset: MemoryLayout<DispatchIndirectArgsSwift>.stride,
+                                         threadsPerThreadgroup: prefixTG)
+            encoder.endEncoding()
+        }
+
+        // Scan original buffer using level-1 block offsets.
+        if let encoder = commandBuffer.makeComputeCommandEncoder() {
+            encoder.label = "PrefixBlockScan(Visible)"
+            encoder.setComputePipelineState(self.blockScanIndirectPipeline)
+            encoder.setBuffer(coverageBuffer, offset: 0, index: 0)
+            encoder.setBuffer(coverageBuffer, offset: 0, index: 1)
+            encoder.setBuffer(blockSumsBuffer, offset: 0, index: 2) // level1Offsets
+            encoder.setBuffer(indirectBuffers.visibleCount, offset: 0, index: 3)
+            encoder.dispatchThreadgroups(indirectBuffer: prefixSumDispatchArgs, indirectBufferOffset: 0, threadsPerThreadgroup: prefixTG)
+            encoder.endEncoding()
+        }
+
+        // 3) Write total assignments to header from level-2 total.
+        if let encoder = commandBuffer.makeComputeCommandEncoder() {
+            encoder.label = "WriteTotalCount(Visible)"
+            encoder.setComputePipelineState(self.writeTotalIndirectPipeline)
+            encoder.setBuffer(blockSumsBuffer, offset: blockSumsLevel2OffsetBytes, index: 0)
+            encoder.setBuffer(tileAssignmentHeader, offset: 0, index: 1)
+            encoder.setBuffer(prefixSumBlockCountBuffer, offset: MemoryLayout<UInt32>.stride, index: 2) // level2Blocks
+            encoder.dispatchThreads(MTLSize(width: 1, height: 1, depth: 1),
+                                    threadsPerThreadgroup: MTLSize(width: 1, height: 1, depth: 1))
+            encoder.endEncoding()
+        }
+
+        // 4) TileScatterIndirect
+        if let encoder = commandBuffer.makeComputeCommandEncoder() {
+            encoder.label = "TileScatterIndirect(Visible)"
+            encoder.setComputePipelineState(self.scatterPipeline)
+            encoder.setBuffer(boundsBuffer, offset: 0, index: 0)
+            encoder.setBuffer(renderData, offset: 0, index: 1)
+            encoder.setBuffer(coverageBuffer, offset: 0, index: 2)
+            encoder.setBuffer(indirectBuffers.visibleIndices, offset: 0, index: 3)
+            encoder.setBuffer(indirectBuffers.visibleCount, offset: 0, index: 4)
+            encoder.setBuffer(tileIndicesBuffer, offset: 0, index: 5)
+            encoder.setBuffer(tileIdsBuffer, offset: 0, index: 6)
+            encoder.setBytes(&params, length: MemoryLayout<TileAssignParams>.stride, index: 7)
 
             let tg = MTLSize(width: threadgroupSize, height: 1, depth: 1)
             encoder.dispatchThreadgroups(indirectBuffer: indirectBuffers.indirectDispatchArgs,

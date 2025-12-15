@@ -8,6 +8,7 @@ typedef uint    UINT32;
 typedef ushort  UINT16;
 typedef int     INT32;
 typedef half    HALF;
+typedef uchar   UCHAR;
 #else
 #include <simd/simd.h>
 #include <stdint.h>
@@ -15,6 +16,7 @@ typedef uint32_t UINT32;
 typedef uint16_t UINT16;
 typedef int32_t  INT32;
 typedef _Float16 HALF;
+typedef uint8_t  UCHAR;
 #endif
 
 typedef struct {
@@ -30,8 +32,10 @@ typedef struct {
     float         farPlane;
     UINT32        shComponents;
     UINT32        gaussianCount;
-    UINT32        padding0;
-    UINT32        padding1;
+    float         inputIsSRGB; // 1.0 = decode evaluated color from sRGB to linear
+    float         _pad1;
+    float         _pad2;
+    float         _pad3;
 } CameraUniforms;
 
 typedef struct {
@@ -68,14 +72,17 @@ typedef struct {
     HALF  _pad0, _pad1;
 } PackedWorldGaussianHalf;
 
-// 32 bytes
+// 16 bytes - compact render data for global/depth-first tiled renderers.
+// Store ellipse parameters (theta, sigma1, sigma2) instead of conic to avoid
+// half-precision determinant issues (ad-b^2) when reconstructing axes.
 typedef struct {
-    HALF meanX, meanY;
-    HALF conicA, conicB, conicC, conicD;
-    HALF colorR, colorG, colorB;
-    HALF opacity;
-    HALF depth;
-    HALF _pad0, _pad1, _pad2, _pad3, _pad4;
+    HALF meanX, meanY;                    // 4 bytes - screen position
+    UINT16 theta;                         // 2 bytes - angle in [0, pi) packed to 0..65535
+    HALF sigma1;                          // 2 bytes - major axis sigma (pixels)
+    HALF sigma2;                          // 2 bytes - minor axis sigma (pixels)
+    HALF depth;                           // 2 bytes - depth for output
+    UCHAR colorR, colorG, colorB;         // 3 bytes - 8-bit color
+    UCHAR opacity;                        // 1 byte - 8-bit opacity
 } GaussianRenderData;
 
 typedef struct {
@@ -153,3 +160,331 @@ enum DispatchSlots {
     DispatchSlotRadixScatter = 8,
     DispatchSlotRenderTiles = 9
 };
+
+// ============================================================================
+// Stereo Rendering Types
+// ============================================================================
+
+// Stereo camera uniforms - contains both eye cameras for single-pass projection
+// NOTE: Using explicit floats instead of simd_float3 to ensure consistent layout
+// between Swift and Metal. simd_float3 has platform-dependent alignment.
+//
+// Layout (all offsets in bytes):
+// Left eye:    0-127 (viewMatrix), 128-191 (projMatrix), 192-215 (camera+focal+pad)
+// Right eye:   224-287 (viewMatrix), 288-351 (projMatrix), 352-375 (camera+focal+pad)
+// Shared:      384-407 (width/height/near/far/sh/count/pad)
+// Transform:   416-479 (sceneTransform)
+// Total: 480 bytes
+typedef struct {
+    // Left eye (offset 0)
+    simd_float4x4 leftViewMatrix;        // 0-63
+    simd_float4x4 leftProjectionMatrix;  // 64-127
+    // Camera center + focal (offset 128, 32 bytes to align next float4x4)
+    float         leftCameraCenterX;     // 128
+    float         leftCameraCenterY;     // 132
+    float         leftCameraCenterZ;     // 136
+    float         leftFocalX;            // 140
+    float         leftFocalY;            // 144
+    float         _padLeft0;             // 148
+    float         _padLeft1;             // 152
+    float         _padLeft2;             // 156
+    // End left: 160 bytes (16-byte aligned)
+
+    // Right eye (offset 160)
+    simd_float4x4 rightViewMatrix;       // 160-223
+    simd_float4x4 rightProjectionMatrix; // 224-287
+    // Camera center + focal (offset 288, 32 bytes to align next section)
+    float         rightCameraCenterX;    // 288
+    float         rightCameraCenterY;    // 292
+    float         rightCameraCenterZ;    // 296
+    float         rightFocalX;           // 300
+    float         rightFocalY;           // 304
+    float         _padRight0;            // 308
+    float         _padRight1;            // 312
+    float         _padRight2;            // 316
+    // End right: 320 bytes (16-byte aligned)
+
+    // Shared parameters (offset 320)
+    float         width;                 // 320
+    float         height;                // 324
+    float         nearPlane;             // 328
+    float         farPlane;              // 332
+    UINT32        shComponents;          // 336
+    UINT32        gaussianCount;         // 340
+    float         inputIsSRGB;           // 344
+    float         _padShared1;           // 348
+    // End shared: 352 bytes (16-byte aligned)
+
+    // Scene transform (offset 352)
+    simd_float4x4 sceneTransform;        // 352-415
+} StereoCameraUniforms;
+// Total size: 416 bytes
+
+// Stereo render data - screen-space data for both eyes per gaussian
+// 64 bytes - stores projection results for both eyes
+typedef struct {
+    // Left eye
+    HALF leftMeanX, leftMeanY;
+    HALF leftConicA, leftConicB, leftConicC, leftConicD;
+    HALF leftDepth;
+    HALF _padLeft;
+
+    // Right eye
+    HALF rightMeanX, rightMeanY;
+    HALF rightConicA, rightConicB, rightConicC, rightConicD;
+    HALF rightDepth;
+    HALF _padRight;
+
+    // Shared (same for both eyes)
+    HALF colorR, colorG, colorB;
+    HALF opacity;
+
+    // Tile bounds per eye (for separate tile assignment)
+    simd_short4 leftBounds;   // minX, maxX, minY, maxY
+    simd_short4 rightBounds;
+} StereoGaussianRenderData;
+
+// Stereo depth first header - tracks visible counts for both eyes
+typedef struct {
+    UINT32 leftVisibleCount;
+    UINT32 rightVisibleCount;
+    UINT32 leftTotalInstances;
+    UINT32 rightTotalInstances;
+    UINT32 paddedLeftVisible;
+    UINT32 paddedRightVisible;
+    UINT32 leftOverflow;
+    UINT32 rightOverflow;
+} StereoDepthFirstHeader;
+
+// Depth-first header for single-eye rendering and radix sort
+typedef struct {
+    UINT32 visibleCount;
+    UINT32 totalInstances;
+    UINT32 paddedVisibleCount;
+    UINT32 paddedInstanceCount;
+    UINT32 overflow;
+    UINT32 padding0;
+    UINT32 padding1;
+    UINT32 padding2;
+} DepthFirstHeader;
+
+// ============================================================================
+// Mesh Shader Renderer Types
+// ============================================================================
+
+// Depth key generation params for mesh renderer (stereo - generates keys for both eyes)
+typedef struct {
+    simd_float4x4 sceneTransform;
+    simd_float4x4 leftViewMatrix;
+    simd_float4x4 rightViewMatrix;
+    float farPlane;
+    UINT32 gaussianCount;
+    float _pad0, _pad1;
+} MeshDepthKeyGenParams;
+
+// Camera uniforms for mesh renderer (single eye - used for per-eye rendering)
+typedef struct {
+    simd_float4x4 viewMatrix;
+    simd_float4x4 projectionMatrix;
+    simd_float4x4 sceneTransform;
+    float cameraPosX, cameraPosY, cameraPosZ;
+    float nearPlane;
+    float width, height;
+    float focalX, focalY;
+    UINT32 gaussianCount;
+    UINT32 shComponents;
+    UINT32 eyeIndex;  // 0 = left, 1 = right (for render target array index)
+    float farPlane;
+    float totalInkThreshold;  // Total ink culling threshold (0 = disabled)
+    float _pad0, _pad1, _pad2;
+} MeshCameraUniforms;
+
+// Stereo camera uniforms for mesh renderer
+typedef struct {
+    // Left eye
+    simd_float4x4 leftViewMatrix;
+    simd_float4x4 leftProjectionMatrix;
+    float leftCameraPosX, leftCameraPosY, leftCameraPosZ;
+    float leftFocalX, leftFocalY;
+    float _padLeft0, _padLeft1, _padLeft2;
+
+    // Right eye
+    simd_float4x4 rightViewMatrix;
+    simd_float4x4 rightProjectionMatrix;
+    float rightCameraPosX, rightCameraPosY, rightCameraPosZ;
+    float rightFocalX, rightFocalY;
+    float _padRight0, _padRight1, _padRight2;
+
+    // Shared
+    simd_float4x4 sceneTransform;
+    float width, height;
+    float nearPlane, farPlane;
+    UINT32 gaussianCount;
+    UINT32 shComponents;
+    float _padShared0, _padShared1;
+} MeshStereoCameraUniforms;
+
+// ============================================================================
+// Instanced Gaussian Renderer Types (hardware rasterization without mesh shaders)
+// ============================================================================
+
+// Indirect draw arguments for instanced primitives (matches MTLDrawPrimitivesIndirectArguments)
+typedef struct {
+    UINT32 vertexCount;      // 6 for two triangles (quad)
+    UINT32 instanceCount;    // Number of visible gaussians
+    UINT32 vertexStart;      // 0
+    UINT32 baseInstance;     // 0
+} DrawIndirectArgs;
+
+// Indirect indexed draw arguments (matches MTLDrawIndexedPrimitivesIndirectArguments)
+typedef struct {
+    UINT32 indexCount;
+    UINT32 instanceCount;
+    UINT32 indexStart;
+    INT32  baseVertex;
+    UINT32 baseInstance;
+} DrawIndexedIndirectArgs;
+
+// Compacted visible gaussian data - written by projection compute shader
+// Stores the 2D ellipse basis directly (axis1/axis2 in pixels) to avoid
+// reconstructing from a quantized conic (which can become near-singular).
+typedef struct {
+    HALF   screenX, screenY;            // 4 bytes - Screen position (pixels)
+    UINT16 theta;                       // 2 bytes - angle in [0, pi) packed to 0..65535
+    HALF   sigma1;                      // 2 bytes - major axis sigma (pixels)
+    HALF   sigma2;                      // 2 bytes - minor axis sigma (pixels)
+    HALF   depth;                       // 2 bytes - For sorting
+    UCHAR  colorR, colorG, colorB;      // 3 bytes - 8-bit color
+    UCHAR  opacity;                     // 1 byte - 8-bit opacity
+} InstancedGaussianData;
+
+// Projection parameters for instanced renderer
+// Note: focalX/Y removed - now derived from projection matrix for efficiency
+typedef struct {
+    simd_float4x4 sceneTransform;
+    simd_float4x4 leftViewMatrix;
+    simd_float4x4 leftProjectionMatrix;
+    simd_float4x4 rightViewMatrix;
+    simd_float4x4 rightProjectionMatrix;
+    float leftCameraPosX, leftCameraPosY, leftCameraPosZ;
+    float _padLeft0;
+    float rightCameraPosX, rightCameraPosY, rightCameraPosZ;
+    float _padRight0;
+    float width, height;
+    float nearPlane, farPlane;
+    UINT32 gaussianCount;
+    UINT32 shComponents;
+    float totalInkThreshold;  // Total ink culling threshold (0 = disabled)
+    float _pad0;
+} InstancedProjectionParams;
+
+typedef struct {
+    float width;
+    float height;
+    float farPlane;
+    float _pad0;
+} CenterSortRenderUniforms;
+
+// ============================================================================
+// Center-Sort Stereo Types (tiled pipeline with single sort)
+// ============================================================================
+
+// Stereo render data for tiled depth-first stereo rendering.
+// 32 bytes - stores per-eye screen positions and precomputed conic coefficients.
+// Uses same tile bounds buffer as mono (computed from center/union).
+typedef struct {
+    // Left eye (12 bytes)
+    HALF leftMeanX, leftMeanY;       // 4 bytes - screen position
+    HALF leftCxx;                    // 2 bytes - conic.xx
+    HALF leftCyy;                    // 2 bytes - conic.yy
+    HALF leftCxy2;                   // 2 bytes - 2*conic.xy
+    HALF leftDepth;                  // 2 bytes
+
+    // Right eye (12 bytes)
+    HALF rightMeanX, rightMeanY;     // 4 bytes - screen position
+    HALF rightCxx;                   // 2 bytes - conic.xx
+    HALF rightCyy;                   // 2 bytes - conic.yy
+    HALF rightCxy2;                  // 2 bytes - 2*conic.xy
+    HALF rightDepth;                 // 2 bytes
+
+    // Shared (8 bytes)
+    UCHAR colorR, colorG, colorB;    // 3 bytes - 8-bit color
+    UCHAR opacity;                   // 1 byte - 8-bit opacity
+    HALF centerDepth;                // 2 bytes - for depth sort
+    UINT16 _pad0;                    // 2 bytes padding to 32
+} StereoTiledRenderData;
+
+// Center-projected gaussian data for stereo rendering with single sort.
+// Stores per-eye screen centers and ellipse bases.
+// 26 bytes (padded to 28)
+typedef struct {
+    // Per-eye screen positions (differ due to IPD)
+    HALF leftScreenX, leftScreenY;   // 4 bytes
+    HALF rightScreenX, rightScreenY; // 4 bytes
+    // Per-eye ellipse params (theta + sigmas). Theta in [0, pi) packed to 0..65535.
+    UINT16 leftTheta;                // 2 bytes
+    UINT16 rightTheta;               // 2 bytes
+    HALF leftSigma1, leftSigma2;     // 4 bytes
+    HALF rightSigma1, rightSigma2;   // 4 bytes
+    HALF depth;                      // 2 bytes - Center eye depth (for sorting)
+    UCHAR colorR, colorG, colorB;    // 3 bytes - 8-bit color
+    UCHAR opacity;                   // 1 byte - 8-bit opacity
+} CenterSortGaussianData;
+
+// Header for center-sort mode (single visible count)
+typedef struct {
+    UINT32 visibleCount;
+    UINT32 paddedCount;
+    UINT32 overflow;
+    UINT32 _pad0;
+} CenterSortHeader;
+
+// Projection parameters for center-sort mode
+typedef struct {
+    simd_float4x4 sceneTransform;
+    simd_float4x4 centerViewMatrix;       // Average of left/right view
+    simd_float4x4 centerProjectionMatrix; // For covariance projection
+    simd_float4x4 leftViewMatrix;
+    simd_float4x4 leftProjectionMatrix;
+    simd_float4x4 rightViewMatrix;
+    simd_float4x4 rightProjectionMatrix;
+    float centerCameraPosX, centerCameraPosY, centerCameraPosZ;
+    float _padCenter0;  // focalX/Y no longer needed - derived from projection matrix
+    float leftCameraPosX, leftCameraPosY, leftCameraPosZ;
+    float _padLeft0;
+    float rightCameraPosX, rightCameraPosY, rightCameraPosZ;
+    float _padRight0;
+    float width, height;
+    float nearPlane, farPlane;
+    UINT32 gaussianCount;
+    UINT32 shComponents;
+    float totalInkThreshold;
+    float inputIsSRGB; // 1.0 = decode evaluated color from sRGB to linear
+} CenterSortProjectionParams;
+
+// ============================================================================
+// Mono Rendering Types (single texture, non-stereo)
+// ============================================================================
+
+// Projection parameters for mono (single-eye) rendering
+typedef struct {
+    simd_float4x4 sceneTransform;
+    simd_float4x4 viewMatrix;
+    simd_float4x4 projectionMatrix;
+    float cameraPosX, cameraPosY, cameraPosZ;
+    float _pad0;
+    float width, height;
+    float nearPlane, farPlane;
+    UINT32 gaussianCount;
+    UINT32 shComponents;
+    float totalInkThreshold;
+    float inputIsSRGB; // 1.0 = decode evaluated color from sRGB to linear
+} MonoProjectionParams;
+
+// Header for mono rendering (single visible count)
+typedef struct {
+    UINT32 visibleCount;
+    UINT32 paddedCount;
+    UINT32 overflow;
+    UINT32 _pad0;
+} MonoRenderHeader;

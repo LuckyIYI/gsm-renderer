@@ -33,11 +33,11 @@ final class DepthFirstUnitTests: XCTestCase {
             let col = i % 32
             let x = Float(col) * 0.1 - 1.6
             let y = Float(row) * 0.1 - 1.6
-            let z = Float(i) * 0.001 - 0.5 // Depth varies by index
+            let z = 2.0 + Float(i) * 0.001 // In front of OpenCV camera, away from near plane
 
             packed.append(PackedWorldGaussian(
                 position: SIMD3<Float>(x, y, z),
-                scale: SIMD3<Float>(0.02, 0.02, 0.02),
+                scale: SIMD3<Float>(0.01, 0.01, 0.01),
                 rotation: SIMD4<Float>(0, 0, 0, 1),
                 opacity: 0.8
             ))
@@ -190,11 +190,12 @@ final class DepthFirstUnitTests: XCTestCase {
         let histogramSize = gridSize * 256 * MemoryLayout<UInt32>.stride
         let blockSumsSize = ((gridSize * 256 + 255) / 256) * MemoryLayout<UInt32>.stride
 
-        guard let histogramBuf = device.makeBuffer(length: max(histogramSize, 1024), options: .storageModePrivate),
-              let blockSumsBuf = device.makeBuffer(length: max(blockSumsSize, 1024), options: .storageModePrivate),
-              let scannedHistBuf = device.makeBuffer(length: max(histogramSize, 1024), options: .storageModePrivate),
-              let scratchKeysBuf = device.makeBuffer(length: paddedCount * MemoryLayout<UInt32>.stride, options: .storageModePrivate),
-              let scratchPayloadBuf = device.makeBuffer(length: paddedCount * MemoryLayout<Int32>.stride, options: .storageModePrivate)
+        // Use shared mode for debugging intermediate values
+        guard let histogramBuf = device.makeBuffer(length: max(histogramSize, 1024), options: .storageModeShared),
+              let blockSumsBuf = device.makeBuffer(length: max(blockSumsSize, 1024), options: .storageModeShared),
+              let scannedHistBuf = device.makeBuffer(length: max(histogramSize, 1024), options: .storageModeShared),
+              let scratchKeysBuf = device.makeBuffer(length: paddedCount * MemoryLayout<UInt32>.stride, options: .storageModeShared),
+              let scratchPayloadBuf = device.makeBuffer(length: paddedCount * MemoryLayout<Int32>.stride, options: .storageModeShared)
         else {
             XCTFail("Failed to create scratch buffers")
             return
@@ -249,21 +250,31 @@ final class DepthFirstUnitTests: XCTestCase {
             return
         }
 
-        let sortBuffers = DepthSortEncoder.SortBuffers(
+        let sortBuffers = RadixSortBuffers(
             histogram: histogramBuf,
             blockSums: blockSumsBuf,
             scannedHistogram: scannedHistBuf,
             scratchKeys: scratchKeysBuf,
-            scratchPayload: scratchPayloadBuf
+            scratchIndices: scratchPayloadBuf
         )
 
-        let encoder: DepthSortEncoder
+        let encoder: DepthRadixSortEncoder
         do {
-            encoder = try DepthSortEncoder(device: device, library: library)
+            encoder = try DepthRadixSortEncoder(device: device, library: library, precision: .bits32)
         } catch {
-            XCTFail("Failed to create DepthSortEncoder: \(error)")
+            XCTFail("Failed to create DepthRadixSortEncoder: \(error)")
             return
         }
+
+        // Create dispatch offsets for test (slots 0-4)
+        let depthDispatchOffsets = DepthRadixSortEncoder.DispatchOffsets.fromSlots(
+            histogram: 0,
+            scanBlocks: 1,
+            exclusive: 2,
+            apply: 3,
+            scatter: 4,
+            stride: MemoryLayout<UInt32>.stride * 3
+        )
 
         // Run the sort
         guard let cb = queue.makeCommandBuffer() else {
@@ -274,14 +285,24 @@ final class DepthFirstUnitTests: XCTestCase {
         encoder.encode(
             commandBuffer: cb,
             depthKeys: depthKeysBuf,
-            primitiveIndices: primitiveIndicesBuf,
+            sortedIndices: primitiveIndicesBuf,
             sortBuffers: sortBuffers,
-            header: headerBuf,
-            dispatchArgs: dispatchArgsBuf
+            sortHeader: headerBuf,
+            dispatchBuffer: dispatchArgsBuf,
+            offsets: depthDispatchOffsets,
+            label: "TestDepthSort"
         )
 
         cb.commit()
         cb.waitUntilCompleted()
+
+        // Debug: Print scanned histogram for bins 0-15
+        let scannedHistPtr = scannedHistBuf.contents().bindMemory(to: UInt32.self, capacity: 256)
+        print("Scanned histogram for bins 0-15: \(Array(UnsafeBufferPointer(start: scannedHistPtr, count: 16)))")
+
+        // Debug: Print scratch keys after passes
+        let scratchKeysPtr = scratchKeysBuf.contents().bindMemory(to: UInt32.self, capacity: min(20, paddedCount))
+        print("Scratch keys (first 20): \(Array(UnsafeBufferPointer(start: scratchKeysPtr, count: min(20, paddedCount))))")
 
         // Read back results
         let sortedKeysPtr = depthKeysBuf.contents().bindMemory(to: UInt32.self, capacity: visibleCount)
@@ -405,15 +426,25 @@ final class DepthFirstUnitTests: XCTestCase {
             return
         }
 
-        let sortBuffers = DepthSortEncoder.SortBuffers(
+        let sortBuffers = RadixSortBuffers(
             histogram: histogramBuf,
             blockSums: blockSumsBuf,
             scannedHistogram: scannedHistBuf,
             scratchKeys: scratchKeysBuf,
-            scratchPayload: scratchPayloadBuf
+            scratchIndices: scratchPayloadBuf
         )
 
-        let encoder = try DepthSortEncoder(device: device, library: library)
+        let encoder = try DepthRadixSortEncoder(device: device, library: library, precision: .bits32)
+
+        // Create dispatch offsets for test (slots 0-4)
+        let depthDispatchOffsets = DepthRadixSortEncoder.DispatchOffsets.fromSlots(
+            histogram: 0,
+            scanBlocks: 1,
+            exclusive: 2,
+            apply: 3,
+            scatter: 4,
+            stride: MemoryLayout<UInt32>.stride * 3
+        )
 
         // Initialize scratch buffers
         guard let cb1 = queue.makeCommandBuffer(),
@@ -439,10 +470,12 @@ final class DepthFirstUnitTests: XCTestCase {
         encoder.encode(
             commandBuffer: cb,
             depthKeys: depthKeysBuf,
-            primitiveIndices: primitiveIndicesBuf,
+            sortedIndices: primitiveIndicesBuf,
             sortBuffers: sortBuffers,
-            header: headerBuf,
-            dispatchArgs: dispatchArgsBuf
+            sortHeader: headerBuf,
+            dispatchBuffer: dispatchArgsBuf,
+            offsets: depthDispatchOffsets,
+            label: "TestDepthSortAtScale"
         )
 
         cb.commit()
@@ -767,9 +800,6 @@ final class DepthFirstUnitTests: XCTestCase {
         print("Overflow: \(header.overflow)")
 
         // Calculate max instances
-        let tilesX = (width + 31) / 32
-        let tilesY = (height + 15) / 16
-        let tileCount = tilesX * tilesY
         let maxInstances = gaussianCount * 32
         print("\nMax instances: \(maxInstances)")
         print("Instance utilization: \(Float(header.totalInstances) / Float(maxInstances) * 100)%")
@@ -945,21 +975,23 @@ final class DepthFirstUnitTests: XCTestCase {
 extension DepthFirstRenderer {
     /// Debug method to read header values from left view
     func debugReadHeader() -> DepthFirstHeaderSwift {
-        let frame = debugLeftFrame
+        guard let frame = debugLeftFrame else {
+            return DepthFirstHeaderSwift(visibleCount: 0, totalInstances: 0, paddedVisibleCount: 0, paddedInstanceCount: 0, overflow: 0, padding0: 0, padding1: 0, padding2: 0)
+        }
         let ptr = frame.header.contents().bindMemory(to: DepthFirstHeaderSwift.self, capacity: 1)
         return ptr.pointee
     }
 
     /// Debug method to read active tile count from left view
     func debugReadActiveTileCount() -> UInt32 {
-        let frame = debugLeftFrame
+        guard let frame = debugLeftFrame else { return 0 }
         let ptr = frame.activeTileCount.contents().bindMemory(to: UInt32.self, capacity: 1)
         return ptr.pointee
     }
 
     /// Debug method to read sorted tile IDs (requires blit copy for private buffers)
     func debugReadSortedTileIds(count: Int) -> [UInt32] {
-        let frame = debugLeftFrame
+        guard let frame = debugLeftFrame else { return [] }
         // instanceTileIds is private, need to copy to shared buffer
         guard let queue = device.makeCommandQueue(),
               let cb = queue.makeCommandBuffer(),
@@ -983,7 +1015,7 @@ extension DepthFirstRenderer {
 
     /// Debug method to read a single bounds entry at a specific index
     func debugReadSingleBounds(at index: Int) -> SIMD4<Int32> {
-        let frame = debugLeftFrame
+        guard let frame = debugLeftFrame else { return SIMD4<Int32>(0, -1, 0, -1) }
         guard let queue = device.makeCommandQueue(),
               let cb = queue.makeCommandBuffer(),
               let sharedBuffer = device.makeBuffer(length: MemoryLayout<SIMD4<Int32>>.stride, options: .storageModeShared)
@@ -1011,7 +1043,7 @@ extension DepthFirstRenderer {
 
     /// Debug method to read tile bounds (requires blit copy for private buffers)
     func debugReadTileBounds(count: Int) -> [SIMD4<Int32>] {
-        let frame = debugLeftFrame
+        guard let frame = debugLeftFrame else { return [] }
         guard let queue = device.makeCommandQueue(),
               let cb = queue.makeCommandBuffer(),
               let sharedBuffer = device.makeBuffer(length: count * MemoryLayout<SIMD4<Int32>>.stride, options: .storageModeShared)
@@ -1039,7 +1071,7 @@ extension DepthFirstRenderer {
 
     /// Debug method to read sorted primitive indices from a specific range
     func debugReadSortedPrimitiveIndicesRange(start: Int, count: Int) -> [Int32] {
-        let frame = debugLeftFrame
+        guard let frame = debugLeftFrame else { return [] }
         let sourceOffset = start * MemoryLayout<Int32>.stride
         guard let queue = device.makeCommandQueue(),
               let cb = queue.makeCommandBuffer(),
@@ -1066,7 +1098,7 @@ extension DepthFirstRenderer {
 
     /// Debug method to read instance offsets (prefix sum result in orderedTileCounts)
     func debugReadInstanceOffsets(count: Int) -> [UInt32] {
-        let frame = debugLeftFrame
+        guard let frame = debugLeftFrame else { return [] }
         guard let queue = device.makeCommandQueue(),
               let cb = queue.makeCommandBuffer(),
               let sharedBuffer = device.makeBuffer(length: count * MemoryLayout<UInt32>.stride, options: .storageModeShared)
@@ -1089,7 +1121,7 @@ extension DepthFirstRenderer {
 
     /// Debug method to read nTouchedTiles (original tile counts per gaussian)
     func debugReadNTouchedTiles(count: Int) -> [UInt32] {
-        let frame = debugLeftFrame
+        guard let frame = debugLeftFrame else { return [] }
         guard let queue = device.makeCommandQueue(),
               let cb = queue.makeCommandBuffer(),
               let sharedBuffer = device.makeBuffer(length: count * MemoryLayout<UInt32>.stride, options: .storageModeShared)
@@ -1112,7 +1144,7 @@ extension DepthFirstRenderer {
 
     /// Debug method to read instanceGaussianIndices (after tile sort)
     func debugReadInstanceGaussianIndices(count: Int) -> [Int32] {
-        let frame = debugLeftFrame
+        guard let frame = debugLeftFrame else { return [] }
         guard let queue = device.makeCommandQueue(),
               let cb = queue.makeCommandBuffer(),
               let sharedBuffer = device.makeBuffer(length: count * MemoryLayout<Int32>.stride, options: .storageModeShared)
@@ -1135,7 +1167,7 @@ extension DepthFirstRenderer {
 
     /// Debug method to read depthKeys (after depth sort, should be sorted)
     func debugReadDepthKeys(count: Int) -> [UInt32] {
-        let frame = debugLeftFrame
+        guard let frame = debugLeftFrame else { return [] }
         guard let queue = device.makeCommandQueue(),
               let cb = queue.makeCommandBuffer(),
               let sharedBuffer = device.makeBuffer(length: count * MemoryLayout<UInt32>.stride, options: .storageModeShared)
@@ -1158,7 +1190,7 @@ extension DepthFirstRenderer {
 
     /// Debug method to read scratch depth keys (intermediate state from pass 0)
     func debugReadScratchDepthKeys(count: Int) -> [UInt32] {
-        let frame = debugLeftFrame
+        guard let frame = debugLeftFrame else { return [] }
         guard let queue = device.makeCommandQueue(),
               let cb = queue.makeCommandBuffer(),
               let sharedBuffer = device.makeBuffer(length: count * MemoryLayout<UInt32>.stride, options: .storageModeShared)
@@ -1181,7 +1213,7 @@ extension DepthFirstRenderer {
 
     /// Debug method to read scratch primitive indices (intermediate state from pass 0)
     func debugReadScratchPrimitiveIndices(count: Int) -> [Int32] {
-        let frame = debugLeftFrame
+        guard let frame = debugLeftFrame else { return [] }
         guard let queue = device.makeCommandQueue(),
               let cb = queue.makeCommandBuffer(),
               let sharedBuffer = device.makeBuffer(length: count * MemoryLayout<Int32>.stride, options: .storageModeShared)
@@ -1204,7 +1236,7 @@ extension DepthFirstRenderer {
 
     /// Debug method to read render data to check stored depth values
     func debugReadRenderData(count: Int) -> [(depth: Float, meanX: Float, meanY: Float, opacity: Float)] {
-        let frame = debugLeftFrame
+        guard let frame = debugLeftFrame else { return [] }
         guard let queue = device.makeCommandQueue(),
               let cb = queue.makeCommandBuffer(),
               let sharedBuffer = device.makeBuffer(length: count * MemoryLayout<GaussianRenderData>.stride, options: .storageModeShared)
@@ -1233,7 +1265,7 @@ extension DepthFirstRenderer {
     /// Debug method to read ordered tile counts (before prefix sum modifies them)
     /// Note: After prefix sum, this buffer contains offsets, not counts!
     func debugReadOrderedTileCounts(count: Int) -> [UInt32] {
-        let frame = debugLeftFrame
+        guard let frame = debugLeftFrame else { return [] }
         guard let queue = device.makeCommandQueue(),
               let cb = queue.makeCommandBuffer(),
               let sharedBuffer = device.makeBuffer(length: count * MemoryLayout<UInt32>.stride, options: .storageModeShared)
@@ -1256,7 +1288,7 @@ extension DepthFirstRenderer {
 
     /// Debug method to read tile headers
     func debugReadTileHeaders(count: Int) -> [(offset: UInt32, count: UInt32)] {
-        let frame = debugLeftFrame
+        guard let frame = debugLeftFrame else { return [] }
         guard let queue = device.makeCommandQueue(),
               let cb = queue.makeCommandBuffer(),
               let sharedBuffer = device.makeBuffer(length: count * MemoryLayout<GaussianHeader>.stride, options: .storageModeShared)

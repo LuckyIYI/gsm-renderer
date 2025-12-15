@@ -111,43 +111,19 @@ public final class LocalRenderer: GaussianRenderer, @unchecked Sendable {
 
     public func renderStereo(
         commandBuffer: MTLCommandBuffer,
-        output: StereoRenderOutput,
+        target: StereoRenderTarget,
         input: GaussianInput,
         camera: StereoCameraParams,
         width: Int,
         height: Int
     ) {
-        let useHalfWorld = config.precision == .float16
+        switch target {
+        case .sideBySide:
+            fatalError("LocalRenderer does not support stereo rendering. Use HardwareRenderer or DepthFirstRenderer instead.")
 
-        renderView(
-            commandBuffer: commandBuffer,
-            colorTexture: output.leftColor,
-            depthTexture: output.leftDepth,
-            worldGaussians: input.gaussians,
-            harmonics: input.harmonics,
-            gaussianCount: input.gaussianCount,
-            camera: camera.leftEye,
-            width: width,
-            height: height,
-            shComponents: input.shComponents,
-            useHalfWorld: useHalfWorld,
-            resources: stereoResources.left
-        )
-
-        renderView(
-            commandBuffer: commandBuffer,
-            colorTexture: output.rightColor,
-            depthTexture: output.rightDepth,
-            worldGaussians: input.gaussians,
-            harmonics: input.harmonics,
-            gaussianCount: input.gaussianCount,
-            camera: camera.rightEye,
-            width: width,
-            height: height,
-            shComponents: input.shComponents,
-            useHalfWorld: useHalfWorld,
-            resources: stereoResources.right
-        )
+        case .foveated:
+            fatalError("LocalRenderer does not support stereo rendering. Use HardwareRenderer or DepthFirstRenderer instead.")
+        }
     }
 
     private func renderView(
@@ -177,7 +153,8 @@ public final class LocalRenderer: GaussianRenderer, @unchecked Sendable {
             width: width,
             height: height,
             gaussianCount: gaussianCount,
-            shComponents: shComponents
+            shComponents: shComponents,
+            inputIsSRGB: config.gaussianColorSpace == .srgb
         )
 
         let params = TileBinningParams(
@@ -283,14 +260,14 @@ public final class LocalRenderer: GaussianRenderer, @unchecked Sendable {
         )
     }
 
-    // MARK: - Debug Helpers
+    // MARK: - Debug Helpers (internal)
 
-    public func getVisibleCount() -> UInt32 {
+    func getVisibleCount() -> UInt32 {
         let ptr = primaryResources.header.contents().bindMemory(to: CompactedHeaderSwift.self, capacity: 1)
         return ptr.pointee.visibleCount
     }
 
-    public func hadOverflow() -> Bool {
+    func hadOverflow() -> Bool {
         let ptr = primaryResources.header.contents().bindMemory(to: CompactedHeaderSwift.self, capacity: 1)
         return ptr.pointee.overflow != 0
     }

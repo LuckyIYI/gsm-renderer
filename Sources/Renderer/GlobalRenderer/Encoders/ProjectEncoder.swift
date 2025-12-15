@@ -1,10 +1,10 @@
 import Metal
 
-struct PackedWorldBuffers {
-    let packedGaussians: MTLBuffer // PackedWorldGaussian or PackedWorldGaussianHalf array
-    let harmonics: MTLBuffer // Separate buffer for variable-size SH data (float or half)
+public struct PackedWorldBuffers {
+    public let packedGaussians: MTLBuffer // PackedWorldGaussian or PackedWorldGaussianHalf array
+    public let harmonics: MTLBuffer // Separate buffer for variable-size SH data (float or half)
 
-    init(packedGaussians: MTLBuffer, harmonics: MTLBuffer) {
+    public init(packedGaussians: MTLBuffer, harmonics: MTLBuffer) {
         self.packedGaussians = packedGaussians
         self.harmonics = harmonics
     }
@@ -63,12 +63,10 @@ final class ProjectEncoder {
         cameraUniforms: CameraUniformsSwift,
         output: ProjectionOutput,
         params: TileBinningParams,
-        clusterVisibility: MTLBuffer? = nil,
-        clusterSize: UInt32 = 1024,
         useHalfWorld: Bool = false
     ) {
         guard let encoder = commandBuffer.makeComputeCommandEncoder() else { return }
-        encoder.label = clusterVisibility != nil ? "ProjectGaussiansFused_Cull" : "ProjectGaussiansFused"
+        encoder.label = "ProjectGaussiansFused"
 
         let shDegree = Self.shDegree(from: cameraUniforms.shComponents)
 
@@ -98,13 +96,6 @@ final class ProjectEncoder {
         // Tile parameters for fused tile bounds computation
         var binParams = params
         encoder.setBytes(&binParams, length: MemoryLayout<TileBinningParams>.stride, index: 6)
-
-        // Cluster visibility (only bound when USE_CLUSTER_CULL=true pipeline is used)
-        if let visibility = clusterVisibility {
-            encoder.setBuffer(visibility, offset: 0, index: 7)
-            var size = clusterSize
-            encoder.setBytes(&size, length: MemoryLayout<UInt32>.stride, index: 8)
-        }
 
         let threads = MTLSize(width: gaussianCount, height: 1, depth: 1)
         let tg = MTLSize(width: pipeline.threadExecutionWidth, height: 1, depth: 1)

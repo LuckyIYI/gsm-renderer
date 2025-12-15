@@ -49,6 +49,24 @@ struct RendererLimits: Sendable {
             totalInkThreshold: 2.0
         )
     }
+
+    /// Build binning params with actual render dimensions (for dynamic sizing like visionOS foveation)
+    func buildBinningParams(gaussianCount: Int, width: Int, height: Int) -> TileBinningParams {
+        let actualTilesX = (width + tileWidth - 1) / tileWidth
+        let actualTilesY = (height + tileHeight - 1) / tileHeight
+        return TileBinningParams(
+            gaussianCount: UInt32(gaussianCount),
+            tilesX: UInt32(actualTilesX),
+            tilesY: UInt32(actualTilesY),
+            tileWidth: UInt32(self.tileWidth),
+            tileHeight: UInt32(self.tileHeight),
+            surfaceWidth: UInt32(width),
+            surfaceHeight: UInt32(height),
+            maxCapacity: UInt32(gaussianCount),
+            alphaThreshold: 0.005,
+            totalInkThreshold: 2.0
+        )
+    }
 }
 
 
@@ -177,6 +195,13 @@ public final class GlobalRenderer: GaussianRenderer, @unchecked Sendable {
         rightMaskCache.label = "RightGaussianMask"
         self.rightBoundsCache = rightBoundsCache
         self.rightMaskCache = rightMaskCache
+
+    }
+
+    /// Debug helper for benchmarks/tests (reads GPU-written shared counters after command buffer completion).
+    public func debugReadTotalAssignments() -> UInt32 {
+        let header = self.stereoResources.left.tileAssignmentHeader.contents().load(as: TileAssignmentHeaderSwift.self)
+        return header.totalAssignments
     }
 
     public func render(
@@ -193,7 +218,8 @@ public final class GlobalRenderer: GaussianRenderer, @unchecked Sendable {
             width: width,
             height: height,
             gaussianCount: input.gaussianCount,
-            shComponents: input.shComponents
+            shComponents: input.shComponents,
+            inputIsSRGB: config.gaussianColorSpace == .srgb
         )
 
         let frameParams = FrameParams(gaussianCount: input.gaussianCount)
@@ -219,60 +245,19 @@ public final class GlobalRenderer: GaussianRenderer, @unchecked Sendable {
 
     public func renderStereo(
         commandBuffer: MTLCommandBuffer,
-        output: StereoRenderOutput,
+        target: StereoRenderTarget,
         input: GaussianInput,
         camera: StereoCameraParams,
         width: Int,
         height: Int
     ) {
-        let frameParams = FrameParams(gaussianCount: input.gaussianCount)
+        switch target {
+        case .sideBySide:
+            fatalError("GlobalRenderer does not support stereo rendering. Use HardwareRenderer or DepthFirstRenderer instead.")
 
-        let packedWorld = PackedWorldBuffers(
-            packedGaussians: input.gaussians,
-            harmonics: input.harmonics
-        )
-
-        let leftCameraUniforms = CameraUniformsSwift(
-            from: camera.leftEye,
-            width: width,
-            height: height,
-            gaussianCount: input.gaussianCount,
-            shComponents: input.shComponents
-        )
-
-        _ = encodeRenderToTargetTexture(
-            commandBuffer: commandBuffer,
-            gaussianCount: input.gaussianCount,
-            packedWorldBuffers: packedWorld,
-            cameraUniforms: leftCameraUniforms,
-            frameParams: frameParams,
-            targetColor: output.leftColor,
-            targetDepth: output.leftDepth,
-            frame: stereoResources.left,
-            boundsCache: leftBoundsCache,
-            maskCache: leftMaskCache
-        )
-
-        let rightCameraUniforms = CameraUniformsSwift(
-            from: camera.rightEye,
-            width: width,
-            height: height,
-            gaussianCount: input.gaussianCount,
-            shComponents: input.shComponents
-        )
-
-        _ = encodeRenderToTargetTexture(
-            commandBuffer: commandBuffer,
-            gaussianCount: input.gaussianCount,
-            packedWorldBuffers: packedWorld,
-            cameraUniforms: rightCameraUniforms,
-            frameParams: frameParams,
-            targetColor: output.rightColor,
-            targetDepth: output.rightDepth,
-            frame: stereoResources.right,
-            boundsCache: rightBoundsCache,
-            maskCache: rightMaskCache
-        )
+        case .foveated:
+            fatalError("GlobalRenderer does not support stereo rendering. Use HardwareRenderer or DepthFirstRenderer instead.")
+        }
     }
 
     func encodeRenderToTextures(
@@ -440,6 +425,65 @@ public final class GlobalRenderer: GaussianRenderer, @unchecked Sendable {
             tileIdsBuffer: frame.tileIds,
             tileAssignmentHeader: frame.tileAssignmentHeader,
             blockSumsBuffer: frame.tileAssignBlockSums,
+            indirectBuffers: indirectBuffers
+        )
+
+        return TileAssignmentBuffers(
+            tileCount: tileCount,
+            maxAssignments: frame.tileAssignmentMaxAssignments,
+            tileIndices: frame.tileIndices,
+            tileIds: frame.tileIds,
+            header: frame.tileAssignmentHeader
+        )
+    }
+
+    /// Build tile assignments starting from an already-compacted visible list in `frame.visibleIndices/frame.visibleCount`.
+    /// Used by the LOD path to avoid any O(M) visibility compaction work.
+    func buildTileAssignmentsFromVisibleList(
+        commandBuffer: MTLCommandBuffer,
+        gaussianCount: Int,
+        projectionOutput: ProjectionOutput,
+        params: RenderParams,
+        frame: GlobalViewResources
+    ) throws -> TileAssignmentBuffers {
+        guard gaussianCount <= self.limits.maxGaussians else {
+            throw RendererError.invalidGaussianCount(provided: gaussianCount, maximum: self.limits.maxGaussians)
+        }
+
+        let tileCount = Int(params.tilesX * params.tilesY)
+        guard tileCount <= self.limits.maxTileCount else {
+            throw RendererError.invalidTileCount(provided: tileCount, maximum: self.limits.maxTileCount)
+        }
+
+        let requiredCapacity = gaussianCount * 4
+        guard requiredCapacity <= frame.tileAssignmentMaxAssignments else {
+            throw RendererError.invalidAssignmentCapacity(required: requiredCapacity, available: frame.tileAssignmentMaxAssignments)
+        }
+
+        self.resetTileBuilderState(commandBuffer: commandBuffer, frame: frame)
+
+        let indirectBuffers = TwoPassTileAssignEncoder.IndirectBuffers(
+            visibleIndices: frame.visibleIndices,
+            visibleCount: frame.visibleCount,
+            indirectDispatchArgs: frame.tileAssignDispatchArgs
+        )
+
+        self.twoPassTileAssignEncoder.encodeFromVisibleList(
+            commandBuffer: commandBuffer,
+            tileWidth: Int(params.tileWidth),
+            tileHeight: Int(params.tileHeight),
+            tilesX: Int(params.tilesX),
+            maxAssignments: frame.tileAssignmentMaxAssignments,
+            boundsBuffer: projectionOutput.bounds,
+            coverageBuffer: frame.coverageBuffer,
+            renderData: projectionOutput.renderData,
+            tileIndicesBuffer: frame.tileIndices,
+            tileIdsBuffer: frame.tileIds,
+            tileAssignmentHeader: frame.tileAssignmentHeader,
+            blockSumsBuffer: frame.tileAssignBlockSums,
+            blockSumsLevel2OffsetBytes: (((gaussianCount + 255) / 256) + 1) * MemoryLayout<UInt32>.stride,
+            prefixSumDispatchArgs: frame.scatterDispatchBuffer,
+            prefixSumBlockCountBuffer: frame.prefixSumBlockCountBuffer,
             indirectBuffers: indirectBuffers
         )
 

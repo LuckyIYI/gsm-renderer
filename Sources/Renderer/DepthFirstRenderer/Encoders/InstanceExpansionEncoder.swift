@@ -6,6 +6,7 @@ import RendererTypes
 final class InstanceExpansionEncoder {
     private let applyDepthOrderingPipeline: MTLComputePipelineState
     private let createInstancesPipeline: MTLComputePipelineState
+    private let createInstancesStereoPipeline: MTLComputePipelineState
     private let blockReducePipeline: MTLComputePipelineState
     private let level2ReducePipeline: MTLComputePipelineState
     private let level2ScanPipeline: MTLComputePipelineState
@@ -19,6 +20,7 @@ final class InstanceExpansionEncoder {
     init(device: MTLDevice, library: MTLLibrary, maxGaussians: Int) throws {
         guard let applyFn = library.makeFunction(name: "applyDepthOrderingKernel"),
               let createFn = library.makeFunction(name: "createInstancesKernel"),
+              let createStereoFn = library.makeFunction(name: "createInstancesStereoKernel"),
               let reduceFn = library.makeFunction(name: "blockReduceKernel"),
               let level2ReduceFn = library.makeFunction(name: "level2ReduceKernel"),
               let level2ScanFn = library.makeFunction(name: "level2ScanKernel"),
@@ -30,6 +32,7 @@ final class InstanceExpansionEncoder {
 
         self.applyDepthOrderingPipeline = try device.makeComputePipelineState(function: applyFn)
         self.createInstancesPipeline = try device.makeComputePipelineState(function: createFn)
+        self.createInstancesStereoPipeline = try device.makeComputePipelineState(function: createStereoFn)
         self.blockReducePipeline = try device.makeComputePipelineState(function: reduceFn)
         self.level2ReducePipeline = try device.makeComputePipelineState(function: level2ReduceFn)
         self.level2ScanPipeline = try device.makeComputePipelineState(function: level2ScanFn)
@@ -200,6 +203,41 @@ final class InstanceExpansionEncoder {
         )
         encoder.endEncoding()
     }
+
+    /// Create instances for stereo - assigns ALL tiles in union bounds (indirect dispatch)
+    func encodeCreateInstancesStereo(
+        commandBuffer: MTLCommandBuffer,
+        sortedPrimitiveIndices: MTLBuffer,
+        instanceOffsets: MTLBuffer,
+        tileBounds: MTLBuffer,
+        instanceTileIds: MTLBuffer,
+        instanceGaussianIndices: MTLBuffer,
+        params: DepthFirstParamsSwift,
+        header: MTLBuffer,
+        dispatchArgs: MTLBuffer
+    ) {
+        guard let encoder = commandBuffer.makeComputeCommandEncoder() else { return }
+        encoder.label = "CreateInstancesStereo"
+
+        encoder.setComputePipelineState(createInstancesStereoPipeline)
+        encoder.setBuffer(sortedPrimitiveIndices, offset: 0, index: 0)
+        encoder.setBuffer(instanceOffsets, offset: 0, index: 1)
+        encoder.setBuffer(tileBounds, offset: 0, index: 2)
+        encoder.setBuffer(instanceTileIds, offset: 0, index: 3)
+        encoder.setBuffer(instanceGaussianIndices, offset: 0, index: 4)
+
+        var p = params
+        encoder.setBytes(&p, length: MemoryLayout<DepthFirstParamsSwift>.stride, index: 5)
+        encoder.setBuffer(header, offset: 0, index: 6)
+
+        let tg = MTLSize(width: threadgroupSize, height: 1, depth: 1)
+        encoder.dispatchThreadgroups(
+            indirectBuffer: dispatchArgs,
+            indirectBufferOffset: DepthFirstDispatchSlot.createInstances.offset,
+            threadsPerThreadgroup: tg
+        )
+        encoder.endEncoding()
+    }
 }
 
 /// Swift struct matching DepthFirstParams in Metal
@@ -211,7 +249,7 @@ struct DepthFirstParamsSwift {
     var tileWidth: UInt32
     var tileHeight: UInt32
     var maxAssignments: UInt32
-    var padding: UInt32
+    var alphaThreshold: Float32
 
     init(
         gaussianCount: Int,
@@ -220,7 +258,8 @@ struct DepthFirstParamsSwift {
         tilesY: Int,
         tileWidth: Int,
         tileHeight: Int,
-        maxAssignments: Int
+        maxAssignments: Int,
+        alphaThreshold: Float = 1.0 / 255.0
     ) {
         self.gaussianCount = UInt32(gaussianCount)
         self.visibleCount = UInt32(visibleCount)
@@ -229,6 +268,6 @@ struct DepthFirstParamsSwift {
         self.tileWidth = UInt32(tileWidth)
         self.tileHeight = UInt32(tileHeight)
         self.maxAssignments = UInt32(maxAssignments)
-        self.padding = 0
+        self.alphaThreshold = alphaThreshold
     }
 }

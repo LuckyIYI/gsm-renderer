@@ -15,10 +15,22 @@ using namespace metal;
 #define RADIX_SCAN_TYPE_INCLUSIVE (0)
 #define RADIX_SCAN_TYPE_EXCLUSIVE (1)
 
+// Default key type for backwards compatibility
 using RadixKeyType = uint;
+
+// Number of passes needed for different key sizes
+#define RADIX_PASSES_16BIT 2
+#define RADIX_PASSES_32BIT 4
 
 struct RadixKeyPayload {
     RadixKeyType key;
+    uint payload;
+};
+
+// Templated key-payload structure for generic key types
+template <typename KeyT>
+struct RadixKeyPayloadT {
+    KeyT key;
     uint payload;
 };
 
@@ -68,8 +80,21 @@ static inline ushort value_to_key_at_digit(RadixKeyType value, ushort current_di
     return value_to_key_at_bit<RADIX_BUCKETS>(value, bits_to_shift);
 }
 
+// Templated version for generic key types
+template <typename KeyT>
+static inline ushort value_to_key_at_digit_t(KeyT value, ushort current_digit) {
+    ushort bits_to_shift = radix_to_bits(RADIX_BUCKETS) * current_digit;
+    return value_to_key_at_bit<RADIX_BUCKETS>(value, bits_to_shift);
+}
+
 template <ushort R>
 static inline ushort value_to_key_at_bit(RadixKeyPayload value, ushort current_bit) {
+    return value_to_key_at_bit<R>(value.key, current_bit);
+}
+
+// Templated version for RadixKeyPayloadT
+template <ushort R, typename KeyT>
+static inline ushort value_to_key_at_bit(RadixKeyPayloadT<KeyT> value, ushort current_bit) {
     return value_to_key_at_bit<R>(value.key, current_bit);
 }
 
@@ -218,6 +243,27 @@ static T radix_partial_sort(const T value, threadgroup T* shared, const ushort l
     T result = value;
     ushort current_bit = current_digit * radix_to_bits(RADIX_BUCKETS);
     const ushort key_bits = (ushort)(sizeof(RadixKeyType) * 8);
+    const ushort range_end = (ushort)(current_bit + radix_to_bits(RADIX_BUCKETS));
+    const ushort last_bit = min(range_end, key_bits);
+    while (current_bit < last_bit) {
+        ushort remaining = last_bit - current_bit;
+        if (remaining >= 2) {
+            result = radix_sort_by_two_bits(result, shared, local_id, current_bit);
+            current_bit += 2;
+        } else {
+            result = radix_sort_by_bit(result, shared, local_id, current_bit);
+            current_bit += 1;
+        }
+    }
+    return result;
+}
+
+// Templated version with explicit key type for key size calculation
+template <typename KeyT, typename T>
+static T radix_partial_sort_t(const T value, threadgroup T* shared, const ushort local_id, const ushort current_digit) {
+    T result = value;
+    ushort current_bit = current_digit * radix_to_bits(RADIX_BUCKETS);
+    const ushort key_bits = (ushort)(sizeof(KeyT) * 8);
     const ushort range_end = (ushort)(current_bit + radix_to_bits(RADIX_BUCKETS));
     const ushort last_bit = min(range_end, key_bits);
     while (current_bit < last_bit) {

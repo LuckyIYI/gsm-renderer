@@ -4,7 +4,6 @@ import RendererTypes
 /// Encoder for unified stereo preprocess kernel.
 /// Projects both eyes in one pass, outputs single StereoTiledRenderData with union bounds.
 final class DepthFirstStereoUnifiedPreprocessEncoder {
-    /// Map shComponents count to SH degree (0-3)
     static func shDegree(from shComponents: Int) -> UInt32 {
         switch shComponents {
         case 0, 1: 0 // DC only

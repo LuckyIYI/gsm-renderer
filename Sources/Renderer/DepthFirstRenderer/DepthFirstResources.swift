@@ -63,7 +63,8 @@ final class DepthFirstViewResources {
         tileWidth: Int,
         tileHeight: Int,
         radixBlockSize: Int,
-        radixGrainSize: Int
+        radixGrainSize: Int,
+        tileIdPrecision: RadixSortKeyPrecision
     ) throws {
         self.device = device
         self.maxGaussians = maxGaussians
@@ -176,14 +177,16 @@ final class DepthFirstViewResources {
             label: "DispatchArgs"
         )
 
-        // Per-instance buffers (tile IDs are 16-bit)
+        let tileIdStride = tileIdPrecision == .bits32 ? MemoryLayout<UInt32>.stride : MemoryLayout<UInt16>.stride
+
+        // Per-instance buffers (tile IDs are 16-bit or 32-bit depending on precision)
         guard let instanceTileIds = device.makeBuffer(
-            length: paddedInstanceCapacity * MemoryLayout<UInt16>.stride,
+            length: paddedInstanceCapacity * tileIdStride,
             options: priv
         ) else {
             throw RendererError.failedToAllocateBuffer(
                 label: "InstanceTileIds",
-                size: paddedInstanceCapacity * MemoryLayout<UInt16>.stride
+                size: paddedInstanceCapacity * tileIdStride
             )
         }
         instanceTileIds.label = "InstanceTileIds"
@@ -270,12 +273,12 @@ final class DepthFirstViewResources {
         )
 
         guard let tileSortScratchTileIds = device.makeBuffer(
-            length: paddedInstanceCapacity * MemoryLayout<UInt16>.stride,
+            length: paddedInstanceCapacity * tileIdStride,
             options: priv
         ) else {
             throw RendererError.failedToAllocateBuffer(
                 label: "TileSortScratchTileIds",
-                size: paddedInstanceCapacity * MemoryLayout<UInt16>.stride
+                size: paddedInstanceCapacity * tileIdStride
             )
         }
         tileSortScratchTileIds.label = "TileSortScratchTileIds"
@@ -349,7 +352,8 @@ final class DepthFirstMultiViewResources {
         tileWidth: Int,
         tileHeight: Int,
         radixBlockSize: Int,
-        radixGrainSize: Int
+        radixGrainSize: Int,
+        tileIdPrecision: RadixSortKeyPrecision
     ) throws {
         self.device = device
 
@@ -361,7 +365,8 @@ final class DepthFirstMultiViewResources {
             tileWidth: tileWidth,
             tileHeight: tileHeight,
             radixBlockSize: radixBlockSize,
-            radixGrainSize: radixGrainSize
+            radixGrainSize: radixGrainSize,
+            tileIdPrecision: tileIdPrecision
         )
 
         self.right = try DepthFirstViewResources(
@@ -372,13 +377,12 @@ final class DepthFirstMultiViewResources {
             tileWidth: tileWidth,
             tileHeight: tileHeight,
             radixBlockSize: radixBlockSize,
-            radixGrainSize: radixGrainSize
+            radixGrainSize: radixGrainSize,
+            tileIdPrecision: tileIdPrecision
         )
     }
 }
 
-/// Resources for unified stereo tiled rendering.
-/// Uses single StereoTiledRenderData buffer with union bounds for shared tile pipeline.
 final class StereoUnifiedTiledResources {
     let device: MTLDevice
 
@@ -436,7 +440,8 @@ final class StereoUnifiedTiledResources {
         tileWidth: Int,
         tileHeight: Int,
         radixBlockSize: Int,
-        radixGrainSize: Int
+        radixGrainSize: Int,
+        tileIdPrecision: RadixSortKeyPrecision
     ) throws {
         self.device = device
         self.maxGaussians = maxGaussians
@@ -551,12 +556,21 @@ final class StereoUnifiedTiledResources {
         )
 
         // Per-instance buffers
-        self.instanceTileIds = try device.makeBuffer(
-            count: maxInstances,
-            type: UInt16.self,
-            options: priv,
-            label: "StereoUnified_InstanceTileIds"
-        )
+        if tileIdPrecision == .bits32 {
+            self.instanceTileIds = try device.makeBuffer(
+                count: maxInstances,
+                type: UInt32.self,
+                options: priv,
+                label: "StereoUnified_InstanceTileIds"
+            )
+        } else {
+            self.instanceTileIds = try device.makeBuffer(
+                count: maxInstances,
+                type: UInt16.self,
+                options: priv,
+                label: "StereoUnified_InstanceTileIds"
+            )
+        }
 
         self.instanceGaussianIndices = try device.makeBuffer(
             count: maxInstances,
@@ -638,12 +652,21 @@ final class StereoUnifiedTiledResources {
             label: "StereoUnified_TileSortScannedHist"
         )
 
-        self.tileSortScratchTileIds = try device.makeBuffer(
-            count: paddedInstanceCapacity,
-            type: UInt16.self,
-            options: priv,
-            label: "StereoUnified_TileSortScratchTileIds"
-        )
+        if tileIdPrecision == .bits32 {
+            self.tileSortScratchTileIds = try device.makeBuffer(
+                count: paddedInstanceCapacity,
+                type: UInt32.self,
+                options: priv,
+                label: "StereoUnified_TileSortScratchTileIds"
+            )
+        } else {
+            self.tileSortScratchTileIds = try device.makeBuffer(
+                count: paddedInstanceCapacity,
+                type: UInt16.self,
+                options: priv,
+                label: "StereoUnified_TileSortScratchTileIds"
+            )
+        }
 
         self.tileSortScratchIndices = try device.makeBuffer(
             count: paddedInstanceCapacity,

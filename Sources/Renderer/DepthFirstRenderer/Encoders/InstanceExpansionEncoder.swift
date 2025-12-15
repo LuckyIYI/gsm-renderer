@@ -5,8 +5,10 @@ import RendererTypes
 /// After depth sort, expands each gaussian into per-tile instances
 final class InstanceExpansionEncoder {
     private let applyDepthOrderingPipeline: MTLComputePipelineState
-    private let createInstancesPipeline: MTLComputePipelineState
-    private let createInstancesStereoPipeline: MTLComputePipelineState
+    private let createInstancesPipeline16: MTLComputePipelineState
+    private let createInstancesPipeline32: MTLComputePipelineState
+    private let createInstancesStereoPipeline16: MTLComputePipelineState
+    private let createInstancesStereoPipeline32: MTLComputePipelineState
     private let blockReducePipeline: MTLComputePipelineState
     private let level2ReducePipeline: MTLComputePipelineState
     private let level2ScanPipeline: MTLComputePipelineState
@@ -16,11 +18,14 @@ final class InstanceExpansionEncoder {
     let threadgroupSize: Int
     private let blockSize = 256
     let maxGaussians: Int
+    private let tileIdPrecision: RadixSortKeyPrecision
 
-    init(device: MTLDevice, library: MTLLibrary, maxGaussians: Int) throws {
+    init(device: MTLDevice, library: MTLLibrary, maxGaussians: Int, tileIdPrecision: RadixSortKeyPrecision) throws {
         guard let applyFn = library.makeFunction(name: "applyDepthOrderingKernel"),
-              let createFn = library.makeFunction(name: "createInstancesKernel"),
-              let createStereoFn = library.makeFunction(name: "createInstancesStereoKernel"),
+              let createFn16 = library.makeFunction(name: "createInstancesKernel"),
+              let createFn32 = library.makeFunction(name: "createInstancesKernel32"),
+              let createStereoFn16 = library.makeFunction(name: "createInstancesStereoKernel"),
+              let createStereoFn32 = library.makeFunction(name: "createInstancesStereoKernel32"),
               let reduceFn = library.makeFunction(name: "blockReduceKernel"),
               let level2ReduceFn = library.makeFunction(name: "level2ReduceKernel"),
               let level2ScanFn = library.makeFunction(name: "level2ScanKernel"),
@@ -31,8 +36,10 @@ final class InstanceExpansionEncoder {
         }
 
         self.applyDepthOrderingPipeline = try device.makeComputePipelineState(function: applyFn)
-        self.createInstancesPipeline = try device.makeComputePipelineState(function: createFn)
-        self.createInstancesStereoPipeline = try device.makeComputePipelineState(function: createStereoFn)
+        self.createInstancesPipeline16 = try device.makeComputePipelineState(function: createFn16)
+        self.createInstancesPipeline32 = try device.makeComputePipelineState(function: createFn32)
+        self.createInstancesStereoPipeline16 = try device.makeComputePipelineState(function: createStereoFn16)
+        self.createInstancesStereoPipeline32 = try device.makeComputePipelineState(function: createStereoFn32)
         self.blockReducePipeline = try device.makeComputePipelineState(function: reduceFn)
         self.level2ReducePipeline = try device.makeComputePipelineState(function: level2ReduceFn)
         self.level2ScanPipeline = try device.makeComputePipelineState(function: level2ScanFn)
@@ -41,6 +48,7 @@ final class InstanceExpansionEncoder {
 
         self.threadgroupSize = min(applyDepthOrderingPipeline.maxTotalThreadsPerThreadgroup, 256)
         self.maxGaussians = maxGaussians
+        self.tileIdPrecision = tileIdPrecision
     }
 
     /// Apply depth ordering - reorder tile counts by depth-sorted indices (indirect dispatch)
@@ -183,7 +191,7 @@ final class InstanceExpansionEncoder {
         guard let encoder = commandBuffer.makeComputeCommandEncoder() else { return }
         encoder.label = "CreateInstances"
 
-        encoder.setComputePipelineState(createInstancesPipeline)
+        encoder.setComputePipelineState(tileIdPrecision == .bits32 ? createInstancesPipeline32 : createInstancesPipeline16)
         encoder.setBuffer(sortedPrimitiveIndices, offset: 0, index: 0)
         encoder.setBuffer(instanceOffsets, offset: 0, index: 1)
         encoder.setBuffer(tileBounds, offset: 0, index: 2)
@@ -219,7 +227,7 @@ final class InstanceExpansionEncoder {
         guard let encoder = commandBuffer.makeComputeCommandEncoder() else { return }
         encoder.label = "CreateInstancesStereo"
 
-        encoder.setComputePipelineState(createInstancesStereoPipeline)
+        encoder.setComputePipelineState(tileIdPrecision == .bits32 ? createInstancesStereoPipeline32 : createInstancesStereoPipeline16)
         encoder.setBuffer(sortedPrimitiveIndices, offset: 0, index: 0)
         encoder.setBuffer(instanceOffsets, offset: 0, index: 1)
         encoder.setBuffer(tileBounds, offset: 0, index: 2)

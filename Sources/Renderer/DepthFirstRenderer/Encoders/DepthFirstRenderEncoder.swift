@@ -2,7 +2,6 @@ import Metal
 import RendererTypes
 
 /// Encoder for depth-first rendering
-/// Renders tiles using depth-sorted gaussian indices
 final class DepthFirstRenderEncoder {
     private let renderPipeline: MTLComputePipelineState
     private let clearPipeline: MTLComputePipelineState
@@ -34,9 +33,9 @@ final class DepthFirstRenderEncoder {
         encoder.label = "ClearRenderTextures"
         encoder.setComputePipelineState(clearPipeline)
         encoder.setTexture(colorTexture, index: 0)
-//        if let depthTex = depthTexture {
-//            encoder.setTexture(depthTex, index: 1)
-//        }
+        if let depthTex = depthTexture, depthTex.pixelFormat != .depth32Float {
+            encoder.setTexture(depthTex, index: 1)
+        }
 
         var params = ClearTextureParams()
         params.width = UInt32(width)
@@ -74,9 +73,9 @@ final class DepthFirstRenderEncoder {
         encoder.setBuffer(activeTileCount, offset: 0, index: 4)
 
         encoder.setTexture(colorTexture, index: 0)
-//        if let depthTex = depthTexture {
-//            encoder.setTexture(depthTex, index: 1)
-//        }
+        if let depthTex = depthTexture, depthTex.pixelFormat != .depth32Float {
+            encoder.setTexture(depthTex, index: 1)
+        }
 
         var renderParams = params
         encoder.setBytes(&renderParams, length: MemoryLayout<RenderParams>.stride, index: 5)

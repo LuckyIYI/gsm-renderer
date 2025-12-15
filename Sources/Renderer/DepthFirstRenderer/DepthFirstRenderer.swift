@@ -37,6 +37,7 @@ public final class DepthFirstRenderer: GaussianRenderer, @unchecked Sendable {
     // Configuration
     private let config: RendererConfig
     private let limits: RendererLimits
+    private let tileIdPrecision: RadixSortKeyPrecision
     private let radixBlockSize = 256
     private let radixGrainSize = 4
 
@@ -45,7 +46,8 @@ public final class DepthFirstRenderer: GaussianRenderer, @unchecked Sendable {
     public init(
         device: MTLDevice? = nil,
         config: RendererConfig = RendererConfig(),
-        depthSortKeyPrecision: RadixSortKeyPrecision = .bits32
+        depthSortKeyPrecision: RadixSortKeyPrecision = .bits32,
+        tileIdPrecision: RadixSortKeyPrecision = .bits16
     ) throws {
         guard config.maxGaussians <= DepthFirstRenderer.maxSupportedGaussians else {
             throw RendererError.invalidGaussianCount(
@@ -60,6 +62,7 @@ public final class DepthFirstRenderer: GaussianRenderer, @unchecked Sendable {
         }
         self.device = device
         self.config = config
+        self.tileIdPrecision = tileIdPrecision
 
         guard let metallibURL = Bundle.module.url(forResource: "DepthFirstShaders", withExtension: "metallib") else {
             throw RendererError.failedToCreatePipeline("DepthFirstShaders.metallib not found in bundle")
@@ -76,9 +79,14 @@ public final class DepthFirstRenderer: GaussianRenderer, @unchecked Sendable {
         )
         self.dispatchEncoder = try DepthFirstDispatchEncoder(device: device, library: library)
         self.depthSortEncoder = try DepthRadixSortEncoder(device: device, library: library, precision: depthSortKeyPrecision)
-        self.instanceExpansionEncoder = try InstanceExpansionEncoder(device: device, library: library, maxGaussians: config.maxGaussians)
-        self.tileSortEncoder = try TileSortEncoder(device: device, library: library)
-        self.tileRangeEncoder = try TileRangeEncoder(device: device, library: library)
+        self.instanceExpansionEncoder = try InstanceExpansionEncoder(
+            device: device,
+            library: library,
+            maxGaussians: config.maxGaussians,
+            tileIdPrecision: tileIdPrecision
+        )
+        self.tileSortEncoder = try TileSortEncoder(device: device, library: library, tileIdPrecision: tileIdPrecision)
+        self.tileRangeEncoder = try TileRangeEncoder(device: device, library: library, tileIdPrecision: tileIdPrecision)
         self.renderEncoder = try DepthFirstRenderEncoder(device: device, library: library)
 
         // Unified stereo encoders (tiled pipeline)
@@ -108,7 +116,8 @@ public final class DepthFirstRenderer: GaussianRenderer, @unchecked Sendable {
             tileWidth: limits.tileWidth,
             tileHeight: limits.tileHeight,
             radixBlockSize: radixBlockSize,
-            radixGrainSize: radixGrainSize
+            radixGrainSize: radixGrainSize,
+            tileIdPrecision: tileIdPrecision
         )
         _monoResources = resources
         return resources
@@ -124,7 +133,8 @@ public final class DepthFirstRenderer: GaussianRenderer, @unchecked Sendable {
             tileWidth: limits.tileWidth,
             tileHeight: limits.tileHeight,
             radixBlockSize: radixBlockSize,
-            radixGrainSize: radixGrainSize
+            radixGrainSize: radixGrainSize,
+            tileIdPrecision: tileIdPrecision
         )
         _stereoUnifiedResources = resources
         return resources
@@ -491,7 +501,6 @@ public final class DepthFirstRenderer: GaussianRenderer, @unchecked Sendable {
             height: height
         )
 
-        // Use unified tiled pipeline (same as foveated) → render directly to side-by-side target.
         encodeUnifiedStereoPipeline(
             commandBuffer: commandBuffer,
             gaussianCount: input.gaussianCount,
@@ -587,11 +596,6 @@ public final class DepthFirstRenderer: GaussianRenderer, @unchecked Sendable {
 
     // MARK: - Unified Stereo Tiled Pipeline
 
-    /// Encode the full unified stereo tiled pipeline.
-    /// This mirrors the mono pipeline but uses:
-    /// - StereoTiledRenderData (both eye positions per gaussian)
-    /// - Union tile bounds for tile assignment
-    /// - Stereo render kernel that outputs to texture array
     private func encodeUnifiedStereoPipeline(
         commandBuffer: MTLCommandBuffer,
         gaussianCount: Int,

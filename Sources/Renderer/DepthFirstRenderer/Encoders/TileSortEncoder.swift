@@ -4,11 +4,14 @@ import RendererTypes
 /// Encoder for stable radix sort on tile IDs (preserves depth order within tiles)
 /// Uses the same multi-block radix sort algorithm as depth sort
 final class TileSortEncoder {
-    private let histogramPipeline: MTLComputePipelineState
+    private let histogramPipeline16: MTLComputePipelineState
+    private let histogramPipeline32: MTLComputePipelineState
     private let scanBlocksPipeline: MTLComputePipelineState
     private let exclusiveScanPipeline: MTLComputePipelineState
     private let applyOffsetsPipeline: MTLComputePipelineState
-    private let scatterPipeline: MTLComputePipelineState
+    private let scatterPipeline16: MTLComputePipelineState
+    private let scatterPipeline32: MTLComputePipelineState
+    private let tileIdPrecision: RadixSortKeyPrecision
 
     private let blockSize = 256
     private let grainSize = 4
@@ -21,21 +24,26 @@ final class TileSortEncoder {
         let scratchGaussianIndices: MTLBuffer
     }
 
-    init(device: MTLDevice, library: MTLLibrary) throws {
-        guard let histFn = library.makeFunction(name: "tileRadixHistogramKernel"),
+    init(device: MTLDevice, library: MTLLibrary, tileIdPrecision: RadixSortKeyPrecision) throws {
+        guard let histFn16 = library.makeFunction(name: "tileRadixHistogramKernel"),
+              let histFn32 = library.makeFunction(name: "tileRadixHistogramKernel32"),
               let scanFn = library.makeFunction(name: "tileRadixScanBlocksKernel"),
               let exclusiveFn = library.makeFunction(name: "tileRadixExclusiveScanKernel"),
               let applyFn = library.makeFunction(name: "tileRadixApplyOffsetsKernel"),
-              let scatterFn = library.makeFunction(name: "tileRadixScatterKernel")
+              let scatterFn16 = library.makeFunction(name: "tileRadixScatterKernel"),
+              let scatterFn32 = library.makeFunction(name: "tileRadixScatterKernel32")
         else {
             throw RendererError.failedToCreatePipeline("Tile radix sort kernels not found")
         }
 
-        self.histogramPipeline = try device.makeComputePipelineState(function: histFn)
+        self.histogramPipeline16 = try device.makeComputePipelineState(function: histFn16)
+        self.histogramPipeline32 = try device.makeComputePipelineState(function: histFn32)
         self.scanBlocksPipeline = try device.makeComputePipelineState(function: scanFn)
         self.exclusiveScanPipeline = try device.makeComputePipelineState(function: exclusiveFn)
         self.applyOffsetsPipeline = try device.makeComputePipelineState(function: applyFn)
-        self.scatterPipeline = try device.makeComputePipelineState(function: scatterFn)
+        self.scatterPipeline16 = try device.makeComputePipelineState(function: scatterFn16)
+        self.scatterPipeline32 = try device.makeComputePipelineState(function: scatterFn32)
+        self.tileIdPrecision = tileIdPrecision
     }
 
     /// Encode stable radix sort on tile IDs
@@ -66,7 +74,7 @@ final class TileSortEncoder {
             // Step 1: Build histogram
             if let encoder = commandBuffer.makeComputeCommandEncoder() {
                 encoder.label = "TileRadixHistogram_\(pass)"
-                encoder.setComputePipelineState(histogramPipeline)
+                encoder.setComputePipelineState(tileIdPrecision == .bits32 ? histogramPipeline32 : histogramPipeline16)
                 encoder.setBuffer(inputTileIds, offset: 0, index: 0)
                 encoder.setBuffer(sortBuffers.histogram, offset: 0, index: 1)
                 encoder.setBuffer(header, offset: 0, index: 2)
@@ -135,7 +143,7 @@ final class TileSortEncoder {
             // Step 5: Scatter to sorted positions
             if let encoder = commandBuffer.makeComputeCommandEncoder() {
                 encoder.label = "TileRadixScatter_\(pass)"
-                encoder.setComputePipelineState(scatterPipeline)
+                encoder.setComputePipelineState(tileIdPrecision == .bits32 ? scatterPipeline32 : scatterPipeline16)
                 encoder.setBuffer(inputTileIds, offset: 0, index: 0)
                 encoder.setBuffer(inputIndices, offset: 0, index: 1)
                 encoder.setBuffer(sortBuffers.scannedHistogram, offset: 0, index: 2) // Use scanned histogram with offsets

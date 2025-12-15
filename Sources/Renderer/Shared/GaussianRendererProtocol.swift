@@ -59,8 +59,7 @@ public struct StereoCameraParams: Sendable {
 
     public init(
         leftEye: CameraParams,
-        rightEye: CameraParams,
-        sortPosition: SIMD3<Float>? = nil
+        rightEye: CameraParams
     ) {
         self.leftEye = leftEye
         self.rightEye = rightEye
@@ -109,15 +108,13 @@ public struct StereoConfiguration: Sendable {
     public init(
         leftEye: EyeView,
         rightEye: EyeView,
-        sortPosition: SIMD3<Float>? = nil,
         sceneTransform: simd_float4x4 = matrix_identity_float4x4
     ) {
         self.leftEye = leftEye
         self.rightEye = rightEye
         self.sceneTransform = sceneTransform
     }
-    
-    
+
     init(
         from camera: StereoCameraParams,
         width: Int,
@@ -159,10 +156,10 @@ public struct StereoConfiguration: Sendable {
             near: camera.rightEye.near,
             far: camera.rightEye.far
         )
-        
+
         self = StereoConfiguration(
             leftEye: leftEyeView,
-            rightEye: rightEyeView,
+            rightEye: rightEyeView
         )
     }
 }

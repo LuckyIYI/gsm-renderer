@@ -86,7 +86,6 @@ final class DepthFirstDispatchEncoder {
     }
 
     /// Prepare render dispatch args based on actual active tile count
-    /// Must be called AFTER extractTileRanges which populates activeTileCount
     func encodePrepareRenderDispatch(
         commandBuffer: MTLCommandBuffer,
         activeTileCount: MTLBuffer,

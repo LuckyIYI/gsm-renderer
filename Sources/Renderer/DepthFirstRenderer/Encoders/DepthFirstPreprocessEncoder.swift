@@ -21,7 +21,6 @@ final class DepthFirstPreprocessEncoder {
     init(device: MTLDevice, library: MTLLibrary) throws {
         var maxThreads = 256
 
-        // Create pipelines for each SH degree (0-3)
         for degree: UInt32 in 0 ... 3 {
             let constants = MTLFunctionConstantValues()
             var shDegree = degree

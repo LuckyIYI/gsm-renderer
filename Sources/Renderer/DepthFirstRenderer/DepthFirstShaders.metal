@@ -715,6 +715,78 @@ kernel void createInstancesKernel(
     }
 }
 
+kernel void createInstancesKernel32(
+    const device int* sortedPrimitiveIndices [[buffer(0)]],
+    const device uint* instanceOffsets [[buffer(1)]],
+    const device int4* tileBounds [[buffer(2)]],
+    const device GaussianRenderData* renderData [[buffer(3)]],
+    device uint* instanceTileIds [[buffer(4)]],
+    device int* instanceGaussianIndices [[buffer(5)]],
+    constant DepthFirstParams& params [[buffer(6)]],
+    constant DepthFirstHeader& header [[buffer(7)]],
+    uint gid [[thread_position_in_grid]]
+) {
+    uint visibleCount = header.visibleCount;
+    if (gid >= visibleCount) { return; }
+
+    int originalIdx = sortedPrimitiveIndices[gid];
+    if (originalIdx < 0) { return; }
+
+    int4 bounds = tileBounds[originalIdx];
+    int minTX = bounds.x;
+    int maxTX = bounds.y;
+    int minTY = bounds.z;
+    int maxTY = bounds.w;
+
+    if (minTX > maxTX || minTY > maxTY) { return; }
+
+    GaussianRenderData g = renderData[originalIdx];
+    float meanX_q = float(g.meanX);
+    float meanY_q = float(g.meanY);
+    float theta_q = unpackThetaPi(g.theta);
+    float sigma1_q = float(g.sigma1);
+    float sigma2_q = float(g.sigma2);
+    float opacity_q = float(g.opacity) * (1.0f / 255.0f);
+
+    float3 conic = conicFromSigmaTheta(sigma1_q, sigma2_q, theta_q);
+    float conic_a = conic.x;
+    float conic_b = conic.y;
+    float conic_c = conic.z;
+
+    float tau = max(params.alphaThreshold, 1e-12f);
+    float d2Cutoff = computeD2Cutoff(opacity_q, tau);
+
+    uint writeOffset = instanceOffsets[gid];
+
+    float tileW = float(params.tileWidth);
+    float tileH = float(params.tileHeight);
+
+    if (d2Cutoff >= 0.0f) {
+        for (int ty = minTY; ty <= maxTY; ty++) {
+            float tileMinY = float(ty) * tileH;
+            float tileMaxY = tileMinY + tileH;
+            float tile_ymin = tileMinY - meanY_q;
+            float tile_ymax = tileMaxY - meanY_q;
+
+            for (int tx = minTX; tx <= maxTX; tx++) {
+                float tileMinX = float(tx) * tileW;
+                float tileMaxX = tileMinX + tileW;
+                float tile_xmin = tileMinX - meanX_q;
+                float tile_xmax = tileMaxX - meanX_q;
+
+                float d2min = minQuadRect(tile_xmin, tile_xmax, tile_ymin, tile_ymax,
+                                          conic_a, conic_b, conic_c);
+                if (d2min <= d2Cutoff && writeOffset < params.maxAssignments) {
+                    uint tileId = uint(ty * int(params.tilesX) + tx);
+                    instanceTileIds[writeOffset] = tileId;
+                    instanceGaussianIndices[writeOffset] = originalIdx;
+                    writeOffset++;
+                }
+            }
+        }
+    }
+}
+
 kernel void createInstancesStereoKernel(
     const device int* sortedPrimitiveIndices [[buffer(0)]],
     const device uint* instanceOffsets [[buffer(1)]],
@@ -745,6 +817,44 @@ kernel void createInstancesStereoKernel(
         for (int tx = minTX; tx <= maxTX; tx++) {
             if (writeOffset < params.maxAssignments) {
                 ushort tileId = ushort(ty * int(params.tilesX) + tx);
+                instanceTileIds[writeOffset] = tileId;
+                instanceGaussianIndices[writeOffset] = originalIdx;
+                writeOffset++;
+            }
+        }
+    }
+}
+
+kernel void createInstancesStereoKernel32(
+    const device int* sortedPrimitiveIndices [[buffer(0)]],
+    const device uint* instanceOffsets [[buffer(1)]],
+    const device int4* tileBounds [[buffer(2)]],
+    device uint* instanceTileIds [[buffer(3)]],
+    device int* instanceGaussianIndices [[buffer(4)]],
+    constant DepthFirstParams& params [[buffer(5)]],
+    constant DepthFirstHeader& header [[buffer(6)]],
+    uint gid [[thread_position_in_grid]]
+) {
+    uint visibleCount = header.visibleCount;
+    if (gid >= visibleCount) { return; }
+
+    int originalIdx = sortedPrimitiveIndices[gid];
+    if (originalIdx < 0) { return; }
+
+    int4 bounds = tileBounds[originalIdx];
+    int minTX = bounds.x;
+    int maxTX = bounds.y;
+    int minTY = bounds.z;
+    int maxTY = bounds.w;
+
+    if (minTX > maxTX || minTY > maxTY) { return; }
+
+    uint writeOffset = instanceOffsets[gid];
+
+    for (int ty = minTY; ty <= maxTY; ty++) {
+        for (int tx = minTX; tx <= maxTX; tx++) {
+            if (writeOffset < params.maxAssignments) {
+                uint tileId = uint(ty * int(params.tilesX) + tx);
                 instanceTileIds[writeOffset] = tileId;
                 instanceGaussianIndices[writeOffset] = originalIdx;
                 writeOffset++;
@@ -784,6 +894,64 @@ kernel void tileRadixHistogramKernel(
 
     ushort keys[RADIX_GRAIN_SIZE];
     ushort sentinelKey = 0xFFFFu;
+
+    load_blocked_local_from_global<RADIX_GRAIN_SIZE>(
+        keys,
+        &inputTileIds[baseId],
+        localId,
+        available,
+        sentinelKey);
+
+    for (ushort i = 0; i < RADIX_GRAIN_SIZE; ++i) {
+        uint offsetInBlock = localId * RADIX_GRAIN_SIZE + i;
+        uint globalIdx = baseId + offsetInBlock;
+
+        if (globalIdx < count && keys[i] != sentinelKey) {
+            uchar bin = (uchar)((keys[i] >> currentDigit) & 0xFFu);
+            atomic_fetch_add_explicit(&localHist[bin], 1u, memory_order_relaxed);
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    for (uint i = 0; i < (RADIX_BUCKETS + RADIX_BLOCK_SIZE - 1u) / RADIX_BLOCK_SIZE; ++i) {
+        uint bin = localId + i * RADIX_BLOCK_SIZE;
+        if (bin < RADIX_BUCKETS) {
+            histFlat[bin * gridSize + groupId] = atomic_load_explicit(&localHist[bin], memory_order_relaxed);
+        }
+    }
+}
+
+kernel void tileRadixHistogramKernel32(
+    device const uint* inputTileIds [[buffer(0)]],
+    device uint* histFlat [[buffer(1)]],
+    constant DepthFirstHeader& header [[buffer(2)]],
+    constant uint& currentDigit [[buffer(3)]],
+    uint gridSize [[threadgroups_per_grid]],
+    uint groupId [[threadgroup_position_in_grid]],
+    ushort localId [[thread_position_in_threadgroup]]
+) {
+    const uint elementsPerBlock = RADIX_BLOCK_SIZE * RADIX_GRAIN_SIZE;
+    uint baseId = groupId * elementsPerBlock;
+
+    uint paddedCount = header.paddedInstanceCount;
+    uint count = header.totalInstances;
+
+    uint bufferRemaining = (baseId < paddedCount) ? (paddedCount - baseId) : 0;
+    uint assignmentsRemain = (baseId < count) ? (count - baseId) : 0;
+    uint available = min(bufferRemaining, assignmentsRemain);
+
+    threadgroup atomic_uint localHist[RADIX_BUCKETS];
+
+    for (uint i = 0; i < (RADIX_BUCKETS + RADIX_BLOCK_SIZE - 1u) / RADIX_BLOCK_SIZE; ++i) {
+        uint bin = localId + i * RADIX_BLOCK_SIZE;
+        if (bin < RADIX_BUCKETS) {
+            atomic_store_explicit(&localHist[bin], 0u, memory_order_relaxed);
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    uint keys[RADIX_GRAIN_SIZE];
+    uint sentinelKey = 0xFFFFFFFFu;
 
     load_blocked_local_from_global<RADIX_GRAIN_SIZE>(
         keys,
@@ -994,7 +1162,98 @@ kernel void tileRadixScatterKernel(
 	        }
 	        threadgroup_barrier(mem_flags::mem_threadgroup);
 	    }
-	}
+}
+
+kernel void tileRadixScatterKernel32(
+    device const uint* inputTileIds [[buffer(0)]],
+    device const int* inputIndices [[buffer(1)]],
+    device const uint* offsetsFlat [[buffer(2)]],
+    device uint* outputTileIds [[buffer(3)]],
+    device int* outputIndices [[buffer(4)]],
+    constant DepthFirstHeader& header [[buffer(5)]],
+    constant uint& currentDigit [[buffer(6)]],
+    uint groupId [[threadgroup_position_in_grid]],
+    uint gridSize [[threadgroups_per_grid]],
+    ushort localId [[thread_position_in_threadgroup]]
+) {
+    const uint elementsPerBlock = RADIX_BLOCK_SIZE * RADIX_GRAIN_SIZE;
+    uint baseId = groupId * elementsPerBlock;
+
+    uint paddedCount = header.paddedInstanceCount;
+    uint count = header.totalInstances;
+
+    uint bufferRemaining = (baseId < paddedCount) ? (paddedCount - baseId) : 0;
+    uint assignmentsRemain = (baseId < count) ? (count - baseId) : 0;
+    uint available = min(bufferRemaining, assignmentsRemain);
+
+    uint keySentinel = 0xFFFFFFFFu;
+
+    uint keys[RADIX_GRAIN_SIZE];
+    int payloads[RADIX_GRAIN_SIZE];
+
+    for (ushort i = 0; i < RADIX_GRAIN_SIZE; ++i) {
+        uint idx = baseId + localId + i * RADIX_BLOCK_SIZE;
+        if (idx < available + baseId && idx < count) {
+            keys[i] = inputTileIds[idx];
+            payloads[i] = inputIndices[idx];
+        } else {
+            keys[i] = keySentinel;
+            payloads[i] = -1;
+        }
+    }
+
+    threadgroup uint globalBinBase[RADIX_BUCKETS];
+    threadgroup RadixKeyPayload tgKp[RADIX_BLOCK_SIZE];
+    threadgroup ushort tgShort[RADIX_BLOCK_SIZE];
+
+    for (uint i = 0; i < (RADIX_BUCKETS + RADIX_BLOCK_SIZE - 1u) / RADIX_BLOCK_SIZE; ++i) {
+        uint bin = localId + i * RADIX_BLOCK_SIZE;
+        if (bin < RADIX_BUCKETS) {
+            globalBinBase[bin] = offsetsFlat[bin * gridSize + groupId];
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    for (ushort chunk = 0; chunk < RADIX_GRAIN_SIZE; ++chunk) {
+        RadixKeyPayload kp;
+        kp.key = keys[chunk];
+        kp.payload = uint(payloads[chunk]);
+
+        ushort digitIndex = (ushort)(currentDigit / 8);
+        kp = radix_partial_sort(kp, tgKp, localId, digitIndex);
+
+        ushort myBin = (ushort)((kp.key >> currentDigit) & 0xFFu);
+
+        bool isValid = (kp.key != keySentinel);
+
+        ushort headBin = isValid ? myBin : (ushort)0xFFFF;
+        uchar headFlag = flag_head_discontinuity<RADIX_BLOCK_SIZE>(headBin, tgShort, localId);
+        if (!isValid) headFlag = 0;
+
+        ushort runStart = radix_threadgroup_prefix_scan<RADIX_SCAN_TYPE_INCLUSIVE>(
+            headFlag ? localId : (ushort)0, tgShort, localId, radix_max_op<ushort>());
+        ushort localOffset = localId - runStart;
+
+        ushort tailBin = isValid ? myBin : (ushort)0xFFFF;
+        uchar tailFlag = flag_tail_discontinuity<RADIX_BLOCK_SIZE>(tailBin, tgShort, localId);
+        if (!isValid) tailFlag = 0;
+
+        if (isValid) {
+            uint dst = globalBinBase[myBin] + localOffset;
+            if (dst < count) {
+                outputTileIds[dst] = kp.key;
+                outputIndices[dst] = int(kp.payload);
+            }
+        }
+
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        if (tailFlag && isValid) {
+            globalBinBase[myBin] += localOffset + 1;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+}
 
 kernel void extractTileRangesKernel(
     const device ushort* sortedTileIds [[buffer(0)]],  // 16-bit tile IDs
@@ -1034,6 +1293,63 @@ kernel void extractTileRangesKernel(
     while (left < right) {
         uint mid = (left + right) >> 1;
         uint midTile = uint(sortedTileIds[mid]);
+        if (midTile <= tile) {
+            left = mid + 1;
+        } else {
+            right = mid;
+        }
+    }
+    uint end = left;
+
+    GaussianHeader tileHeader;
+    tileHeader.offset = start;
+    tileHeader.count = end > start ? (end - start) : 0;
+    tileHeaders[tile] = tileHeader;
+
+    if (tileHeader.count > 0) {
+        uint index = atomic_fetch_add_explicit(activeTileCount, 1u, memory_order_relaxed);
+        activeTiles[index] = tile;
+    }
+}
+
+kernel void extractTileRangesKernel32(
+    const device uint* sortedTileIds [[buffer(0)]],
+    device GaussianHeader* tileHeaders [[buffer(1)]],
+    device uint* activeTiles [[buffer(2)]],
+    device atomic_uint* activeTileCount [[buffer(3)]],
+    constant DepthFirstHeader& dfHeader [[buffer(4)]],
+    constant uint& tileCount [[buffer(5)]],
+    uint tile [[thread_position_in_grid]]
+) {
+    if (tile >= tileCount) { return; }
+
+    uint totalInstances = dfHeader.totalInstances;
+    if (totalInstances == 0) {
+        GaussianHeader emptyHeader;
+        emptyHeader.offset = 0;
+        emptyHeader.count = 0;
+        tileHeaders[tile] = emptyHeader;
+        return;
+    }
+
+    uint left = 0;
+    uint right = totalInstances;
+    while (left < right) {
+        uint mid = (left + right) >> 1;
+        uint midTile = sortedTileIds[mid];
+        if (midTile < tile) {
+            left = mid + 1;
+        } else {
+            right = mid;
+        }
+    }
+    uint start = left;
+
+    left = start;
+    right = totalInstances;
+    while (left < right) {
+        uint mid = (left + right) >> 1;
+        uint midTile = sortedTileIds[mid];
         if (midTile <= tile) {
             left = mid + 1;
         } else {

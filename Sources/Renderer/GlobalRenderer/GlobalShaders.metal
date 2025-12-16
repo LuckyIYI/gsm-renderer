@@ -17,7 +17,7 @@ inline half getOpacity(const thread GaussianRenderData& g) { return half(g.opaci
 constant bool USE_CLUSTER_CULL [[function_constant(1)]];
 
 template <typename PackedWorldT, typename HarmonicT, typename RenderDataT>
-kernel void projectGaussiansFused(
+kernel void globalProjectCull(
     const device PackedWorldT* worldGaussians [[buffer(0)]],
     const device HarmonicT* harmonics [[buffer(1)]],
     device RenderDataT* outRenderData [[buffer(2)]],      // AoS packed output
@@ -122,17 +122,17 @@ kernel void projectGaussiansFused(
     outMask[gid] = 1;
 }
 
-// Fused projection + tile bounds kernel instantiation
+// Project+cull kernel instantiation
 // Float world input
-template [[host_name("projectGaussiansFusedKernel")]]
-kernel void projectGaussiansFused<PackedWorldGaussian, float, GaussianRenderData>(
+template [[host_name("globalProjectCullKernel")]]
+kernel void globalProjectCull<PackedWorldGaussian, float, GaussianRenderData>(
     const device PackedWorldGaussian*, const device float*,
     device GaussianRenderData*, device int4*, device uchar*,
     constant CameraUniforms&, constant TileBinningParams&, uint);
 
 // Half world input (for bandwidth optimization)
-template [[host_name("projectGaussiansFusedKernelHalf")]]
-kernel void projectGaussiansFused<PackedWorldGaussianHalf, half, GaussianRenderData>(
+template [[host_name("globalProjectCullKernelHalf")]]
+kernel void globalProjectCull<PackedWorldGaussianHalf, half, GaussianRenderData>(
     const device PackedWorldGaussianHalf*, const device half*,
     device GaussianRenderData*, device int4*, device uchar*,
     constant CameraUniforms&, constant TileBinningParams&, uint);
@@ -300,7 +300,7 @@ kernel void computeSortKeysKernel<GaussianRenderData>(
     device uint*, device int*, const device TileAssignmentHeader&, uint);
 
 
-// Fused: build headers + compact active tiles in one pass
+// Build headers + compact active tiles in one pass
 kernel void buildHeadersFromSortedKernel(
     const device uint* sortedKeys [[buffer(0)]],  // 32-bit keys: [tile:16][depth:16]
     device GaussianHeader* headers [[buffer(1)]],
@@ -355,7 +355,7 @@ kernel void buildHeadersFromSortedKernel(
     header.count = end > start ? (end - start) : 0u;
     headers[tile] = header;
 
-    // Compact active tiles (fused - no separate pass needed)
+    // Compact active tiles (no separate pass needed)
     if (header.count > 0u) {
         uint index = atomic_fetch_add_explicit(activeCount, 1u, memory_order_relaxed);
         activeTiles[index] = tile;
@@ -693,7 +693,7 @@ kernel void prepareAssignmentDispatchKernel(
     }
     uint total = header[0].totalAssignments;
 
-    // Clamp totalAssignments to maxAssignments (fix for fused scatter overflow)
+    // Clamp totalAssignments to maxAssignments (fix for scatter overflow)
     if (total > config.maxAssignments) {
         total = config.maxAssignments;
         header[0].totalAssignments = total;

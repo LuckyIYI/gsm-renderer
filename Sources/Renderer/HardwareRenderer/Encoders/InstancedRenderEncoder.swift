@@ -12,7 +12,7 @@ private func isDepthRenderable(_ format: MTLPixelFormat) -> Bool {
 }
 
 /// Encoder for instanced Gaussian rendering.
-/// Handles center-sort stereo and mono rendering modes.
+/// Handles hardware stereo and mono rendering modes.
 final class InstancedRenderEncoder {
 
     private enum Constants {
@@ -20,7 +20,7 @@ final class InstancedRenderEncoder {
     }
 
     private let initializePipeline: MTLRenderPipelineState
-    private let centerSortPipeline: MTLRenderPipelineState
+    private let stereoPipeline: MTLRenderPipelineState
     private let postprocessPipeline: MTLRenderPipelineState
     private let monoPipeline: MTLRenderPipelineState
     private let depthStencilState: MTLDepthStencilState
@@ -30,7 +30,7 @@ final class InstancedRenderEncoder {
 
     init(
         initializePipeline: MTLRenderPipelineState,
-        centerSortPipeline: MTLRenderPipelineState,
+        stereoPipeline: MTLRenderPipelineState,
         postprocessPipeline: MTLRenderPipelineState,
         monoPipeline: MTLRenderPipelineState,
         depthStencilState: MTLDepthStencilState,
@@ -38,7 +38,7 @@ final class InstancedRenderEncoder {
         quadIndexBuffer: MTLBuffer
     ) {
         self.initializePipeline = initializePipeline
-        self.centerSortPipeline = centerSortPipeline
+        self.stereoPipeline = stereoPipeline
         self.postprocessPipeline = postprocessPipeline
         self.monoPipeline = monoPipeline
         self.depthStencilState = depthStencilState
@@ -82,7 +82,7 @@ final class InstancedRenderEncoder {
         renderPassDesc.imageblockSampleLength = initializePipeline.imageblockSampleLength
 
         guard let encoder = commandBuffer.makeRenderCommandEncoder(descriptor: renderPassDesc) else { return }
-        encoder.label = "InstancedGaussian_CenterSortFoveated"
+        encoder.label = "InstancedGaussian_Stereo"
 
         encoder.pushDebugGroup("Initialize Fragment Store")
         encoder.setRenderPipelineState(initializePipeline)
@@ -90,7 +90,7 @@ final class InstancedRenderEncoder {
         encoder.popDebugGroup()
 
         encoder.pushDebugGroup("Draw Gaussians")
-        encoder.setRenderPipelineState(centerSortPipeline)
+        encoder.setRenderPipelineState(stereoPipeline)
         encoder.setDepthStencilState(noDepthStencilState)
 
         let leftViewport = MTLViewport(
@@ -125,13 +125,13 @@ final class InstancedRenderEncoder {
 
         encoder.setVertexBuffer(projectedSorted, offset: 0, index: 0)
 
-        var uniforms = CenterSortRenderUniforms(
+        var uniforms = HardwareRenderUniforms(
             width: Float(width),
             height: Float(height),
             farPlane: configuration.leftEye.far,
             _pad0: 0
         )
-        encoder.setVertexBytes(&uniforms, length: MemoryLayout<CenterSortRenderUniforms>.stride, index: 1)
+        encoder.setVertexBytes(&uniforms, length: MemoryLayout<HardwareRenderUniforms>.stride, index: 1)
 
         encoder.setVertexBuffer(header, offset: 0, index: 2)
 
@@ -191,8 +191,8 @@ final class InstancedRenderEncoder {
 
         encoder.setVertexBuffer(projectedSorted, offset: 0, index: 0)
 
-        var uniforms = CenterSortRenderUniforms(width: Float(width), height: Float(height), farPlane: farPlane, _pad0: 0)
-        encoder.setVertexBytes(&uniforms, length: MemoryLayout<CenterSortRenderUniforms>.stride, index: 1)
+        var uniforms = HardwareRenderUniforms(width: Float(width), height: Float(height), farPlane: farPlane, _pad0: 0)
+        encoder.setVertexBytes(&uniforms, length: MemoryLayout<HardwareRenderUniforms>.stride, index: 1)
 
         encoder.setVertexBuffer(header, offset: 0, index: 2)
 

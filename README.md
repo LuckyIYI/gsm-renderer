@@ -6,11 +6,9 @@ A high-performance Gaussian Splatting renderer for Apple platforms, written in S
 
 ## Features
 
-- **Three rendering strategies:** Global (radix sort), Local (per-tile bitonic sort), and DepthFirst (hybrid)
-- **Float16/Float32 precision:** Configurable for performance vs accuracy trade-off
+- **Multiple rendering strategies:** Global, Local, DepthFirst, and Hardware (mesh shaders / instanced)
 - **Spherical Harmonics:** Supports SH degrees 0-3 for view-dependent color
-- **Optimized for Apple Silicon:** Indirect dispatch, SIMD operations, minimal memory bandwidth
-- **Scales to millions of Gaussians:** Tested with 6M+ Gaussians at real-time rates
+- **Stereo rendering:** Side-by-side and visionOS foveated targets
 
 ## Requirements
 
@@ -43,6 +41,7 @@ let config = RendererConfig(
 let renderer = try DepthFirstRenderer(device: device, config: config)
 // Or: try GlobalRenderer(device: device, config: config)
 // Or: try LocalRenderer(device: device, config: config)
+// Or: try HardwareRenderer(device: device, config: config)
 
 // Prepare input data
 let input = GaussianInput(
@@ -74,6 +73,13 @@ renderer.render(
 commandBuffer.commit()
 ```
 
+## Stereo Rendering
+
+All renderers implement `GaussianRenderer.renderStereo(...)` with a `StereoRenderTarget`:
+
+- `.sideBySide(colorTexture:depthTexture:)`: left eye on the left half, right eye on the right half.
+- `.foveated(drawable:configuration:)`: visionOS Compositor Services output (rasterization rate map supported).
+
 ## Renderers
 
 ### GlobalRenderer
@@ -81,42 +87,31 @@ commandBuffer.commit()
 Uses a global radix sort to order all tile-gaussian assignments by (tile, depth).
 
 **Pipeline:**
-1. **Project** - Transform 3D gaussians to 2D screen space, compute conic matrices and colors from SH
+1. **Project + Cull** - Transform 3D gaussians to 2D screen space, cull, compute conics and colors from SH
 2. **Tile Assignment** - Two-pass: count tiles per gaussian, prefix sum, then write (tileId, gaussianId) tuples
 3. **Generate Sort Keys** - Build 64-bit keys as (tileId << 32 | depth) for each assignment
 4. **Radix Sort** - Sort all assignments globally by sort key using 8-pass radix sort
 5. **Build Headers** - Scan sorted keys to find offset/count for each tile, build active tile list
 6. **Render** - Each active tile blends its gaussians front-to-back using indirect dispatch
 
-**Characteristics:**
-- Single global sort handles all tiles at once
-- Best for scenes with many overlapping gaussians
-- Memory: O(total tile assignments)
-- Supports up to ~16M tile assignments per frame
-
 ### LocalRenderer
 
 Sorts gaussians independently per tile using threadgroup memory.
 
 **Pipeline:**
-1. **Project + Compact** - Transform 3D to 2D, compute conics/colors, stream compact visible gaussians
+1. **Project + Cull** - Transform 3D to 2D, compute conics/colors, compact visible gaussians
 2. **Scatter** - Each gaussian atomically increments tile counters, writes depth key and index to tile slots
 3. **Prefix Scan** - Compute tile offsets from counts, build active tile list
 4. **Per-Tile Sort** - Bitonic sort within each tile's slot range (16-bit depth keys, threadgroup memory)
 5. **Render** - Each active tile blends its sorted gaussians front-to-back using indirect dispatch
 
-**Characteristics:**
-- Per-tile sorting is cache-friendly
-- Fixed capacity per tile (maxPerTile limit)
-- Memory: O(tiles × maxPerTile)
-- No global radix sort overhead
 
 ### DepthFirstRenderer
 
 Sorts gaussians by depth first (globally), then by tile. This ensures correct back-to-front ordering is established before tile assignment, using a stable tile sort to preserve depth order within each tile.
 
 **Pipeline:**
-1. **Preprocess** - Project 3D to 2D, compute conics/colors, depth keys, and tile touch counts per gaussian
+1. **Project + Cull** - Project 3D to 2D, compute conics/colors, depth keys, and tile touch counts per gaussian
 2. **Depth Sort** - Radix sort all visible gaussians globally by depth (back-to-front)
 3. **Apply Depth Order** - Reorder tile counts according to depth-sorted gaussian order
 4. **Prefix Sum** - Compute instance offsets from ordered tile counts
@@ -125,12 +120,20 @@ Sorts gaussians by depth first (globally), then by tile. This ensures correct ba
 7. **Extract Tile Ranges** - Scan sorted tile IDs to find offset/count for each tile
 8. **Render** - Each active tile blends its gaussians front-to-back, 2×2 pixels per thread
 
-**Characteristics:**
-- Depth-first sorting ensures correct ordering before tile expansion
-- Stable tile sort preserves depth order within tiles
-- 16×16 pixel tiles, 8×8 threadgroup (each thread renders 2×2 pixels)
-- Memory: O(total instances) where instances = gaussians × avg tiles touched
-- Supports up to ~16M instances per frame
+### HardwareRenderer
+
+Single renderer that supports two draw backends:
+
+- **Mesh shaders** (object/mesh stages) when supported.
+- **Instanced** draw fallback (indexed indirect draw).
+
+**Pipeline (high level):**
+1. **Project + Cull** - Project gaussians for mono or stereo views (viewport-driven).
+2. **Visibility Compaction** - Compact visible gaussians.
+3. **Depth Sort** - Radix sort visible gaussians by depth.
+4. **Reorder** - Reorder projected gaussians into sorted order.
+5. **Draw** - Encode either instanced or mesh-shader draw.
+
 
 ## Data Formats
 
@@ -191,8 +194,13 @@ Sources/
 │   ├── DepthFirstRenderer/
 │   │   ├── DepthFirstRenderer.swift  # Hybrid renderer
 │   │   ├── DepthFirstShaders.metal
-│   │   └── Encoders/                 # Fused pipeline encoders
-│   ├── GaussianRendererProtocol.swift
+│   │   └── Encoders/
+│   ├── HardwareRenderer/
+│   │   ├── HardwareRenderer.swift    # Hardware raster renderer (mesh/instanced)
+│   │   ├── HardwareGaussianShaders.metal
+│   │   └── Encoders/
+│   ├── Shared/
+│   │   └── GaussianRendererProtocol.swift
 │   └── Utils/
 │       ├── PLYLoader.swift           # Point cloud loading
 │       └── Scene.swift               # Scene utilities
@@ -201,11 +209,15 @@ Sources/
         └── BridgingTypes.h           # Swift/Metal shared types
 ```
 
+## Formatting
+
+- Swift: `swiftformat .` (repo includes `gsm-renderer/.swiftformat` with `--self insert`).
+- Metal: use `clang-format` for `.metal` files.
+
 ## TODO
 
 - [ ] Release viewer app
-- [x] Fix radix sort scan grain limitation (was capped at ~8M instances, now supports ~16M)
-- [ ] Efficient stereo rendering
+- [x] Efficient stereo rendering
 - [ ] Cleanup memory allocation
 - [ ] Proper LOD and culling
 - [ ] SPZ import support

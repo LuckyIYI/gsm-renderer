@@ -17,7 +17,7 @@ public final class LocalRenderer: GaussianRenderer, @unchecked Sendable {
 
     // Stage encoders (internal helpers)
     private let clearEncoder: LocalClearEncoder
-    private let projectEncoder: LocalProjectEncoder
+    private let projectCullEncoder: LocalProjectCullEncoder
     private let prefixScanEncoder: LocalPrefixScanEncoder
     private let scatterEncoder: LocalScatterEncoder
     private let sortEncoder: LocalSortEncoder
@@ -60,7 +60,7 @@ public final class LocalRenderer: GaussianRenderer, @unchecked Sendable {
 
         // Initialize stage encoders
         self.clearEncoder = try LocalClearEncoder(library: localLibrary, device: device)
-        self.projectEncoder = try LocalProjectEncoder(LocalLibrary: localLibrary, mainLibrary: mainLibrary, device: device)
+        self.projectCullEncoder = try LocalProjectCullEncoder(LocalLibrary: localLibrary, mainLibrary: mainLibrary, device: device)
         self.prefixScanEncoder = try LocalPrefixScanEncoder(library: localLibrary, device: device)
         self.scatterEncoder = try LocalScatterEncoder(library: localLibrary, device: device)
         self.sortEncoder = try LocalSortEncoder(library: localLibrary, device: device)
@@ -178,7 +178,7 @@ public final class LocalRenderer: GaussianRenderer, @unchecked Sendable {
             maxCompacted: gaussianCount
         )
 
-        projectEncoder.encode(
+        projectCullEncoder.encode(
             commandBuffer: commandBuffer,
             worldGaussians: worldGaussians,
             harmonics: harmonics,

@@ -67,7 +67,7 @@ final class LocalPrefixScanEncoder {
             blitEncoder.endEncoding()
         }
 
-        // Finalize scan + zero counters + compact active tiles (fused)
+        // Finalize scan + zero counters + compact active tiles (single pass)
         if let encoder = commandBuffer.makeComputeCommandEncoder() {
             encoder.label = "Local_FinalizeScanAndZero"
             encoder.setComputePipelineState(self.finalizeScanAndZeroPipeline)

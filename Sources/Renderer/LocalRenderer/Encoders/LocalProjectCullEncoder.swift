@@ -1,6 +1,6 @@
 import Metal
 
-final class LocalProjectEncoder {
+final class LocalProjectCullEncoder {
     private var projectStoreFloatPipelines: [UInt32: MTLComputePipelineState] = [:]
     private var projectStoreHalfPipelines: [UInt32: MTLComputePipelineState] = [:]
 

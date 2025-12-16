@@ -12,7 +12,7 @@ final class PackEncoder {
         self.packThreadgroupSize = 256
     }
 
-    /// Build per-tile headers and the active-tile list (fused in one pass)
+    /// Build per-tile headers and the active-tile list (single pass)
     func encodeHeadersAndActiveTiles(
         commandBuffer: MTLCommandBuffer,
         sortedKeys: MTLBuffer,
@@ -21,7 +21,7 @@ final class PackEncoder {
         activeTileIndices: MTLBuffer,
         activeTileCount: MTLBuffer
     ) {
-        // Fused: Headers From Sorted + Compact Active Tiles
+        // Headers from sorted assignments + compact active tiles
         if let encoder = commandBuffer.makeComputeCommandEncoder() {
             encoder.label = "HeadersAndActiveTiles"
             var tileCount = UInt32(assignment.tileCount)

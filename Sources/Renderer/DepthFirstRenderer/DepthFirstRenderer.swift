@@ -12,7 +12,7 @@ public final class DepthFirstRenderer: GaussianRenderer, @unchecked Sendable {
     let library: MTLLibrary
 
     // Encoders
-    let preprocessEncoder: DepthFirstPreprocessEncoder
+    let projectCullEncoder: DepthFirstProjectCullEncoder
     let visibilityCompactionEncoder: VisibilityCompactionEncoder
     let dispatchEncoder: DepthFirstDispatchEncoder
     let depthSortEncoder: DepthRadixSortEncoder
@@ -21,14 +21,13 @@ public final class DepthFirstRenderer: GaussianRenderer, @unchecked Sendable {
     let tileRangeEncoder: TileRangeEncoder
     let renderEncoder: DepthFirstRenderEncoder
 
-    // Unified stereo encoders (tiled pipeline)
-    let stereoUnifiedPreprocessEncoder: DepthFirstStereoUnifiedPreprocessEncoder
+    // Stereo encoders (tiled pipeline)
     let stereoComputeRenderEncoder: DepthFirstStereoComputeRenderEncoder
     let stereoCopyEncoder: DepthFirstStereoCopyEncoder
 
     // Resources (lazily allocated based on usage)
     private var _monoResources: DepthFirstViewResources?
-    private var _stereoUnifiedResources: StereoUnifiedTiledResources?
+    private var _stereoResources: StereoTiledResources?
     private var _stereoIntermediateColor: MTLTexture?
 
     // Debug access for testing
@@ -71,7 +70,7 @@ public final class DepthFirstRenderer: GaussianRenderer, @unchecked Sendable {
         self.library = library
 
         // Initialize encoders
-        self.preprocessEncoder = try DepthFirstPreprocessEncoder(device: device, library: library)
+        self.projectCullEncoder = try DepthFirstProjectCullEncoder(device: device, library: library)
         self.visibilityCompactionEncoder = try VisibilityCompactionEncoder(
             device: device,
             library: library,
@@ -89,8 +88,7 @@ public final class DepthFirstRenderer: GaussianRenderer, @unchecked Sendable {
         self.tileRangeEncoder = try TileRangeEncoder(device: device, library: library, tileIdPrecision: tileIdPrecision)
         self.renderEncoder = try DepthFirstRenderEncoder(device: device, library: library)
 
-        // Unified stereo encoders (tiled pipeline)
-        self.stereoUnifiedPreprocessEncoder = try DepthFirstStereoUnifiedPreprocessEncoder(device: device, library: library)
+        // Stereo encoders (tiled pipeline)
         self.stereoComputeRenderEncoder = try DepthFirstStereoComputeRenderEncoder(device: device, library: library)
         self.stereoCopyEncoder = try DepthFirstStereoCopyEncoder(device: device, library: library, colorFormat: config.colorFormat)
 
@@ -123,9 +121,9 @@ public final class DepthFirstRenderer: GaussianRenderer, @unchecked Sendable {
         return resources
     }
 
-    private func ensureStereoUnifiedResources() throws -> StereoUnifiedTiledResources {
-        if let existing = _stereoUnifiedResources { return existing }
-        let resources = try StereoUnifiedTiledResources(
+    private func ensureStereoResources() throws -> StereoTiledResources {
+        if let existing = _stereoResources { return existing }
+        let resources = try StereoTiledResources(
             device: device,
             maxGaussians: limits.maxGaussians,
             maxWidth: limits.maxWidth,
@@ -136,7 +134,7 @@ public final class DepthFirstRenderer: GaussianRenderer, @unchecked Sendable {
             radixGrainSize: radixGrainSize,
             tileIdPrecision: tileIdPrecision
         )
-        _stereoUnifiedResources = resources
+        _stereoResources = resources
         return resources
     }
 
@@ -275,8 +273,8 @@ public final class DepthFirstRenderer: GaussianRenderer, @unchecked Sendable {
             blit.endEncoding()
         }
 
-        // Step 1: Preprocess - project gaussians, compute depth keys, count tiles
-        preprocessEncoder.encode(
+        // Step 1: Project + cull - project gaussians, compute depth keys, count tiles
+        projectCullEncoder.encodeMono(
             commandBuffer: commandBuffer,
             gaussianCount: gaussianCount,
             packedWorldBuffers: packedWorldBuffers,
@@ -288,7 +286,7 @@ public final class DepthFirstRenderer: GaussianRenderer, @unchecked Sendable {
             totalInstances: frame.totalInstances,
             binningParams: binningParams,
             useHalfWorld: config.precision == .float16,
-            shDegree: DepthFirstPreprocessEncoder.shDegree(from: shComponents)
+            shDegree: DepthFirstProjectCullEncoder.shDegree(from: shComponents)
         )
 
         // Step 1.25: Deterministic visibility compaction into depth sort buffers (writes visibleCount).
@@ -468,7 +466,7 @@ public final class DepthFirstRenderer: GaussianRenderer, @unchecked Sendable {
         )
     }
 
-    // MARK: - Stereo Rendering (Center-Sort with Billboard Quads)
+    // MARK: - Stereo Rendering (Side-by-Side)
 
     private func renderStereoSideBySideRaster(
         commandBuffer: MTLCommandBuffer,
@@ -501,7 +499,7 @@ public final class DepthFirstRenderer: GaussianRenderer, @unchecked Sendable {
             height: height
         )
 
-        encodeUnifiedStereoPipeline(
+        encodeStereoPipeline(
             commandBuffer: commandBuffer,
             gaussianCount: input.gaussianCount,
             packedWorldBuffers: packedWorld,
@@ -515,7 +513,7 @@ public final class DepthFirstRenderer: GaussianRenderer, @unchecked Sendable {
         )
     }
 
-    // MARK: - Foveated Stereo Rendering (Unified Tiled Pipeline)
+    // MARK: - Foveated Stereo Rendering (Tiled Pipeline)
 
     private func renderFoveatedStereoInternal(
         commandBuffer: MTLCommandBuffer,
@@ -540,7 +538,7 @@ public final class DepthFirstRenderer: GaussianRenderer, @unchecked Sendable {
             height: height
         )
 
-        encodeUnifiedStereoPipeline(
+        encodeStereoPipeline(
             commandBuffer: commandBuffer,
             gaussianCount: input.gaussianCount,
             packedWorldBuffers: packedWorld,
@@ -594,9 +592,9 @@ public final class DepthFirstRenderer: GaussianRenderer, @unchecked Sendable {
         )
     }
 
-    // MARK: - Unified Stereo Tiled Pipeline
+    // MARK: - Stereo Tiled Pipeline
 
-    private func encodeUnifiedStereoPipeline(
+    private func encodeStereoPipeline(
         commandBuffer: MTLCommandBuffer,
         gaussianCount: Int,
         packedWorldBuffers: PackedWorldBuffers,
@@ -609,7 +607,7 @@ public final class DepthFirstRenderer: GaussianRenderer, @unchecked Sendable {
         shComponents: Int
     ) {
         guard gaussianCount > 0, gaussianCount <= limits.maxGaussians else { return }
-        guard let res = try? ensureStereoUnifiedResources() else { return }
+        guard let res = try? ensureStereoResources() else { return }
 
         let tilesX = (width + DepthFirstRenderer.tileWidth - 1) / DepthFirstRenderer.tileWidth
         let tilesY = (height + DepthFirstRenderer.tileHeight - 1) / DepthFirstRenderer.tileHeight
@@ -627,14 +625,14 @@ public final class DepthFirstRenderer: GaussianRenderer, @unchecked Sendable {
 
         // Clear atomic counters
         if let blit = commandBuffer.makeBlitCommandEncoder() {
-            blit.label = "ClearStereoUnifiedCounters"
+            blit.label = "DepthFirstStereo_ClearCounters"
             blit.fill(buffer: res.visibleCount, range: 0 ..< 4, value: 0)
             blit.fill(buffer: res.totalInstances, range: 0 ..< 4, value: 0)
             blit.endEncoding()
         }
 
         // Step 1: Stereo preprocess - project both eyes, compute union bounds
-        stereoUnifiedPreprocessEncoder.encode(
+        projectCullEncoder.encodeStereo(
             commandBuffer: commandBuffer,
             gaussianCount: gaussianCount,
             packedWorldBuffers: packedWorldBuffers,
@@ -646,7 +644,7 @@ public final class DepthFirstRenderer: GaussianRenderer, @unchecked Sendable {
             totalInstances: res.totalInstances,
             binningParams: binningParams,
             useHalfWorld: config.precision == .float16,
-            shDegree: DepthFirstStereoUnifiedPreprocessEncoder.shDegree(from: shComponents)
+            shDegree: DepthFirstProjectCullEncoder.shDegree(from: shComponents)
         )
 
         // Step 1.25: Deterministic visibility compaction into depth sort buffers (writes visibleCount).
@@ -834,201 +832,4 @@ public final class DepthFirstRenderer: GaussianRenderer, @unchecked Sendable {
         )
     }
 
-    // MARK: - Mono Pipeline Support
-
-    private func buildDispatchConfig(frame: DepthFirstViewResources, tileCount: Int) -> DepthFirstDispatchConfigSwift {
-        DepthFirstDispatchConfigSwift(
-            maxGaussians: UInt32(limits.maxGaussians),
-            maxInstances: UInt32(frame.maxInstances),
-            radixBlockSize: UInt32(radixBlockSize),
-            radixGrainSize: UInt32(radixGrainSize),
-            instanceExpansionTGSize: UInt32(instanceExpansionEncoder.threadgroupSize),
-            prefixSumTGSize: 256,
-            tileRangeTGSize: UInt32(tileRangeEncoder.threadgroupSize),
-            tileCount: UInt32(tileCount)
-        )
-    }
-
-    private func encodeDepthSort(commandBuffer: MTLCommandBuffer, frame: DepthFirstViewResources) {
-        let depthSortBuffers = RadixSortBuffers(
-            histogram: frame.depthSortHistogram,
-            blockSums: frame.depthSortBlockSums,
-            scannedHistogram: frame.depthSortScannedHist,
-            scratchKeys: frame.depthSortScratchKeys,
-            scratchIndices: frame.depthSortScratchPayload
-        )
-        let depthDispatchOffsets = DepthRadixSortEncoder.DispatchOffsets.fromSlots(
-            histogram: DepthFirstDispatchSlot.depthHistogram.rawValue,
-            scanBlocks: DepthFirstDispatchSlot.depthScanBlocks.rawValue,
-            exclusive: DepthFirstDispatchSlot.depthExclusive.rawValue,
-            apply: DepthFirstDispatchSlot.depthApply.rawValue,
-            scatter: DepthFirstDispatchSlot.depthScatter.rawValue,
-            stride: MemoryLayout<DispatchIndirectArgsSwift>.stride
-        )
-        depthSortEncoder.encode(
-            commandBuffer: commandBuffer,
-            depthKeys: frame.depthKeys,
-            sortedIndices: frame.primitiveIndices,
-            sortBuffers: depthSortBuffers,
-            sortHeader: frame.header,
-            dispatchBuffer: frame.dispatchArgs,
-            offsets: depthDispatchOffsets,
-            label: "DepthSort"
-        )
-    }
-
-    /// Shared between stereo eyes (after preprocess and optional shared sorting).
-    private func encodePostPreprocessPipeline(
-        commandBuffer: MTLCommandBuffer,
-        gaussianCount: Int,
-        frame: DepthFirstViewResources,
-        tilesX: Int,
-        tilesY: Int,
-        tileCount: Int,
-        visibleCount: MTLBuffer,
-        sortedPrimitiveIndices: MTLBuffer,
-        doDepthSort: Bool,
-        alphaThreshold: Float
-    ) {
-        // Step 1.5: Prepare indirect dispatch arguments
-        let dispatchConfig = buildDispatchConfig(frame: frame, tileCount: tileCount)
-        dispatchEncoder.encode(
-            commandBuffer: commandBuffer,
-            visibleCount: visibleCount,
-            totalInstances: frame.totalInstances,
-            header: frame.header,
-            dispatchArgs: frame.dispatchArgs,
-            config: dispatchConfig
-        )
-
-        // Step 2: Sort by depth (optional for center-sort mode)
-        if doDepthSort {
-            encodeDepthSort(commandBuffer: commandBuffer, frame: frame)
-        }
-
-        // Step 3: Apply depth ordering
-        instanceExpansionEncoder.encodeApplyDepthOrdering(
-            commandBuffer: commandBuffer,
-            sortedPrimitiveIndices: sortedPrimitiveIndices,
-            nTouchedTiles: frame.nTouchedTiles,
-            orderedTileCounts: frame.orderedTileCounts,
-            header: frame.header,
-            dispatchArgs: frame.dispatchArgs
-        )
-
-        // Step 4: Prefix sum
-        instanceExpansionEncoder.encodePrefixSum(
-            commandBuffer: commandBuffer,
-            dataBuffer: frame.orderedTileCounts,
-            blockSumsBuffer: frame.prefixSumBlockSums,
-            header: frame.header,
-            dispatchArgs: frame.dispatchArgs
-        )
-
-        // Step 5: Create instances
-        let instanceParams = DepthFirstParamsSwift(
-            gaussianCount: gaussianCount,
-            visibleCount: 0,
-            tilesX: tilesX,
-            tilesY: tilesY,
-            tileWidth: DepthFirstRenderer.tileWidth,
-            tileHeight: DepthFirstRenderer.tileHeight,
-            maxAssignments: frame.maxInstances,
-            alphaThreshold: alphaThreshold
-        )
-        instanceExpansionEncoder.encodeCreateInstances(
-            commandBuffer: commandBuffer,
-            sortedPrimitiveIndices: sortedPrimitiveIndices,
-            instanceOffsets: frame.orderedTileCounts,
-            tileBounds: frame.bounds,
-            renderData: frame.renderData,
-            instanceTileIds: frame.instanceTileIds,
-            instanceGaussianIndices: frame.instanceGaussianIndices,
-            params: instanceParams,
-            header: frame.header,
-            dispatchArgs: frame.dispatchArgs
-        )
-
-        // Step 6: Sort instances by tile ID (stable, preserves order within each tile)
-        let tileSortBuffers = TileSortEncoder.SortBuffers(
-            histogram: frame.tileSortHistogram,
-            blockSums: frame.tileSortBlockSums,
-            scannedHistogram: frame.tileSortScannedHist,
-            scratchTileIds: frame.tileSortScratchTileIds,
-            scratchGaussianIndices: frame.tileSortScratchIndices
-        )
-        tileSortEncoder.encode(
-            commandBuffer: commandBuffer,
-            tileIds: frame.instanceTileIds,
-            gaussianIndices: frame.instanceGaussianIndices,
-            tileCount: tileCount,
-            sortBuffers: tileSortBuffers,
-            header: frame.header,
-            dispatchArgs: frame.dispatchArgs
-        )
-
-        // Step 7: Extract tile ranges
-        tileRangeEncoder.encodeExtractRanges(
-            commandBuffer: commandBuffer,
-            sortedTileIds: frame.instanceTileIds,
-            tileHeaders: frame.tileHeaders,
-            activeTiles: frame.activeTiles,
-            activeTileCount: frame.activeTileCount,
-            header: frame.header,
-            tileCount: tileCount
-        )
-    }
-
-    private func encodeComputeRenderStage(
-        commandBuffer: MTLCommandBuffer,
-        frame: DepthFirstViewResources,
-        targetColor: MTLTexture,
-        targetDepth: MTLTexture?,
-        gaussianCount: Int,
-        width: Int,
-        height: Int,
-        tilesX: Int,
-        tilesY: Int,
-        tileCount: Int
-    ) {
-        dispatchEncoder.encodePrepareRenderDispatch(
-            commandBuffer: commandBuffer,
-            activeTileCount: frame.activeTileCount,
-            dispatchArgs: frame.dispatchArgs,
-            tileCount: UInt32(tileCount)
-        )
-
-        renderEncoder.encodeClear(
-            commandBuffer: commandBuffer,
-            colorTexture: targetColor,
-            depthTexture: targetDepth,
-            width: width,
-            height: height
-        )
-
-        let renderParams = RenderParams(
-            width: UInt32(width),
-            height: UInt32(height),
-            tileWidth: UInt32(DepthFirstRenderer.tileWidth),
-            tileHeight: UInt32(DepthFirstRenderer.tileHeight),
-            tilesX: UInt32(tilesX),
-            tilesY: UInt32(tilesY),
-            activeTileCount: 0,
-            gaussianCount: UInt32(gaussianCount)
-        )
-
-        renderEncoder.encodeRender(
-            commandBuffer: commandBuffer,
-            tileHeaders: frame.tileHeaders,
-            renderData: frame.renderData,
-            sortedGaussianIndices: frame.instanceGaussianIndices,
-            activeTiles: frame.activeTiles,
-            activeTileCount: frame.activeTileCount,
-            colorTexture: targetColor,
-            depthTexture: targetDepth,
-            params: renderParams,
-            dispatchArgs: frame.dispatchArgs,
-            dispatchOffset: DepthFirstDispatchSlot.render.offset
-        )
-    }
 }

@@ -7,7 +7,7 @@ import simd
 ///
 /// Usage:
 /// 1. Build LOD tree from Gaussian records: `buildTree(from:harmonics:shComponents:)`
-/// 2. Use LODProjectEncoder for fused LOD+projection in render pipeline
+/// 2. Use LODProjectEncoder for combined LOD+projection in render pipeline
 public final class LODManager {
 
     private let device: MTLDevice
@@ -65,17 +65,17 @@ public final class LODManager {
 
 public extension LODManager {
 
-    /// Access to LOD node buffer for fused LOD+projection
+    /// Access to LOD node buffer for combined LOD+projection
     var nodeBuffer: MTLBuffer? {
         resources?.nodeBuffer
     }
 
-    /// Access to merged Gaussians buffer for fused LOD+projection
+    /// Access to merged Gaussians buffer for combined LOD+projection
     var mergedGaussiansBuffer: MTLBuffer? {
         resources?.mergedGaussiansBuffer
     }
 
-    /// Access to merged harmonics buffer for fused LOD+projection
+    /// Access to merged harmonics buffer for combined LOD+projection
     var mergedHarmonicsBuffer: MTLBuffer? {
         resources?.mergedHarmonicsBuffer
     }

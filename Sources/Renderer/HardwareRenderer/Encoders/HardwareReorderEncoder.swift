@@ -2,25 +2,25 @@ import Metal
 import RendererTypes
 
 /// Encoder for reordering projected Gaussian data based on sorted indices.
-/// Handles center-sort (stereo) and mono rendering modes.
-final class ReorderDataEncoder {
+/// Handles hardware stereo and mono rendering modes.
+final class HardwareReorderEncoder {
     static let threadgroupSize: Int = 256
 
-    private let centerSortPipeline: MTLComputePipelineState
+    private let stereoPipeline: MTLComputePipelineState
     private let monoPipeline: MTLComputePipelineState
 
     init(device: MTLDevice, library: MTLLibrary) throws {
-        guard let centerFn = library.makeFunction(name: "reorderCenterSortDataKernel"),
+        guard let centerFn = library.makeFunction(name: "reorderStereoProjectedKernel"),
               let monoFn = library.makeFunction(name: "reorderMonoDataKernel") else {
             throw RendererError.failedToCreatePipeline("Reorder kernels not found")
         }
 
-        self.centerSortPipeline = try device.makeComputePipelineState(function: centerFn)
+        self.stereoPipeline = try device.makeComputePipelineState(function: centerFn)
         self.monoPipeline = try device.makeComputePipelineState(function: monoFn)
     }
 
-    /// Reorder data for center-sort stereo (single shared sort)
-    func encodeCenterSort(
+    /// Reorder data for hardware stereo
+    func encodeStereo(
         commandBuffer: MTLCommandBuffer,
         projected: MTLBuffer,
         sortedIndices: MTLBuffer,
@@ -30,8 +30,8 @@ final class ReorderDataEncoder {
         backToFront: Bool
     ) {
         guard let encoder = commandBuffer.makeComputeCommandEncoder() else { return }
-        encoder.label = "CenterReorder"
-        encoder.setComputePipelineState(centerSortPipeline)
+        encoder.label = "ReorderStereo"
+        encoder.setComputePipelineState(stereoPipeline)
 
         encoder.setBuffer(projected, offset: 0, index: 0)
         encoder.setBuffer(sortedIndices, offset: 0, index: 1)

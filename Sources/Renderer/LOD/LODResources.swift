@@ -3,7 +3,7 @@ import simd
 @_exported import RendererTypes
 
 /// Manages GPU resources for LOD tree rendering.
-/// Used with LODProjectEncoder for fused LOD+projection.
+/// Used with LODProjectEncoder for combined LOD+projection.
 public final class LODResources {
 
     /// GPU buffer containing LOD tree nodes

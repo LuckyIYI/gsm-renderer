@@ -358,35 +358,15 @@ typedef struct {
     UCHAR  opacity;                     // 1 byte - 8-bit opacity
 } InstancedGaussianData;
 
-// Projection parameters for instanced renderer
-// Note: focalX/Y removed - now derived from projection matrix for efficiency
-typedef struct {
-    simd_float4x4 sceneTransform;
-    simd_float4x4 leftViewMatrix;
-    simd_float4x4 leftProjectionMatrix;
-    simd_float4x4 rightViewMatrix;
-    simd_float4x4 rightProjectionMatrix;
-    float leftCameraPosX, leftCameraPosY, leftCameraPosZ;
-    float _padLeft0;
-    float rightCameraPosX, rightCameraPosY, rightCameraPosZ;
-    float _padRight0;
-    float width, height;
-    float nearPlane, farPlane;
-    UINT32 gaussianCount;
-    UINT32 shComponents;
-    float totalInkThreshold;  // Total ink culling threshold (0 = disabled)
-    float _pad0;
-} InstancedProjectionParams;
-
 typedef struct {
     float width;
     float height;
     float farPlane;
     float _pad0;
-} CenterSortRenderUniforms;
+} HardwareRenderUniforms;
 
 // ============================================================================
-// Center-Sort Stereo Types (tiled pipeline with single sort)
+// Hardware Stereo Types (single sort, two-eye draw)
 // ============================================================================
 
 // Stereo render data for tiled depth-first stereo rendering.
@@ -414,7 +394,7 @@ typedef struct {
     UINT16 _pad0;                    // 2 bytes padding to 32
 } StereoTiledRenderData;
 
-// Center-projected gaussian data for stereo rendering with single sort.
+// Projected gaussian data for hardware stereo rendering (single sort).
 // Stores per-eye screen centers and ellipse bases.
 // 26 bytes (padded to 28)
 typedef struct {
@@ -429,17 +409,17 @@ typedef struct {
     HALF depth;                      // 2 bytes - Center eye depth (for sorting)
     UCHAR colorR, colorG, colorB;    // 3 bytes - 8-bit color
     UCHAR opacity;                   // 1 byte - 8-bit opacity
-} CenterSortGaussianData;
+} HardwareProjectedGaussian;
 
-// Header for center-sort mode (single visible count)
+// Header for hardware stereo mode
 typedef struct {
     UINT32 visibleCount;
     UINT32 paddedCount;
     UINT32 overflow;
     UINT32 _pad0;
-} CenterSortHeader;
+} HardwareStereoHeader;
 
-// Projection parameters for center-sort mode
+// Projection parameters for hardware stereo mode
 typedef struct {
     simd_float4x4 sceneTransform;
     simd_float4x4 centerViewMatrix;       // Average of left/right view
@@ -460,13 +440,13 @@ typedef struct {
     UINT32 shComponents;
     float totalInkThreshold;
     float inputIsSRGB; // 1.0 = decode evaluated color from sRGB to linear
-} CenterSortProjectionParams;
+} HardwareStereoProjectionParams;
 
 // ============================================================================
 // Mono Rendering Types (single texture, non-stereo)
 // ============================================================================
 
-// Projection parameters for mono (single-eye) rendering
+// Projection parameters for hardware mono (single-eye) rendering
 typedef struct {
     simd_float4x4 sceneTransform;
     simd_float4x4 viewMatrix;
@@ -479,12 +459,12 @@ typedef struct {
     UINT32 shComponents;
     float totalInkThreshold;
     float inputIsSRGB; // 1.0 = decode evaluated color from sRGB to linear
-} MonoProjectionParams;
+} HardwareMonoProjectionParams;
 
-// Header for mono rendering (single visible count)
+// Header for hardware mono rendering
 typedef struct {
     UINT32 visibleCount;
     UINT32 paddedCount;
     UINT32 overflow;
     UINT32 _pad0;
-} MonoRenderHeader;
+} HardwareMonoHeader;

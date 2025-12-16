@@ -44,7 +44,7 @@ inline float sortable_uint_to_float(uint v) {
 
 
 template <typename PackedWorldT, typename HarmonicT, typename RenderDataT>
-	kernel void depthFirstPreprocessKernel(
+	kernel void depthFirstProjectCullKernel(
 	    const device PackedWorldT* worldGaussians [[buffer(0)]],
 	    const device HarmonicT* harmonics [[buffer(1)]],
 	    device RenderDataT* outRenderData [[buffer(2)]],
@@ -218,15 +218,15 @@ template <typename PackedWorldT, typename HarmonicT, typename RenderDataT>
     atomic_fetch_add_explicit(totalInstances, touchedCount, memory_order_relaxed);
 }
 
-template [[host_name("depthFirstPreprocessKernel")]]
-kernel void depthFirstPreprocessKernel<PackedWorldGaussian, float, GaussianRenderData>(
+template [[host_name("depthFirstProjectCullKernel")]]
+kernel void depthFirstProjectCullKernel<PackedWorldGaussian, float, GaussianRenderData>(
     const device PackedWorldGaussian*, const device float*,
     device GaussianRenderData*, device int4*, device uint*,
     device uint*, device atomic_uint*,
     constant CameraUniforms&, constant TileBinningParams&, uint);
 
-template [[host_name("depthFirstPreprocessKernelHalf")]]
-kernel void depthFirstPreprocessKernel<PackedWorldGaussianHalf, half, GaussianRenderData>(
+template [[host_name("depthFirstProjectCullKernelHalf")]]
+kernel void depthFirstProjectCullKernel<PackedWorldGaussianHalf, half, GaussianRenderData>(
     const device PackedWorldGaussianHalf*, const device half*,
     device GaussianRenderData*, device int4*, device uint*,
     device uint*, device atomic_uint*,
@@ -339,7 +339,7 @@ inline EyeProjectionResult projectToEye(
 }
 
 template <typename PackedWorldT, typename HarmonicT>
-	kernel void depthFirstStereoUnifiedPreprocessKernel(
+	kernel void depthFirstStereoProjectCullKernel(
 	    const device PackedWorldT* worldGaussians [[buffer(0)]],
 	    const device HarmonicT* harmonics [[buffer(1)]],
 	    device StereoTiledRenderData* outRenderData [[buffer(2)]],
@@ -498,15 +498,15 @@ template <typename PackedWorldT, typename HarmonicT>
     atomic_fetch_add_explicit(totalInstances, touchedCount, memory_order_relaxed);
 }
 
-template [[host_name("depthFirstStereoUnifiedPreprocessKernel")]]
-kernel void depthFirstStereoUnifiedPreprocessKernel<PackedWorldGaussian, float>(
+template [[host_name("depthFirstStereoProjectCullKernel")]]
+kernel void depthFirstStereoProjectCullKernel<PackedWorldGaussian, float>(
     const device PackedWorldGaussian*, const device float*,
     device StereoTiledRenderData*, device int4*, device uint*,
     device uint*, device atomic_uint*,
     constant StereoCameraUniforms&, constant TileBinningParams&, uint);
 
-template [[host_name("depthFirstStereoUnifiedPreprocessKernelHalf")]]
-kernel void depthFirstStereoUnifiedPreprocessKernel<PackedWorldGaussianHalf, half>(
+template [[host_name("depthFirstStereoProjectCullKernelHalf")]]
+kernel void depthFirstStereoProjectCullKernel<PackedWorldGaussianHalf, half>(
     const device PackedWorldGaussianHalf*, const device half*,
     device StereoTiledRenderData*, device int4*, device uint*,
     device uint*, device atomic_uint*,

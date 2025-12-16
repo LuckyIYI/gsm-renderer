@@ -12,7 +12,7 @@ private func isDepthRenderable(_ format: MTLPixelFormat) -> Bool {
 }
 
 /// Encoder for mesh shader Gaussian rendering.
-/// Handles center-sort stereo and mono rendering modes.
+/// Handles hardware stereo and mono rendering modes.
 final class MeshRenderEncoder {
 
     static let gaussiansPerObjectTG: Int = 64
@@ -27,7 +27,7 @@ final class MeshRenderEncoder {
     }
 
     private let initializePipeline: MTLRenderPipelineState
-    private let centerSortPipeline: MTLRenderPipelineState
+    private let stereoPipeline: MTLRenderPipelineState
     private let postprocessPipeline: MTLRenderPipelineState
     private let monoPipeline: MTLRenderPipelineState
     private let depthStencilState: MTLDepthStencilState
@@ -35,14 +35,14 @@ final class MeshRenderEncoder {
 
     init(
         initializePipeline: MTLRenderPipelineState,
-        centerSortPipeline: MTLRenderPipelineState,
+        stereoPipeline: MTLRenderPipelineState,
         postprocessPipeline: MTLRenderPipelineState,
         monoPipeline: MTLRenderPipelineState,
         depthStencilState: MTLDepthStencilState,
         noDepthStencilState: MTLDepthStencilState
     ) {
         self.initializePipeline = initializePipeline
-        self.centerSortPipeline = centerSortPipeline
+        self.stereoPipeline = stereoPipeline
         self.postprocessPipeline = postprocessPipeline
         self.monoPipeline = monoPipeline
         self.depthStencilState = depthStencilState
@@ -84,7 +84,7 @@ final class MeshRenderEncoder {
         renderPassDescriptor.imageblockSampleLength = initializePipeline.imageblockSampleLength
 
         guard let encoder = commandBuffer.makeRenderCommandEncoder(descriptor: renderPassDescriptor) else { return }
-        encoder.label = "CenterSort_Drawable"
+        encoder.label = "MeshGaussian_Stereo"
 
         encoder.pushDebugGroup("Initialize Fragment Store")
         encoder.setRenderPipelineState(initializePipeline)
@@ -92,7 +92,7 @@ final class MeshRenderEncoder {
         encoder.popDebugGroup()
 
         encoder.pushDebugGroup("Draw Gaussians")
-        encoder.setRenderPipelineState(centerSortPipeline)
+        encoder.setRenderPipelineState(stereoPipeline)
         encoder.setDepthStencilState(noDepthStencilState)
         
         let leftViewport = MTLViewport(
@@ -128,15 +128,15 @@ final class MeshRenderEncoder {
         encoder.setObjectBuffer(projectedSorted, offset: 0, index: 0)
         encoder.setObjectBuffer(header, offset: 0, index: 2)
 
-        var uniforms = CenterSortRenderUniforms(
+        var uniforms = HardwareRenderUniforms(
             width: Float(width),
             height: Float(height),
             farPlane: configuration.leftEye.far,
             _pad0: 0
         )
         
-        encoder.setObjectBytes(&uniforms, length: MemoryLayout<CenterSortRenderUniforms>.stride, index: 1)
-        encoder.setMeshBytes(&uniforms, length: MemoryLayout<CenterSortRenderUniforms>.stride, index: 1)
+        encoder.setObjectBytes(&uniforms, length: MemoryLayout<HardwareRenderUniforms>.stride, index: 1)
+        encoder.setMeshBytes(&uniforms, length: MemoryLayout<HardwareRenderUniforms>.stride, index: 1)
 
         encoder.drawMeshThreadgroups(
             indirectBuffer: meshDrawArgs,
@@ -196,11 +196,11 @@ final class MeshRenderEncoder {
         encoder.setViewport(viewport)
 
         encoder.setObjectBuffer(projectedSorted, offset: 0, index: 0)
-        encoder.setObjectBuffer(header, offset: 0, index: 2) // visibleCount is at offset 0 in MonoRenderHeader
+        encoder.setObjectBuffer(header, offset: 0, index: 2) // visibleCount is at offset 0 in HardwareMonoHeader
 
-        var uniforms = CenterSortRenderUniforms(width: Float(width), height: Float(height), farPlane: farPlane, _pad0: 0)
-        encoder.setObjectBytes(&uniforms, length: MemoryLayout<CenterSortRenderUniforms>.stride, index: 1)
-        encoder.setMeshBytes(&uniforms, length: MemoryLayout<CenterSortRenderUniforms>.stride, index: 1)
+        var uniforms = HardwareRenderUniforms(width: Float(width), height: Float(height), farPlane: farPlane, _pad0: 0)
+        encoder.setObjectBytes(&uniforms, length: MemoryLayout<HardwareRenderUniforms>.stride, index: 1)
+        encoder.setMeshBytes(&uniforms, length: MemoryLayout<HardwareRenderUniforms>.stride, index: 1)
 
         encoder.drawMeshThreadgroups(
             indirectBuffer: meshDrawArgs,

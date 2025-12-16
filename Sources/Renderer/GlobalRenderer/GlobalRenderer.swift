@@ -83,9 +83,9 @@ public final class GlobalRenderer: GaussianRenderer, @unchecked Sendable {
     let sortKeyGenEncoder: SortKeyGenEncoder
     let radixSortEncoder: RadixSortEncoder
     let packEncoder: PackEncoder
-    let projectEncoder: ProjectEncoder
+    let projectCullEncoder: GlobalProjectCullEncoder
     let dispatchEncoder: DispatchEncoder
-    let fusedPipelineEncoder: FusedPipelineEncoder
+    let renderEncoder: GlobalRenderEncoder
     let twoPassTileAssignEncoder: TwoPassTileAssignEncoder
 
     // Reset tile builder state pipeline
@@ -130,8 +130,8 @@ public final class GlobalRenderer: GaussianRenderer, @unchecked Sendable {
         self.sortKeyGenEncoder = try SortKeyGenEncoder(device: device, library: library)
         self.radixSortEncoder = try RadixSortEncoder(device: device, library: library)
         self.packEncoder = try PackEncoder(device: device, library: library)
-        self.projectEncoder = try ProjectEncoder(device: device, library: library)
-        self.fusedPipelineEncoder = try FusedPipelineEncoder(device: device, library: library)
+        self.projectCullEncoder = try GlobalProjectCullEncoder(device: device, library: library)
+        self.renderEncoder = try GlobalRenderEncoder(device: device, library: library)
         self.twoPassTileAssignEncoder = try TwoPassTileAssignEncoder(device: device, library: library)
 
         let dispatchConfig = AssignmentDispatchConfigSwift(
@@ -311,7 +311,7 @@ public final class GlobalRenderer: GaussianRenderer, @unchecked Sendable {
         )
 
         let binningParams = self.limits.buildBinningParams(gaussianCount: gaussianCount)
-        self.projectEncoder.encode(
+        self.projectCullEncoder.encode(
             commandBuffer: commandBuffer,
             gaussianCount: gaussianCount,
             packedWorldBuffers: packedWorldBuffers,
@@ -360,7 +360,7 @@ public final class GlobalRenderer: GaussianRenderer, @unchecked Sendable {
         else {
             return false
         }
-        self.fusedPipelineEncoder.encodeCompleteRender(
+        self.renderEncoder.encodeCompleteRender(
             commandBuffer: commandBuffer,
             orderedBuffers: ordered,
             renderData: renderData,

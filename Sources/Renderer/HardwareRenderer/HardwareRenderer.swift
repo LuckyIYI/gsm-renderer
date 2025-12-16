@@ -5,9 +5,9 @@ import simd
 
 // MARK: - Resources
 
-/// Resources for center-sort stereo rendering (single shared sort).
+/// Resources for hardware stereo rendering (single shared sort).
 /// Includes buffers for both instanced and mesh-shader draw backends.
-struct HardwareCenterSortResources {
+struct HardwareStereoResources {
     let projected: MTLBuffer
     let projectedSorted: MTLBuffer
     let depthKeys: MTLBuffer
@@ -78,9 +78,9 @@ final class HardwareResourceManager {
     private let radixBlockSize: Int
     private let radixGrainSize: Int
 
-    private var centerSortResources: HardwareCenterSortResources?
+    private var stereoResources: HardwareStereoResources?
     private var monoResources: HardwareMonoResources?
-    private var maxCenterSortGaussians: Int = 0
+    private var maxStereoGaussians: Int = 0
     private var maxMonoGaussians: Int = 0
 
     init(device: MTLDevice, radixBlockSize: Int = 256, radixGrainSize: Int = 4) {
@@ -89,12 +89,12 @@ final class HardwareResourceManager {
         self.radixGrainSize = radixGrainSize
     }
 
-    func ensureCenterSortResources(gaussianCount: Int) throws -> HardwareCenterSortResources {
-        if let existing = centerSortResources, maxCenterSortGaussians >= gaussianCount {
+    func ensureStereoResources(gaussianCount: Int) throws -> HardwareStereoResources {
+        if let existing = stereoResources, maxStereoGaussians >= gaussianCount {
             return existing
         }
 
-        let newMax = max(gaussianCount, maxCenterSortGaussians * 2, 100_000)
+        let newMax = max(gaussianCount, maxStereoGaussians * 2, 100_000)
         let radixAlignment = radixBlockSize * radixGrainSize
         let paddedMax = ((newMax + radixAlignment - 1) / radixAlignment) * radixAlignment
         let numBlocks = paddedMax / radixAlignment + 4
@@ -104,7 +104,7 @@ final class HardwareResourceManager {
         let maxScanLevel3Blocks = (maxScanLevel2Blocks + scanBlockSize - 1) / scanBlockSize
         let compactionScratchCount = maxScanBlocks + 1 + maxScanLevel2Blocks + 1 + maxScanLevel3Blocks + 1
 
-        let dataSize = MemoryLayout<CenterSortGaussianData>.stride
+        let dataSize = MemoryLayout<HardwareProjectedGaussian>.stride
         let dispatchArgsSize = MemoryLayout<DispatchIndirectArgs>.stride
         let drawArgsSize = MemoryLayout<DrawIndexedIndirectArgs>.stride
 
@@ -120,7 +120,7 @@ final class HardwareResourceManager {
               let histogram = device.makeBuffer(length: 256 * numBlocks * MemoryLayout<UInt32>.stride, options: .storageModePrivate),
               let blockSums = device.makeBuffer(length: numBlocks * MemoryLayout<UInt32>.stride, options: .storageModePrivate),
               let scannedHistogram = device.makeBuffer(length: 256 * numBlocks * MemoryLayout<UInt32>.stride, options: .storageModePrivate),
-              let header = device.makeBuffer(length: MemoryLayout<CenterSortHeader>.stride, options: .storageModeShared),
+              let header = device.makeBuffer(length: MemoryLayout<HardwareStereoHeader>.stride, options: .storageModeShared),
               let sortHeader = device.makeBuffer(length: MemoryLayout<DepthFirstHeader>.stride, options: .storageModeShared),
               let sortDispatch = device.makeBuffer(length: dispatchArgsSize, options: .storageModeShared),
               let scanDispatch = device.makeBuffer(length: dispatchArgsSize, options: .storageModeShared),
@@ -128,10 +128,10 @@ final class HardwareResourceManager {
               let drawArgs = device.makeBuffer(length: drawArgsSize, options: .storageModeShared),
               let meshDrawArgs = device.makeBuffer(length: 12, options: .storageModePrivate)
         else {
-            throw RendererError.failedToAllocateBuffer(label: "HardwareCenterSortResources", size: paddedMax * dataSize)
+            throw RendererError.failedToAllocateBuffer(label: "HardwareStereoResources", size: paddedMax * dataSize)
         }
 
-        let resources = HardwareCenterSortResources(
+        let resources = HardwareStereoResources(
             projected: projected,
             projectedSorted: projectedSorted,
             depthKeys: depthKeys,
@@ -155,8 +155,8 @@ final class HardwareResourceManager {
             numBlocks: numBlocks
         )
 
-        centerSortResources = resources
-        maxCenterSortGaussians = newMax
+        stereoResources = resources
+        maxStereoGaussians = newMax
         return resources
     }
 
@@ -191,7 +191,7 @@ final class HardwareResourceManager {
               let histogram = device.makeBuffer(length: 256 * numBlocks * MemoryLayout<UInt32>.stride, options: .storageModePrivate),
               let blockSums = device.makeBuffer(length: numBlocks * MemoryLayout<UInt32>.stride, options: .storageModePrivate),
               let scannedHistogram = device.makeBuffer(length: 256 * numBlocks * MemoryLayout<UInt32>.stride, options: .storageModePrivate),
-              let header = device.makeBuffer(length: MemoryLayout<MonoRenderHeader>.stride, options: .storageModeShared),
+              let header = device.makeBuffer(length: MemoryLayout<HardwareMonoHeader>.stride, options: .storageModeShared),
               let sortHeader = device.makeBuffer(length: MemoryLayout<DepthFirstHeader>.stride, options: .storageModeShared),
               let sortDispatch = device.makeBuffer(length: dispatchArgsSize, options: .storageModeShared),
               let scanDispatch = device.makeBuffer(length: dispatchArgsSize, options: .storageModeShared),
@@ -247,12 +247,10 @@ public final class HardwareRenderer: GaussianRenderer, @unchecked Sendable {
     private let inputIsSRGB: Bool
 
     // Shared encoders
-    private let centerProjectionEncoder: CenterProjectionEncoder
-    private let monoProjectionEncoder: MonoProjectionEncoder
-    private let prepareDispatchEncoder: PrepareDispatchEncoder
-    private let initIndicesEncoder: InitIndicesEncoder
+    private let projectCullEncoder: HardwareProjectCullEncoder
+    private let dispatchSetupEncoder: HardwareDispatchSetupEncoder
     private let depthRadixSortEncoder: DepthRadixSortEncoder
-    private let reorderDataEncoder: ReorderDataEncoder
+    private let reorderEncoder: HardwareReorderEncoder
     private let visibilityCompactionEncoder: VisibilityCompactionEncoder
 
     // Backends
@@ -290,12 +288,10 @@ public final class HardwareRenderer: GaussianRenderer, @unchecked Sendable {
         }
         let depthFirstLib = try device.makeLibrary(URL: depthFirstLibURL)
 
-        self.centerProjectionEncoder = try CenterProjectionEncoder(device: device, library: hardwareLib)
-        self.monoProjectionEncoder = try MonoProjectionEncoder(device: device, library: hardwareLib)
-        self.prepareDispatchEncoder = try PrepareDispatchEncoder(device: device, library: hardwareLib)
-        self.initIndicesEncoder = try InitIndicesEncoder(device: device, library: hardwareLib)
+        self.projectCullEncoder = try HardwareProjectCullEncoder(device: device, library: hardwareLib)
+        self.dispatchSetupEncoder = try HardwareDispatchSetupEncoder(device: device, library: hardwareLib)
         self.depthRadixSortEncoder = try DepthRadixSortEncoder(device: device, library: depthFirstLib, precision: depthSortKeyPrecision)
-        self.reorderDataEncoder = try ReorderDataEncoder(device: device, library: hardwareLib)
+        self.reorderEncoder = try HardwareReorderEncoder(device: device, library: hardwareLib)
         self.visibilityCompactionEncoder = try VisibilityCompactionEncoder(
             device: device,
             library: depthFirstLib,
@@ -325,7 +321,7 @@ public final class HardwareRenderer: GaussianRenderer, @unchecked Sendable {
             )
             let encoder = MeshRenderEncoder(
                 initializePipeline: pipelines.initialize,
-                centerSortPipeline: pipelines.centerSortDraw,
+                stereoPipeline: pipelines.stereoDraw,
                 postprocessPipeline: pipelines.postprocess,
                 monoPipeline: pipelines.mono,
                 depthStencilState: depthStencilState,
@@ -345,7 +341,7 @@ public final class HardwareRenderer: GaussianRenderer, @unchecked Sendable {
             let quadIndexBuffer = Self.makeQuadIndexBuffer(device: device)
             let encoder = InstancedRenderEncoder(
                 initializePipeline: pipelines.initialize,
-                centerSortPipeline: pipelines.centerSortDraw,
+                stereoPipeline: pipelines.stereoDraw,
                 postprocessPipeline: pipelines.postprocess,
                 monoPipeline: pipelines.mono,
                 depthStencilState: pipelines.depthStencilState,
@@ -398,7 +394,7 @@ public final class HardwareRenderer: GaussianRenderer, @unchecked Sendable {
     ) {
         switch target {
         case .sideBySide(let colorTexture, let depthTexture):
-            renderSideBySideCenterSort(
+            renderStereoSideBySide(
                 commandBuffer: commandBuffer,
                 colorTexture: colorTexture,
                 depthTexture: depthTexture,
@@ -414,7 +410,7 @@ public final class HardwareRenderer: GaussianRenderer, @unchecked Sendable {
             )
 
         case .foveated(let drawable, let configuration):
-            renderFoveatedStereoCenterSort(
+            renderStereoFoveated(
                 commandBuffer: commandBuffer,
                 drawable: drawable,
                 input: input,
@@ -443,7 +439,7 @@ public final class HardwareRenderer: GaussianRenderer, @unchecked Sendable {
             blitEncoder.endEncoding()
         }
 
-        monoProjectionEncoder.encode(
+        projectCullEncoder.encodeMono(
             commandBuffer: commandBuffer,
             input: input,
             projected: resources.projected,
@@ -470,8 +466,8 @@ public final class HardwareRenderer: GaussianRenderer, @unchecked Sendable {
             maxCountCapacity: resources.paddedMax
         )
 
-        let sortConfig = PrepareDispatchConfig(numBlocks: resources.numBlocks)
-        prepareDispatchEncoder.encodeMono(
+        let sortConfig = HardwareDispatchSetupConfig(numBlocks: resources.numBlocks)
+        dispatchSetupEncoder.encodeMono(
             commandBuffer: commandBuffer,
             counter: resources.counter,
             header: resources.header,
@@ -501,7 +497,7 @@ public final class HardwareRenderer: GaussianRenderer, @unchecked Sendable {
             label: "Mono"
         )
 
-        reorderDataEncoder.encodeMono(
+        reorderEncoder.encodeMono(
             commandBuffer: commandBuffer,
             projected: resources.projected,
             sortedIndices: resources.sortedIndices,
@@ -526,7 +522,7 @@ public final class HardwareRenderer: GaussianRenderer, @unchecked Sendable {
             )
 
         case .mesh(let encoder):
-            prepareDispatchEncoder.encodeMeshDrawArgs(
+            dispatchSetupEncoder.encodeMeshDrawArgs(
                 commandBuffer: commandBuffer,
                 header: resources.header,
                 meshDrawArgs: resources.meshDrawArgs
@@ -547,7 +543,7 @@ public final class HardwareRenderer: GaussianRenderer, @unchecked Sendable {
 
     // MARK: - Stereo (Center Sort)
 
-    private func renderSideBySideCenterSort(
+    private func renderStereoSideBySide(
         commandBuffer: MTLCommandBuffer,
         colorTexture: MTLTexture,
         depthTexture: MTLTexture?,
@@ -559,8 +555,8 @@ public final class HardwareRenderer: GaussianRenderer, @unchecked Sendable {
         guard input.gaussianCount > 0 else { return }
 
         do {
-            let resources = try resourceManager.ensureCenterSortResources(gaussianCount: input.gaussianCount)
-            renderCenterSortInternal(
+            let resources = try resourceManager.ensureStereoResources(gaussianCount: input.gaussianCount)
+            renderStereoInternal(
                 commandBuffer: commandBuffer,
                 colorTexture: colorTexture,
                 depthTexture: depthTexture,
@@ -572,11 +568,11 @@ public final class HardwareRenderer: GaussianRenderer, @unchecked Sendable {
                 height: eyeHeight
             )
         } catch {
-            print("Failed to allocate center-sort resources: \(error)")
+            print("Failed to allocate stereo resources: \(error)")
         }
     }
 
-    private func renderFoveatedStereoCenterSort(
+    private func renderStereoFoveated(
         commandBuffer: MTLCommandBuffer,
         drawable: FoveatedStereoDrawable,
         input: GaussianInput,
@@ -587,8 +583,8 @@ public final class HardwareRenderer: GaussianRenderer, @unchecked Sendable {
         guard input.gaussianCount > 0 else { return }
 
         do {
-            let resources = try resourceManager.ensureCenterSortResources(gaussianCount: input.gaussianCount)
-            renderCenterSortInternal(
+            let resources = try resourceManager.ensureStereoResources(gaussianCount: input.gaussianCount)
+            renderStereoInternal(
                 commandBuffer: commandBuffer,
                 colorTexture: drawable.colorTexture,
                 depthTexture: drawable.depthTexture,
@@ -600,28 +596,28 @@ public final class HardwareRenderer: GaussianRenderer, @unchecked Sendable {
                 height: height
             )
         } catch {
-            print("Failed to allocate center-sort resources: \(error)")
+            print("Failed to allocate stereo resources: \(error)")
         }
     }
 
-    private func renderCenterSortInternal(
+    private func renderStereoInternal(
         commandBuffer: MTLCommandBuffer,
         colorTexture: MTLTexture,
         depthTexture: MTLTexture?,
         rasterizationRateMap: MTLRasterizationRateMap?,
         input: GaussianInput,
         configuration: StereoConfiguration,
-        resources: HardwareCenterSortResources,
+        resources: HardwareStereoResources,
         width: Int,
         height: Int
     ) {
         if let blitEncoder = commandBuffer.makeBlitCommandEncoder() {
-            blitEncoder.label = "ResetCenterSortCounter"
+            blitEncoder.label = "ResetStereoCounter"
             blitEncoder.fill(buffer: resources.visibleCount, range: 0..<4, value: 0)
             blitEncoder.endEncoding()
         }
 
-        centerProjectionEncoder.encode(
+        projectCullEncoder.encodeStereo(
             commandBuffer: commandBuffer,
             input: input,
             projected: resources.projected,
@@ -648,8 +644,8 @@ public final class HardwareRenderer: GaussianRenderer, @unchecked Sendable {
             maxCountCapacity: resources.paddedMax
         )
 
-        let centerConfig = PrepareDispatchConfig(numBlocks: resources.numBlocks)
-        prepareDispatchEncoder.encodeCenterSort(
+        let centerConfig = HardwareDispatchSetupConfig(numBlocks: resources.numBlocks)
+        dispatchSetupEncoder.encodeStereo(
             commandBuffer: commandBuffer,
             visibleCount: resources.visibleCount,
             header: resources.header,
@@ -675,10 +671,10 @@ public final class HardwareRenderer: GaussianRenderer, @unchecked Sendable {
             sortHeader: resources.sortHeader,
             sortDispatch: resources.sortDispatch,
             scanDispatch: resources.scanDispatch,
-            label: "CenterSort"
+            label: "Stereo"
         )
 
-        reorderDataEncoder.encodeCenterSort(
+        reorderEncoder.encodeStereo(
             commandBuffer: commandBuffer,
             projected: resources.projected,
             sortedIndices: resources.sortedIndices,
@@ -690,7 +686,7 @@ public final class HardwareRenderer: GaussianRenderer, @unchecked Sendable {
 
         switch backendImpl {
         case .instanced(let encoder):
-            prepareDispatchEncoder.encodeCenterSortDrawArgs(
+            dispatchSetupEncoder.encodeStereoDrawArgs(
                 commandBuffer: commandBuffer,
                 header: resources.header,
                 drawArgs: resources.drawArgs
@@ -709,7 +705,7 @@ public final class HardwareRenderer: GaussianRenderer, @unchecked Sendable {
             )
 
         case .mesh(let encoder):
-            prepareDispatchEncoder.encodeMeshDrawArgs(
+            dispatchSetupEncoder.encodeMeshDrawArgs(
                 commandBuffer: commandBuffer,
                 header: resources.header,
                 meshDrawArgs: resources.meshDrawArgs
@@ -735,7 +731,7 @@ public final class HardwareRenderer: GaussianRenderer, @unchecked Sendable {
 private extension HardwareRenderer {
     struct InstancedPipelines {
         let initialize: MTLRenderPipelineState
-        let centerSortDraw: MTLRenderPipelineState
+        let stereoDraw: MTLRenderPipelineState
         let postprocess: MTLRenderPipelineState
         let mono: MTLRenderPipelineState
         let depthStencilState: MTLDepthStencilState
@@ -750,11 +746,11 @@ private extension HardwareRenderer {
         depthStencilState: MTLDepthStencilState,
         noDepthStencilState: MTLDepthStencilState
     ) throws -> InstancedPipelines {
-        guard let centerVertexFn = library.makeFunction(name: "centerSortInstancedVertex"),
+        guard let centerVertexFn = library.makeFunction(name: "stereoInstancedVertex"),
               let initFn = library.makeFunction(name: "initializeFragmentStore"),
               let postVertexFn = library.makeFunction(name: "postprocessVertexShader"),
               let postFragmentFn = library.makeFunction(name: "postprocessFragmentShader"),
-              let centerFragmentFn = library.makeFunction(name: backToFront ? "centerSortInstancedFragmentBackToFront" : "centerSortInstancedFragment") else {
+              let centerFragmentFn = library.makeFunction(name: backToFront ? "stereoInstancedFragmentBackToFront" : "stereoInstancedFragment") else {
             throw RendererError.failedToCreatePipeline("Render shader functions not found")
         }
 
@@ -771,7 +767,7 @@ private extension HardwareRenderer {
         drawDesc.depthAttachmentPixelFormat = .depth32Float
         drawDesc.inputPrimitiveTopology = .triangle
         drawDesc.maxVertexAmplificationCount = 2
-        let centerSortDrawPipeline = try device.makeRenderPipelineState(descriptor: drawDesc)
+        let stereoDrawPipeline = try device.makeRenderPipelineState(descriptor: drawDesc)
 
         let postDesc = MTLRenderPipelineDescriptor()
         postDesc.vertexFunction = postVertexFn
@@ -809,7 +805,7 @@ private extension HardwareRenderer {
 
         return InstancedPipelines(
             initialize: initializePipeline,
-            centerSortDraw: centerSortDrawPipeline,
+            stereoDraw: stereoDrawPipeline,
             postprocess: postprocessPipeline,
             mono: monoPipeline,
             depthStencilState: depthStencilState,
@@ -819,7 +815,7 @@ private extension HardwareRenderer {
 
     struct MeshPipelines {
         let initialize: MTLRenderPipelineState
-        let centerSortDraw: MTLRenderPipelineState
+        let stereoDraw: MTLRenderPipelineState
         let postprocess: MTLRenderPipelineState
         let mono: MTLRenderPipelineState
     }
@@ -836,9 +832,9 @@ private extension HardwareRenderer {
         let centerGaussiansPerObjectTG = 64
         let centerGaussiansPerMeshTG = 16
 
-        guard let centerObjectFn = library.makeFunction(name: "centerSortObjectShader"),
-              let centerMeshFn = library.makeFunction(name: "centerSortMeshShader") else {
-            throw RendererError.failedToCreatePipeline("Center-sort mesh shader functions not found")
+        guard let centerObjectFn = library.makeFunction(name: "stereoObjectShader"),
+              let centerMeshFn = library.makeFunction(name: "stereoMeshShader") else {
+            throw RendererError.failedToCreatePipeline("Stereo mesh shader functions not found")
         }
 
         guard let initFn = library.makeFunction(name: "initializeFragmentStore"),
@@ -860,12 +856,12 @@ private extension HardwareRenderer {
         centerDrawDesc.fragmentFunction = centerFragmentFn
         centerDrawDesc.colorAttachments[0].pixelFormat = colorFormat
         centerDrawDesc.depthAttachmentPixelFormat = .depth32Float
-        centerDrawDesc.payloadMemoryLength = MemoryLayout<CenterSortGaussianData>.stride * centerGaussiansPerObjectTG + 16
+        centerDrawDesc.payloadMemoryLength = MemoryLayout<HardwareProjectedGaussian>.stride * centerGaussiansPerObjectTG + 16
         centerDrawDesc.maxTotalThreadsPerObjectThreadgroup = centerGaussiansPerObjectTG
         centerDrawDesc.maxTotalThreadsPerMeshThreadgroup = meshThreads
         centerDrawDesc.maxTotalThreadgroupsPerMeshGrid = (centerGaussiansPerObjectTG + centerGaussiansPerMeshTG - 1) / centerGaussiansPerMeshTG
         centerDrawDesc.maxVertexAmplificationCount = 2
-        let centerSortDrawPipeline = try device.makeRenderPipelineState(descriptor: centerDrawDesc, options: []).0
+        let stereoDrawPipeline = try device.makeRenderPipelineState(descriptor: centerDrawDesc, options: []).0
 
         let postDesc = MTLRenderPipelineDescriptor()
         postDesc.vertexFunction = postVertexFn
@@ -909,7 +905,7 @@ private extension HardwareRenderer {
 
         return MeshPipelines(
             initialize: initializePipeline,
-            centerSortDraw: centerSortDrawPipeline,
+            stereoDraw: stereoDrawPipeline,
             postprocess: postprocessPipeline,
             mono: monoPipeline
         )

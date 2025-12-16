@@ -304,7 +304,7 @@ kernel void localScanPartialSums(
     }
 }
 
-// Fused finalize scan + compact active tiles
+// Finalize scan + compact active tiles
 kernel void localFinalizeScanAndZero(
     device uint* output [[buffer(0)]],
     const device uint* counters [[buffer(1)]],

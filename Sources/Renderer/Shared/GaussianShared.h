@@ -193,7 +193,7 @@ inline float2 ndcToScreenCentered(float2 ndc, float width, float height) {
 }
 
 // ============================================================================
-// Unified Projection Helpers - Z-sign agnostic
+// Shared projection helpers - Z-sign agnostic
 // Works with both OpenCV (+Z forward) and OpenGL (-Z forward) conventions
 // ============================================================================
 
@@ -332,7 +332,7 @@ inline float3x3 buildCovariance3D(float3 scale, float4 quat) {
 }
 
 // ============================================================================
-// Unified Covariance Projection - THE canonical function
+// Shared covariance projection - canonical function
 // Z-sign agnostic: works with both OpenCV (+Z forward) and OpenGL (-Z forward)
 // Derives focal length from projection matrix for correctness
 // ============================================================================
@@ -812,7 +812,7 @@ inline bool intersectsTileHalf(
 }
 
 // ============================================================================
-// Unified Covariance Stabilization
+// Shared covariance stabilization
 // Ensures numerical stability for half-precision packing and prevents
 // degenerate conics (needles/lines). Use this before packing to half.
 // ============================================================================
@@ -879,7 +879,7 @@ inline float2x2 stabilizeCovariance2D(float2x2 cov, float2 screenSize) {
 }
 
 // ============================================================================
-// Unified Culling Helpers
+// Shared culling helpers
 // These consolidate the duplicated culling logic across all projection kernels
 // ============================================================================
 
@@ -951,7 +951,7 @@ inline bool cullByScreenBounds(
 }
 
 // ============================================================================
-// Unified Tile Bounds Computation
+// Shared tile bounds computation
 // ============================================================================
 
 struct TileBounds {
@@ -1002,7 +1002,7 @@ inline TileBounds computeTileBounds(
 }
 
 // ============================================================================
-// Unified Gaussian Projection Result
+// Shared Gaussian projection result
 // Contains all computed values from projection + culling
 // ============================================================================
 

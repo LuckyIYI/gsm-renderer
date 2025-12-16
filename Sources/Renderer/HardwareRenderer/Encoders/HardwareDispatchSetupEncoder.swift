@@ -2,7 +2,7 @@ import Metal
 import RendererTypes
 
 /// Configuration for dispatch preparation
-struct PrepareDispatchConfig {
+struct HardwareDispatchSetupConfig {
     let radixBlockSize: Int
     let radixGrainSize: Int
     let reorderThreadgroupSize: Int
@@ -22,23 +22,23 @@ struct PrepareDispatchConfig {
 }
 
 /// Encoder for preparing indirect dispatch arguments based on visible Gaussian counts.
-/// Handles center-sort (stereo) and mono rendering modes.
-final class PrepareDispatchEncoder {
-    private let centerSortPipeline: MTLComputePipelineState
+/// Handles hardware stereo and mono rendering modes.
+final class HardwareDispatchSetupEncoder {
+    private let stereoPipeline: MTLComputePipelineState
     private let monoSortPipeline: MTLComputePipelineState
-    private let centerSortDrawArgsPipeline: MTLComputePipelineState
+    private let stereoDrawArgsPipeline: MTLComputePipelineState
     private let meshDrawArgsPipeline: MTLComputePipelineState?
 
     init(device: MTLDevice, library: MTLLibrary) throws {
-        guard let centerFn = library.makeFunction(name: "prepareCenterSortKernel"),
+        guard let centerFn = library.makeFunction(name: "prepareStereoSortKernel"),
               let monoFn = library.makeFunction(name: "prepareMonoSortKernel"),
-              let drawArgsFn = library.makeFunction(name: "prepareCenterSortDrawArgsKernel") else {
+              let drawArgsFn = library.makeFunction(name: "prepareStereoDrawArgsKernel") else {
             throw RendererError.failedToCreatePipeline("Prepare dispatch kernels not found")
         }
 
-        self.centerSortPipeline = try device.makeComputePipelineState(function: centerFn)
+        self.stereoPipeline = try device.makeComputePipelineState(function: centerFn)
         self.monoSortPipeline = try device.makeComputePipelineState(function: monoFn)
-        self.centerSortDrawArgsPipeline = try device.makeComputePipelineState(function: drawArgsFn)
+        self.stereoDrawArgsPipeline = try device.makeComputePipelineState(function: drawArgsFn)
 
         // Mesh draw args pipeline (optional - only available if mesh shaders are supported)
         if let meshDrawArgsFn = library.makeFunction(name: "prepareMeshDrawArgsKernel") {
@@ -48,8 +48,8 @@ final class PrepareDispatchEncoder {
         }
     }
 
-    /// Encode preparation for center-sort stereo (single center viewpoint sort)
-    func encodeCenterSort(
+    /// Encode preparation for hardware stereo (single shared sort)
+    func encodeStereo(
         commandBuffer: MTLCommandBuffer,
         visibleCount: MTLBuffer,
         header: MTLBuffer,
@@ -57,11 +57,11 @@ final class PrepareDispatchEncoder {
         sortDispatch: MTLBuffer,
         scanDispatch: MTLBuffer,
         reorderDispatch: MTLBuffer,
-        config: PrepareDispatchConfig
+        config: HardwareDispatchSetupConfig
     ) {
         guard let encoder = commandBuffer.makeComputeCommandEncoder() else { return }
-        encoder.label = "CenterPrepareSort"
-        encoder.setComputePipelineState(centerSortPipeline)
+        encoder.label = "PrepareStereoSort"
+        encoder.setComputePipelineState(stereoPipeline)
 
         encoder.setBuffer(visibleCount, offset: 0, index: 0)
         encoder.setBuffer(header, offset: 0, index: 1)
@@ -93,7 +93,7 @@ final class PrepareDispatchEncoder {
         scanDispatch: MTLBuffer,
         reorderDispatch: MTLBuffer,
         drawArgs: MTLBuffer,
-        config: PrepareDispatchConfig
+        config: HardwareDispatchSetupConfig
     ) {
         guard let encoder = commandBuffer.makeComputeCommandEncoder() else { return }
         encoder.label = "PrepareMonoSort"
@@ -120,15 +120,15 @@ final class PrepareDispatchEncoder {
         encoder.endEncoding()
     }
 
-    /// Encode preparation of draw args for center-sort stereo (separate kernel)
-    func encodeCenterSortDrawArgs(
+    /// Encode preparation of draw args for hardware stereo (instanced backend)
+    func encodeStereoDrawArgs(
         commandBuffer: MTLCommandBuffer,
         header: MTLBuffer,
         drawArgs: MTLBuffer
     ) {
         guard let encoder = commandBuffer.makeComputeCommandEncoder() else { return }
-        encoder.label = "PrepareCenterSortDrawArgs"
-        encoder.setComputePipelineState(centerSortDrawArgsPipeline)
+        encoder.label = "PrepareStereoDrawArgs"
+        encoder.setComputePipelineState(stereoDrawArgsPipeline)
 
         encoder.setBuffer(header, offset: 0, index: 0)
         encoder.setBuffer(drawArgs, offset: 0, index: 1)

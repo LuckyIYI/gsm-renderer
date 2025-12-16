@@ -229,7 +229,7 @@ public struct RendererConfig: Sendable {
 
 // MARK: - Stereo Render Target
 
-/// Unified stereo render target - all stereo rendering goes through this
+/// Stereo render target - all stereo rendering goes through this
 public enum StereoRenderTarget: Sendable {
     /// Render side-by-side to a single texture (left eye on left half, right eye on right half)
     case sideBySide(colorTexture: MTLTexture, depthTexture: MTLTexture?)

@@ -174,13 +174,13 @@ inline EyeProjected projectGaussianForEye(
 // so projection kernels must write per-gaussian outputs at `gid` (not atomic append).
 
 template<typename GaussianType, typename HarmonicType>
-void centerSortProjectImpl(
+void stereoProjectCullImpl(
     const device GaussianType* gaussians,
     const device HarmonicType* harmonics,
-    device CenterSortGaussianData* projected,
+    device HardwareProjectedGaussian* projected,
     device uint* preDepthKeys,
     device uint* visibilityMarks,
-    constant CenterSortProjectionParams& params,
+    constant HardwareStereoProjectionParams& params,
     uint gid
 ) {
     if (gid >= params.gaussianCount) return;
@@ -263,7 +263,7 @@ void centerSortProjectImpl(
     color = max(color + 0.5f, 0.0f);
     color = maybeDecodeSRGBToLinear(color, params.inputIsSRGB);
 
-    CenterSortGaussianData data;
+    HardwareProjectedGaussian data;
     data.leftScreenX = half(left.screenPos.x);
     data.leftScreenY = half(left.screenPos.y);
     data.rightScreenX = half(right.screenPos.x);
@@ -284,33 +284,33 @@ void centerSortProjectImpl(
     visibilityMarks[gid] = 1u;
 }
 
-kernel void centerSortProjectKernel(
+kernel void stereoProjectCullKernel(
     const device PackedWorldGaussian* gaussians [[buffer(0)]],
     const device float* harmonics [[buffer(1)]],
-    device CenterSortGaussianData* projected [[buffer(2)]],
+    device HardwareProjectedGaussian* projected [[buffer(2)]],
     device uint* preDepthKeys [[buffer(3)]],
     device uint* visibilityMarks [[buffer(4)]],
-    constant CenterSortProjectionParams& params [[buffer(5)]],
+    constant HardwareStereoProjectionParams& params [[buffer(5)]],
     uint gid [[thread_position_in_grid]]
 ) {
-    centerSortProjectImpl(gaussians, harmonics, projected, preDepthKeys, visibilityMarks, params, gid);
+    stereoProjectCullImpl(gaussians, harmonics, projected, preDepthKeys, visibilityMarks, params, gid);
 }
 
-kernel void centerSortProjectKernelHalf(
+kernel void stereoProjectCullKernelHalf(
     const device PackedWorldGaussianHalf* gaussians [[buffer(0)]],
     const device half* harmonics [[buffer(1)]],
-    device CenterSortGaussianData* projected [[buffer(2)]],
+    device HardwareProjectedGaussian* projected [[buffer(2)]],
     device uint* preDepthKeys [[buffer(3)]],
     device uint* visibilityMarks [[buffer(4)]],
-    constant CenterSortProjectionParams& params [[buffer(5)]],
+    constant HardwareStereoProjectionParams& params [[buffer(5)]],
     uint gid [[thread_position_in_grid]]
 ) {
-    centerSortProjectImpl(gaussians, harmonics, projected, preDepthKeys, visibilityMarks, params, gid);
+    stereoProjectCullImpl(gaussians, harmonics, projected, preDepthKeys, visibilityMarks, params, gid);
 }
 
-kernel void prepareCenterSortKernel(
+kernel void prepareStereoSortKernel(
     device const uint* count [[buffer(0)]],
-    device CenterSortHeader* header [[buffer(1)]],
+    device HardwareStereoHeader* header [[buffer(1)]],
     device DepthFirstHeader* sortHeader [[buffer(2)]],
     device DispatchIndirectArgs* sortDispatch [[buffer(3)]],
     device DispatchIndirectArgs* scanDispatch [[buffer(4)]],
@@ -351,19 +351,10 @@ kernel void prepareCenterSortKernel(
     reorderDispatch->threadgroupsPerGridZ = 1;
 }
 
-kernel void initCenterSortIndicesKernel(
-    device uint* indices [[buffer(0)]],
-    constant uint& maxCount [[buffer(1)]],
-    uint gid [[thread_position_in_grid]]
-) {
-    if (gid >= maxCount) return;
-    indices[gid] = gid;
-}
-
-kernel void reorderCenterSortDataKernel(
-    const device CenterSortGaussianData* srcData [[buffer(0)]],
+kernel void reorderStereoProjectedKernel(
+    const device HardwareProjectedGaussian* srcData [[buffer(0)]],
     const device uint* sortedIndices [[buffer(1)]],
-    device CenterSortGaussianData* dstData [[buffer(2)]],
+    device HardwareProjectedGaussian* dstData [[buffer(2)]],
     device const uint* countPtr [[buffer(3)]],
     constant uint& backToFront [[buffer(4)]],
     uint gid [[thread_position_in_grid]]
@@ -377,14 +368,14 @@ kernel void reorderCenterSortDataKernel(
     dstData[gid] = srcData[srcIdx];
 }
 
-struct CenterSortVertexOut {
+struct HardwareStereoVertexOut {
     float4 position [[position]];
     half2 relativePosition;
     half3 color;
     half opacity;
 };
 
-kernel void prepareCenterSortDrawArgsKernel(
+kernel void prepareStereoDrawArgsKernel(
     device const uint* count [[buffer(0)]],
     device DrawIndexedIndirectArgs* drawArgs [[buffer(1)]],
     uint tid [[thread_position_in_grid]]
@@ -427,19 +418,19 @@ kernel void prepareMeshDrawArgsKernel(
     drawArgs->threadgroupsPerGridZ = 1;
 }
 
-vertex CenterSortVertexOut centerSortInstancedVertex(
+vertex HardwareStereoVertexOut stereoInstancedVertex(
     uint vertexId [[vertex_id]],
     uint instanceId [[instance_id]],
     ushort ampId [[amplification_id]],
-    const device CenterSortGaussianData* gaussians [[buffer(0)]],
-    constant CenterSortRenderUniforms& uniforms [[buffer(1)]],
+    const device HardwareProjectedGaussian* gaussians [[buffer(0)]],
+    constant HardwareRenderUniforms& uniforms [[buffer(1)]],
     constant uint& visibleCount [[buffer(2)]]
 ) {
     uint localSplatIndex = vertexId / 4;
     uint cornerIndex = vertexId % 4;
     uint gaussianIndex = instanceId * MAX_INDEXED_SPLAT_COUNT + localSplatIndex;
 
-    CenterSortVertexOut out;
+    HardwareStereoVertexOut out;
     if (gaussianIndex >= visibleCount) {
         // Clip immediately (avoid undefined behavior with w=0)
         out.position = float4(2.0f, 2.0f, 1.0f, 1.0f);
@@ -449,7 +440,7 @@ vertex CenterSortVertexOut centerSortInstancedVertex(
         return out;
     }
 
-    CenterSortGaussianData g = gaussians[gaussianIndex];
+    HardwareProjectedGaussian g = gaussians[gaussianIndex];
 
     half2 center = (ampId == 0)
         ? half2(g.leftScreenX, g.leftScreenY)
@@ -495,8 +486,8 @@ vertex CenterSortVertexOut centerSortInstancedVertex(
     return out;
 }
 
-fragment DepthFragmentStore centerSortInstancedFragment(
-    CenterSortVertexOut in [[stage_in]],
+fragment DepthFragmentStore stereoInstancedFragment(
+    HardwareStereoVertexOut in [[stage_in]],
     DepthFragmentValues previous [[imageblock_data]]
 ) {
     DepthFragmentStore out;
@@ -518,8 +509,8 @@ fragment DepthFragmentStore centerSortInstancedFragment(
     return out;
 }
 
-fragment DepthFragmentStore centerSortInstancedFragmentBackToFront(
-    CenterSortVertexOut in [[stage_in]],
+fragment DepthFragmentStore stereoInstancedFragmentBackToFront(
+    HardwareStereoVertexOut in [[stage_in]],
     DepthFragmentValues previous [[imageblock_data]]
 ) {
     DepthFragmentStore out;
@@ -545,13 +536,13 @@ fragment DepthFragmentStore centerSortInstancedFragmentBackToFront(
 // ============================================================================
 
 template<typename GaussianType, typename HarmonicType>
-void monoProjectImpl(
+void monoProjectCullImpl(
     const device GaussianType* gaussians,
     const device HarmonicType* harmonics,
     device InstancedGaussianData* projected,
     device uint* preDepthKeys,
     device uint* visibilityMarks,
-    constant MonoProjectionParams& params,
+    constant HardwareMonoProjectionParams& params,
     uint gid
 ) {
     if (gid >= params.gaussianCount) return;
@@ -623,33 +614,33 @@ void monoProjectImpl(
     visibilityMarks[gid] = 1u;
 }
 
-kernel void monoProjectKernel(
+kernel void monoProjectCullKernel(
     const device PackedWorldGaussian* gaussians [[buffer(0)]],
     const device float* harmonics [[buffer(1)]],
     device InstancedGaussianData* projected [[buffer(2)]],
     device uint* preDepthKeys [[buffer(3)]],
     device uint* visibilityMarks [[buffer(4)]],
-    constant MonoProjectionParams& params [[buffer(5)]],
+    constant HardwareMonoProjectionParams& params [[buffer(5)]],
     uint gid [[thread_position_in_grid]]
 ) {
-    monoProjectImpl(gaussians, harmonics, projected, preDepthKeys, visibilityMarks, params, gid);
+    monoProjectCullImpl(gaussians, harmonics, projected, preDepthKeys, visibilityMarks, params, gid);
 }
 
-kernel void monoProjectKernelHalf(
+kernel void monoProjectCullKernelHalf(
     const device PackedWorldGaussianHalf* gaussians [[buffer(0)]],
     const device half* harmonics [[buffer(1)]],
     device InstancedGaussianData* projected [[buffer(2)]],
     device uint* preDepthKeys [[buffer(3)]],
     device uint* visibilityMarks [[buffer(4)]],
-    constant MonoProjectionParams& params [[buffer(5)]],
+    constant HardwareMonoProjectionParams& params [[buffer(5)]],
     uint gid [[thread_position_in_grid]]
 ) {
-    monoProjectImpl(gaussians, harmonics, projected, preDepthKeys, visibilityMarks, params, gid);
+    monoProjectCullImpl(gaussians, harmonics, projected, preDepthKeys, visibilityMarks, params, gid);
 }
 
 kernel void prepareMonoSortKernel(
     device const uint* count [[buffer(0)]],
-    device MonoRenderHeader* header [[buffer(1)]],
+    device HardwareMonoHeader* header [[buffer(1)]],
     device DepthFirstHeader* sortHeader [[buffer(2)]],
     device DispatchIndirectArgs* sortDispatch [[buffer(3)]],
     device DispatchIndirectArgs* scanDispatch [[buffer(4)]],
@@ -700,15 +691,6 @@ kernel void prepareMonoSortKernel(
     drawArgs->baseInstance = 0;
 }
 
-kernel void initMonoIndicesKernel(
-    device uint* indices [[buffer(0)]],
-    constant uint& maxCount [[buffer(1)]],
-    uint gid [[thread_position_in_grid]]
-) {
-    if (gid >= maxCount) return;
-    indices[gid] = gid;
-}
-
 kernel void reorderMonoDataKernel(
     const device InstancedGaussianData* srcData [[buffer(0)]],
     const device uint* sortedIndices [[buffer(1)]],
@@ -738,7 +720,7 @@ vertex MonoVertexOut monoGaussianVertex(
     uint vertexId [[vertex_id]],
     uint instanceId [[instance_id]],
     const device InstancedGaussianData* gaussians [[buffer(0)]],
-    constant CenterSortRenderUniforms& uniforms [[buffer(1)]],
+    constant HardwareRenderUniforms& uniforms [[buffer(1)]],
     constant uint& visibleCount [[buffer(2)]]
 ) {
     uint localSplatIndex = vertexId / 4;
@@ -882,16 +864,16 @@ constant uint CENTER_MESH_THREADS = CENTER_GAUSSIANS_PER_MESH_TG * VERTICES_PER_
 constant uint CENTER_MESH_VERTICES = CENTER_GAUSSIANS_PER_MESH_TG * VERTICES_PER_GAUSSIAN;
 constant uint CENTER_MESH_TRIANGLES = CENTER_GAUSSIANS_PER_MESH_TG * TRIANGLES_PER_GAUSSIAN;
 
-struct CenterSortPayload {
-    CenterSortGaussianData gaussians[CENTER_GAUSSIANS_PER_OBJECT_TG];
+struct HardwareStereoPayload {
+    HardwareProjectedGaussian gaussians[CENTER_GAUSSIANS_PER_OBJECT_TG];
     uint validCount;
 };
 
 [[object, max_total_threads_per_threadgroup(CENTER_GAUSSIANS_PER_OBJECT_TG)]]
-void centerSortObjectShader(
-    object_data CenterSortPayload& payload [[payload]],
-    const device CenterSortGaussianData* projectedSorted [[buffer(0)]],
-    constant CenterSortRenderUniforms& uniforms [[buffer(1)]],
+void stereoObjectShader(
+    object_data HardwareStereoPayload& payload [[payload]],
+    const device HardwareProjectedGaussian* projectedSorted [[buffer(0)]],
+    constant HardwareRenderUniforms& uniforms [[buffer(1)]],
     const device uint* visibleCountPtr [[buffer(2)]],
     uint tid [[thread_index_in_threadgroup]],
     uint tgid [[threadgroup_position_in_grid]],
@@ -917,13 +899,13 @@ void centerSortObjectShader(
     }
 }
 
-using CenterSortMesh = metal::mesh<VertexOut, PrimitiveOut, CENTER_MESH_VERTICES, CENTER_MESH_TRIANGLES, metal::topology::triangle>;
+using HardwareStereoMesh = metal::mesh<VertexOut, PrimitiveOut, CENTER_MESH_VERTICES, CENTER_MESH_TRIANGLES, metal::topology::triangle>;
 
 [[mesh, max_total_threads_per_threadgroup(CENTER_MESH_THREADS)]]
-void centerSortMeshShader(
-    CenterSortMesh output,
-    const object_data CenterSortPayload& payload [[payload]],
-    constant CenterSortRenderUniforms& uniforms [[buffer(1)]],
+void stereoMeshShader(
+    HardwareStereoMesh output,
+    const object_data HardwareStereoPayload& payload [[payload]],
+    constant HardwareRenderUniforms& uniforms [[buffer(1)]],
     uint tid [[thread_index_in_threadgroup]],
     uint tgid [[threadgroup_position_in_grid]],
     ushort ampId [[amplification_id]]
@@ -935,7 +917,7 @@ void centerSortMeshShader(
 
     VertexOut v;
     if (validGaussian) {
-        CenterSortGaussianData g = payload.gaussians[payloadGaussianIdx];
+        HardwareProjectedGaussian g = payload.gaussians[payloadGaussianIdx];
 
         half2 center = (ampId == 0)
             ? half2(g.leftScreenX, g.leftScreenY)
@@ -1026,7 +1008,7 @@ struct MonoObjectPayload {
 void monoObjectShader(
     object_data MonoObjectPayload& payload [[payload]],
     const device InstancedGaussianData* projectedSorted [[buffer(0)]],
-    constant CenterSortRenderUniforms& uniforms [[buffer(1)]],
+    constant HardwareRenderUniforms& uniforms [[buffer(1)]],
     const device uint* visibleCountPtr [[buffer(2)]],
     uint tid [[thread_index_in_threadgroup]],
     uint tgid [[threadgroup_position_in_grid]],
@@ -1058,7 +1040,7 @@ using MonoMesh = metal::mesh<MonoVertexOut, void, MESH_VERTICES, MESH_TRIANGLES,
 void monoMeshShader(
     MonoMesh output,
     const object_data MonoObjectPayload& payload [[payload]],
-    constant CenterSortRenderUniforms& uniforms [[buffer(1)]],
+    constant HardwareRenderUniforms& uniforms [[buffer(1)]],
     uint tid [[thread_index_in_threadgroup]],
     uint tgid [[threadgroup_position_in_grid]]
 ) {

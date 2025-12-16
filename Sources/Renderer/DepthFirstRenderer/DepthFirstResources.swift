@@ -103,42 +103,42 @@ final class DepthFirstViewResources {
             count: maxGaussians,
             type: GaussianRenderData.self,
             options: priv,
-            label: "RenderData"
+            label: "DepthFirstMono_RenderData"
         )
 
         self.bounds = try device.makeBuffer(
             count: maxGaussians,
             type: SIMD4<Int32>.self,
             options: priv,
-            label: "Bounds"
+            label: "DepthFirstMono_Bounds"
         )
 
         self.depthKeys = try device.makeBuffer(
             count: paddedGaussianCapacity,
             type: UInt32.self,
             options: priv,
-            label: "DepthKeys"
+            label: "DepthFirstMono_DepthKeys"
         )
 
         self.primitiveIndices = try device.makeBuffer(
             count: paddedGaussianCapacity,
             type: Int32.self,
             options: priv,
-            label: "PrimitiveIndices"
+            label: "DepthFirstMono_PrimitiveIndices"
         )
 
         self.nTouchedTiles = try device.makeBuffer(
             count: maxGaussians,
             type: UInt32.self,
             options: priv,
-            label: "NTouchedTiles"
+            label: "DepthFirstMono_NTouchedTiles"
         )
 
         self.orderedTileCounts = try device.makeBuffer(
             count: maxGaussians,
             type: UInt32.self,
             options: priv,
-            label: "OrderedTileCounts"
+            label: "DepthFirstMono_OrderedTileCounts"
         )
 
         // Counters (shared for CPU readback)
@@ -146,35 +146,35 @@ final class DepthFirstViewResources {
             count: 1,
             type: UInt32.self,
             options: shared,
-            label: "VisibleCount"
+            label: "DepthFirstMono_VisibleCount"
         )
 
         self.totalInstances = try device.makeBuffer(
             count: 1,
             type: UInt32.self,
             options: shared,
-            label: "TotalInstances"
+            label: "DepthFirstMono_TotalInstances"
         )
 
         self.activeTileCount = try device.makeBuffer(
             count: 1,
             type: UInt32.self,
             options: shared,
-            label: "ActiveTileCount"
+            label: "DepthFirstMono_ActiveTileCount"
         )
 
         // Header (32 bytes for DepthFirstHeader)
         guard let header = device.makeBuffer(length: 32, options: shared) else {
-            throw RendererError.failedToAllocateBuffer(label: "Header", size: 32)
+            throw RendererError.failedToAllocateBuffer(label: "DepthFirstMono_Header", size: 32)
         }
-        header.label = "Header"
+        header.label = "DepthFirstMono_Header"
         self.header = header
 
         self.dispatchArgs = try device.makeBuffer(
             count: DepthFirstDispatchSlot.count,
             type: DispatchIndirectArgsSwift.self,
             options: priv,
-            label: "DispatchArgs"
+            label: "DepthFirstMono_DispatchArgs"
         )
 
         let tileIdStride = tileIdPrecision == .bits32 ? MemoryLayout<UInt32>.stride : MemoryLayout<UInt16>.stride
@@ -185,18 +185,18 @@ final class DepthFirstViewResources {
             options: priv
         ) else {
             throw RendererError.failedToAllocateBuffer(
-                label: "InstanceTileIds",
+                label: "DepthFirstMono_InstanceTileIds",
                 size: paddedInstanceCapacity * tileIdStride
             )
         }
-        instanceTileIds.label = "InstanceTileIds"
+        instanceTileIds.label = "DepthFirstMono_InstanceTileIds"
         self.instanceTileIds = instanceTileIds
 
         self.instanceGaussianIndices = try device.makeBuffer(
             count: paddedInstanceCapacity,
             type: Int32.self,
             options: priv,
-            label: "InstanceGaussianIndices"
+            label: "DepthFirstMono_InstanceGaussianIndices"
         )
 
         // Tile headers
@@ -204,14 +204,14 @@ final class DepthFirstViewResources {
             count: tileCount,
             type: GaussianHeader.self,
             options: priv,
-            label: "TileHeaders"
+            label: "DepthFirstMono_TileHeaders"
         )
 
         self.activeTiles = try device.makeBuffer(
             count: tileCount,
             type: UInt32.self,
             options: priv,
-            label: "ActiveTiles"
+            label: "DepthFirstMono_ActiveTiles"
         )
 
         // Depth sort buffers
@@ -219,35 +219,35 @@ final class DepthFirstViewResources {
             count: gaussianGridSize * radix,
             type: UInt32.self,
             options: priv,
-            label: "DepthSortHistogram"
+            label: "DepthFirstMono_DepthSortHistogram"
         )
 
         self.depthSortBlockSums = try device.makeBuffer(
             count: gaussianGridSize,
             type: UInt32.self,
             options: priv,
-            label: "DepthSortBlockSums"
+            label: "DepthFirstMono_DepthSortBlockSums"
         )
 
         self.depthSortScannedHist = try device.makeBuffer(
             count: gaussianGridSize * radix,
             type: UInt32.self,
             options: priv,
-            label: "DepthSortScannedHist"
+            label: "DepthFirstMono_DepthSortScannedHist"
         )
 
         self.depthSortScratchKeys = try device.makeBuffer(
             count: paddedGaussianCapacity,
             type: UInt32.self,
             options: priv,
-            label: "DepthSortScratchKeys"
+            label: "DepthFirstMono_DepthSortScratchKeys"
         )
 
         self.depthSortScratchPayload = try device.makeBuffer(
             count: paddedGaussianCapacity,
             type: Int32.self,
             options: priv,
-            label: "DepthSortScratchPayload"
+            label: "DepthFirstMono_DepthSortScratchPayload"
         )
 
         // Tile sort buffers
@@ -255,21 +255,21 @@ final class DepthFirstViewResources {
             count: instanceGridSize * radix,
             type: UInt32.self,
             options: priv,
-            label: "TileSortHistogram"
+            label: "DepthFirstMono_TileSortHistogram"
         )
 
         self.tileSortBlockSums = try device.makeBuffer(
             count: instanceGridSize,
             type: UInt32.self,
             options: priv,
-            label: "TileSortBlockSums"
+            label: "DepthFirstMono_TileSortBlockSums"
         )
 
         self.tileSortScannedHist = try device.makeBuffer(
             count: instanceGridSize * radix,
             type: UInt32.self,
             options: priv,
-            label: "TileSortScannedHist"
+            label: "DepthFirstMono_TileSortScannedHist"
         )
 
         guard let tileSortScratchTileIds = device.makeBuffer(
@@ -277,18 +277,18 @@ final class DepthFirstViewResources {
             options: priv
         ) else {
             throw RendererError.failedToAllocateBuffer(
-                label: "TileSortScratchTileIds",
+                label: "DepthFirstMono_TileSortScratchTileIds",
                 size: paddedInstanceCapacity * tileIdStride
             )
         }
-        tileSortScratchTileIds.label = "TileSortScratchTileIds"
+        tileSortScratchTileIds.label = "DepthFirstMono_TileSortScratchTileIds"
         self.tileSortScratchTileIds = tileSortScratchTileIds
 
         self.tileSortScratchIndices = try device.makeBuffer(
             count: paddedInstanceCapacity,
             type: Int32.self,
             options: priv,
-            label: "TileSortScratchIndices"
+            label: "DepthFirstMono_TileSortScratchIndices"
         )
 
         // Prefix sum block sums
@@ -296,7 +296,7 @@ final class DepthFirstViewResources {
             count: prefixBlockSumsCount,
             type: UInt32.self,
             options: priv,
-            label: "PrefixSumBlockSums"
+            label: "DepthFirstMono_PrefixSumBlockSums"
         )
 
         // Output textures
@@ -338,52 +338,7 @@ final class DepthFirstViewResources {
     }
 }
 
-/// Stereo resources for DepthFirstRenderer - left and right view buffer sets.
-final class DepthFirstMultiViewResources {
-    let device: MTLDevice
-    let left: DepthFirstViewResources
-    let right: DepthFirstViewResources
-
-    init(
-        device: MTLDevice,
-        maxGaussians: Int,
-        maxWidth: Int,
-        maxHeight: Int,
-        tileWidth: Int,
-        tileHeight: Int,
-        radixBlockSize: Int,
-        radixGrainSize: Int,
-        tileIdPrecision: RadixSortKeyPrecision
-    ) throws {
-        self.device = device
-
-        self.left = try DepthFirstViewResources(
-            device: device,
-            maxGaussians: maxGaussians,
-            maxWidth: maxWidth,
-            maxHeight: maxHeight,
-            tileWidth: tileWidth,
-            tileHeight: tileHeight,
-            radixBlockSize: radixBlockSize,
-            radixGrainSize: radixGrainSize,
-            tileIdPrecision: tileIdPrecision
-        )
-
-        self.right = try DepthFirstViewResources(
-            device: device,
-            maxGaussians: maxGaussians,
-            maxWidth: maxWidth,
-            maxHeight: maxHeight,
-            tileWidth: tileWidth,
-            tileHeight: tileHeight,
-            radixBlockSize: radixBlockSize,
-            radixGrainSize: radixGrainSize,
-            tileIdPrecision: tileIdPrecision
-        )
-    }
-}
-
-final class StereoUnifiedTiledResources {
+final class StereoTiledResources {
     let device: MTLDevice
 
     // Per-gaussian stereo render data (32 bytes per gaussian)
@@ -480,42 +435,42 @@ final class StereoUnifiedTiledResources {
             count: maxGaussians,
             type: StereoTiledRenderData.self,
             options: priv,
-            label: "StereoUnified_RenderData"
+            label: "DepthFirstStereo_RenderData"
         )
 
         self.bounds = try device.makeBuffer(
             count: maxGaussians,
             type: SIMD4<Int32>.self,
             options: priv,
-            label: "StereoUnified_Bounds"
+            label: "DepthFirstStereo_Bounds"
         )
 
         self.depthKeys = try device.makeBuffer(
             count: paddedGaussianCapacity,
             type: UInt32.self,
             options: priv,
-            label: "StereoUnified_DepthKeys"
+            label: "DepthFirstStereo_DepthKeys"
         )
 
         self.primitiveIndices = try device.makeBuffer(
             count: paddedGaussianCapacity,
             type: Int32.self,
             options: priv,
-            label: "StereoUnified_PrimitiveIndices"
+            label: "DepthFirstStereo_PrimitiveIndices"
         )
 
         self.nTouchedTiles = try device.makeBuffer(
             count: maxGaussians,
             type: UInt32.self,
             options: priv,
-            label: "StereoUnified_NTouchedTiles"
+            label: "DepthFirstStereo_NTouchedTiles"
         )
 
         self.orderedTileCounts = try device.makeBuffer(
             count: maxGaussians,
             type: UInt32.self,
             options: priv,
-            label: "StereoUnified_OrderedTileCounts"
+            label: "DepthFirstStereo_OrderedTileCounts"
         )
 
         // Counters
@@ -523,21 +478,21 @@ final class StereoUnifiedTiledResources {
             count: 1,
             type: UInt32.self,
             options: shared,
-            label: "StereoUnified_VisibleCount"
+            label: "DepthFirstStereo_VisibleCount"
         )
 
         self.totalInstances = try device.makeBuffer(
             count: 1,
             type: UInt32.self,
             options: shared,
-            label: "StereoUnified_TotalInstances"
+            label: "DepthFirstStereo_TotalInstances"
         )
 
         self.activeTileCount = try device.makeBuffer(
             count: 1,
             type: UInt32.self,
             options: shared,
-            label: "StereoUnified_ActiveTileCount"
+            label: "DepthFirstStereo_ActiveTileCount"
         )
 
         // Header for dispatch
@@ -545,14 +500,14 @@ final class StereoUnifiedTiledResources {
             count: 1,
             type: DepthFirstHeader.self,
             options: shared,
-            label: "StereoUnified_Header"
+            label: "DepthFirstStereo_Header"
         )
 
         self.dispatchArgs = try device.makeBuffer(
             count: DepthFirstDispatchSlot.count,
             type: DispatchIndirectArgsSwift.self,
             options: priv,
-            label: "StereoUnified_DispatchArgs"
+            label: "DepthFirstStereo_DispatchArgs"
         )
 
         // Per-instance buffers
@@ -561,14 +516,14 @@ final class StereoUnifiedTiledResources {
                 count: maxInstances,
                 type: UInt32.self,
                 options: priv,
-                label: "StereoUnified_InstanceTileIds"
+                label: "DepthFirstStereo_InstanceTileIds"
             )
         } else {
             self.instanceTileIds = try device.makeBuffer(
                 count: maxInstances,
                 type: UInt16.self,
                 options: priv,
-                label: "StereoUnified_InstanceTileIds"
+                label: "DepthFirstStereo_InstanceTileIds"
             )
         }
 
@@ -576,7 +531,7 @@ final class StereoUnifiedTiledResources {
             count: maxInstances,
             type: Int32.self,
             options: priv,
-            label: "StereoUnified_InstanceGaussianIndices"
+            label: "DepthFirstStereo_InstanceGaussianIndices"
         )
 
         // Tile headers
@@ -584,14 +539,14 @@ final class StereoUnifiedTiledResources {
             count: tileCount,
             type: GaussianHeader.self,
             options: priv,
-            label: "StereoUnified_TileHeaders"
+            label: "DepthFirstStereo_TileHeaders"
         )
 
         self.activeTiles = try device.makeBuffer(
             count: tileCount,
             type: UInt32.self,
             options: priv,
-            label: "StereoUnified_ActiveTiles"
+            label: "DepthFirstStereo_ActiveTiles"
         )
 
         // Depth sort scratch
@@ -599,35 +554,35 @@ final class StereoUnifiedTiledResources {
             count: gaussianGridSize * radix,
             type: UInt32.self,
             options: priv,
-            label: "StereoUnified_DepthSortHistogram"
+            label: "DepthFirstStereo_DepthSortHistogram"
         )
 
         self.depthSortBlockSums = try device.makeBuffer(
             count: gaussianGridSize,
             type: UInt32.self,
             options: priv,
-            label: "StereoUnified_DepthSortBlockSums"
+            label: "DepthFirstStereo_DepthSortBlockSums"
         )
 
         self.depthSortScannedHist = try device.makeBuffer(
             count: gaussianGridSize * radix,
             type: UInt32.self,
             options: priv,
-            label: "StereoUnified_DepthSortScannedHist"
+            label: "DepthFirstStereo_DepthSortScannedHist"
         )
 
         self.depthSortScratchKeys = try device.makeBuffer(
             count: paddedGaussianCapacity,
             type: UInt32.self,
             options: priv,
-            label: "StereoUnified_DepthSortScratchKeys"
+            label: "DepthFirstStereo_DepthSortScratchKeys"
         )
 
         self.depthSortScratchPayload = try device.makeBuffer(
             count: paddedGaussianCapacity,
             type: Int32.self,
             options: priv,
-            label: "StereoUnified_DepthSortScratchPayload"
+            label: "DepthFirstStereo_DepthSortScratchPayload"
         )
 
         // Tile sort scratch
@@ -635,21 +590,21 @@ final class StereoUnifiedTiledResources {
             count: instanceGridSize * radix,
             type: UInt32.self,
             options: priv,
-            label: "StereoUnified_TileSortHistogram"
+            label: "DepthFirstStereo_TileSortHistogram"
         )
 
         self.tileSortBlockSums = try device.makeBuffer(
             count: instanceGridSize,
             type: UInt32.self,
             options: priv,
-            label: "StereoUnified_TileSortBlockSums"
+            label: "DepthFirstStereo_TileSortBlockSums"
         )
 
         self.tileSortScannedHist = try device.makeBuffer(
             count: instanceGridSize * radix,
             type: UInt32.self,
             options: priv,
-            label: "StereoUnified_TileSortScannedHist"
+            label: "DepthFirstStereo_TileSortScannedHist"
         )
 
         if tileIdPrecision == .bits32 {
@@ -657,14 +612,14 @@ final class StereoUnifiedTiledResources {
                 count: paddedInstanceCapacity,
                 type: UInt32.self,
                 options: priv,
-                label: "StereoUnified_TileSortScratchTileIds"
+                label: "DepthFirstStereo_TileSortScratchTileIds"
             )
         } else {
             self.tileSortScratchTileIds = try device.makeBuffer(
                 count: paddedInstanceCapacity,
                 type: UInt16.self,
                 options: priv,
-                label: "StereoUnified_TileSortScratchTileIds"
+                label: "DepthFirstStereo_TileSortScratchTileIds"
             )
         }
 
@@ -672,7 +627,7 @@ final class StereoUnifiedTiledResources {
             count: paddedInstanceCapacity,
             type: Int32.self,
             options: priv,
-            label: "StereoUnified_TileSortScratchIndices"
+            label: "DepthFirstStereo_TileSortScratchIndices"
         )
 
         // Prefix sum block sums
@@ -680,7 +635,7 @@ final class StereoUnifiedTiledResources {
             count: prefixBlockSumsCount,
             type: UInt32.self,
             options: priv,
-            label: "StereoUnified_PrefixSumBlockSums"
+            label: "DepthFirstStereo_PrefixSumBlockSums"
         )
     }
 }

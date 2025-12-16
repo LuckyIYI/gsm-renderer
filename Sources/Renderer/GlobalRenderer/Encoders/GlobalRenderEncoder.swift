@@ -17,7 +17,6 @@ final class GlobalRenderEncoder {
                           userInfo: [NSLocalizedDescriptionKey: "Render kernel function missing"])
         }
 
-        // Prepare dispatch and clear textures kernels
         guard let prepFn = library.makeFunction(name: "prepareRenderDispatchKernel"),
               let clearTexFn = library.makeFunction(name: "clearRenderTexturesKernel")
         else {
@@ -25,7 +24,6 @@ final class GlobalRenderEncoder {
                           userInfo: [NSLocalizedDescriptionKey: "Prepare/Clear kernel functions missing"])
         }
 
-        // Create pipeline states
         self.renderPipeline = try device.makeComputePipelineState(function: renderFn)
         self.prepareDispatchPipeline = try device.makeComputePipelineState(function: prepFn)
         self.clearTexturesPipeline = try device.makeComputePipelineState(function: clearTexFn)

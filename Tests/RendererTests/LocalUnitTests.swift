@@ -14,7 +14,6 @@ final class LocalUnitTests: XCTestCase {
         self.device = MTLCreateSystemDefaultDevice()!
         self.queue = self.device.makeCommandQueue()!
 
-        // Load Local library
         guard let libraryURL = Bundle.module.url(forResource: "LocalShaders", withExtension: "metallib"),
               let lib = try? device.makeLibrary(URL: libraryURL)
         else {
@@ -29,11 +28,9 @@ final class LocalUnitTests: XCTestCase {
     func testPrefixScanCorrectness() throws {
         let prefixScanEncoder = try LocalPrefixScanEncoder(library: library, device: device)
 
-        // Test with 64 tiles (4x16 grid)
         let tileCount = 64
         var tileCounts = [UInt32](repeating: 0, count: tileCount)
 
-        // Fill with known values: tile i has i gaussians
         for i in 0 ..< tileCount {
             tileCounts[i] = UInt32(i + 1)
         }
@@ -47,14 +44,12 @@ final class LocalUnitTests: XCTestCase {
         }
         let expectedTotal = sum
 
-        // GPU buffers
         let tileCountsBuffer = self.device.makeBuffer(bytes: tileCounts, length: tileCount * 4, options: .storageModeShared)!
         let tileOffsetsBuffer = self.device.makeBuffer(length: tileCount * 4, options: .storageModeShared)!
         let partialSumsBuffer = self.device.makeBuffer(length: 1024 * 4, options: .storageModeShared)!
         let activeTileIndicesBuffer = self.device.makeBuffer(length: tileCount * 4, options: .storageModeShared)!
         let activeTileCountBuffer = self.device.makeBuffer(length: 4, options: .storageModeShared)!
 
-        // Encode
         let cb = self.queue.makeCommandBuffer()!
         prefixScanEncoder.encode(
             commandBuffer: cb,
@@ -68,13 +63,11 @@ final class LocalUnitTests: XCTestCase {
         cb.commit()
         cb.waitUntilCompleted()
 
-        // Verify offsets
         let gpuOffsets = tileOffsetsBuffer.contents().bindMemory(to: UInt32.self, capacity: tileCount)
         for i in 0 ..< tileCount {
             XCTAssertEqual(gpuOffsets[i], expectedOffsets[i], "Offset mismatch at tile \(i): got \(gpuOffsets[i]), expected \(expectedOffsets[i])")
         }
 
-        // Verify last offset + last count = total
         let lastOffset = gpuOffsets[tileCount - 1]
         let lastCount = UInt32(tileCount) // Last tile has tileCount gaussians
         XCTAssertEqual(lastOffset + lastCount, expectedTotal, "Total assignment count mismatch")
@@ -83,7 +76,6 @@ final class LocalUnitTests: XCTestCase {
     func testPrefixScanLargeScale() throws {
         let prefixScanEncoder = try LocalPrefixScanEncoder(library: library, device: device)
 
-        // Test with 4096 tiles (64x64 grid)
         let tileCount = 4096
         var tileCounts = [UInt32](repeating: 0, count: tileCount)
 
@@ -100,7 +92,6 @@ final class LocalUnitTests: XCTestCase {
             sum += tileCounts[i]
         }
 
-        // GPU
         let tileCountsBuffer = self.device.makeBuffer(bytes: tileCounts, length: tileCount * 4, options: .storageModeShared)!
         let tileOffsetsBuffer = self.device.makeBuffer(length: tileCount * 4, options: .storageModeShared)!
         let partialSumsBuffer = self.device.makeBuffer(length: 4096 * 4, options: .storageModeShared)!
@@ -120,7 +111,6 @@ final class LocalUnitTests: XCTestCase {
         cb.commit()
         cb.waitUntilCompleted()
 
-        // Verify
         let gpuOffsets = tileOffsetsBuffer.contents().bindMemory(to: UInt32.self, capacity: tileCount)
         for i in 0 ..< tileCount {
             XCTAssertEqual(gpuOffsets[i], expectedOffsets[i], "Offset mismatch at tile \(i)")
@@ -132,12 +122,10 @@ final class LocalUnitTests: XCTestCase {
     func testPerTileSortCorrectness() throws {
         let sortEncoder = try LocalSortEncoder(library: library, device: device)
 
-        // Test 4 tiles with known data (16-bit sort)
         let tileCount = 4
         let maxPerTile = 64
         let totalAssignments = tileCount * maxPerTile
 
-        // Generate 16-bit depth keys
         var depthKeys16 = [UInt16](repeating: 0, count: totalAssignments)
         var globalIndices = [UInt32](repeating: 0, count: totalAssignments)
         let tileCounts = [UInt32](repeating: UInt32(maxPerTile), count: tileCount)
@@ -167,7 +155,6 @@ final class LocalUnitTests: XCTestCase {
             }
         }
 
-        // GPU buffers
         let depthKeys16Buffer = self.device.makeBuffer(bytes: depthKeys16, length: totalAssignments * 2, options: .storageModeShared)!
         let globalIndicesBuffer = self.device.makeBuffer(bytes: globalIndices, length: totalAssignments * 4, options: .storageModeShared)!
         let sortedLocalIdxBuffer = self.device.makeBuffer(length: totalAssignments * 2, options: .storageModeShared)!
@@ -186,7 +173,6 @@ final class LocalUnitTests: XCTestCase {
         cb.commit()
         cb.waitUntilCompleted()
 
-        // Verify sorted local indices match expected
         let gpuSortedIdx = sortedLocalIdxBuffer.contents().bindMemory(to: UInt16.self, capacity: totalAssignments)
         for i in 0 ..< totalAssignments {
             XCTAssertEqual(gpuSortedIdx[i], expectedSortedIdx[i], "Sorted index mismatch at \(i)")
@@ -196,13 +182,11 @@ final class LocalUnitTests: XCTestCase {
     func testPerTileSortVariableCounts() throws {
         let sortEncoder = try LocalSortEncoder(library: library, device: device)
 
-        // Test with variable tile counts (fixed layout: maxPerTile per tile)
         let tileCount = 8
         let maxPerTile = 128
         let tileCounts: [UInt32] = [10, 50, 5, 100, 25, 0, 75, 30]
         let totalSize = tileCount * maxPerTile
 
-        // Generate 16-bit depth keys with variable counts
         var depthKeys16 = [UInt16](repeating: 0xFFFF, count: totalSize)
         var globalIndices = [UInt32](repeating: 0, count: totalSize)
 
@@ -216,7 +200,6 @@ final class LocalUnitTests: XCTestCase {
             }
         }
 
-        // GPU buffers
         let depthKeys16Buffer = self.device.makeBuffer(bytes: depthKeys16, length: totalSize * 2, options: .storageModeShared)!
         let globalIndicesBuffer = self.device.makeBuffer(bytes: globalIndices, length: totalSize * 4, options: .storageModeShared)!
         let sortedLocalIdxBuffer = self.device.makeBuffer(length: totalSize * 2, options: .storageModeShared)!
@@ -235,7 +218,6 @@ final class LocalUnitTests: XCTestCase {
         cb.commit()
         cb.waitUntilCompleted()
 
-        // Verify each tile's sorted output is in order by depth
         let gpuSortedIdx = sortedLocalIdxBuffer.contents().bindMemory(to: UInt16.self, capacity: totalSize)
         for tile in 0 ..< tileCount {
             let offset = tile * maxPerTile

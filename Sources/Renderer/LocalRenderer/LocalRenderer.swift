@@ -45,7 +45,6 @@ public final class LocalRenderer: GaussianRenderer, @unchecked Sendable {
         self.device = device
         self.config = config
 
-        // Load shader libraries
         guard let localLibraryURL = Bundle.module.url(forResource: "LocalShaders", withExtension: "metallib"),
               let localLibrary = try? device.makeLibrary(URL: localLibraryURL)
         else {
@@ -58,7 +57,6 @@ public final class LocalRenderer: GaussianRenderer, @unchecked Sendable {
             throw RendererError.failedToCreatePipeline("GlobalShaders.metallib not found")
         }
 
-        // Initialize stage encoders
         self.clearEncoder = try LocalClearEncoder(library: localLibrary, device: device)
         self.projectCullEncoder = try LocalProjectCullEncoder(LocalLibrary: localLibrary, mainLibrary: mainLibrary, device: device)
         self.prefixScanEncoder = try LocalPrefixScanEncoder(library: localLibrary, device: device)
@@ -66,13 +64,11 @@ public final class LocalRenderer: GaussianRenderer, @unchecked Sendable {
         self.sortEncoder = try LocalSortEncoder(library: localLibrary, device: device)
         self.renderEncoder = try LocalRenderEncoder(library: localLibrary, device: device)
 
-        // Pre-compute limits from config
         self.tilesX = (config.maxWidth + LocalRenderer.tileWidth - 1) / LocalRenderer.tileWidth
         self.tilesY = (config.maxHeight + LocalRenderer.tileHeight - 1) / LocalRenderer.tileHeight
         self.maxTileCount = self.tilesX * self.tilesY
         self.maxAssignments = self.maxTileCount * LocalRenderer.maxGaussiansPerTile16Bit
 
-        // Create stereo resources (left/right view buffer sets)
         self.stereoResources = try LocalMultiViewResources(
             device: device,
             maxGaussians: config.maxGaussians,

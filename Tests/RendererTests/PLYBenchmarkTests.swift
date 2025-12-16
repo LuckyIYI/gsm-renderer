@@ -93,7 +93,6 @@ final class PLYBenchmarkTests: XCTestCase {
         print("Loaded \(dataset.records.count) gaussians in \(String(format: "%.2f", elapsed))s")
         print("SH components: \(dataset.shComponents)")
 
-        // Compute scene bounds
         let bounds = GaussianSceneBuilder.bounds(of: dataset.records)
         print("Scene center: \(bounds.center)")
         print("Scene radius: \(bounds.radius)")
@@ -126,19 +125,16 @@ final class PLYBenchmarkTests: XCTestCase {
 
         print("\n=== Render PLY Scene Test [\(conventionName)] ===")
 
-        // Load PLY with Y-flip for correct orientation
         let dataset = try PLYLoader.load(url: url)
         let gaussianCount = dataset.records.count
         print("Loaded \(gaussianCount) gaussians, SH: \(dataset.shComponents)")
 
-        // Get scene bounds
         let bounds = GaussianSceneBuilder.bounds(of: dataset.records)
         print("Scene center: \(bounds.center), radius: \(bounds.radius)")
 
         let width = 1920
         let height = 1080
 
-        // Create packed gaussians from PLY data
         var packed: [PackedWorldGaussianHalf] = []
         packed.reserveCapacity(gaussianCount)
         for record in dataset.records {
@@ -150,7 +146,6 @@ final class PLYBenchmarkTests: XCTestCase {
             ))
         }
 
-        // Extract DC coefficients from harmonics
         var harmonics = dataset.harmonics.map(Float16.init)
         guard let gaussianBuf = device.makeBuffer(bytes: &packed, length: packed.count * MemoryLayout<PackedWorldGaussianHalf>.stride, options: .storageModeShared),
               let harmonicsBuf = device.makeBuffer(bytes: &harmonics, length: harmonics.count * MemoryLayout<Float16>.stride, options: .storageModeShared)
@@ -190,7 +185,6 @@ final class PLYBenchmarkTests: XCTestCase {
             shComponents: dataset.shComponents
         )
 
-        // Create output textures
         guard let colorTexture = makeColorTexture(device: device, width: width, height: height, pixelFormat: .rgba8Unorm_srgb),
               let depthTexture = makeDepthTexture(device: device, width: width, height: height)
         else {
@@ -206,7 +200,6 @@ final class PLYBenchmarkTests: XCTestCase {
         print("\nBenchmarking \(gaussianCount) gaussians at \(width)x\(height) [\(conventionName)]...")
         print("Warmup: 3 runs, Measurement: 10 runs\n")
 
-        // Run benchmarks for Local renderer
         print("=== Local Renderer ===")
         let localTiming = benchmark(name: "Local") {
             guard let cb = q.makeCommandBuffer() else { return }
@@ -304,7 +297,6 @@ final class PLYBenchmarkTests: XCTestCase {
         print("Instanced: \(String(format: "%.2f", instancedTiming.avg))ms")
         print("Mesh: \(String(format: "%.2f", meshTiming.avg))ms")
 
-        // Save final render for visual verification
         if let cb = q.makeCommandBuffer() {
             localRenderer.render(
                 commandBuffer: cb,
@@ -320,7 +312,6 @@ final class PLYBenchmarkTests: XCTestCase {
         }
         self.saveTextureToJPEG(texture: colorTexture, filename: "render_local_\(fileSuffix).jpg")
 
-        // Save Global render
         if let cb = q.makeCommandBuffer() {
             globalRenderer.render(
                 commandBuffer: cb,
@@ -336,7 +327,6 @@ final class PLYBenchmarkTests: XCTestCase {
         }
         self.saveTextureToJPEG(texture: colorTexture, filename: "render_global_\(fileSuffix).jpg")
 
-        // Save DepthFirst render
         if let cb = q.makeCommandBuffer() {
             depthFirstRenderer.render(
                 commandBuffer: cb,
@@ -352,7 +342,6 @@ final class PLYBenchmarkTests: XCTestCase {
         }
         self.saveTextureToJPEG(texture: colorTexture, filename: "render_depthfirst_\(fileSuffix).jpg")
 
-        // Save Instanced render
         if let cb = q.makeCommandBuffer() {
             instancedRenderer.render(
                 commandBuffer: cb,
@@ -368,7 +357,6 @@ final class PLYBenchmarkTests: XCTestCase {
         }
         self.saveTextureToJPEG(texture: colorTexture, filename: "render_instanced_\(fileSuffix).jpg")
 
-        // Save Mesh render
         if let cb = q.makeCommandBuffer() {
             meshRenderer.render(
                 commandBuffer: cb,
@@ -399,10 +387,8 @@ final class PLYBenchmarkTests: XCTestCase {
             print("Failed to create CIImage from MTLTexture")
             return
         }
-        // Orient to match prior PNG path
         ciImage = ciImage.oriented(.downMirrored)
 
-        // Create a solid background color image
         let bgColor = CIColor(red: CGFloat(background.x), green: CGFloat(background.y), blue: CGFloat(background.z), alpha: CGFloat(background.w))
         guard let bgGenerator = CIFilter(name: "CIConstantColorGenerator") else {
             print("Failed to create CIConstantColorGenerator filter")

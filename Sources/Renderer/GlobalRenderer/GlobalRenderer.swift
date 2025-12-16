@@ -125,7 +125,6 @@ public final class GlobalRenderer: GaussianRenderer, @unchecked Sendable {
         let library = try device.makeLibrary(URL: metallibURL)
         self.library = library
 
-        // Initialize encoders
         self.sortKeyGenEncoder = try SortKeyGenEncoder(device: device, library: library)
         self.radixSortEncoder = try RadixSortEncoder(device: device, library: library)
         self.packEncoder = try PackEncoder(device: device, library: library)
@@ -149,14 +148,12 @@ public final class GlobalRenderer: GaussianRenderer, @unchecked Sendable {
         }
         self.resetTileBuilderStatePipeline = try device.makeComputePipelineState(function: resetFn)
 
-        // Compute limits
         self.limits = RendererLimits(
             from: config,
             tileWidth: GlobalRenderer.tileWidth,
             tileHeight: GlobalRenderer.tileHeight
         )
 
-        // Initialize stereo resources (left for mono, both for stereo)
         self.stereoResources = try GlobalMultiViewResources(
             device: device,
             maxGaussians: self.limits.maxGaussians,
@@ -169,7 +166,6 @@ public final class GlobalRenderer: GaussianRenderer, @unchecked Sendable {
             precision: config.precision
         )
 
-        // Allocate projection caches (per-eye for stereo)
         let g = self.limits.maxGaussians
         let boundsSize = g * MemoryLayout<SIMD4<Int32>>.stride
 

@@ -69,7 +69,6 @@ public final class DepthFirstRenderer: GaussianRenderer, @unchecked Sendable {
         let library = try device.makeLibrary(URL: metallibURL)
         self.library = library
 
-        // Initialize encoders
         self.projectCullEncoder = try DepthFirstProjectCullEncoder(device: device, library: library)
         self.visibilityCompactionEncoder = try VisibilityCompactionEncoder(
             device: device,
@@ -92,7 +91,6 @@ public final class DepthFirstRenderer: GaussianRenderer, @unchecked Sendable {
         self.stereoComputeRenderEncoder = try DepthFirstStereoComputeRenderEncoder(device: device, library: library)
         self.stereoCopyEncoder = try DepthFirstStereoCopyEncoder(device: device, library: library, colorFormat: config.colorFormat)
 
-        // Compute limits
         self.limits = RendererLimits(
             from: config,
             tileWidth: DepthFirstRenderer.tileWidth,

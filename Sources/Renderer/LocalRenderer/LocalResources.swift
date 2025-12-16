@@ -42,7 +42,6 @@ public final class LocalViewResources {
         let priv: MTLResourceOptions = .storageModePrivate
         let shared: MTLResourceOptions = .storageModeShared
 
-        // Pipeline control buffers
         self.header = try device.makeBuffer(
             count: 1,
             type: CompactedHeaderSwift.self,
@@ -92,7 +91,6 @@ public final class LocalViewResources {
             label: "\(label)/DispatchArgs"
         )
 
-        // Projection buffers
         self.tempProjection = try device.makeBuffer(
             count: maxGaussians,
             type: ProjectedGaussianSwift.self,
@@ -122,7 +120,6 @@ public final class LocalViewResources {
             label: "\(label)/VisibilityPartialSums"
         )
 
-        // Sort buffers (16-bit for per-tile radix sort)
         self.sortIndices = try device.makeBuffer(
             count: maxAssignments,
             type: UInt32.self,

@@ -72,7 +72,6 @@ final class DepthFirstViewResources {
         let priv: MTLResourceOptions = .storageModePrivate
         let shared: MTLResourceOptions = .storageModeShared
 
-        // Calculate derived sizes
         let tilesX = (maxWidth + tileWidth - 1) / tileWidth
         let tilesY = (maxHeight + tileHeight - 1) / tileHeight
         let tileCount = max(1, tilesX * tilesY)
@@ -81,24 +80,20 @@ final class DepthFirstViewResources {
         let maxInstances = maxGaussians * 4
         self.maxInstances = maxInstances
 
-        // Padded capacities for radix sort alignment
         let radixAlignment = radixBlockSize * radixGrainSize
         let paddedGaussianCapacity = ((maxGaussians + radixAlignment - 1) / radixAlignment) * radixAlignment
         let paddedInstanceCapacity = ((maxInstances + radixAlignment - 1) / radixAlignment) * radixAlignment
 
-        // Radix sort histogram sizing
         let radix = 256
         let gaussianGridSize = max(1, (paddedGaussianCapacity + radixAlignment - 1) / radixAlignment)
         let instanceGridSize = max(1, (paddedInstanceCapacity + radixAlignment - 1) / radixAlignment)
 
-        // Prefix sum block sums sizing
         let prefixBlockSize = 256
         let prefixNumBlocks = (maxGaussians + prefixBlockSize - 1) / prefixBlockSize
         let prefixLevel2Blocks = (prefixNumBlocks + prefixBlockSize - 1) / prefixBlockSize
         let prefixLevel3Blocks = (prefixLevel2Blocks + prefixBlockSize - 1) / prefixBlockSize
         let prefixBlockSumsCount = prefixNumBlocks + 1 + prefixLevel2Blocks + 1 + prefixLevel3Blocks + 1
 
-        // Per-gaussian buffers
         self.renderData = try device.makeBuffer(
             count: maxGaussians,
             type: GaussianRenderData.self,
@@ -141,7 +136,6 @@ final class DepthFirstViewResources {
             label: "DepthFirstMono_OrderedTileCounts"
         )
 
-        // Counters (shared for CPU readback)
         self.visibleCount = try device.makeBuffer(
             count: 1,
             type: UInt32.self,
@@ -163,7 +157,6 @@ final class DepthFirstViewResources {
             label: "DepthFirstMono_ActiveTileCount"
         )
 
-        // Header (32 bytes for DepthFirstHeader)
         guard let header = device.makeBuffer(length: 32, options: shared) else {
             throw RendererError.failedToAllocateBuffer(label: "DepthFirstMono_Header", size: 32)
         }
@@ -179,7 +172,6 @@ final class DepthFirstViewResources {
 
         let tileIdStride = tileIdPrecision == .bits32 ? MemoryLayout<UInt32>.stride : MemoryLayout<UInt16>.stride
 
-        // Per-instance buffers (tile IDs are 16-bit or 32-bit depending on precision)
         guard let instanceTileIds = device.makeBuffer(
             length: paddedInstanceCapacity * tileIdStride,
             options: priv
@@ -199,7 +191,6 @@ final class DepthFirstViewResources {
             label: "DepthFirstMono_InstanceGaussianIndices"
         )
 
-        // Tile headers
         self.tileHeaders = try device.makeBuffer(
             count: tileCount,
             type: GaussianHeader.self,
@@ -214,7 +205,6 @@ final class DepthFirstViewResources {
             label: "DepthFirstMono_ActiveTiles"
         )
 
-        // Depth sort buffers
         self.depthSortHistogram = try device.makeBuffer(
             count: gaussianGridSize * radix,
             type: UInt32.self,
@@ -250,7 +240,6 @@ final class DepthFirstViewResources {
             label: "DepthFirstMono_DepthSortScratchPayload"
         )
 
-        // Tile sort buffers
         self.tileSortHistogram = try device.makeBuffer(
             count: instanceGridSize * radix,
             type: UInt32.self,
@@ -291,7 +280,6 @@ final class DepthFirstViewResources {
             label: "DepthFirstMono_TileSortScratchIndices"
         )
 
-        // Prefix sum block sums
         self.prefixSumBlockSums = try device.makeBuffer(
             count: prefixBlockSumsCount,
             type: UInt32.self,
@@ -299,7 +287,6 @@ final class DepthFirstViewResources {
             label: "DepthFirstMono_PrefixSumBlockSums"
         )
 
-        // Output textures
         let texDesc = MTLTextureDescriptor.texture2DDescriptor(
             pixelFormat: .rgba16Float,
             width: maxWidth,
@@ -404,7 +391,6 @@ final class StereoTiledResources {
         let priv: MTLResourceOptions = .storageModePrivate
         let shared: MTLResourceOptions = .storageModeShared
 
-        // Calculate derived sizes
         let tilesX = (maxWidth + tileWidth - 1) / tileWidth
         let tilesY = (maxHeight + tileHeight - 1) / tileHeight
         let tileCount = max(1, tilesX * tilesY)
@@ -413,24 +399,20 @@ final class StereoTiledResources {
         let maxInstances = maxGaussians * 4
         self.maxInstances = maxInstances
 
-        // Padded capacities for radix sort alignment
         let radixAlignment = radixBlockSize * radixGrainSize
         let paddedGaussianCapacity = ((maxGaussians + radixAlignment - 1) / radixAlignment) * radixAlignment
         let paddedInstanceCapacity = ((maxInstances + radixAlignment - 1) / radixAlignment) * radixAlignment
 
-        // Radix sort histogram sizing
         let radix = 256
         let gaussianGridSize = max(1, (paddedGaussianCapacity + radixAlignment - 1) / radixAlignment)
         let instanceGridSize = max(1, (paddedInstanceCapacity + radixAlignment - 1) / radixAlignment)
 
-        // Prefix sum block sums sizing
         let prefixBlockSize = 256
         let prefixNumBlocks = (maxGaussians + prefixBlockSize - 1) / prefixBlockSize
         let prefixLevel2Blocks = (prefixNumBlocks + prefixBlockSize - 1) / prefixBlockSize
         let prefixLevel3Blocks = (prefixLevel2Blocks + prefixBlockSize - 1) / prefixBlockSize
         let prefixBlockSumsCount = prefixNumBlocks + 1 + prefixLevel2Blocks + 1 + prefixLevel3Blocks + 1
 
-        // Per-gaussian buffers - using StereoTiledRenderData (32 bytes)
         self.renderData = try device.makeBuffer(
             count: maxGaussians,
             type: StereoTiledRenderData.self,
@@ -473,7 +455,6 @@ final class StereoTiledResources {
             label: "DepthFirstStereo_OrderedTileCounts"
         )
 
-        // Counters
         self.visibleCount = try device.makeBuffer(
             count: 1,
             type: UInt32.self,
@@ -495,7 +476,6 @@ final class StereoTiledResources {
             label: "DepthFirstStereo_ActiveTileCount"
         )
 
-        // Header for dispatch
         self.header = try device.makeBuffer(
             count: 1,
             type: DepthFirstHeader.self,
@@ -510,7 +490,6 @@ final class StereoTiledResources {
             label: "DepthFirstStereo_DispatchArgs"
         )
 
-        // Per-instance buffers
         if tileIdPrecision == .bits32 {
             self.instanceTileIds = try device.makeBuffer(
                 count: maxInstances,
@@ -534,7 +513,6 @@ final class StereoTiledResources {
             label: "DepthFirstStereo_InstanceGaussianIndices"
         )
 
-        // Tile headers
         self.tileHeaders = try device.makeBuffer(
             count: tileCount,
             type: GaussianHeader.self,
@@ -549,7 +527,6 @@ final class StereoTiledResources {
             label: "DepthFirstStereo_ActiveTiles"
         )
 
-        // Depth sort scratch
         self.depthSortHistogram = try device.makeBuffer(
             count: gaussianGridSize * radix,
             type: UInt32.self,
@@ -585,7 +562,6 @@ final class StereoTiledResources {
             label: "DepthFirstStereo_DepthSortScratchPayload"
         )
 
-        // Tile sort scratch
         self.tileSortHistogram = try device.makeBuffer(
             count: instanceGridSize * radix,
             type: UInt32.self,
@@ -630,7 +606,6 @@ final class StereoTiledResources {
             label: "DepthFirstStereo_TileSortScratchIndices"
         )
 
-        // Prefix sum block sums
         self.prefixSumBlockSums = try device.makeBuffer(
             count: prefixBlockSumsCount,
             type: UInt32.self,

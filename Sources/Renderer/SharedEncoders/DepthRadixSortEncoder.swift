@@ -18,8 +18,8 @@ public enum RadixSortKeyPrecision: Sendable {
 
     var numPasses: Int {
         switch self {
-        case .bits16: return 2
-        case .bits32: return 4
+        case .bits16: 2
+        case .bits32: 4
         }
     }
 }
@@ -49,7 +49,8 @@ final class DepthRadixSortEncoder {
               let scanFn = library.makeFunction(name: "depthSortScanBlocksKernel"),
               let exclusiveFn = library.makeFunction(name: "depthSortExclusiveScanKernel"),
               let applyFn = library.makeFunction(name: "depthSortApplyOffsetsKernel"),
-              let scatterFn = library.makeFunction(name: "depthSortScatterKernel\(suffix)") else {
+              let scatterFn = library.makeFunction(name: "depthSortScatterKernel\(suffix)")
+        else {
             throw RendererError.failedToCreatePipeline("Depth radix sort kernels not found")
         }
 
@@ -111,7 +112,7 @@ final class DepthRadixSortEncoder {
         scanDispatch: MTLBuffer,
         label: String
     ) {
-        encode(
+        self.encode(
             commandBuffer: commandBuffer,
             depthKeys: depthKeys,
             sortedIndices: sortedIndices,
@@ -147,16 +148,16 @@ final class DepthRadixSortEncoder {
         label: String
     ) {
         let scanDispatch = scanDispatchBuffer ?? dispatchBuffer
-        let numPasses = precision.numPasses
+        let numPasses = self.precision.numPasses
 
-        for pass in 0..<numPasses {
+        for pass in 0 ..< numPasses {
             let isEvenPass = pass % 2 == 0
             let inputKeys = isEvenPass ? depthKeys : sortBuffers.scratchKeys
             let inputIndices = isEvenPass ? sortedIndices : sortBuffers.scratchIndices
             let outputKeys = isEvenPass ? sortBuffers.scratchKeys : depthKeys
             let outputIndices = isEvenPass ? sortBuffers.scratchIndices : sortedIndices
 
-            encodeHistogram(
+            self.encodeHistogram(
                 commandBuffer: commandBuffer,
                 inputKeys: inputKeys,
                 histogram: sortBuffers.histogram,
@@ -167,7 +168,7 @@ final class DepthRadixSortEncoder {
                 label: label
             )
 
-            encodeScanBlocks(
+            self.encodeScanBlocks(
                 commandBuffer: commandBuffer,
                 histogram: sortBuffers.histogram,
                 blockSums: sortBuffers.blockSums,
@@ -178,7 +179,7 @@ final class DepthRadixSortEncoder {
                 label: label
             )
 
-            encodeExclusiveScan(
+            self.encodeExclusiveScan(
                 commandBuffer: commandBuffer,
                 blockSums: sortBuffers.blockSums,
                 scannedHistogram: sortBuffers.scannedHistogram,
@@ -187,7 +188,7 @@ final class DepthRadixSortEncoder {
                 label: label
             )
 
-            encodeApplyOffsets(
+            self.encodeApplyOffsets(
                 commandBuffer: commandBuffer,
                 histogram: sortBuffers.histogram,
                 blockSums: sortBuffers.blockSums,
@@ -199,7 +200,7 @@ final class DepthRadixSortEncoder {
                 label: label
             )
 
-            encodeScatter(
+            self.encodeScatter(
                 commandBuffer: commandBuffer,
                 inputKeys: inputKeys,
                 inputIndices: inputIndices,
@@ -229,7 +230,7 @@ final class DepthRadixSortEncoder {
     ) {
         guard let encoder = commandBuffer.makeComputeCommandEncoder() else { return }
         encoder.label = "\(label)_RadixHist_Pass\(pass)"
-        encoder.setComputePipelineState(histogramPipeline)
+        encoder.setComputePipelineState(self.histogramPipeline)
         encoder.setBuffer(inputKeys, offset: 0, index: 0)
         encoder.setBuffer(histogram, offset: 0, index: 1)
         var passVal = UInt32(pass)
@@ -255,7 +256,7 @@ final class DepthRadixSortEncoder {
     ) {
         guard let encoder = commandBuffer.makeComputeCommandEncoder() else { return }
         encoder.label = "\(label)_RadixScan_Pass\(pass)"
-        encoder.setComputePipelineState(scanBlocksPipeline)
+        encoder.setComputePipelineState(self.scanBlocksPipeline)
         encoder.setBuffer(histogram, offset: 0, index: 0)
         encoder.setBuffer(blockSums, offset: 0, index: 1)
         encoder.setBuffer(sortHeader, offset: 0, index: 2)
@@ -270,14 +271,14 @@ final class DepthRadixSortEncoder {
     private func encodeExclusiveScan(
         commandBuffer: MTLCommandBuffer,
         blockSums: MTLBuffer,
-        scannedHistogram: MTLBuffer,
+        scannedHistogram _: MTLBuffer,
         sortHeader: MTLBuffer,
         pass: Int,
         label: String
     ) {
         guard let encoder = commandBuffer.makeComputeCommandEncoder() else { return }
         encoder.label = "\(label)_RadixExcl_Pass\(pass)"
-        encoder.setComputePipelineState(exclusiveScanPipeline)
+        encoder.setComputePipelineState(self.exclusiveScanPipeline)
         encoder.setBuffer(blockSums, offset: 0, index: 0)
         encoder.setBuffer(sortHeader, offset: 0, index: 1)
         encoder.setThreadgroupMemoryLength(Self.blockSize * MemoryLayout<UInt32>.stride, index: 0)
@@ -301,7 +302,7 @@ final class DepthRadixSortEncoder {
     ) {
         guard let encoder = commandBuffer.makeComputeCommandEncoder() else { return }
         encoder.label = "\(label)_RadixApply_Pass\(pass)"
-        encoder.setComputePipelineState(applyOffsetsPipeline)
+        encoder.setComputePipelineState(self.applyOffsetsPipeline)
         encoder.setBuffer(histogram, offset: 0, index: 0)
         encoder.setBuffer(blockSums, offset: 0, index: 1)
         encoder.setBuffer(scannedHistogram, offset: 0, index: 2)
@@ -330,7 +331,7 @@ final class DepthRadixSortEncoder {
     ) {
         guard let encoder = commandBuffer.makeComputeCommandEncoder() else { return }
         encoder.label = "\(label)_RadixScatter_Pass\(pass)"
-        encoder.setComputePipelineState(scatterPipeline)
+        encoder.setComputePipelineState(self.scatterPipeline)
         encoder.setBuffer(outputKeys, offset: 0, index: 0)
         encoder.setBuffer(inputKeys, offset: 0, index: 1)
         encoder.setBuffer(outputIndices, offset: 0, index: 2)

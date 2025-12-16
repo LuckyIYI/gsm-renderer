@@ -39,7 +39,7 @@ final class DepthFirstStereoCopyEncoder {
         guard let encoder = commandBuffer.makeRenderCommandEncoder(descriptor: rpd) else { return }
         encoder.label = "DepthFirstStereoCopy"
 
-        encoder.setRenderPipelineState(renderPipeline)
+        encoder.setRenderPipelineState(self.renderPipeline)
 
         let leftViewport = MTLViewport(
             originX: configuration.leftEye.viewport.originX,
@@ -73,4 +73,3 @@ final class DepthFirstStereoCopyEncoder {
         encoder.endEncoding()
     }
 }
-

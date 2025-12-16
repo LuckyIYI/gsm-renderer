@@ -11,7 +11,8 @@ final class HardwareReorderEncoder {
 
     init(device: MTLDevice, library: MTLLibrary) throws {
         guard let centerFn = library.makeFunction(name: "reorderStereoProjectedKernel"),
-              let monoFn = library.makeFunction(name: "reorderMonoDataKernel") else {
+              let monoFn = library.makeFunction(name: "reorderMonoDataKernel")
+        else {
             throw RendererError.failedToCreatePipeline("Reorder kernels not found")
         }
 
@@ -31,7 +32,7 @@ final class HardwareReorderEncoder {
     ) {
         guard let encoder = commandBuffer.makeComputeCommandEncoder() else { return }
         encoder.label = "ReorderStereo"
-        encoder.setComputePipelineState(stereoPipeline)
+        encoder.setComputePipelineState(self.stereoPipeline)
 
         encoder.setBuffer(projected, offset: 0, index: 0)
         encoder.setBuffer(sortedIndices, offset: 0, index: 1)
@@ -57,7 +58,7 @@ final class HardwareReorderEncoder {
     ) {
         guard let encoder = commandBuffer.makeComputeCommandEncoder() else { return }
         encoder.label = "ReorderMono"
-        encoder.setComputePipelineState(monoPipeline)
+        encoder.setComputePipelineState(self.monoPipeline)
 
         encoder.setBuffer(projected, offset: 0, index: 0)
         encoder.setBuffer(sortedIndices, offset: 0, index: 1)

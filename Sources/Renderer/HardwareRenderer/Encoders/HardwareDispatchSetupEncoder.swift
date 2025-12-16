@@ -8,10 +8,10 @@ struct HardwareDispatchSetupConfig {
     let reorderThreadgroupSize: Int
     let numBlocks: Int
 
-    var radixAlignment: UInt32 { UInt32(radixBlockSize * radixGrainSize) }
-    var sortThreadgroupSize: UInt32 { UInt32(radixBlockSize) }
-    var reorderTGSize: UInt32 { UInt32(reorderThreadgroupSize) }
-    var maxNumBlocks: UInt32 { UInt32(numBlocks) }
+    var radixAlignment: UInt32 { UInt32(self.radixBlockSize * self.radixGrainSize) }
+    var sortThreadgroupSize: UInt32 { UInt32(self.radixBlockSize) }
+    var reorderTGSize: UInt32 { UInt32(self.reorderThreadgroupSize) }
+    var maxNumBlocks: UInt32 { UInt32(self.numBlocks) }
 
     init(radixBlockSize: Int = 256, radixGrainSize: Int = 4, reorderThreadgroupSize: Int = 256, numBlocks: Int) {
         self.radixBlockSize = radixBlockSize
@@ -32,7 +32,8 @@ final class HardwareDispatchSetupEncoder {
     init(device: MTLDevice, library: MTLLibrary) throws {
         guard let centerFn = library.makeFunction(name: "prepareStereoSortKernel"),
               let monoFn = library.makeFunction(name: "prepareMonoSortKernel"),
-              let drawArgsFn = library.makeFunction(name: "prepareStereoDrawArgsKernel") else {
+              let drawArgsFn = library.makeFunction(name: "prepareStereoDrawArgsKernel")
+        else {
             throw RendererError.failedToCreatePipeline("Prepare dispatch kernels not found")
         }
 
@@ -61,7 +62,7 @@ final class HardwareDispatchSetupEncoder {
     ) {
         guard let encoder = commandBuffer.makeComputeCommandEncoder() else { return }
         encoder.label = "PrepareStereoSort"
-        encoder.setComputePipelineState(stereoPipeline)
+        encoder.setComputePipelineState(self.stereoPipeline)
 
         encoder.setBuffer(visibleCount, offset: 0, index: 0)
         encoder.setBuffer(header, offset: 0, index: 1)
@@ -97,7 +98,7 @@ final class HardwareDispatchSetupEncoder {
     ) {
         guard let encoder = commandBuffer.makeComputeCommandEncoder() else { return }
         encoder.label = "PrepareMonoSort"
-        encoder.setComputePipelineState(monoSortPipeline)
+        encoder.setComputePipelineState(self.monoSortPipeline)
 
         encoder.setBuffer(counter, offset: 0, index: 0)
         encoder.setBuffer(header, offset: 0, index: 1)
@@ -128,7 +129,7 @@ final class HardwareDispatchSetupEncoder {
     ) {
         guard let encoder = commandBuffer.makeComputeCommandEncoder() else { return }
         encoder.label = "PrepareStereoDrawArgs"
-        encoder.setComputePipelineState(stereoDrawArgsPipeline)
+        encoder.setComputePipelineState(self.stereoDrawArgsPipeline)
 
         encoder.setBuffer(header, offset: 0, index: 0)
         encoder.setBuffer(drawArgs, offset: 0, index: 1)

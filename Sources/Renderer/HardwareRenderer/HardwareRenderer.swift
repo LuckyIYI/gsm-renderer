@@ -95,7 +95,7 @@ final class HardwareResourceManager {
         }
 
         let newMax = max(gaussianCount, maxStereoGaussians * 2, 100_000)
-        let radixAlignment = radixBlockSize * radixGrainSize
+        let radixAlignment = self.radixBlockSize * self.radixGrainSize
         let paddedMax = ((newMax + radixAlignment - 1) / radixAlignment) * radixAlignment
         let numBlocks = paddedMax / radixAlignment + 4
         let scanBlockSize = 256
@@ -155,8 +155,8 @@ final class HardwareResourceManager {
             numBlocks: numBlocks
         )
 
-        stereoResources = resources
-        maxStereoGaussians = newMax
+        self.stereoResources = resources
+        self.maxStereoGaussians = newMax
         return resources
     }
 
@@ -166,7 +166,7 @@ final class HardwareResourceManager {
         }
 
         let newMax = max(gaussianCount, maxMonoGaussians * 2, 100_000)
-        let radixAlignment = radixBlockSize * radixGrainSize
+        let radixAlignment = self.radixBlockSize * self.radixGrainSize
         let paddedMax = ((newMax + radixAlignment - 1) / radixAlignment) * radixAlignment
         let numBlocks = paddedMax / radixAlignment + 4
         let scanBlockSize = 256
@@ -226,8 +226,8 @@ final class HardwareResourceManager {
             numBlocks: numBlocks
         )
 
-        monoResources = resources
-        maxMonoGaussians = newMax
+        self.monoResources = resources
+        self.maxMonoGaussians = newMax
         return resources
     }
 }
@@ -258,6 +258,7 @@ public final class HardwareRenderer: GaussianRenderer, @unchecked Sendable {
         case mesh(MeshRenderEncoder)
         case instanced(InstancedRenderEncoder)
     }
+
     private let backendImpl: BackendImpl
 
     // Resources
@@ -369,7 +370,7 @@ public final class HardwareRenderer: GaussianRenderer, @unchecked Sendable {
 
         do {
             let resources = try resourceManager.ensureMonoResources(gaussianCount: input.gaussianCount)
-            renderMonoInternal(
+            self.renderMonoInternal(
                 commandBuffer: commandBuffer,
                 colorTexture: colorTexture,
                 depthTexture: depthTexture,
@@ -393,8 +394,8 @@ public final class HardwareRenderer: GaussianRenderer, @unchecked Sendable {
         height: Int
     ) {
         switch target {
-        case .sideBySide(let colorTexture, let depthTexture):
-            renderStereoSideBySide(
+        case let .sideBySide(colorTexture, depthTexture):
+            self.renderStereoSideBySide(
                 commandBuffer: commandBuffer,
                 colorTexture: colorTexture,
                 depthTexture: depthTexture,
@@ -409,8 +410,8 @@ public final class HardwareRenderer: GaussianRenderer, @unchecked Sendable {
                 eyeHeight: height
             )
 
-        case .foveated(let drawable, let configuration):
-            renderStereoFoveated(
+        case let .foveated(drawable, configuration):
+            self.renderStereoFoveated(
                 commandBuffer: commandBuffer,
                 drawable: drawable,
                 input: input,
@@ -435,11 +436,11 @@ public final class HardwareRenderer: GaussianRenderer, @unchecked Sendable {
     ) {
         if let blitEncoder = commandBuffer.makeBlitCommandEncoder() {
             blitEncoder.label = "ResetMonoCounter"
-            blitEncoder.fill(buffer: resources.counter, range: 0..<4, value: 0)
+            blitEncoder.fill(buffer: resources.counter, range: 0 ..< 4, value: 0)
             blitEncoder.endEncoding()
         }
 
-        projectCullEncoder.encodeMono(
+        self.projectCullEncoder.encodeMono(
             commandBuffer: commandBuffer,
             input: input,
             projected: resources.projected,
@@ -448,11 +449,11 @@ public final class HardwareRenderer: GaussianRenderer, @unchecked Sendable {
             camera: camera,
             width: width,
             height: height,
-            inputIsSRGB: inputIsSRGB,
-            precision: precision
+            inputIsSRGB: self.inputIsSRGB,
+            precision: self.precision
         )
 
-        visibilityCompactionEncoder.encode(
+        self.visibilityCompactionEncoder.encode(
             commandBuffer: commandBuffer,
             gaussianCount: input.gaussianCount,
             nTouchedTiles: resources.visibilityMarks,
@@ -467,7 +468,7 @@ public final class HardwareRenderer: GaussianRenderer, @unchecked Sendable {
         )
 
         let sortConfig = HardwareDispatchSetupConfig(numBlocks: resources.numBlocks)
-        dispatchSetupEncoder.encodeMono(
+        self.dispatchSetupEncoder.encodeMono(
             commandBuffer: commandBuffer,
             counter: resources.counter,
             header: resources.header,
@@ -486,7 +487,7 @@ public final class HardwareRenderer: GaussianRenderer, @unchecked Sendable {
             scratchKeys: resources.scratchKeys,
             scratchIndices: resources.scratchIndices
         )
-        depthRadixSortEncoder.encode(
+        self.depthRadixSortEncoder.encode(
             commandBuffer: commandBuffer,
             depthKeys: resources.depthKeys,
             sortedIndices: resources.sortedIndices,
@@ -497,18 +498,18 @@ public final class HardwareRenderer: GaussianRenderer, @unchecked Sendable {
             label: "Mono"
         )
 
-        reorderEncoder.encodeMono(
+        self.reorderEncoder.encodeMono(
             commandBuffer: commandBuffer,
             projected: resources.projected,
             sortedIndices: resources.sortedIndices,
             projectedSorted: resources.projectedSorted,
             header: resources.header,
             reorderDispatch: resources.reorderDispatch,
-            backToFront: backToFront
+            backToFront: self.backToFront
         )
 
-        switch backendImpl {
-        case .instanced(let encoder):
+        switch self.backendImpl {
+        case let .instanced(encoder):
             encoder.encodeMono(
                 commandBuffer: commandBuffer,
                 colorTexture: colorTexture,
@@ -521,8 +522,8 @@ public final class HardwareRenderer: GaussianRenderer, @unchecked Sendable {
                 farPlane: camera.far
             )
 
-        case .mesh(let encoder):
-            dispatchSetupEncoder.encodeMeshDrawArgs(
+        case let .mesh(encoder):
+            self.dispatchSetupEncoder.encodeMeshDrawArgs(
                 commandBuffer: commandBuffer,
                 header: resources.header,
                 meshDrawArgs: resources.meshDrawArgs
@@ -556,7 +557,7 @@ public final class HardwareRenderer: GaussianRenderer, @unchecked Sendable {
 
         do {
             let resources = try resourceManager.ensureStereoResources(gaussianCount: input.gaussianCount)
-            renderStereoInternal(
+            self.renderStereoInternal(
                 commandBuffer: commandBuffer,
                 colorTexture: colorTexture,
                 depthTexture: depthTexture,
@@ -584,7 +585,7 @@ public final class HardwareRenderer: GaussianRenderer, @unchecked Sendable {
 
         do {
             let resources = try resourceManager.ensureStereoResources(gaussianCount: input.gaussianCount)
-            renderStereoInternal(
+            self.renderStereoInternal(
                 commandBuffer: commandBuffer,
                 colorTexture: drawable.colorTexture,
                 depthTexture: drawable.depthTexture,
@@ -613,11 +614,11 @@ public final class HardwareRenderer: GaussianRenderer, @unchecked Sendable {
     ) {
         if let blitEncoder = commandBuffer.makeBlitCommandEncoder() {
             blitEncoder.label = "ResetStereoCounter"
-            blitEncoder.fill(buffer: resources.visibleCount, range: 0..<4, value: 0)
+            blitEncoder.fill(buffer: resources.visibleCount, range: 0 ..< 4, value: 0)
             blitEncoder.endEncoding()
         }
 
-        projectCullEncoder.encodeStereo(
+        self.projectCullEncoder.encodeStereo(
             commandBuffer: commandBuffer,
             input: input,
             projected: resources.projected,
@@ -626,11 +627,11 @@ public final class HardwareRenderer: GaussianRenderer, @unchecked Sendable {
             configuration: configuration,
             eyeWidth: width,
             eyeHeight: height,
-            inputIsSRGB: inputIsSRGB,
-            precision: precision
+            inputIsSRGB: self.inputIsSRGB,
+            precision: self.precision
         )
 
-        visibilityCompactionEncoder.encode(
+        self.visibilityCompactionEncoder.encode(
             commandBuffer: commandBuffer,
             gaussianCount: input.gaussianCount,
             nTouchedTiles: resources.visibilityMarks,
@@ -645,7 +646,7 @@ public final class HardwareRenderer: GaussianRenderer, @unchecked Sendable {
         )
 
         let centerConfig = HardwareDispatchSetupConfig(numBlocks: resources.numBlocks)
-        dispatchSetupEncoder.encodeStereo(
+        self.dispatchSetupEncoder.encodeStereo(
             commandBuffer: commandBuffer,
             visibleCount: resources.visibleCount,
             header: resources.header,
@@ -663,7 +664,7 @@ public final class HardwareRenderer: GaussianRenderer, @unchecked Sendable {
             scratchKeys: resources.scratchKeys,
             scratchIndices: resources.scratchIndices
         )
-        depthRadixSortEncoder.encode(
+        self.depthRadixSortEncoder.encode(
             commandBuffer: commandBuffer,
             depthKeys: resources.depthKeys,
             sortedIndices: resources.sortedIndices,
@@ -674,19 +675,19 @@ public final class HardwareRenderer: GaussianRenderer, @unchecked Sendable {
             label: "Stereo"
         )
 
-        reorderEncoder.encodeStereo(
+        self.reorderEncoder.encodeStereo(
             commandBuffer: commandBuffer,
             projected: resources.projected,
             sortedIndices: resources.sortedIndices,
             projectedSorted: resources.projectedSorted,
             header: resources.header,
             reorderDispatch: resources.reorderDispatch,
-            backToFront: backToFront
+            backToFront: self.backToFront
         )
 
-        switch backendImpl {
-        case .instanced(let encoder):
-            dispatchSetupEncoder.encodeStereoDrawArgs(
+        switch self.backendImpl {
+        case let .instanced(encoder):
+            self.dispatchSetupEncoder.encodeStereoDrawArgs(
                 commandBuffer: commandBuffer,
                 header: resources.header,
                 drawArgs: resources.drawArgs
@@ -704,8 +705,8 @@ public final class HardwareRenderer: GaussianRenderer, @unchecked Sendable {
                 height: height
             )
 
-        case .mesh(let encoder):
-            dispatchSetupEncoder.encodeMeshDrawArgs(
+        case let .mesh(encoder):
+            self.dispatchSetupEncoder.encodeMeshDrawArgs(
                 commandBuffer: commandBuffer,
                 header: resources.header,
                 meshDrawArgs: resources.meshDrawArgs
@@ -750,7 +751,8 @@ private extension HardwareRenderer {
               let initFn = library.makeFunction(name: "initializeFragmentStore"),
               let postVertexFn = library.makeFunction(name: "postprocessVertexShader"),
               let postFragmentFn = library.makeFunction(name: "postprocessFragmentShader"),
-              let centerFragmentFn = library.makeFunction(name: backToFront ? "stereoInstancedFragmentBackToFront" : "stereoInstancedFragment") else {
+              let centerFragmentFn = library.makeFunction(name: backToFront ? "stereoInstancedFragmentBackToFront" : "stereoInstancedFragment")
+        else {
             throw RendererError.failedToCreatePipeline("Render shader functions not found")
         }
 
@@ -778,7 +780,8 @@ private extension HardwareRenderer {
         let postprocessPipeline = try device.makeRenderPipelineState(descriptor: postDesc)
 
         guard let monoVertexFn = library.makeFunction(name: "monoGaussianVertex"),
-              let monoFragmentFn = library.makeFunction(name: "monoGaussianFragment") else {
+              let monoFragmentFn = library.makeFunction(name: "monoGaussianFragment")
+        else {
             throw RendererError.failedToCreatePipeline("Mono render functions not found")
         }
 
@@ -833,14 +836,16 @@ private extension HardwareRenderer {
         let centerGaussiansPerMeshTG = 16
 
         guard let centerObjectFn = library.makeFunction(name: "stereoObjectShader"),
-              let centerMeshFn = library.makeFunction(name: "stereoMeshShader") else {
+              let centerMeshFn = library.makeFunction(name: "stereoMeshShader")
+        else {
             throw RendererError.failedToCreatePipeline("Stereo mesh shader functions not found")
         }
 
         guard let initFn = library.makeFunction(name: "initializeFragmentStore"),
               let postVertexFn = library.makeFunction(name: "postprocessVertexShader"),
               let postFragmentFn = library.makeFunction(name: "postprocessFragmentShader"),
-              let centerFragmentFn = library.makeFunction(name: backToFront ? "gaussianFragmentShaderBackToFront" : "gaussianFragmentShader") else {
+              let centerFragmentFn = library.makeFunction(name: backToFront ? "gaussianFragmentShaderBackToFront" : "gaussianFragmentShader")
+        else {
             throw RendererError.failedToCreatePipeline("Imageblock shader functions not found")
         }
 
@@ -873,7 +878,8 @@ private extension HardwareRenderer {
 
         guard let monoObjectFn = library.makeFunction(name: "monoObjectShader"),
               let monoMeshFn = library.makeFunction(name: "monoMeshShader"),
-              let monoFragmentFn = library.makeFunction(name: "monoFragmentShader") else {
+              let monoFragmentFn = library.makeFunction(name: "monoFragmentShader")
+        else {
             throw RendererError.failedToCreatePipeline("Mono mesh shader functions not found")
         }
 
@@ -922,7 +928,7 @@ private extension HardwareRenderer {
         buffer.label = "InstancedGaussian.QuadIndexBuffer"
 
         let indices = buffer.contents().bindMemory(to: UInt32.self, capacity: indexCount)
-        for i in 0..<maxIndexedSplatCount {
+        for i in 0 ..< maxIndexedSplatCount {
             let baseV = UInt32(i * 4)
             let baseI = i * 6
             indices[baseI + 0] = baseV + 0

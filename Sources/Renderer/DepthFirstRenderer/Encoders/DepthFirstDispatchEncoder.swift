@@ -70,7 +70,7 @@ final class DepthFirstDispatchEncoder {
         guard let encoder = commandBuffer.makeComputeCommandEncoder() else { return }
         encoder.label = "PrepareDepthFirstDispatch"
 
-        encoder.setComputePipelineState(pipeline)
+        encoder.setComputePipelineState(self.pipeline)
         encoder.setBuffer(visibleCount, offset: 0, index: 0)
         encoder.setBuffer(totalInstances, offset: 0, index: 1)
         encoder.setBuffer(header, offset: 0, index: 2)
@@ -95,7 +95,7 @@ final class DepthFirstDispatchEncoder {
         guard let encoder = commandBuffer.makeComputeCommandEncoder() else { return }
         encoder.label = "PrepareRenderDispatch"
 
-        encoder.setComputePipelineState(prepareRenderPipeline)
+        encoder.setComputePipelineState(self.prepareRenderPipeline)
         encoder.setBuffer(activeTileCount, offset: 0, index: 0)
         encoder.setBuffer(dispatchArgs, offset: 0, index: 1)
 

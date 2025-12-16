@@ -260,7 +260,7 @@ final class DepthFirstUnitTests: XCTestCase {
 
         let encoder: DepthRadixSortEncoder
         do {
-            encoder = try DepthRadixSortEncoder(device: device, library: library, precision: .bits32)
+            encoder = try DepthRadixSortEncoder(device: self.device, library: library, precision: .bits32)
         } catch {
             XCTFail("Failed to create DepthRadixSortEncoder: \(error)")
             return
@@ -1066,7 +1066,7 @@ extension DepthFirstRenderer {
 
     /// Debug method to read sorted primitive indices
     func debugReadSortedPrimitiveIndices(count: Int) -> [Int32] {
-        debugReadSortedPrimitiveIndicesRange(start: 0, count: count)
+        self.debugReadSortedPrimitiveIndicesRange(start: 0, count: count)
     }
 
     /// Debug method to read sorted primitive indices from a specific range

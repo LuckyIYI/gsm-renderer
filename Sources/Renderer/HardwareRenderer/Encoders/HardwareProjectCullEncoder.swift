@@ -11,37 +11,37 @@ final class HardwareProjectCullEncoder {
     private var stereoHalfPipelines: [UInt32: MTLComputePipelineState] = [:]
 
     init(device: MTLDevice, library: MTLLibrary) throws {
-        for degree: UInt32 in 0...3 {
+        for degree: UInt32 in 0 ... 3 {
             let constantValues = MTLFunctionConstantValues()
             var shDegreeValue = degree
             constantValues.setConstantValue(&shDegreeValue, type: .uint, index: 0)
 
             if let fn = try? library.makeFunction(name: "monoProjectCullKernel", constantValues: constantValues) {
-                monoFloatPipelines[degree] = try? device.makeComputePipelineState(function: fn)
+                self.monoFloatPipelines[degree] = try? device.makeComputePipelineState(function: fn)
             }
             if let fn = try? library.makeFunction(name: "monoProjectCullKernelHalf", constantValues: constantValues) {
-                monoHalfPipelines[degree] = try? device.makeComputePipelineState(function: fn)
+                self.monoHalfPipelines[degree] = try? device.makeComputePipelineState(function: fn)
             }
 
             if let fn = try? library.makeFunction(name: "stereoProjectCullKernel", constantValues: constantValues) {
-                stereoFloatPipelines[degree] = try? device.makeComputePipelineState(function: fn)
+                self.stereoFloatPipelines[degree] = try? device.makeComputePipelineState(function: fn)
             }
             if let fn = try? library.makeFunction(name: "stereoProjectCullKernelHalf", constantValues: constantValues) {
-                stereoHalfPipelines[degree] = try? device.makeComputePipelineState(function: fn)
+                self.stereoHalfPipelines[degree] = try? device.makeComputePipelineState(function: fn)
             }
         }
 
-        guard monoFloatPipelines[0] != nil, stereoFloatPipelines[0] != nil else {
+        guard self.monoFloatPipelines[0] != nil, self.stereoFloatPipelines[0] != nil else {
             throw RendererError.failedToCreatePipeline("Hardware project+cull pipelines not found")
         }
     }
 
     private static func shDegree(from shComponents: Int) -> UInt32 {
         switch shComponents {
-        case 0, 1: return 0
-        case 2...4: return 1
-        case 5...9: return 2
-        default: return 3
+        case 0, 1: 0
+        case 2 ... 4: 1
+        case 5 ... 9: 2
+        default: 3
         }
     }
 
@@ -61,11 +61,10 @@ final class HardwareProjectCullEncoder {
         encoder.label = "Hardware_ProjectCull_Mono"
 
         let shDegree = Self.shDegree(from: input.shComponents)
-        let pipeline: MTLComputePipelineState
-        if precision == .float32 {
-            pipeline = monoFloatPipelines[shDegree] ?? monoFloatPipelines[0]!
+        let pipeline: MTLComputePipelineState = if precision == .float32 {
+            self.monoFloatPipelines[shDegree] ?? self.monoFloatPipelines[0]!
         } else {
-            pipeline = monoHalfPipelines[shDegree] ?? monoHalfPipelines[0] ?? monoFloatPipelines[0]!
+            self.monoHalfPipelines[shDegree] ?? self.monoHalfPipelines[0] ?? self.monoFloatPipelines[0]!
         }
         encoder.setComputePipelineState(pipeline)
 
@@ -116,11 +115,10 @@ final class HardwareProjectCullEncoder {
         encoder.label = "Hardware_ProjectCull_Stereo"
 
         let shDegree = Self.shDegree(from: input.shComponents)
-        let pipeline: MTLComputePipelineState
-        if precision == .float32 {
-            pipeline = stereoFloatPipelines[shDegree] ?? stereoFloatPipelines[0]!
+        let pipeline: MTLComputePipelineState = if precision == .float32 {
+            self.stereoFloatPipelines[shDegree] ?? self.stereoFloatPipelines[0]!
         } else {
-            pipeline = stereoHalfPipelines[shDegree] ?? stereoHalfPipelines[0] ?? stereoFloatPipelines[0]!
+            self.stereoHalfPipelines[shDegree] ?? self.stereoHalfPipelines[0] ?? self.stereoFloatPipelines[0]!
         }
         encoder.setComputePipelineState(pipeline)
 
@@ -184,4 +182,3 @@ final class HardwareProjectCullEncoder {
         encoder.endEncoding()
     }
 }
-

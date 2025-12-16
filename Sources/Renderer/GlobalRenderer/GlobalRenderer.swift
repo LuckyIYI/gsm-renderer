@@ -14,7 +14,7 @@ struct RendererLimits: Sendable {
     var tilesY: Int { (self.maxHeight + self.tileHeight - 1) / self.tileHeight }
     var maxTileCount: Int { max(1, self.tilesX * self.tilesY) }
 
-    init(from config: RendererConfig, tileWidth: Int = 32, tileHeight: Int = 16,) {
+    init(from config: RendererConfig, tileWidth: Int = 32, tileHeight: Int = 16) {
         self.maxGaussians = max(1, config.maxGaussians)
         self.maxWidth = max(1, config.maxWidth)
         self.maxHeight = max(1, config.maxHeight)
@@ -52,8 +52,8 @@ struct RendererLimits: Sendable {
 
     /// Build binning params with actual render dimensions (for dynamic sizing like visionOS foveation)
     func buildBinningParams(gaussianCount: Int, width: Int, height: Int) -> TileBinningParams {
-        let actualTilesX = (width + tileWidth - 1) / tileWidth
-        let actualTilesY = (height + tileHeight - 1) / tileHeight
+        let actualTilesX = (width + self.tileWidth - 1) / self.tileWidth
+        let actualTilesY = (height + self.tileHeight - 1) / self.tileHeight
         return TileBinningParams(
             gaussianCount: UInt32(gaussianCount),
             tilesX: UInt32(actualTilesX),
@@ -68,7 +68,6 @@ struct RendererLimits: Sendable {
         )
     }
 }
-
 
 public final class GlobalRenderer: GaussianRenderer, @unchecked Sendable {
     private static let maxSupportedGaussians = 30_000_000
@@ -154,19 +153,19 @@ public final class GlobalRenderer: GaussianRenderer, @unchecked Sendable {
         self.limits = RendererLimits(
             from: config,
             tileWidth: GlobalRenderer.tileWidth,
-            tileHeight: GlobalRenderer.tileHeight,
+            tileHeight: GlobalRenderer.tileHeight
         )
 
         // Initialize stereo resources (left for mono, both for stereo)
         self.stereoResources = try GlobalMultiViewResources(
             device: device,
-            maxGaussians: limits.maxGaussians,
-            maxWidth: limits.maxWidth,
-            maxHeight: limits.maxHeight,
-            tileWidth: limits.tileWidth,
-            tileHeight: limits.tileHeight,
-            radixBlockSize: radixSortEncoder.blockSize,
-            radixGrainSize: radixSortEncoder.grainSize,
+            maxGaussians: self.limits.maxGaussians,
+            maxWidth: self.limits.maxWidth,
+            maxHeight: self.limits.maxHeight,
+            tileWidth: self.limits.tileWidth,
+            tileHeight: self.limits.tileHeight,
+            radixBlockSize: self.radixSortEncoder.blockSize,
+            radixGrainSize: self.radixSortEncoder.grainSize,
             precision: config.precision
         )
 
@@ -195,7 +194,6 @@ public final class GlobalRenderer: GaussianRenderer, @unchecked Sendable {
         rightMaskCache.label = "RightGaussianMask"
         self.rightBoundsCache = rightBoundsCache
         self.rightMaskCache = rightMaskCache
-
     }
 
     /// Debug helper for benchmarks/tests (reads GPU-written shared counters after command buffer completion).
@@ -219,7 +217,7 @@ public final class GlobalRenderer: GaussianRenderer, @unchecked Sendable {
             height: height,
             gaussianCount: input.gaussianCount,
             shComponents: input.shComponents,
-            inputIsSRGB: config.gaussianColorSpace == .srgb
+            inputIsSRGB: self.config.gaussianColorSpace == .srgb
         )
 
         let frameParams = FrameParams(gaussianCount: input.gaussianCount)
@@ -229,7 +227,7 @@ public final class GlobalRenderer: GaussianRenderer, @unchecked Sendable {
             harmonics: input.harmonics
         )
 
-        _ = encodeRenderToTargetTexture(
+        _ = self.encodeRenderToTargetTexture(
             commandBuffer: commandBuffer,
             gaussianCount: input.gaussianCount,
             packedWorldBuffers: packedWorld,
@@ -237,19 +235,19 @@ public final class GlobalRenderer: GaussianRenderer, @unchecked Sendable {
             frameParams: frameParams,
             targetColor: colorTexture,
             targetDepth: depthTexture,
-            frame: stereoResources.left,
-            boundsCache: leftBoundsCache,
-            maskCache: leftMaskCache
+            frame: self.stereoResources.left,
+            boundsCache: self.leftBoundsCache,
+            maskCache: self.leftMaskCache
         )
     }
 
     public func renderStereo(
-        commandBuffer: MTLCommandBuffer,
+        commandBuffer _: MTLCommandBuffer,
         target: StereoRenderTarget,
-        input: GaussianInput,
-        camera: StereoCameraParams,
-        width: Int,
-        height: Int
+        input _: GaussianInput,
+        camera _: StereoCameraParams,
+        width _: Int,
+        height _: Int
     ) {
         switch target {
         case .sideBySide:
@@ -267,8 +265,8 @@ public final class GlobalRenderer: GaussianRenderer, @unchecked Sendable {
         cameraUniforms: CameraUniformsSwift,
         frameParams: FrameParams
     ) -> RenderOutputTextures? {
-        let textures = stereoResources.left.outputTextures
-        let success = encodeRenderToTargetTexture(
+        let textures = self.stereoResources.left.outputTextures
+        let success = self.encodeRenderToTargetTexture(
             commandBuffer: commandBuffer,
             gaussianCount: gaussianCount,
             packedWorldBuffers: packedWorldBuffers,
@@ -276,9 +274,9 @@ public final class GlobalRenderer: GaussianRenderer, @unchecked Sendable {
             frameParams: frameParams,
             targetColor: textures.color,
             targetDepth: textures.depth,
-            frame: stereoResources.left,
-            boundsCache: leftBoundsCache,
-            maskCache: leftMaskCache
+            frame: self.stereoResources.left,
+            boundsCache: self.leftBoundsCache,
+            maskCache: self.leftMaskCache
         )
         return success ? textures : nil
     }
@@ -546,7 +544,7 @@ public final class GlobalRenderer: GaussianRenderer, @unchecked Sendable {
         boundsCache: MTLBuffer,
         maskCache: MTLBuffer
     ) -> ProjectionOutput {
-        return ProjectionOutput(
+        ProjectionOutput(
             renderData: frame.interleavedGaussians,
             bounds: boundsCache,
             mask: maskCache

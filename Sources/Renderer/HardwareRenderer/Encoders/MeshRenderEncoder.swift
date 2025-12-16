@@ -5,16 +5,15 @@ import RendererTypes
 private func isDepthRenderable(_ format: MTLPixelFormat) -> Bool {
     switch format {
     case .depth16Unorm, .depth32Float, .depth32Float_stencil8, .depth24Unorm_stencil8:
-        return true
+        true
     default:
-        return false
+        false
     }
 }
 
 /// Encoder for mesh shader Gaussian rendering.
 /// Handles hardware stereo and mono rendering modes.
 final class MeshRenderEncoder {
-
     static let gaussiansPerObjectTG: Int = 64
     static let gaussiansPerMeshTG: Int = 16
     static let meshThreads: Int = 64
@@ -66,7 +65,7 @@ final class MeshRenderEncoder {
         renderPassDescriptor.colorAttachments[0].loadAction = .clear
         renderPassDescriptor.colorAttachments[0].storeAction = .store
         renderPassDescriptor.colorAttachments[0].clearColor = MTLClearColor(red: 0, green: 0, blue: 0, alpha: 0)
-        
+
         let renderTargetArrayLength = colorTexture.arrayLength
         renderPassDescriptor.renderTargetArrayLength = renderTargetArrayLength
         renderPassDescriptor.rasterizationRateMap = rasterizationRateMap
@@ -81,20 +80,20 @@ final class MeshRenderEncoder {
 
         renderPassDescriptor.tileWidth = Constants.tileSize.width
         renderPassDescriptor.tileHeight = Constants.tileSize.height
-        renderPassDescriptor.imageblockSampleLength = initializePipeline.imageblockSampleLength
+        renderPassDescriptor.imageblockSampleLength = self.initializePipeline.imageblockSampleLength
 
         guard let encoder = commandBuffer.makeRenderCommandEncoder(descriptor: renderPassDescriptor) else { return }
         encoder.label = "MeshGaussian_Stereo"
 
         encoder.pushDebugGroup("Initialize Fragment Store")
-        encoder.setRenderPipelineState(initializePipeline)
+        encoder.setRenderPipelineState(self.initializePipeline)
         encoder.dispatchThreadsPerTile(Constants.tileSize)
         encoder.popDebugGroup()
 
         encoder.pushDebugGroup("Draw Gaussians")
-        encoder.setRenderPipelineState(stereoPipeline)
-        encoder.setDepthStencilState(noDepthStencilState)
-        
+        encoder.setRenderPipelineState(self.stereoPipeline)
+        encoder.setDepthStencilState(self.noDepthStencilState)
+
         let leftViewport = MTLViewport(
             originX: configuration.leftEye.viewport.originX,
             originY: configuration.leftEye.viewport.originY,
@@ -134,7 +133,7 @@ final class MeshRenderEncoder {
             farPlane: configuration.leftEye.far,
             _pad0: 0
         )
-        
+
         encoder.setObjectBytes(&uniforms, length: MemoryLayout<HardwareRenderUniforms>.stride, index: 1)
         encoder.setMeshBytes(&uniforms, length: MemoryLayout<HardwareRenderUniforms>.stride, index: 1)
 
@@ -148,15 +147,14 @@ final class MeshRenderEncoder {
         encoder.popDebugGroup()
 
         encoder.pushDebugGroup("Postprocess")
-        encoder.setRenderPipelineState(postprocessPipeline)
-        encoder.setDepthStencilState(depthStencilState)
+        encoder.setRenderPipelineState(self.postprocessPipeline)
+        encoder.setDepthStencilState(self.depthStencilState)
         encoder.setCullMode(.none)
         encoder.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: 3)
         encoder.popDebugGroup()
 
         encoder.endEncoding()
     }
-
 
     /// Encode mono render
     func encodeMono(
@@ -189,8 +187,8 @@ final class MeshRenderEncoder {
         guard let encoder = commandBuffer.makeRenderCommandEncoder(descriptor: renderPassDesc) else { return }
         encoder.label = "MeshGaussian_Mono"
 
-        encoder.setRenderPipelineState(monoPipeline)
-        encoder.setDepthStencilState(hasValidDepth ? depthStencilState : noDepthStencilState)
+        encoder.setRenderPipelineState(self.monoPipeline)
+        encoder.setDepthStencilState(hasValidDepth ? self.depthStencilState : self.noDepthStencilState)
 
         let viewport = MTLViewport(originX: 0, originY: 0, width: Double(width), height: Double(height), znear: 0, zfar: 1)
         encoder.setViewport(viewport)

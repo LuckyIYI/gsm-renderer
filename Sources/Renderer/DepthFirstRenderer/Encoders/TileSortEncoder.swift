@@ -74,7 +74,7 @@ final class TileSortEncoder {
             // Step 1: Build histogram
             if let encoder = commandBuffer.makeComputeCommandEncoder() {
                 encoder.label = "TileRadixHistogram_\(pass)"
-                encoder.setComputePipelineState(tileIdPrecision == .bits32 ? histogramPipeline32 : histogramPipeline16)
+                encoder.setComputePipelineState(self.tileIdPrecision == .bits32 ? self.histogramPipeline32 : self.histogramPipeline16)
                 encoder.setBuffer(inputTileIds, offset: 0, index: 0)
                 encoder.setBuffer(sortBuffers.histogram, offset: 0, index: 1)
                 encoder.setBuffer(header, offset: 0, index: 2)
@@ -92,7 +92,7 @@ final class TileSortEncoder {
             // Step 2: Scan histogram blocks
             if let encoder = commandBuffer.makeComputeCommandEncoder() {
                 encoder.label = "TileRadixScanBlocks_\(pass)"
-                encoder.setComputePipelineState(scanBlocksPipeline)
+                encoder.setComputePipelineState(self.scanBlocksPipeline)
                 encoder.setBuffer(sortBuffers.histogram, offset: 0, index: 0)
                 encoder.setBuffer(sortBuffers.blockSums, offset: 0, index: 1)
                 encoder.setBuffer(header, offset: 0, index: 2)
@@ -108,7 +108,7 @@ final class TileSortEncoder {
             // Step 3: Exclusive scan of block sums
             if let encoder = commandBuffer.makeComputeCommandEncoder() {
                 encoder.label = "TileRadixExclusive_\(pass)"
-                encoder.setComputePipelineState(exclusiveScanPipeline)
+                encoder.setComputePipelineState(self.exclusiveScanPipeline)
                 encoder.setBuffer(sortBuffers.blockSums, offset: 0, index: 0)
                 encoder.setBuffer(sortBuffers.scannedHistogram, offset: 0, index: 1)
                 encoder.setBuffer(sortBuffers.histogram, offset: 0, index: 2)
@@ -126,7 +126,7 @@ final class TileSortEncoder {
             // Step 4: Apply offsets to histogram
             if let encoder = commandBuffer.makeComputeCommandEncoder() {
                 encoder.label = "TileRadixApply_\(pass)"
-                encoder.setComputePipelineState(applyOffsetsPipeline)
+                encoder.setComputePipelineState(self.applyOffsetsPipeline)
                 encoder.setBuffer(sortBuffers.histogram, offset: 0, index: 0)
                 encoder.setBuffer(sortBuffers.blockSums, offset: 0, index: 1)
                 encoder.setBuffer(sortBuffers.scannedHistogram, offset: 0, index: 2)
@@ -143,7 +143,7 @@ final class TileSortEncoder {
             // Step 5: Scatter to sorted positions
             if let encoder = commandBuffer.makeComputeCommandEncoder() {
                 encoder.label = "TileRadixScatter_\(pass)"
-                encoder.setComputePipelineState(tileIdPrecision == .bits32 ? scatterPipeline32 : scatterPipeline16)
+                encoder.setComputePipelineState(self.tileIdPrecision == .bits32 ? self.scatterPipeline32 : self.scatterPipeline16)
                 encoder.setBuffer(inputTileIds, offset: 0, index: 0)
                 encoder.setBuffer(inputIndices, offset: 0, index: 1)
                 encoder.setBuffer(sortBuffers.scannedHistogram, offset: 0, index: 2) // Use scanned histogram with offsets

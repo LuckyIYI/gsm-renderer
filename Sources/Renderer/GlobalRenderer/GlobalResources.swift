@@ -127,7 +127,7 @@ final class GlobalViewResources {
             label: "TileHeader"
         )
         // Initialize header
-        let headerPtr = tileAssignmentHeader.contents().bindMemory(to: TileAssignmentHeaderSwift.self, capacity: 1)
+        let headerPtr = self.tileAssignmentHeader.contents().bindMemory(to: TileAssignmentHeaderSwift.self, capacity: 1)
         headerPtr.pointee.maxCapacity = UInt32(maxAssignmentCapacity)
         headerPtr.pointee.paddedCount = UInt32(paddedCapacity)
         headerPtr.pointee.totalAssignments = 0

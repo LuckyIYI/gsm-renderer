@@ -30,7 +30,7 @@ func makeProjectionMatrix(
     fovDegrees: Float = TestCameraDefaults.fovDegrees
 ) -> simd_float4x4 {
     // Default to OpenCV convention for backward compatibility
-    return makeProjectionMatrix(width: width, height: height, near: near, far: far, fovDegrees: fovDegrees, convention: .openCV)
+    makeProjectionMatrix(width: width, height: height, near: near, far: far, fovDegrees: fovDegrees, convention: .openCV)
 }
 
 /// Creates a perspective projection matrix for tests with explicit convention.
@@ -136,7 +136,7 @@ struct GeneratedGaussians {
     let opacities: [Float]
     let colors: [SIMD3<Float>]
 
-    var count: Int { positions.count }
+    var count: Int { self.positions.count }
 }
 
 /// Generates test gaussians on a grid pattern.
@@ -353,22 +353,22 @@ struct BenchmarkResult {
     let name: String
     let times: [Double]
 
-    var avg: Double { times.reduce(0, +) / Double(times.count) }
-    var min: Double { times.min() ?? 0 }
-    var max: Double { times.max() ?? 0 }
-    var fps: Double { 1000.0 / avg }
+    var avg: Double { self.times.reduce(0, +) / Double(self.times.count) }
+    var min: Double { self.times.min() ?? 0 }
+    var max: Double { self.times.max() ?? 0 }
+    var fps: Double { 1000.0 / self.avg }
 
     var stdDev: Double {
-        let mean = avg
-        let variance = times.map { ($0 - mean) * ($0 - mean) }.reduce(0, +) / Double(times.count)
+        let mean = self.avg
+        let variance = self.times.map { ($0 - mean) * ($0 - mean) }.reduce(0, +) / Double(self.times.count)
         return sqrt(variance)
     }
 
     func printSummary(gaussianCount: Int? = nil) {
-        print("  \(name):")
-        print("    Avg: \(String(format: "%.3f", avg))ms (stddev: \(String(format: "%.3f", stdDev)))")
-        print("    Min: \(String(format: "%.3f", min))ms, Max: \(String(format: "%.3f", max))ms")
-        print("    FPS: \(String(format: "%.1f", fps))")
+        print("  \(self.name):")
+        print("    Avg: \(String(format: "%.3f", self.avg))ms (stddev: \(String(format: "%.3f", self.stdDev)))")
+        print("    Min: \(String(format: "%.3f", self.min))ms, Max: \(String(format: "%.3f", self.max))ms")
+        print("    FPS: \(String(format: "%.1f", self.fps))")
         if let count = gaussianCount {
             let throughput = Double(count) / (avg * 1000.0) // M gaussians/sec
             print("    Throughput: \(String(format: "%.2f", throughput))M gaussians/sec")

@@ -342,8 +342,8 @@ final class StereoTiledResources {
     let device: MTLDevice
 
     // Per-gaussian stereo render data (32 bytes per gaussian)
-    let renderData: MTLBuffer       // StereoTiledRenderData
-    let bounds: MTLBuffer           // Union tile bounds (int4)
+    let renderData: MTLBuffer // StereoTiledRenderData
+    let bounds: MTLBuffer // Union tile bounds (int4)
     let depthKeys: MTLBuffer
     let primitiveIndices: MTLBuffer
     let nTouchedTiles: MTLBuffer

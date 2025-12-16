@@ -22,7 +22,7 @@ final class TileRangeEncoder {
         self.extractRangesPipeline32 = try device.makeComputePipelineState(function: extractFn32)
         self.resetStatePipeline = try device.makeComputePipelineState(function: resetFn)
         self.tileIdPrecision = tileIdPrecision
-        self.threadgroupSize = min(extractRangesPipeline16.maxTotalThreadsPerThreadgroup, 256)
+        self.threadgroupSize = min(self.extractRangesPipeline16.maxTotalThreadsPerThreadgroup, 256)
     }
 
     /// Reset depth-first state (visible count, instance count, active tile count)
@@ -33,7 +33,7 @@ final class TileRangeEncoder {
     ) {
         guard let encoder = commandBuffer.makeComputeCommandEncoder() else { return }
         encoder.label = "ResetDepthFirstState"
-        encoder.setComputePipelineState(resetStatePipeline)
+        encoder.setComputePipelineState(self.resetStatePipeline)
         encoder.setBuffer(header, offset: 0, index: 0)
         encoder.setBuffer(activeTileCount, offset: 0, index: 1)
         encoder.dispatchThreads(MTLSize(width: 1, height: 1, depth: 1),
@@ -54,7 +54,7 @@ final class TileRangeEncoder {
         guard let encoder = commandBuffer.makeComputeCommandEncoder() else { return }
         encoder.label = "ExtractTileRanges"
 
-        encoder.setComputePipelineState(tileIdPrecision == .bits32 ? extractRangesPipeline32 : extractRangesPipeline16)
+        encoder.setComputePipelineState(self.tileIdPrecision == .bits32 ? self.extractRangesPipeline32 : self.extractRangesPipeline16)
         encoder.setBuffer(sortedTileIds, offset: 0, index: 0)
         encoder.setBuffer(tileHeaders, offset: 0, index: 1)
         encoder.setBuffer(activeTiles, offset: 0, index: 2)

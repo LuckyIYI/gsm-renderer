@@ -60,9 +60,9 @@ final class VisibilityCompactionEncoder {
         let maxOut = UInt32(maxOutCount)
 
         let stride = MemoryLayout<UInt32>.stride
-        let maxBlocks = (maxCountCapacity + blockSize - 1) / blockSize
-        let maxLevel2Blocks = (maxBlocks + blockSize - 1) / blockSize
-        let maxLevel3Blocks = (maxLevel2Blocks + blockSize - 1) / blockSize
+        let maxBlocks = (maxCountCapacity + self.blockSize - 1) / self.blockSize
+        let maxLevel2Blocks = (maxBlocks + self.blockSize - 1) / self.blockSize
+        let maxLevel3Blocks = (maxLevel2Blocks + self.blockSize - 1) / self.blockSize
         let requiredScratchCount = maxBlocks + 1 + maxLevel2Blocks + 1 + maxLevel3Blocks + 1
         let availableScratchCount = prefixSumsScratch.length / stride
         if availableScratchCount < requiredScratchCount {
@@ -72,16 +72,16 @@ final class VisibilityCompactionEncoder {
         let level2OffsetBytes = (maxBlocks + 1) * stride
         let level3OffsetBytes = (maxBlocks + 1 + maxLevel2Blocks + 1) * stride
 
-        let level1Blocks = (gaussianCount + blockSize - 1) / blockSize
-        let level2Blocks = (level1Blocks + blockSize - 1) / blockSize
-        let level3Blocks = (level2Blocks + blockSize - 1) / blockSize
+        let level1Blocks = (gaussianCount + self.blockSize - 1) / self.blockSize
+        let level2Blocks = (level1Blocks + self.blockSize - 1) / self.blockSize
+        let level3Blocks = (level2Blocks + self.blockSize - 1) / self.blockSize
 
         let tg = MTLSize(width: blockSize, height: 1, depth: 1)
 
         // Level 1 reduce (marks from nTouchedTiles)
         if let encoder = commandBuffer.makeComputeCommandEncoder() {
             encoder.label = "VisCompact_Level1Reduce"
-            encoder.setComputePipelineState(markReducePipeline)
+            encoder.setComputePipelineState(self.markReducePipeline)
             encoder.setBuffer(nTouchedTiles, offset: 0, index: 0)
             encoder.setBuffer(prefixSumsScratch, offset: 0, index: 1)
             var c = count
@@ -93,7 +93,7 @@ final class VisibilityCompactionEncoder {
         // Level 2 reduce (reduce level1 block sums)
         if let encoder = commandBuffer.makeComputeCommandEncoder() {
             encoder.label = "VisCompact_Level2Reduce"
-            encoder.setComputePipelineState(reducePipeline)
+            encoder.setComputePipelineState(self.reducePipeline)
             encoder.setBuffer(prefixSumsScratch, offset: 0, index: 0)
             encoder.setBuffer(prefixSumsScratch, offset: level2OffsetBytes, index: 1)
             var c = UInt32(level1Blocks)
@@ -105,7 +105,7 @@ final class VisibilityCompactionEncoder {
         // Level 3 reduce (reduce level2 block sums)
         if let encoder = commandBuffer.makeComputeCommandEncoder() {
             encoder.label = "VisCompact_Level3Reduce"
-            encoder.setComputePipelineState(reducePipeline)
+            encoder.setComputePipelineState(self.reducePipeline)
             encoder.setBuffer(prefixSumsScratch, offset: level2OffsetBytes, index: 0)
             encoder.setBuffer(prefixSumsScratch, offset: level3OffsetBytes, index: 1)
             var c = UInt32(level2Blocks)
@@ -117,7 +117,7 @@ final class VisibilityCompactionEncoder {
         // Scan level 3 block sums in a single block
         if let encoder = commandBuffer.makeComputeCommandEncoder() {
             encoder.label = "VisCompact_Level3Scan"
-            encoder.setComputePipelineState(singleBlockScanPipeline)
+            encoder.setComputePipelineState(self.singleBlockScanPipeline)
             encoder.setBuffer(prefixSumsScratch, offset: level3OffsetBytes, index: 0)
             var bc = UInt32(level3Blocks)
             encoder.setBytes(&bc, length: MemoryLayout<UInt32>.stride, index: 1)
@@ -128,7 +128,7 @@ final class VisibilityCompactionEncoder {
         // Scan level 2 block sums using scanned level 3 as block offsets
         if let encoder = commandBuffer.makeComputeCommandEncoder() {
             encoder.label = "VisCompact_Level2Scan"
-            encoder.setComputePipelineState(scanPipeline)
+            encoder.setComputePipelineState(self.scanPipeline)
             encoder.setBuffer(prefixSumsScratch, offset: level2OffsetBytes, index: 0)
             encoder.setBuffer(prefixSumsScratch, offset: level2OffsetBytes, index: 1)
             encoder.setBuffer(prefixSumsScratch, offset: level3OffsetBytes, index: 2)
@@ -141,7 +141,7 @@ final class VisibilityCompactionEncoder {
         // Scan level 1 block sums using scanned level 2 as block offsets
         if let encoder = commandBuffer.makeComputeCommandEncoder() {
             encoder.label = "VisCompact_Level1Scan"
-            encoder.setComputePipelineState(scanPipeline)
+            encoder.setComputePipelineState(self.scanPipeline)
             encoder.setBuffer(prefixSumsScratch, offset: 0, index: 0)
             encoder.setBuffer(prefixSumsScratch, offset: 0, index: 1)
             encoder.setBuffer(prefixSumsScratch, offset: level2OffsetBytes, index: 2)
@@ -154,7 +154,7 @@ final class VisibilityCompactionEncoder {
         // Scan the per-gaussian visibility marks (nTouchedTiles > 0) into `prefixOffsetsOut`
         if let encoder = commandBuffer.makeComputeCommandEncoder() {
             encoder.label = "VisCompact_MarkScan"
-            encoder.setComputePipelineState(markScanPipeline)
+            encoder.setComputePipelineState(self.markScanPipeline)
             encoder.setBuffer(nTouchedTiles, offset: 0, index: 0)
             encoder.setBuffer(prefixOffsetsOut, offset: 0, index: 1)
             encoder.setBuffer(prefixSumsScratch, offset: 0, index: 2)
@@ -167,7 +167,7 @@ final class VisibilityCompactionEncoder {
         // Scatter compaction into the depth-sort buffers and write visibleCountOut.
         if let encoder = commandBuffer.makeComputeCommandEncoder() {
             encoder.label = "VisCompact_Scatter"
-            encoder.setComputePipelineState(scatterPipeline)
+            encoder.setComputePipelineState(self.scatterPipeline)
             encoder.setBuffer(nTouchedTiles, offset: 0, index: 0)
             encoder.setBuffer(prefixOffsetsOut, offset: 0, index: 1)
             encoder.setBuffer(preDepthKeys, offset: 0, index: 2)

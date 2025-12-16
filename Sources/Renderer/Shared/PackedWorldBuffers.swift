@@ -10,4 +10,3 @@ public struct PackedWorldBuffers {
         self.harmonics = harmonics
     }
 }
-

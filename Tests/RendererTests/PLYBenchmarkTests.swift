@@ -35,7 +35,7 @@ final class PLYBenchmarkTests: XCTestCase {
             [0.7994084, -0.22484124, 0.557129, 0.0],
             [0.28039712, 0.9597669, -0.014999399, 0.0],
             [-0.53134143, 0.16820799, 0.8302905, 0.0],
-            [-1.7380741, -13.886897, 11.441933, 1.0]
+            [-1.7380741, -13.886897, 11.441933, 1.0],
         ])
 
         let viewMatrix: simd_float4x4
@@ -105,12 +105,12 @@ final class PLYBenchmarkTests: XCTestCase {
 
     /// Test rendering with OpenCV convention (+Z forward)
     func testRenderPLYSceneOpenCV() throws {
-        try renderPLYScene(convention: .openCV)
+        try self.renderPLYScene(convention: .openCV)
     }
 
     /// Test rendering with OpenGL convention (-Z forward)
     func testRenderPLYSceneOpenGL() throws {
-        try renderPLYScene(convention: .openGL)
+        try self.renderPLYScene(convention: .openGL)
     }
 
     /// Base rendering function that supports both coordinate conventions.
@@ -166,7 +166,6 @@ final class PLYBenchmarkTests: XCTestCase {
             precision: .float16,
             gaussianColorSpace: .linear,
             backToFront: true
-            
         )
         let localRenderer = try LocalRenderer(config: config)
         let globalRenderer = try GlobalRenderer(config: config)
@@ -176,7 +175,7 @@ final class PLYBenchmarkTests: XCTestCase {
 
         let cameraMargin: Float = 0.25
         let cameraDistance = bounds.radius * cameraMargin
-        let camera = createSceneCameraParams(
+        let camera = self.createSceneCameraParams(
             lookAt: bounds.center - .init(-6.0, -10.0, 0.0),
             distance: cameraDistance,
             width: width,
@@ -319,7 +318,7 @@ final class PLYBenchmarkTests: XCTestCase {
             cb.commit()
             cb.waitUntilCompleted()
         }
-        saveTextureToJPEG(texture: colorTexture, filename: "render_local_\(fileSuffix).jpg")
+        self.saveTextureToJPEG(texture: colorTexture, filename: "render_local_\(fileSuffix).jpg")
 
         // Save Global render
         if let cb = q.makeCommandBuffer() {
@@ -335,7 +334,7 @@ final class PLYBenchmarkTests: XCTestCase {
             cb.commit()
             cb.waitUntilCompleted()
         }
-        saveTextureToJPEG(texture: colorTexture, filename: "render_global_\(fileSuffix).jpg")
+        self.saveTextureToJPEG(texture: colorTexture, filename: "render_global_\(fileSuffix).jpg")
 
         // Save DepthFirst render
         if let cb = q.makeCommandBuffer() {
@@ -351,7 +350,7 @@ final class PLYBenchmarkTests: XCTestCase {
             cb.commit()
             cb.waitUntilCompleted()
         }
-        saveTextureToJPEG(texture: colorTexture, filename: "render_depthfirst_\(fileSuffix).jpg")
+        self.saveTextureToJPEG(texture: colorTexture, filename: "render_depthfirst_\(fileSuffix).jpg")
 
         // Save Instanced render
         if let cb = q.makeCommandBuffer() {
@@ -367,7 +366,7 @@ final class PLYBenchmarkTests: XCTestCase {
             cb.commit()
             cb.waitUntilCompleted()
         }
-        saveTextureToJPEG(texture: colorTexture, filename: "render_instanced_\(fileSuffix).jpg")
+        self.saveTextureToJPEG(texture: colorTexture, filename: "render_instanced_\(fileSuffix).jpg")
 
         // Save Mesh render
         if let cb = q.makeCommandBuffer() {
@@ -383,7 +382,7 @@ final class PLYBenchmarkTests: XCTestCase {
             cb.commit()
             cb.waitUntilCompleted()
         }
-        saveTextureToJPEG(texture: colorTexture, filename: "render_mesh_\(fileSuffix).jpg")
+        self.saveTextureToJPEG(texture: colorTexture, filename: "render_mesh_\(fileSuffix).jpg")
     }
 
     // MARK: - Debug Helpers

@@ -36,28 +36,28 @@ final class DepthFirstProjectCullEncoder {
 
             if let fn = try? library.makeFunction(name: "depthFirstProjectCullKernel", constantValues: constants) {
                 let pipeline = try device.makeComputePipelineState(function: fn)
-                monoFloatPipelines[degree] = pipeline
+                self.monoFloatPipelines[degree] = pipeline
                 maxThreads = min(maxThreads, pipeline.maxTotalThreadsPerThreadgroup)
             }
             if let fn = try? library.makeFunction(name: "depthFirstProjectCullKernelHalf", constantValues: constants) {
                 let pipeline = try device.makeComputePipelineState(function: fn)
-                monoHalfPipelines[degree] = pipeline
+                self.monoHalfPipelines[degree] = pipeline
                 maxThreads = min(maxThreads, pipeline.maxTotalThreadsPerThreadgroup)
             }
 
             if let fn = try? library.makeFunction(name: "depthFirstStereoProjectCullKernel", constantValues: constants) {
                 let pipeline = try device.makeComputePipelineState(function: fn)
-                stereoFloatPipelines[degree] = pipeline
+                self.stereoFloatPipelines[degree] = pipeline
                 maxThreads = min(maxThreads, pipeline.maxTotalThreadsPerThreadgroup)
             }
             if let fn = try? library.makeFunction(name: "depthFirstStereoProjectCullKernelHalf", constantValues: constants) {
                 let pipeline = try device.makeComputePipelineState(function: fn)
-                stereoHalfPipelines[degree] = pipeline
+                self.stereoHalfPipelines[degree] = pipeline
                 maxThreads = min(maxThreads, pipeline.maxTotalThreadsPerThreadgroup)
             }
         }
 
-        guard monoFloatPipelines[0] != nil, stereoFloatPipelines[0] != nil else {
+        guard self.monoFloatPipelines[0] != nil, self.stereoFloatPipelines[0] != nil else {
             throw RendererError.failedToCreatePipeline("Depth-first project+cull kernels not found")
         }
 
@@ -81,7 +81,7 @@ final class DepthFirstProjectCullEncoder {
         guard let encoder = commandBuffer.makeComputeCommandEncoder() else { return }
         encoder.label = "DepthFirst_ProjectCull_Mono"
 
-        let pipelines = useHalfWorld ? monoHalfPipelines : monoFloatPipelines
+        let pipelines = useHalfWorld ? self.monoHalfPipelines : self.monoFloatPipelines
         guard let pipeline = pipelines[shDegree] ?? pipelines[0] else {
             encoder.endEncoding()
             return
@@ -124,7 +124,7 @@ final class DepthFirstProjectCullEncoder {
         guard let encoder = commandBuffer.makeComputeCommandEncoder() else { return }
         encoder.label = "DepthFirst_ProjectCull_Stereo"
 
-        let pipelines = useHalfWorld ? stereoHalfPipelines : stereoFloatPipelines
+        let pipelines = useHalfWorld ? self.stereoHalfPipelines : self.stereoFloatPipelines
         guard let pipeline = pipelines[shDegree] ?? pipelines[0] else {
             encoder.endEncoding()
             return
@@ -151,4 +151,3 @@ final class DepthFirstProjectCullEncoder {
         encoder.endEncoding()
     }
 }
-

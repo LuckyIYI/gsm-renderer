@@ -4,7 +4,7 @@ import Metal
 
 struct BufferAllocationError: Error, LocalizedError {
     let label: String
-    var errorDescription: String? { "Failed to allocate buffer: \(label)" }
+    var errorDescription: String? { "Failed to allocate buffer: \(self.label)" }
 }
 
 // MARK: - MTLDevice Buffer Creation

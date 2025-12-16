@@ -5,16 +5,15 @@ import RendererTypes
 private func isDepthRenderable(_ format: MTLPixelFormat) -> Bool {
     switch format {
     case .depth16Unorm, .depth32Float, .depth32Float_stencil8, .depth24Unorm_stencil8:
-        return true
+        true
     default:
-        return false
+        false
     }
 }
 
 /// Encoder for instanced Gaussian rendering.
 /// Handles hardware stereo and mono rendering modes.
 final class InstancedRenderEncoder {
-
     private enum Constants {
         static let tileSize = MTLSize(width: 32, height: 32, depth: 1)
     }
@@ -58,7 +57,6 @@ final class InstancedRenderEncoder {
         width: Int,
         height: Int
     ) {
-        
         let renderPassDesc = MTLRenderPassDescriptor()
         renderPassDesc.colorAttachments[0].texture = colorTexture
         renderPassDesc.colorAttachments[0].loadAction = .clear
@@ -79,19 +77,19 @@ final class InstancedRenderEncoder {
 
         renderPassDesc.tileWidth = Constants.tileSize.width
         renderPassDesc.tileHeight = Constants.tileSize.height
-        renderPassDesc.imageblockSampleLength = initializePipeline.imageblockSampleLength
+        renderPassDesc.imageblockSampleLength = self.initializePipeline.imageblockSampleLength
 
         guard let encoder = commandBuffer.makeRenderCommandEncoder(descriptor: renderPassDesc) else { return }
         encoder.label = "InstancedGaussian_Stereo"
 
         encoder.pushDebugGroup("Initialize Fragment Store")
-        encoder.setRenderPipelineState(initializePipeline)
+        encoder.setRenderPipelineState(self.initializePipeline)
         encoder.dispatchThreadsPerTile(Constants.tileSize)
         encoder.popDebugGroup()
 
         encoder.pushDebugGroup("Draw Gaussians")
-        encoder.setRenderPipelineState(stereoPipeline)
-        encoder.setDepthStencilState(noDepthStencilState)
+        encoder.setRenderPipelineState(self.stereoPipeline)
+        encoder.setDepthStencilState(self.noDepthStencilState)
 
         let leftViewport = MTLViewport(
             originX: configuration.leftEye.viewport.originX,
@@ -136,8 +134,8 @@ final class InstancedRenderEncoder {
         encoder.setVertexBuffer(header, offset: 0, index: 2)
 
         encoder.drawIndexedPrimitives(type: .triangle,
-                                      indexType: quadIndexType,
-                                      indexBuffer: quadIndexBuffer,
+                                      indexType: self.quadIndexType,
+                                      indexBuffer: self.quadIndexBuffer,
                                       indexBufferOffset: 0,
                                       indirectBuffer: drawArgs,
                                       indirectBufferOffset: 0)
@@ -145,8 +143,8 @@ final class InstancedRenderEncoder {
         encoder.popDebugGroup()
 
         encoder.pushDebugGroup("Postprocess")
-        encoder.setRenderPipelineState(postprocessPipeline)
-        encoder.setDepthStencilState(depthStencilState)
+        encoder.setRenderPipelineState(self.postprocessPipeline)
+        encoder.setDepthStencilState(self.depthStencilState)
         encoder.setCullMode(.none)
         encoder.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: 3)
         encoder.popDebugGroup()
@@ -183,8 +181,8 @@ final class InstancedRenderEncoder {
         guard let encoder = commandBuffer.makeRenderCommandEncoder(descriptor: renderPassDesc) else { return }
         encoder.label = "InstancedGaussian_Mono"
 
-        encoder.setRenderPipelineState(monoPipeline)
-        encoder.setDepthStencilState(hasValidDepth ? depthStencilState : noDepthStencilState)
+        encoder.setRenderPipelineState(self.monoPipeline)
+        encoder.setDepthStencilState(hasValidDepth ? self.depthStencilState : self.noDepthStencilState)
 
         let viewport = MTLViewport(originX: 0, originY: 0, width: Double(width), height: Double(height), znear: 0, zfar: 1)
         encoder.setViewport(viewport)
@@ -197,8 +195,8 @@ final class InstancedRenderEncoder {
         encoder.setVertexBuffer(header, offset: 0, index: 2)
 
         encoder.drawIndexedPrimitives(type: .triangle,
-                                      indexType: quadIndexType,
-                                      indexBuffer: quadIndexBuffer,
+                                      indexType: self.quadIndexType,
+                                      indexBuffer: self.quadIndexBuffer,
                                       indexBufferOffset: 0,
                                       indirectBuffer: drawArgs,
                                       indirectBufferOffset: 0)

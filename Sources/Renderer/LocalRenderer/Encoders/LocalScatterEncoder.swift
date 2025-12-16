@@ -49,7 +49,7 @@ final class LocalScatterEncoder {
             threadgroupSize = 256 // 256 threads per TG
             gaussiansPerTG = 256 * 32 // Each thread processes 32 gaussians (8192 per TG)
         } else {
-            scatter16 = scatter16Pipeline
+            scatter16 = self.scatter16Pipeline
             threadgroupSize = 128 // 4 SIMD groups
             gaussiansPerTG = 4
         }

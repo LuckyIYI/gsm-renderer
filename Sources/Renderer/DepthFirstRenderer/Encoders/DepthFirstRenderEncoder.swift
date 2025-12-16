@@ -31,7 +31,7 @@ final class DepthFirstRenderEncoder {
     ) {
         guard let encoder = commandBuffer.makeComputeCommandEncoder() else { return }
         encoder.label = "ClearRenderTextures"
-        encoder.setComputePipelineState(clearPipeline)
+        encoder.setComputePipelineState(self.clearPipeline)
         encoder.setTexture(colorTexture, index: 0)
         if let depthTex = depthTexture, depthTex.pixelFormat != .depth32Float {
             encoder.setTexture(depthTex, index: 1)
@@ -65,7 +65,7 @@ final class DepthFirstRenderEncoder {
         guard let encoder = commandBuffer.makeComputeCommandEncoder() else { return }
         encoder.label = "DepthFirstRender"
 
-        encoder.setComputePipelineState(renderPipeline)
+        encoder.setComputePipelineState(self.renderPipeline)
         encoder.setBuffer(tileHeaders, offset: 0, index: 0)
         encoder.setBuffer(renderData, offset: 0, index: 1)
         encoder.setBuffer(sortedGaussianIndices, offset: 0, index: 2)
@@ -83,7 +83,7 @@ final class DepthFirstRenderEncoder {
         encoder.dispatchThreadgroups(
             indirectBuffer: dispatchArgs,
             indirectBufferOffset: dispatchOffset,
-            threadsPerThreadgroup: threadgroupSize
+            threadsPerThreadgroup: self.threadgroupSize
         )
         encoder.endEncoding()
     }

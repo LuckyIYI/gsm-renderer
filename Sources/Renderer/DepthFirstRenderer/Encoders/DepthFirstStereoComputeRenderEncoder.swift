@@ -28,7 +28,7 @@ final class DepthFirstStereoComputeRenderEncoder {
     ) {
         guard let encoder = commandBuffer.makeComputeCommandEncoder() else { return }
         encoder.label = "ClearStereoIntermediate"
-        encoder.setComputePipelineState(clearPipeline)
+        encoder.setComputePipelineState(self.clearPipeline)
         encoder.setTexture(colorTexture, index: 0)
 
         var params = ClearTextureParams()
@@ -57,7 +57,7 @@ final class DepthFirstStereoComputeRenderEncoder {
         guard let encoder = commandBuffer.makeComputeCommandEncoder() else { return }
         encoder.label = "DepthFirstStereoRender"
 
-        encoder.setComputePipelineState(renderPipeline)
+        encoder.setComputePipelineState(self.renderPipeline)
         encoder.setBuffer(tileHeaders, offset: 0, index: 0)
         encoder.setBuffer(renderData, offset: 0, index: 1)
         encoder.setBuffer(sortedGaussianIndices, offset: 0, index: 2)
@@ -72,9 +72,8 @@ final class DepthFirstStereoComputeRenderEncoder {
         encoder.dispatchThreadgroups(
             indirectBuffer: dispatchArgs,
             indirectBufferOffset: dispatchOffset,
-            threadsPerThreadgroup: threadgroupSize
+            threadsPerThreadgroup: self.threadgroupSize
         )
         encoder.endEncoding()
     }
 }
-

@@ -342,7 +342,7 @@ enum BufferValidation {
         gaussianCount: Int,
         precision: RenderPrecision
     ) throws {
-        let elementSize = precision == .float32 ? packedWorldGaussianSize : packedWorldGaussianHalfSize
+        let elementSize = precision == .float32 ? self.packedWorldGaussianSize : self.packedWorldGaussianHalfSize
         let expectedSize = gaussianCount * elementSize
         guard buffer.length >= expectedSize else {
             throw RendererError.invalidBufferSize(
@@ -361,7 +361,7 @@ enum BufferValidation {
         precision: RenderPrecision
     ) throws {
         // Each gaussian has shComponents * 3 coefficients (R, G, B channels)
-        let coeffSize = precision == .float32 ? shCoefficientSize : shCoefficientHalfSize
+        let coeffSize = precision == .float32 ? self.shCoefficientSize : self.shCoefficientHalfSize
         let expectedSize = gaussianCount * shComponents * 3 * coeffSize
         guard buffer.length >= expectedSize else {
             throw RendererError.invalidBufferSize(
@@ -385,10 +385,10 @@ enum BufferValidation {
             )
         }
 
-        try validateGaussianBuffer(input.gaussians, gaussianCount: input.gaussianCount, precision: precision)
+        try self.validateGaussianBuffer(input.gaussians, gaussianCount: input.gaussianCount, precision: precision)
 
         if input.shComponents > 0 {
-            try validateHarmonicsBuffer(
+            try self.validateHarmonicsBuffer(
                 input.harmonics,
                 gaussianCount: input.gaussianCount,
                 shComponents: input.shComponents,

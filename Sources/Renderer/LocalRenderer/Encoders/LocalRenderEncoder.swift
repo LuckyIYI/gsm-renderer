@@ -107,7 +107,7 @@ final class LocalRenderEncoder {
         )
 
         encoder.label = "Local_RenderIndirect16"
-        encoder.setComputePipelineState(renderIndirect16Pipeline)
+        encoder.setComputePipelineState(self.renderIndirect16Pipeline)
         encoder.setBuffer(projectedGaussians, offset: 0, index: 0)
         encoder.setBuffer(tileCounts, offset: 0, index: 1)
         encoder.setBytes(&maxPerTileU, length: 4, index: 2)

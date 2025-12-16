@@ -31,11 +31,15 @@ let package = Package(
                 "LocalRenderer/LocalShaders.air",
                 "DepthFirstRenderer/DepthFirstShaders.air",
                 "HardwareRenderer/HardwareGaussianShaders.air",
+                "MeshExtraction/MeshExtractionShaders.air",
                 // Metal source files (kept for reference, compiled separately)
                 "GlobalRenderer/GlobalShaders.metal",
                 "LocalRenderer/LocalShaders.metal",
                 "DepthFirstRenderer/DepthFirstShaders.metal",
                 "HardwareRenderer/HardwareGaussianShaders.metal",
+                "MeshExtraction/MeshExtractionShaders.metal",
+                // Marching cubes tables (header only, included by Metal)
+                "MeshExtraction/MarchingCubesTables.h",
             ],
             resources: [
                 // Pre-compiled Metal libraries (run ./compile_shaders.sh to rebuild)
@@ -43,6 +47,7 @@ let package = Package(
                 .copy("LocalRenderer/LocalShaders.metallib"),
                 .copy("DepthFirstRenderer/DepthFirstShaders.metallib"),
                 .copy("HardwareRenderer/HardwareGaussianShaders.metallib"),
+                .copy("MeshExtraction/MeshExtractionShaders.metallib"),
             ]
         ),
         .testTarget(

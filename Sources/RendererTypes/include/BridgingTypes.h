@@ -339,3 +339,61 @@ typedef struct {
     UINT32 overflow;
     UINT32 _pad0;
 } HardwareMonoHeader;
+
+// ============================================================================
+// MESH EXTRACTION TYPES
+// ============================================================================
+
+// Parameters for mesh extraction from Gaussian opacity field
+typedef struct {
+    simd_float3 gridMin;          // Grid lower bound in world space
+    float       voxelSize;        // Size of each voxel
+    simd_float3 gridMax;          // Grid upper bound in world space
+    float       isoLevel;         // Isosurface threshold (typically 0.5)
+    UINT32      gridDimX;         // Grid dimensions
+    UINT32      gridDimY;
+    UINT32      gridDimZ;
+    UINT32      gaussianCount;    // Number of Gaussians
+    float       opacityCutoff;    // Min opacity to consider (e.g., 1/255)
+    float       sigmaCutoff;      // Distance cutoff in sigma units (e.g., 3.0)
+    UINT32      _pad0;
+    UINT32      _pad1;
+} MeshExtractionParams;
+
+// Mesh extraction header with counts
+typedef struct {
+    UINT32 totalVertices;
+    UINT32 totalTriangles;
+    UINT32 activeCells;          // Cells that produce triangles
+    UINT32 overflow;             // Set if buffers exceeded
+} MeshExtractionHeader;
+
+// Output vertex from mesh extraction
+typedef struct {
+    simd_float3 position;
+    float       _pad0;
+    simd_float3 normal;
+    float       _pad1;
+    simd_float3 color;           // Optional: color from opacity field
+    float       opacity;         // Opacity at this vertex
+} MeshVertex;
+
+// Per-cell triangle count for prefix sum
+typedef struct {
+    UINT32 triangleCount;
+    UINT32 vertexOffset;        // After prefix sum: starting vertex index
+} CellTriangleInfo;
+
+// Spatial hash entry for accelerating Gaussian lookups
+typedef struct {
+    UINT32 offset;              // Offset into gaussianIndices array
+    UINT32 count;               // Number of Gaussians in this cell
+} SpatialHashEntry;
+
+// Bounds reduction result
+typedef struct {
+    simd_float3 minBound;
+    float       _pad0;
+    simd_float3 maxBound;
+    float       _pad1;
+} BoundsResult;

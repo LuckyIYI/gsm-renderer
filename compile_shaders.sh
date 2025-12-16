@@ -32,7 +32,7 @@ case "$PLATFORM" in
 esac
 
 RENDERER_DIR="Sources/Renderer"
-INCLUDE="-I Sources/RendererTypes/include -I $RENDERER_DIR -I $RENDERER_DIR/Shared"
+INCLUDE="-I Sources/RendererTypes/include -I $RENDERER_DIR -I $RENDERER_DIR/Shared -I $RENDERER_DIR/MeshExtraction"
 
 compile_shader() {
     local NAME=$1
@@ -62,8 +62,8 @@ compile_shader() {
 compile_shader "GlobalShaders" "GlobalRenderer"
 compile_shader "LocalShaders" "LocalRenderer"
 compile_shader "DepthFirstShaders" "DepthFirstRenderer"
-
 compile_shader "HardwareGaussianShaders" "HardwareRenderer"
+compile_shader "MeshExtractionShaders" "MeshExtraction"
 
 echo ""
 echo "Metal shaders compiled successfully for $PLATFORM"

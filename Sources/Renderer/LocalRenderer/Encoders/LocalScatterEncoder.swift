@@ -12,12 +12,12 @@ final class LocalScatterEncoder {
         }
         self.prepareDispatchPipeline = try device.makeComputePipelineState(function: prepareDispatchFn)
 
-        // 16-bit baseline scatter
         guard let scatter16Fn = library.makeFunction(name: "localScatterSimd16") else {
             throw RendererError.failedToCreatePipeline("Missing localScatterSimd16 kernel")
         }
         self.scatter16Pipeline = try device.makeComputePipelineState(function: scatter16Fn)
 
+        // Optimized variant (if available)
         if let scatter16OptFn = library.makeFunction(name: "localScatterSimd16V7") {
             self.scatter16OptimizedPipeline = try? device.makeComputePipelineState(function: scatter16OptFn)
         } else {
@@ -49,7 +49,7 @@ final class LocalScatterEncoder {
             threadgroupSize = 256 // 256 threads per TG
             gaussiansPerTG = 256 * 32 // Each thread processes 32 gaussians (8192 per TG)
         } else {
-            scatter16 = scatter16Pipeline
+            scatter16 = self.scatter16Pipeline
             threadgroupSize = 128 // 4 SIMD groups
             gaussiansPerTG = 4
         }
@@ -59,12 +59,10 @@ final class LocalScatterEncoder {
         var tileW = Int32(tileWidth)
         var tileH = Int32(tileHeight)
 
-        // Create dispatch args buffer
         guard let dispatchArgsBuffer = commandBuffer.device.makeBuffer(length: 12, options: .storageModeShared) else {
             return
         }
 
-        // Prepare indirect dispatch
         if let encoder = commandBuffer.makeComputeCommandEncoder() {
             encoder.label = "Local_PrepareScatter16Dispatch"
             encoder.setComputePipelineState(self.prepareDispatchPipeline)

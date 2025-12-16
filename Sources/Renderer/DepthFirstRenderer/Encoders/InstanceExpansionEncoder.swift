@@ -5,7 +5,10 @@ import RendererTypes
 /// After depth sort, expands each gaussian into per-tile instances
 final class InstanceExpansionEncoder {
     private let applyDepthOrderingPipeline: MTLComputePipelineState
-    private let createInstancesPipeline: MTLComputePipelineState
+    private let createInstancesPipeline16: MTLComputePipelineState
+    private let createInstancesPipeline32: MTLComputePipelineState
+    private let createInstancesStereoPipeline16: MTLComputePipelineState
+    private let createInstancesStereoPipeline32: MTLComputePipelineState
     private let blockReducePipeline: MTLComputePipelineState
     private let level2ReducePipeline: MTLComputePipelineState
     private let level2ScanPipeline: MTLComputePipelineState
@@ -15,10 +18,14 @@ final class InstanceExpansionEncoder {
     let threadgroupSize: Int
     private let blockSize = 256
     let maxGaussians: Int
+    private let tileIdPrecision: RadixSortKeyPrecision
 
-    init(device: MTLDevice, library: MTLLibrary, maxGaussians: Int) throws {
+    init(device: MTLDevice, library: MTLLibrary, maxGaussians: Int, tileIdPrecision: RadixSortKeyPrecision) throws {
         guard let applyFn = library.makeFunction(name: "applyDepthOrderingKernel"),
-              let createFn = library.makeFunction(name: "createInstancesKernel"),
+              let createFn16 = library.makeFunction(name: "createInstancesKernel"),
+              let createFn32 = library.makeFunction(name: "createInstancesKernel32"),
+              let createStereoFn16 = library.makeFunction(name: "createInstancesStereoKernel"),
+              let createStereoFn32 = library.makeFunction(name: "createInstancesStereoKernel32"),
               let reduceFn = library.makeFunction(name: "blockReduceKernel"),
               let level2ReduceFn = library.makeFunction(name: "level2ReduceKernel"),
               let level2ScanFn = library.makeFunction(name: "level2ScanKernel"),
@@ -29,15 +36,19 @@ final class InstanceExpansionEncoder {
         }
 
         self.applyDepthOrderingPipeline = try device.makeComputePipelineState(function: applyFn)
-        self.createInstancesPipeline = try device.makeComputePipelineState(function: createFn)
+        self.createInstancesPipeline16 = try device.makeComputePipelineState(function: createFn16)
+        self.createInstancesPipeline32 = try device.makeComputePipelineState(function: createFn32)
+        self.createInstancesStereoPipeline16 = try device.makeComputePipelineState(function: createStereoFn16)
+        self.createInstancesStereoPipeline32 = try device.makeComputePipelineState(function: createStereoFn32)
         self.blockReducePipeline = try device.makeComputePipelineState(function: reduceFn)
         self.level2ReducePipeline = try device.makeComputePipelineState(function: level2ReduceFn)
         self.level2ScanPipeline = try device.makeComputePipelineState(function: level2ScanFn)
         self.level2ApplyPipeline = try device.makeComputePipelineState(function: level2ApplyFn)
         self.blockScanPipeline = try device.makeComputePipelineState(function: blockScanFn)
 
-        self.threadgroupSize = min(applyDepthOrderingPipeline.maxTotalThreadsPerThreadgroup, 256)
+        self.threadgroupSize = min(self.applyDepthOrderingPipeline.maxTotalThreadsPerThreadgroup, 256)
         self.maxGaussians = maxGaussians
+        self.tileIdPrecision = tileIdPrecision
     }
 
     /// Apply depth ordering - reorder tile counts by depth-sorted indices (indirect dispatch)
@@ -52,7 +63,7 @@ final class InstanceExpansionEncoder {
         guard let encoder = commandBuffer.makeComputeCommandEncoder() else { return }
         encoder.label = "ApplyDepthOrdering"
 
-        encoder.setComputePipelineState(applyDepthOrderingPipeline)
+        encoder.setComputePipelineState(self.applyDepthOrderingPipeline)
         encoder.setBuffer(sortedPrimitiveIndices, offset: 0, index: 0)
         encoder.setBuffer(nTouchedTiles, offset: 0, index: 1)
         encoder.setBuffer(orderedTileCounts, offset: 0, index: 2)
@@ -80,13 +91,13 @@ final class InstanceExpansionEncoder {
 
         // Calculate level 2 buffer offset (after level 1 block sums)
         // maxGaussians / 256 blocks at level 1, rounded up + 1 for safety
-        let numBlocks = (maxGaussians + blockSize - 1) / blockSize
+        let numBlocks = (maxGaussians + self.blockSize - 1) / self.blockSize
         let level2Offset = (numBlocks + 1) * MemoryLayout<UInt32>.stride
 
         // Step 1: Block-level reduce - computes sum for each block
         if let encoder = commandBuffer.makeComputeCommandEncoder() {
             encoder.label = "PrefixBlockReduce"
-            encoder.setComputePipelineState(blockReducePipeline)
+            encoder.setComputePipelineState(self.blockReducePipeline)
             encoder.setBuffer(dataBuffer, offset: 0, index: 0)
             encoder.setBuffer(blockSumsBuffer, offset: 0, index: 1)
             encoder.setBuffer(header, offset: 0, index: 2)
@@ -102,7 +113,7 @@ final class InstanceExpansionEncoder {
         // Step 2: Level 2 reduce - reduces every 256 block sums into super-block sums
         if let encoder = commandBuffer.makeComputeCommandEncoder() {
             encoder.label = "PrefixLevel2Reduce"
-            encoder.setComputePipelineState(level2ReducePipeline)
+            encoder.setComputePipelineState(self.level2ReducePipeline)
             encoder.setBuffer(blockSumsBuffer, offset: 0, index: 0)
             encoder.setBuffer(blockSumsBuffer, offset: level2Offset, index: 1)
             encoder.setBuffer(header, offset: 0, index: 2)
@@ -118,7 +129,7 @@ final class InstanceExpansionEncoder {
         // Step 3: Level 2 scan - exclusive scan of super-block sums (single block)
         if let encoder = commandBuffer.makeComputeCommandEncoder() {
             encoder.label = "PrefixLevel2Scan"
-            encoder.setComputePipelineState(level2ScanPipeline)
+            encoder.setComputePipelineState(self.level2ScanPipeline)
             encoder.setBuffer(blockSumsBuffer, offset: level2Offset, index: 0)
             encoder.setBuffer(header, offset: 0, index: 1)
 
@@ -133,7 +144,7 @@ final class InstanceExpansionEncoder {
         // Step 4: Level 2 apply + scan - apply super-block offsets to block sums and scan them
         if let encoder = commandBuffer.makeComputeCommandEncoder() {
             encoder.label = "PrefixLevel2Apply"
-            encoder.setComputePipelineState(level2ApplyPipeline)
+            encoder.setComputePipelineState(self.level2ApplyPipeline)
             encoder.setBuffer(blockSumsBuffer, offset: 0, index: 0)
             encoder.setBuffer(blockSumsBuffer, offset: level2Offset, index: 1)
             encoder.setBuffer(header, offset: 0, index: 2)
@@ -149,7 +160,7 @@ final class InstanceExpansionEncoder {
         // Step 5: Final block scan - each block scans its elements and adds block offset
         if let encoder = commandBuffer.makeComputeCommandEncoder() {
             encoder.label = "PrefixFinalScan"
-            encoder.setComputePipelineState(blockScanPipeline)
+            encoder.setComputePipelineState(self.blockScanPipeline)
             encoder.setBuffer(dataBuffer, offset: 0, index: 0)
             encoder.setBuffer(dataBuffer, offset: 0, index: 1)
             encoder.setBuffer(blockSumsBuffer, offset: 0, index: 2)
@@ -180,7 +191,7 @@ final class InstanceExpansionEncoder {
         guard let encoder = commandBuffer.makeComputeCommandEncoder() else { return }
         encoder.label = "CreateInstances"
 
-        encoder.setComputePipelineState(createInstancesPipeline)
+        encoder.setComputePipelineState(self.tileIdPrecision == .bits32 ? self.createInstancesPipeline32 : self.createInstancesPipeline16)
         encoder.setBuffer(sortedPrimitiveIndices, offset: 0, index: 0)
         encoder.setBuffer(instanceOffsets, offset: 0, index: 1)
         encoder.setBuffer(tileBounds, offset: 0, index: 2)
@@ -191,6 +202,41 @@ final class InstanceExpansionEncoder {
         var p = params
         encoder.setBytes(&p, length: MemoryLayout<DepthFirstParamsSwift>.stride, index: 6)
         encoder.setBuffer(header, offset: 0, index: 7)
+
+        let tg = MTLSize(width: threadgroupSize, height: 1, depth: 1)
+        encoder.dispatchThreadgroups(
+            indirectBuffer: dispatchArgs,
+            indirectBufferOffset: DepthFirstDispatchSlot.createInstances.offset,
+            threadsPerThreadgroup: tg
+        )
+        encoder.endEncoding()
+    }
+
+    /// Create instances for stereo - assigns ALL tiles in union bounds (indirect dispatch)
+    func encodeCreateInstancesStereo(
+        commandBuffer: MTLCommandBuffer,
+        sortedPrimitiveIndices: MTLBuffer,
+        instanceOffsets: MTLBuffer,
+        tileBounds: MTLBuffer,
+        instanceTileIds: MTLBuffer,
+        instanceGaussianIndices: MTLBuffer,
+        params: DepthFirstParamsSwift,
+        header: MTLBuffer,
+        dispatchArgs: MTLBuffer
+    ) {
+        guard let encoder = commandBuffer.makeComputeCommandEncoder() else { return }
+        encoder.label = "CreateInstancesStereo"
+
+        encoder.setComputePipelineState(self.tileIdPrecision == .bits32 ? self.createInstancesStereoPipeline32 : self.createInstancesStereoPipeline16)
+        encoder.setBuffer(sortedPrimitiveIndices, offset: 0, index: 0)
+        encoder.setBuffer(instanceOffsets, offset: 0, index: 1)
+        encoder.setBuffer(tileBounds, offset: 0, index: 2)
+        encoder.setBuffer(instanceTileIds, offset: 0, index: 3)
+        encoder.setBuffer(instanceGaussianIndices, offset: 0, index: 4)
+
+        var p = params
+        encoder.setBytes(&p, length: MemoryLayout<DepthFirstParamsSwift>.stride, index: 5)
+        encoder.setBuffer(header, offset: 0, index: 6)
 
         let tg = MTLSize(width: threadgroupSize, height: 1, depth: 1)
         encoder.dispatchThreadgroups(
@@ -211,7 +257,7 @@ struct DepthFirstParamsSwift {
     var tileWidth: UInt32
     var tileHeight: UInt32
     var maxAssignments: UInt32
-    var padding: UInt32
+    var alphaThreshold: Float32
 
     init(
         gaussianCount: Int,
@@ -220,7 +266,8 @@ struct DepthFirstParamsSwift {
         tilesY: Int,
         tileWidth: Int,
         tileHeight: Int,
-        maxAssignments: Int
+        maxAssignments: Int,
+        alphaThreshold: Float = 1.0 / 255.0
     ) {
         self.gaussianCount = UInt32(gaussianCount)
         self.visibleCount = UInt32(visibleCount)
@@ -229,6 +276,6 @@ struct DepthFirstParamsSwift {
         self.tileWidth = UInt32(tileWidth)
         self.tileHeight = UInt32(tileHeight)
         self.maxAssignments = UInt32(maxAssignments)
-        self.padding = 0
+        self.alphaThreshold = alphaThreshold
     }
 }

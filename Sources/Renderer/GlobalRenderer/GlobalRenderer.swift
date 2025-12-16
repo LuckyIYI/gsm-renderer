@@ -14,7 +14,7 @@ struct RendererLimits: Sendable {
     var tilesY: Int { (self.maxHeight + self.tileHeight - 1) / self.tileHeight }
     var maxTileCount: Int { max(1, self.tilesX * self.tilesY) }
 
-    init(from config: RendererConfig, tileWidth: Int = 32, tileHeight: Int = 16,) {
+    init(from config: RendererConfig, tileWidth: Int = 32, tileHeight: Int = 16) {
         self.maxGaussians = max(1, config.maxGaussians)
         self.maxWidth = max(1, config.maxWidth)
         self.maxHeight = max(1, config.maxHeight)
@@ -49,8 +49,25 @@ struct RendererLimits: Sendable {
             totalInkThreshold: 2.0
         )
     }
-}
 
+    /// Build binning params with actual render dimensions (for dynamic sizing like visionOS foveation)
+    func buildBinningParams(gaussianCount: Int, width: Int, height: Int) -> TileBinningParams {
+        let actualTilesX = (width + self.tileWidth - 1) / self.tileWidth
+        let actualTilesY = (height + self.tileHeight - 1) / self.tileHeight
+        return TileBinningParams(
+            gaussianCount: UInt32(gaussianCount),
+            tilesX: UInt32(actualTilesX),
+            tilesY: UInt32(actualTilesY),
+            tileWidth: UInt32(self.tileWidth),
+            tileHeight: UInt32(self.tileHeight),
+            surfaceWidth: UInt32(width),
+            surfaceHeight: UInt32(height),
+            maxCapacity: UInt32(gaussianCount),
+            alphaThreshold: 0.005,
+            totalInkThreshold: 2.0
+        )
+    }
+}
 
 public final class GlobalRenderer: GaussianRenderer, @unchecked Sendable {
     private static let maxSupportedGaussians = 30_000_000
@@ -65,9 +82,9 @@ public final class GlobalRenderer: GaussianRenderer, @unchecked Sendable {
     let sortKeyGenEncoder: SortKeyGenEncoder
     let radixSortEncoder: RadixSortEncoder
     let packEncoder: PackEncoder
-    let projectEncoder: ProjectEncoder
+    let projectCullEncoder: GlobalProjectCullEncoder
     let dispatchEncoder: DispatchEncoder
-    let fusedPipelineEncoder: FusedPipelineEncoder
+    let renderEncoder: GlobalRenderEncoder
     let twoPassTileAssignEncoder: TwoPassTileAssignEncoder
 
     // Reset tile builder state pipeline
@@ -108,12 +125,11 @@ public final class GlobalRenderer: GaussianRenderer, @unchecked Sendable {
         let library = try device.makeLibrary(URL: metallibURL)
         self.library = library
 
-        // Initialize encoders
         self.sortKeyGenEncoder = try SortKeyGenEncoder(device: device, library: library)
         self.radixSortEncoder = try RadixSortEncoder(device: device, library: library)
         self.packEncoder = try PackEncoder(device: device, library: library)
-        self.projectEncoder = try ProjectEncoder(device: device, library: library)
-        self.fusedPipelineEncoder = try FusedPipelineEncoder(device: device, library: library)
+        self.projectCullEncoder = try GlobalProjectCullEncoder(device: device, library: library)
+        self.renderEncoder = try GlobalRenderEncoder(device: device, library: library)
         self.twoPassTileAssignEncoder = try TwoPassTileAssignEncoder(device: device, library: library)
 
         let dispatchConfig = AssignmentDispatchConfigSwift(
@@ -132,27 +148,24 @@ public final class GlobalRenderer: GaussianRenderer, @unchecked Sendable {
         }
         self.resetTileBuilderStatePipeline = try device.makeComputePipelineState(function: resetFn)
 
-        // Compute limits
         self.limits = RendererLimits(
             from: config,
             tileWidth: GlobalRenderer.tileWidth,
-            tileHeight: GlobalRenderer.tileHeight,
+            tileHeight: GlobalRenderer.tileHeight
         )
 
-        // Initialize stereo resources (left for mono, both for stereo)
         self.stereoResources = try GlobalMultiViewResources(
             device: device,
-            maxGaussians: limits.maxGaussians,
-            maxWidth: limits.maxWidth,
-            maxHeight: limits.maxHeight,
-            tileWidth: limits.tileWidth,
-            tileHeight: limits.tileHeight,
-            radixBlockSize: radixSortEncoder.blockSize,
-            radixGrainSize: radixSortEncoder.grainSize,
+            maxGaussians: self.limits.maxGaussians,
+            maxWidth: self.limits.maxWidth,
+            maxHeight: self.limits.maxHeight,
+            tileWidth: self.limits.tileWidth,
+            tileHeight: self.limits.tileHeight,
+            radixBlockSize: self.radixSortEncoder.blockSize,
+            radixGrainSize: self.radixSortEncoder.grainSize,
             precision: config.precision
         )
 
-        // Allocate projection caches (per-eye for stereo)
         let g = self.limits.maxGaussians
         let boundsSize = g * MemoryLayout<SIMD4<Int32>>.stride
 
@@ -179,6 +192,12 @@ public final class GlobalRenderer: GaussianRenderer, @unchecked Sendable {
         self.rightMaskCache = rightMaskCache
     }
 
+    /// Debug helper for benchmarks/tests (reads GPU-written shared counters after command buffer completion).
+    public func debugReadTotalAssignments() -> UInt32 {
+        let header = self.stereoResources.left.tileAssignmentHeader.contents().load(as: TileAssignmentHeaderSwift.self)
+        return header.totalAssignments
+    }
+
     public func render(
         commandBuffer: MTLCommandBuffer,
         colorTexture: MTLTexture,
@@ -193,7 +212,8 @@ public final class GlobalRenderer: GaussianRenderer, @unchecked Sendable {
             width: width,
             height: height,
             gaussianCount: input.gaussianCount,
-            shComponents: input.shComponents
+            shComponents: input.shComponents,
+            inputIsSRGB: self.config.gaussianColorSpace == .srgb
         )
 
         let frameParams = FrameParams(gaussianCount: input.gaussianCount)
@@ -203,7 +223,7 @@ public final class GlobalRenderer: GaussianRenderer, @unchecked Sendable {
             harmonics: input.harmonics
         )
 
-        _ = encodeRenderToTargetTexture(
+        _ = self.encodeRenderToTargetTexture(
             commandBuffer: commandBuffer,
             gaussianCount: input.gaussianCount,
             packedWorldBuffers: packedWorld,
@@ -211,68 +231,27 @@ public final class GlobalRenderer: GaussianRenderer, @unchecked Sendable {
             frameParams: frameParams,
             targetColor: colorTexture,
             targetDepth: depthTexture,
-            frame: stereoResources.left,
-            boundsCache: leftBoundsCache,
-            maskCache: leftMaskCache
+            frame: self.stereoResources.left,
+            boundsCache: self.leftBoundsCache,
+            maskCache: self.leftMaskCache
         )
     }
 
     public func renderStereo(
-        commandBuffer: MTLCommandBuffer,
-        output: StereoRenderOutput,
-        input: GaussianInput,
-        camera: StereoCameraParams,
-        width: Int,
-        height: Int
+        commandBuffer _: MTLCommandBuffer,
+        target: StereoRenderTarget,
+        input _: GaussianInput,
+        camera _: StereoCameraParams,
+        width _: Int,
+        height _: Int
     ) {
-        let frameParams = FrameParams(gaussianCount: input.gaussianCount)
+        switch target {
+        case .sideBySide:
+            fatalError("GlobalRenderer does not support stereo rendering. Use HardwareRenderer or DepthFirstRenderer instead.")
 
-        let packedWorld = PackedWorldBuffers(
-            packedGaussians: input.gaussians,
-            harmonics: input.harmonics
-        )
-
-        let leftCameraUniforms = CameraUniformsSwift(
-            from: camera.leftEye,
-            width: width,
-            height: height,
-            gaussianCount: input.gaussianCount,
-            shComponents: input.shComponents
-        )
-
-        _ = encodeRenderToTargetTexture(
-            commandBuffer: commandBuffer,
-            gaussianCount: input.gaussianCount,
-            packedWorldBuffers: packedWorld,
-            cameraUniforms: leftCameraUniforms,
-            frameParams: frameParams,
-            targetColor: output.leftColor,
-            targetDepth: output.leftDepth,
-            frame: stereoResources.left,
-            boundsCache: leftBoundsCache,
-            maskCache: leftMaskCache
-        )
-
-        let rightCameraUniforms = CameraUniformsSwift(
-            from: camera.rightEye,
-            width: width,
-            height: height,
-            gaussianCount: input.gaussianCount,
-            shComponents: input.shComponents
-        )
-
-        _ = encodeRenderToTargetTexture(
-            commandBuffer: commandBuffer,
-            gaussianCount: input.gaussianCount,
-            packedWorldBuffers: packedWorld,
-            cameraUniforms: rightCameraUniforms,
-            frameParams: frameParams,
-            targetColor: output.rightColor,
-            targetDepth: output.rightDepth,
-            frame: stereoResources.right,
-            boundsCache: rightBoundsCache,
-            maskCache: rightMaskCache
-        )
+        case .foveated:
+            fatalError("GlobalRenderer does not support stereo rendering. Use HardwareRenderer or DepthFirstRenderer instead.")
+        }
     }
 
     func encodeRenderToTextures(
@@ -282,8 +261,8 @@ public final class GlobalRenderer: GaussianRenderer, @unchecked Sendable {
         cameraUniforms: CameraUniformsSwift,
         frameParams: FrameParams
     ) -> RenderOutputTextures? {
-        let textures = stereoResources.left.outputTextures
-        let success = encodeRenderToTargetTexture(
+        let textures = self.stereoResources.left.outputTextures
+        let success = self.encodeRenderToTargetTexture(
             commandBuffer: commandBuffer,
             gaussianCount: gaussianCount,
             packedWorldBuffers: packedWorldBuffers,
@@ -291,9 +270,9 @@ public final class GlobalRenderer: GaussianRenderer, @unchecked Sendable {
             frameParams: frameParams,
             targetColor: textures.color,
             targetDepth: textures.depth,
-            frame: stereoResources.left,
-            boundsCache: leftBoundsCache,
-            maskCache: leftMaskCache
+            frame: self.stereoResources.left,
+            boundsCache: self.leftBoundsCache,
+            maskCache: self.leftMaskCache
         )
         return success ? textures : nil
     }
@@ -326,7 +305,7 @@ public final class GlobalRenderer: GaussianRenderer, @unchecked Sendable {
         )
 
         let binningParams = self.limits.buildBinningParams(gaussianCount: gaussianCount)
-        self.projectEncoder.encode(
+        self.projectCullEncoder.encode(
             commandBuffer: commandBuffer,
             gaussianCount: gaussianCount,
             packedWorldBuffers: packedWorldBuffers,
@@ -375,7 +354,7 @@ public final class GlobalRenderer: GaussianRenderer, @unchecked Sendable {
         else {
             return false
         }
-        self.fusedPipelineEncoder.encodeCompleteRender(
+        self.renderEncoder.encodeCompleteRender(
             commandBuffer: commandBuffer,
             orderedBuffers: ordered,
             renderData: renderData,
@@ -561,7 +540,7 @@ public final class GlobalRenderer: GaussianRenderer, @unchecked Sendable {
         boundsCache: MTLBuffer,
         maskCache: MTLBuffer
     ) -> ProjectionOutput {
-        return ProjectionOutput(
+        ProjectionOutput(
             renderData: frame.interleavedGaussians,
             bounds: boundsCache,
             mask: maskCache

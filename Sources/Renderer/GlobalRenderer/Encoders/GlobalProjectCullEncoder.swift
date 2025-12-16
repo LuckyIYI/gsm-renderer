@@ -1,15 +1,5 @@
 import Metal
 
-struct PackedWorldBuffers {
-    let packedGaussians: MTLBuffer // PackedWorldGaussian or PackedWorldGaussianHalf array
-    let harmonics: MTLBuffer // Separate buffer for variable-size SH data (float or half)
-
-    init(packedGaussians: MTLBuffer, harmonics: MTLBuffer) {
-        self.packedGaussians = packedGaussians
-        self.harmonics = harmonics
-    }
-}
-
 struct ProjectionOutput {
     let renderData: MTLBuffer
     let bounds: MTLBuffer
@@ -22,8 +12,7 @@ struct ProjectionOutput {
     }
 }
 
-final class ProjectEncoder {
-    // Pipelines without cluster culling (USE_CLUSTER_CULL=false)
+final class GlobalProjectCullEncoder {
     private var floatPipelines: [UInt32: MTLComputePipelineState] = [:]
     private var halfPipelines: [UInt32: MTLComputePipelineState] = [:]
 
@@ -38,21 +27,20 @@ final class ProjectEncoder {
 
     init(device: MTLDevice, library: MTLLibrary) throws {
         for degree: UInt32 in 0 ... 3 {
-            // Without cluster culling (USE_CLUSTER_CULL=false)
             let noCullConstants = MTLFunctionConstantValues()
             var shDegree = degree
             noCullConstants.setConstantValue(&shDegree, type: .uint, index: 0)
 
-            if let fn = try? library.makeFunction(name: "projectGaussiansFusedKernel", constantValues: noCullConstants) {
+            if let fn = try? library.makeFunction(name: "globalProjectCullKernel", constantValues: noCullConstants) {
                 self.floatPipelines[degree] = try? device.makeComputePipelineState(function: fn)
             }
-            if let fn = try? library.makeFunction(name: "projectGaussiansFusedKernelHalf", constantValues: noCullConstants) {
+            if let fn = try? library.makeFunction(name: "globalProjectCullKernelHalf", constantValues: noCullConstants) {
                 self.halfPipelines[degree] = try? device.makeComputePipelineState(function: fn)
             }
         }
 
         guard self.floatPipelines[0] != nil else {
-            throw RendererError.failedToCreatePipeline("Failed to create fused projection pipeline")
+            throw RendererError.failedToCreatePipeline("Failed to create global project+cull pipeline")
         }
     }
 
@@ -63,12 +51,10 @@ final class ProjectEncoder {
         cameraUniforms: CameraUniformsSwift,
         output: ProjectionOutput,
         params: TileBinningParams,
-        clusterVisibility: MTLBuffer? = nil,
-        clusterSize: UInt32 = 1024,
         useHalfWorld: Bool = false
     ) {
         guard let encoder = commandBuffer.makeComputeCommandEncoder() else { return }
-        encoder.label = clusterVisibility != nil ? "ProjectGaussiansFused_Cull" : "ProjectGaussiansFused"
+        encoder.label = "Global_ProjectCull"
 
         let shDegree = Self.shDegree(from: cameraUniforms.shComponents)
 
@@ -95,16 +81,9 @@ final class ProjectEncoder {
         var cam = cameraUniforms
         encoder.setBytes(&cam, length: MemoryLayout<CameraUniformsSwift>.stride, index: 5)
 
-        // Tile parameters for fused tile bounds computation
+        // Tile parameters
         var binParams = params
         encoder.setBytes(&binParams, length: MemoryLayout<TileBinningParams>.stride, index: 6)
-
-        // Cluster visibility (only bound when USE_CLUSTER_CULL=true pipeline is used)
-        if let visibility = clusterVisibility {
-            encoder.setBuffer(visibility, offset: 0, index: 7)
-            var size = clusterSize
-            encoder.setBytes(&size, length: MemoryLayout<UInt32>.stride, index: 8)
-        }
 
         let threads = MTLSize(width: gaussianCount, height: 1, depth: 1)
         let tg = MTLSize(width: pipeline.threadExecutionWidth, height: 1, depth: 1)

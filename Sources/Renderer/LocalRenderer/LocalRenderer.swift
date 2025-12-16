@@ -17,7 +17,7 @@ public final class LocalRenderer: GaussianRenderer, @unchecked Sendable {
 
     // Stage encoders (internal helpers)
     private let clearEncoder: LocalClearEncoder
-    private let projectEncoder: LocalProjectEncoder
+    private let projectCullEncoder: LocalProjectCullEncoder
     private let prefixScanEncoder: LocalPrefixScanEncoder
     private let scatterEncoder: LocalScatterEncoder
     private let sortEncoder: LocalSortEncoder
@@ -35,7 +35,7 @@ public final class LocalRenderer: GaussianRenderer, @unchecked Sendable {
     private let stereoResources: LocalMultiViewResources
 
     // Convenience accessors for mono rendering (uses left view resources)
-    private var primaryResources: LocalViewResources { stereoResources.left }
+    private var primaryResources: LocalViewResources { self.stereoResources.left }
 
     public init(device: MTLDevice? = nil, config: RendererConfig = RendererConfig()) throws {
         let device = device ?? MTLCreateSystemDefaultDevice()
@@ -45,7 +45,6 @@ public final class LocalRenderer: GaussianRenderer, @unchecked Sendable {
         self.device = device
         self.config = config
 
-        // Load shader libraries
         guard let localLibraryURL = Bundle.module.url(forResource: "LocalShaders", withExtension: "metallib"),
               let localLibrary = try? device.makeLibrary(URL: localLibraryURL)
         else {
@@ -58,21 +57,18 @@ public final class LocalRenderer: GaussianRenderer, @unchecked Sendable {
             throw RendererError.failedToCreatePipeline("GlobalShaders.metallib not found")
         }
 
-        // Initialize stage encoders
         self.clearEncoder = try LocalClearEncoder(library: localLibrary, device: device)
-        self.projectEncoder = try LocalProjectEncoder(LocalLibrary: localLibrary, mainLibrary: mainLibrary, device: device)
+        self.projectCullEncoder = try LocalProjectCullEncoder(LocalLibrary: localLibrary, mainLibrary: mainLibrary, device: device)
         self.prefixScanEncoder = try LocalPrefixScanEncoder(library: localLibrary, device: device)
         self.scatterEncoder = try LocalScatterEncoder(library: localLibrary, device: device)
         self.sortEncoder = try LocalSortEncoder(library: localLibrary, device: device)
         self.renderEncoder = try LocalRenderEncoder(library: localLibrary, device: device)
 
-        // Pre-compute limits from config
         self.tilesX = (config.maxWidth + LocalRenderer.tileWidth - 1) / LocalRenderer.tileWidth
         self.tilesY = (config.maxHeight + LocalRenderer.tileHeight - 1) / LocalRenderer.tileHeight
-        self.maxTileCount = tilesX * tilesY
-        self.maxAssignments = maxTileCount * LocalRenderer.maxGaussiansPerTile16Bit
+        self.maxTileCount = self.tilesX * self.tilesY
+        self.maxAssignments = self.maxTileCount * LocalRenderer.maxGaussiansPerTile16Bit
 
-        // Create stereo resources (left/right view buffer sets)
         self.stereoResources = try LocalMultiViewResources(
             device: device,
             maxGaussians: config.maxGaussians,
@@ -93,7 +89,7 @@ public final class LocalRenderer: GaussianRenderer, @unchecked Sendable {
         width: Int,
         height: Int
     ) {
-        renderView(
+        self.renderView(
             commandBuffer: commandBuffer,
             colorTexture: colorTexture,
             depthTexture: depthTexture,
@@ -104,50 +100,26 @@ public final class LocalRenderer: GaussianRenderer, @unchecked Sendable {
             width: width,
             height: height,
             shComponents: input.shComponents,
-            useHalfWorld: config.precision == .float16,
-            resources: primaryResources
+            useHalfWorld: self.config.precision == .float16,
+            resources: self.primaryResources
         )
     }
 
     public func renderStereo(
-        commandBuffer: MTLCommandBuffer,
-        output: StereoRenderOutput,
-        input: GaussianInput,
-        camera: StereoCameraParams,
-        width: Int,
-        height: Int
+        commandBuffer _: MTLCommandBuffer,
+        target: StereoRenderTarget,
+        input _: GaussianInput,
+        camera _: StereoCameraParams,
+        width _: Int,
+        height _: Int
     ) {
-        let useHalfWorld = config.precision == .float16
+        switch target {
+        case .sideBySide:
+            fatalError("LocalRenderer does not support stereo rendering. Use HardwareRenderer or DepthFirstRenderer instead.")
 
-        renderView(
-            commandBuffer: commandBuffer,
-            colorTexture: output.leftColor,
-            depthTexture: output.leftDepth,
-            worldGaussians: input.gaussians,
-            harmonics: input.harmonics,
-            gaussianCount: input.gaussianCount,
-            camera: camera.leftEye,
-            width: width,
-            height: height,
-            shComponents: input.shComponents,
-            useHalfWorld: useHalfWorld,
-            resources: stereoResources.left
-        )
-
-        renderView(
-            commandBuffer: commandBuffer,
-            colorTexture: output.rightColor,
-            depthTexture: output.rightDepth,
-            worldGaussians: input.gaussians,
-            harmonics: input.harmonics,
-            gaussianCount: input.gaussianCount,
-            camera: camera.rightEye,
-            width: width,
-            height: height,
-            shComponents: input.shComponents,
-            useHalfWorld: useHalfWorld,
-            resources: stereoResources.right
-        )
+        case .foveated:
+            fatalError("LocalRenderer does not support stereo rendering. Use HardwareRenderer or DepthFirstRenderer instead.")
+        }
     }
 
     private func renderView(
@@ -165,8 +137,8 @@ public final class LocalRenderer: GaussianRenderer, @unchecked Sendable {
         resources: LocalViewResources
     ) {
         guard gaussianCount > 0, width > 0, height > 0 else { return }
-        guard gaussianCount <= config.maxGaussians else { return }
-        guard width <= config.maxWidth, height <= config.maxHeight else { return }
+        guard gaussianCount <= self.config.maxGaussians else { return }
+        guard width <= self.config.maxWidth, height <= self.config.maxHeight else { return }
 
         let tilesX = (width + LocalRenderer.tileWidth - 1) / LocalRenderer.tileWidth
         let tilesY = (height + LocalRenderer.tileHeight - 1) / LocalRenderer.tileHeight
@@ -177,7 +149,8 @@ public final class LocalRenderer: GaussianRenderer, @unchecked Sendable {
             width: width,
             height: height,
             gaussianCount: gaussianCount,
-            shComponents: shComponents
+            shComponents: shComponents,
+            inputIsSRGB: config.gaussianColorSpace == .srgb
         )
 
         let params = TileBinningParams(
@@ -193,7 +166,7 @@ public final class LocalRenderer: GaussianRenderer, @unchecked Sendable {
             totalInkThreshold: 2.0
         )
 
-        clearEncoder.encode(
+        self.clearEncoder.encode(
             commandBuffer: commandBuffer,
             tileCounts: resources.tileCounts,
             header: resources.header,
@@ -201,7 +174,7 @@ public final class LocalRenderer: GaussianRenderer, @unchecked Sendable {
             maxCompacted: gaussianCount
         )
 
-        projectEncoder.encode(
+        self.projectCullEncoder.encode(
             commandBuffer: commandBuffer,
             worldGaussians: worldGaussians,
             harmonics: harmonics,
@@ -216,7 +189,7 @@ public final class LocalRenderer: GaussianRenderer, @unchecked Sendable {
             useHalfWorld: useHalfWorld
         )
 
-        scatterEncoder.encode16(
+        self.scatterEncoder.encode16(
             commandBuffer: commandBuffer,
             compactedGaussians: resources.compactedGaussians,
             compactedHeader: resources.header,
@@ -229,7 +202,7 @@ public final class LocalRenderer: GaussianRenderer, @unchecked Sendable {
             tileHeight: LocalRenderer.tileHeight
         )
 
-        prefixScanEncoder.encode(
+        self.prefixScanEncoder.encode(
             commandBuffer: commandBuffer,
             tileCounts: resources.tileCounts,
             tileOffsets: resources.tileOffsets,
@@ -239,7 +212,7 @@ public final class LocalRenderer: GaussianRenderer, @unchecked Sendable {
             activeTileCount: resources.activeTileCount
         )
 
-        sortEncoder.encode16(
+        self.sortEncoder.encode16(
             commandBuffer: commandBuffer,
             depthKeys16: resources.depthKeys,
             globalIndices: resources.sortIndices,
@@ -249,7 +222,7 @@ public final class LocalRenderer: GaussianRenderer, @unchecked Sendable {
             tileCount: tileCount
         )
 
-        renderEncoder.encodeClearTextures(
+        self.renderEncoder.encodeClearTextures(
             commandBuffer: commandBuffer,
             colorTexture: colorTexture,
             depthTexture: depthTexture,
@@ -257,13 +230,13 @@ public final class LocalRenderer: GaussianRenderer, @unchecked Sendable {
             height: height
         )
 
-        renderEncoder.encodePrepareRenderDispatch(
+        self.renderEncoder.encodePrepareRenderDispatch(
             commandBuffer: commandBuffer,
             activeTileCount: resources.activeTileCount,
             dispatchArgs: resources.dispatchArgs
         )
 
-        renderEncoder.encodeIndirect16(
+        self.renderEncoder.encodeIndirect16(
             commandBuffer: commandBuffer,
             projectedGaussians: resources.compactedGaussians,
             tileCounts: resources.tileCounts,
@@ -283,15 +256,15 @@ public final class LocalRenderer: GaussianRenderer, @unchecked Sendable {
         )
     }
 
-    // MARK: - Debug Helpers
+    // MARK: - Debug Helpers (internal)
 
-    public func getVisibleCount() -> UInt32 {
-        let ptr = primaryResources.header.contents().bindMemory(to: CompactedHeaderSwift.self, capacity: 1)
+    func getVisibleCount() -> UInt32 {
+        let ptr = self.primaryResources.header.contents().bindMemory(to: CompactedHeaderSwift.self, capacity: 1)
         return ptr.pointee.visibleCount
     }
 
-    public func hadOverflow() -> Bool {
-        let ptr = primaryResources.header.contents().bindMemory(to: CompactedHeaderSwift.self, capacity: 1)
+    func hadOverflow() -> Bool {
+        let ptr = self.primaryResources.header.contents().bindMemory(to: CompactedHeaderSwift.self, capacity: 1)
         return ptr.pointee.overflow != 0
     }
 }

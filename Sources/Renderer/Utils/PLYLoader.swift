@@ -280,9 +280,9 @@ public enum PLYLoader {
             vertex.properties.contains(where: { $0.name == "packed_color" })
 
         if isCompressed {
-            return try loadCompressed(data: data, header: header, bodyStart: headerEnd.upperBound)
+            return try self.loadCompressed(data: data, header: header, bodyStart: headerEnd.upperBound)
         } else {
-            return try loadStandard(data: data, header: header, vertex: vertex, bodyStart: headerEnd.upperBound)
+            return try self.loadStandard(data: data, header: header, vertex: vertex, bodyStart: headerEnd.upperBound)
         }
     }
 

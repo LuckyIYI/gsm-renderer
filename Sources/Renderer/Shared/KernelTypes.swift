@@ -82,8 +82,7 @@ extension CameraUniforms {
         farPlane: Float,
         shComponents: UInt32,
         gaussianCount: UInt32,
-        padding0: UInt32 = 0,
-        padding1: UInt32 = 0
+        inputIsSRGB: Bool
     ) {
         self.init()
         self.viewMatrix = viewMatrix
@@ -98,12 +97,14 @@ extension CameraUniforms {
         self.farPlane = farPlane
         self.shComponents = shComponents
         self.gaussianCount = gaussianCount
-        self.padding0 = padding0
-        self.padding1 = padding1
+        self.inputIsSRGB = inputIsSRGB ? 1.0 : 0.0
+        self._pad1 = 0
+        self._pad2 = 0
+        self._pad3 = 0
     }
 
     /// Convenience initializer from CameraParams
-    init(from camera: CameraParams, width: Int, height: Int, gaussianCount: Int, shComponents: Int) {
+    init(from camera: CameraParams, width: Int, height: Int, gaussianCount: Int, shComponents: Int, inputIsSRGB: Bool) {
         self.init(
             viewMatrix: camera.viewMatrix,
             projectionMatrix: camera.projectionMatrix,
@@ -116,7 +117,8 @@ extension CameraUniforms {
             nearPlane: camera.near,
             farPlane: camera.far,
             shComponents: UInt32(shComponents),
-            gaussianCount: UInt32(gaussianCount)
+            gaussianCount: UInt32(gaussianCount),
+            inputIsSRGB: inputIsSRGB
         )
     }
 }
@@ -183,6 +185,45 @@ extension TileBinningParams {
         self.maxCapacity = maxCapacity
         self.alphaThreshold = alphaThreshold
         self.totalInkThreshold = totalInkThreshold
+    }
+}
+
+extension StereoCameraUniforms {
+    init(configuration: StereoConfiguration, width: Int, height: Int, gaussianCount: Int, shComponents: Int, inputIsSRGB: Bool) {
+        self.init()
+
+        leftViewMatrix = configuration.leftEye.viewMatrix
+        leftProjectionMatrix = configuration.leftEye.projectionMatrix
+        leftCameraCenterX = configuration.leftEye.cameraPosition.x
+        leftCameraCenterY = configuration.leftEye.cameraPosition.y
+        leftCameraCenterZ = configuration.leftEye.cameraPosition.z
+        leftFocalX = configuration.leftEye.focalX
+        leftFocalY = configuration.leftEye.focalY
+        _padLeft0 = 0
+        _padLeft1 = 0
+        _padLeft2 = 0
+
+        rightViewMatrix = configuration.rightEye.viewMatrix
+        rightProjectionMatrix = configuration.rightEye.projectionMatrix
+        rightCameraCenterX = configuration.rightEye.cameraPosition.x
+        rightCameraCenterY = configuration.rightEye.cameraPosition.y
+        rightCameraCenterZ = configuration.rightEye.cameraPosition.z
+        rightFocalX = configuration.rightEye.focalX
+        rightFocalY = configuration.rightEye.focalY
+        _padRight0 = 0
+        _padRight1 = 0
+        _padRight2 = 0
+
+        self.width = Float(width)
+        self.height = Float(height)
+        nearPlane = configuration.leftEye.near
+        farPlane = configuration.leftEye.far
+        self.shComponents = UInt32(shComponents)
+        self.gaussianCount = UInt32(gaussianCount)
+        self.inputIsSRGB = inputIsSRGB ? 1.0 : 0.0
+        _padShared1 = 0
+
+        sceneTransform = configuration.sceneTransform
     }
 }
 

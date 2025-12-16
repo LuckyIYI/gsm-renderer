@@ -2,13 +2,11 @@ import Metal
 import RendererTypes
 
 final class LocalRenderEncoder {
-    // Indirect dispatch pipelines
     private let clearTexturesPipeline: MTLComputePipelineState
     private let prepareRenderDispatchPipeline: MTLComputePipelineState
     private let renderIndirect16Pipeline: MTLComputePipelineState
 
     init(library: MTLLibrary, device: MTLDevice) throws {
-        // Required indirect dispatch pipelines
         guard let clearFn = library.makeFunction(name: "localClearTextures"),
               let prepareFn = library.makeFunction(name: "localPrepareRenderDispatch")
         else {
@@ -107,7 +105,7 @@ final class LocalRenderEncoder {
         )
 
         encoder.label = "Local_RenderIndirect16"
-        encoder.setComputePipelineState(renderIndirect16Pipeline)
+        encoder.setComputePipelineState(self.renderIndirect16Pipeline)
         encoder.setBuffer(projectedGaussians, offset: 0, index: 0)
         encoder.setBuffer(tileCounts, offset: 0, index: 1)
         encoder.setBytes(&maxPerTileU, length: 4, index: 2)

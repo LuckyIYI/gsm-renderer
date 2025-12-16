@@ -30,16 +30,19 @@ let package = Package(
                 "GlobalRenderer/GlobalShaders.air",
                 "LocalRenderer/LocalShaders.air",
                 "DepthFirstRenderer/DepthFirstShaders.air",
+                "HardwareRenderer/HardwareGaussianShaders.air",
                 // Metal source files (kept for reference, compiled separately)
                 "GlobalRenderer/GlobalShaders.metal",
                 "LocalRenderer/LocalShaders.metal",
                 "DepthFirstRenderer/DepthFirstShaders.metal",
+                "HardwareRenderer/HardwareGaussianShaders.metal",
             ],
             resources: [
                 // Pre-compiled Metal libraries (run ./compile_shaders.sh to rebuild)
                 .copy("GlobalRenderer/GlobalShaders.metallib"),
                 .copy("LocalRenderer/LocalShaders.metallib"),
                 .copy("DepthFirstRenderer/DepthFirstShaders.metallib"),
+                .copy("HardwareRenderer/HardwareGaussianShaders.metallib"),
             ]
         ),
         .testTarget(

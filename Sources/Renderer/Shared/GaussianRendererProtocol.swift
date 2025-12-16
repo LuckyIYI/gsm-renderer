@@ -56,61 +56,195 @@ public struct CameraParams: Sendable {
 public struct StereoCameraParams: Sendable {
     public let leftEye: CameraParams
     public let rightEye: CameraParams
-    public let sortPosition: SIMD3<Float>
 
     public init(
         leftEye: CameraParams,
-        rightEye: CameraParams,
-        sortPosition: SIMD3<Float>? = nil
+        rightEye: CameraParams
     ) {
         self.leftEye = leftEye
         self.rightEye = rightEye
-        self.sortPosition = sortPosition ?? (leftEye.position + rightEye.position) * 0.5
     }
 }
 
-public struct StereoRenderOutput: Sendable {
-    public let leftColor: MTLTexture
-    public let leftDepth: MTLTexture?
-    public let rightColor: MTLTexture
-    public let rightDepth: MTLTexture?
+public struct EyeView: Sendable {
+    public let viewport: MTLViewport
+    public let viewMatrix: simd_float4x4
+    public let projectionMatrix: simd_float4x4
+    public let cameraPosition: SIMD3<Float>
+    public let focalX: Float
+    public let focalY: Float
+    public let near: Float
+    public let far: Float
 
     public init(
-        leftColor: MTLTexture,
-        leftDepth: MTLTexture?,
-        rightColor: MTLTexture,
-        rightDepth: MTLTexture?
+        viewport: MTLViewport,
+        viewMatrix: simd_float4x4,
+        projectionMatrix: simd_float4x4,
+        cameraPosition: SIMD3<Float>,
+        focalX: Float,
+        focalY: Float,
+        near: Float = 0.1,
+        far: Float = 10.0
     ) {
-        self.leftColor = leftColor
-        self.leftDepth = leftDepth
-        self.rightColor = rightColor
-        self.rightDepth = rightDepth
+        self.viewport = viewport
+        self.viewMatrix = viewMatrix
+        self.projectionMatrix = projectionMatrix
+        self.cameraPosition = cameraPosition
+        self.focalX = focalX
+        self.focalY = focalY
+        self.near = near
+        self.far = far
+    }
+}
+
+public struct StereoConfiguration: Sendable {
+    /// Left eye view configuration
+    public let leftEye: EyeView
+    /// Right eye view configuration
+    public let rightEye: EyeView
+    /// Scene transform - transforms gaussian positions from scene space to world space
+    public let sceneTransform: simd_float4x4
+
+    public init(
+        leftEye: EyeView,
+        rightEye: EyeView,
+        sceneTransform: simd_float4x4 = matrix_identity_float4x4
+    ) {
+        self.leftEye = leftEye
+        self.rightEye = rightEye
+        self.sceneTransform = sceneTransform
+    }
+
+    init(
+        from camera: StereoCameraParams,
+        width: Int,
+        height: Int,
+        leftViewOrigin: SIMD2<Float> = .zero,
+        rightViewOrigin: SIMD2<Float> = .zero
+    ) {
+        let leftEyeView = EyeView(
+            viewport: MTLViewport(
+                originX: Double(leftViewOrigin.x),
+                originY: Double(leftViewOrigin.y),
+                width: Double(width),
+                height: Double(height),
+                znear: 0,
+                zfar: 1
+            ),
+            viewMatrix: camera.leftEye.viewMatrix,
+            projectionMatrix: camera.leftEye.projectionMatrix,
+            cameraPosition: camera.leftEye.position,
+            focalX: camera.leftEye.focalX,
+            focalY: camera.leftEye.focalY,
+            near: camera.leftEye.near,
+            far: camera.leftEye.far
+        )
+        let rightEyeView = EyeView(
+            viewport: MTLViewport(
+                originX: Double(rightViewOrigin.x),
+                originY: Double(rightViewOrigin.y),
+                width: Double(width),
+                height: Double(height),
+                znear: 0,
+                zfar: 1
+            ),
+            viewMatrix: camera.rightEye.viewMatrix,
+            projectionMatrix: camera.rightEye.projectionMatrix,
+            cameraPosition: camera.rightEye.position,
+            focalX: camera.rightEye.focalX,
+            focalY: camera.rightEye.focalY,
+            near: camera.rightEye.near,
+            far: camera.rightEye.far
+        )
+
+        self = StereoConfiguration(
+            leftEye: leftEyeView,
+            rightEye: rightEyeView
+        )
+    }
+}
+
+/// Drawable output for foveated stereo rendering (from Compositor Services)
+public struct FoveatedStereoDrawable: Sendable {
+    /// Color texture - either a texture array (layered) or single texture (shared/dedicated)
+    public let colorTexture: MTLTexture
+    /// Depth texture (optional) - matches colorTexture format
+    public let depthTexture: MTLTexture?
+    /// Rasterization rate map for foveated rendering (from Compositor Services)
+    public let rasterizationRateMap: MTLRasterizationRateMap?
+    /// Color texture pixel format
+    public let colorPixelFormat: MTLPixelFormat
+    /// Depth texture pixel format (if depth texture provided)
+    public let depthPixelFormat: MTLPixelFormat
+
+    public init(
+        colorTexture: MTLTexture,
+        depthTexture: MTLTexture?,
+        rasterizationRateMap: MTLRasterizationRateMap?,
+        colorPixelFormat: MTLPixelFormat = .bgra8Unorm_srgb,
+        depthPixelFormat: MTLPixelFormat = .depth32Float
+    ) {
+        self.colorTexture = colorTexture
+        self.depthTexture = depthTexture
+        self.rasterizationRateMap = rasterizationRateMap
+        self.colorPixelFormat = colorPixelFormat
+        self.depthPixelFormat = depthPixelFormat
     }
 }
 
 public struct RendererConfig: Sendable {
+    public enum GaussianColorSpace: UInt32, Sendable {
+        /// Values are already linear.
+        case linear = 0
+        /// Values are encoded as sRGB and must be decoded to linear before blending/output.
+        case srgb = 1
+    }
+
     public let maxGaussians: Int
     public let maxWidth: Int
     public let maxHeight: Int
     public let precision: RenderPrecision
+    public let colorFormat: MTLPixelFormat
+    public let gaussianColorSpace: GaussianColorSpace
+    public let backToFront: Bool
 
     public init(
         maxGaussians: Int = 6_000_000,
         maxWidth: Int = 1920,
         maxHeight: Int = 1080,
-        precision: RenderPrecision = .float16
+        precision: RenderPrecision = .float16,
+        colorFormat: MTLPixelFormat = .bgra8Unorm_srgb,
+        gaussianColorSpace: GaussianColorSpace = .srgb,
+        backToFront: Bool = false
     ) {
         self.maxGaussians = maxGaussians
         self.maxWidth = maxWidth
         self.maxHeight = maxHeight
         self.precision = precision
+        self.colorFormat = colorFormat
+        self.gaussianColorSpace = gaussianColorSpace
+        self.backToFront = backToFront
     }
 }
+
+// MARK: - Stereo Render Target
+
+/// Stereo render target - all stereo rendering goes through this
+public enum StereoRenderTarget: Sendable {
+    /// Render side-by-side to a single texture (left eye on left half, right eye on right half)
+    case sideBySide(colorTexture: MTLTexture, depthTexture: MTLTexture?)
+
+    /// Render to foveated stereo drawable (Vision Pro Compositor Services)
+    case foveated(drawable: FoveatedStereoDrawable, configuration: StereoConfiguration)
+}
+
+// MARK: - Protocol
 
 public protocol GaussianRenderer: AnyObject, Sendable {
     var device: MTLDevice { get }
     var lastGPUTime: Double? { get }
 
+    /// Render gaussians to a single texture (mono rendering)
     func render(
         commandBuffer: MTLCommandBuffer,
         colorTexture: MTLTexture,
@@ -121,45 +255,20 @@ public protocol GaussianRenderer: AnyObject, Sendable {
         height: Int
     )
 
+    /// Render stereo to the specified target
+    /// - Parameters:
+    ///   - target: Where to render (side-by-side or foveated)
+    ///   - camera: Stereo camera parameters (used for sideBySide)
+    ///   - width: Width per eye in pixels
+    ///   - height: Height per eye in pixels
     func renderStereo(
         commandBuffer: MTLCommandBuffer,
-        output: StereoRenderOutput,
+        target: StereoRenderTarget,
         input: GaussianInput,
         camera: StereoCameraParams,
         width: Int,
         height: Int
     )
-}
-
-public extension GaussianRenderer {
-    func renderStereo(
-        commandBuffer: MTLCommandBuffer,
-        output: StereoRenderOutput,
-        input: GaussianInput,
-        camera: StereoCameraParams,
-        width: Int,
-        height: Int
-    ) {
-        render(
-            commandBuffer: commandBuffer,
-            colorTexture: output.leftColor,
-            depthTexture: output.leftDepth,
-            input: input,
-            camera: camera.leftEye,
-            width: width,
-            height: height
-        )
-
-        render(
-            commandBuffer: commandBuffer,
-            colorTexture: output.rightColor,
-            depthTexture: output.rightDepth,
-            input: input,
-            camera: camera.rightEye,
-            width: width,
-            height: height
-        )
-    }
 }
 
 public enum RendererError: Error, Sendable, CustomStringConvertible {
@@ -233,7 +342,7 @@ enum BufferValidation {
         gaussianCount: Int,
         precision: RenderPrecision
     ) throws {
-        let elementSize = precision == .float32 ? packedWorldGaussianSize : packedWorldGaussianHalfSize
+        let elementSize = precision == .float32 ? self.packedWorldGaussianSize : self.packedWorldGaussianHalfSize
         let expectedSize = gaussianCount * elementSize
         guard buffer.length >= expectedSize else {
             throw RendererError.invalidBufferSize(
@@ -252,7 +361,7 @@ enum BufferValidation {
         precision: RenderPrecision
     ) throws {
         // Each gaussian has shComponents * 3 coefficients (R, G, B channels)
-        let coeffSize = precision == .float32 ? shCoefficientSize : shCoefficientHalfSize
+        let coeffSize = precision == .float32 ? self.shCoefficientSize : self.shCoefficientHalfSize
         let expectedSize = gaussianCount * shComponents * 3 * coeffSize
         guard buffer.length >= expectedSize else {
             throw RendererError.invalidBufferSize(
@@ -276,10 +385,10 @@ enum BufferValidation {
             )
         }
 
-        try validateGaussianBuffer(input.gaussians, gaussianCount: input.gaussianCount, precision: precision)
+        try self.validateGaussianBuffer(input.gaussians, gaussianCount: input.gaussianCount, precision: precision)
 
         if input.shComponents > 0 {
-            try validateHarmonicsBuffer(
+            try self.validateHarmonicsBuffer(
                 input.harmonics,
                 gaussianCount: input.gaussianCount,
                 shComponents: input.shComponents,

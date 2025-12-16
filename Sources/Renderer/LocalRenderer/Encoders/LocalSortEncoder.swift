@@ -25,7 +25,7 @@ final class LocalSortEncoder {
         var maxPerTileU = UInt32(maxPerTile)
 
         encoder.label = "Local_PerTileSort16"
-        encoder.setComputePipelineState(sort16Pipeline)
+        encoder.setComputePipelineState(self.sort16Pipeline)
         encoder.setBuffer(depthKeys16, offset: 0, index: 0)
         encoder.setBuffer(globalIndices, offset: 0, index: 1)
         encoder.setBuffer(sortedLocalIdx, offset: 0, index: 2)

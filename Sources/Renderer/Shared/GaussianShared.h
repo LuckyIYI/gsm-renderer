@@ -115,10 +115,6 @@ inline float3 computeSHColor(
     return color;
 }
 
-// ============================================================================
-// Color Space Helpers
-// ============================================================================
-
 inline float srgbToLinearChannel(float c) {
     c = clamp(c, 0.0f, 1.0f);
     return (c <= 0.04045f) ? (c / 12.92f) : fast::powr((c + 0.055f) / 1.055f, 2.4f);
@@ -192,10 +188,6 @@ inline float2 ndcToScreenCentered(float2 ndc, float width, float height) {
     );
 }
 
-// ============================================================================
-// Shared projection helpers - Z-sign agnostic
-// Works with both OpenCV (+Z forward) and OpenGL (-Z forward) conventions
-// ============================================================================
 
 // Result of projecting a point to screen space
 struct ProjectedPoint {
@@ -331,12 +323,6 @@ inline float3x3 buildCovariance3D(float3 scale, float4 quat) {
     );
 }
 
-// ============================================================================
-// Shared covariance projection - canonical function
-// Z-sign agnostic: works with both OpenCV (+Z forward) and OpenGL (-Z forward)
-// Derives focal length from projection matrix for correctness
-// ============================================================================
-
 inline float2x2 projectCovariance2D(
     float3x3 cov3d,
     float3 viewPos,
@@ -401,80 +387,6 @@ inline float2x2 projectCovariance2D(
     return projectCovariance2D(cov3d, viewPos, viewRotation, projMatrix, screenSize);
 }
 
-// ============================================================================
-// DEPRECATED: Legacy function signatures for backward compatibility
-// These all delegate to projectCovariance2D
-// ============================================================================
-
-// DEPRECATED: Use projectCovariance2D instead
-inline float2x2 projectCovarianceFromMatrices(
-    float3x3 cov3d,
-    float3 viewPos,
-    float4x4 viewMatrix,
-    float4x4 projMatrix,
-    uint2 screenSize
-) {
-    return projectCovariance2D(cov3d, viewPos, viewMatrix, projMatrix, float2(screenSize));
-}
-
-// DEPRECATED: Use projectCovariance2D instead
-// This version requires caller to build a synthetic projection matrix or use the new API
-// Z-sign agnostic: works with both OpenCV (+Z) and OpenGL (-Z) conventions
-inline float2x2 projectCovariance(
-    float3x3 cov3d,
-    float3 viewPos,
-    float3x3 viewRotation,
-    float focalX,
-    float focalY,
-    float width,
-    float height
-) {
-    float tanHalfFovX = width / max(2.0f * max(focalX, 1e-4f), 1e-4f);
-    float tanHalfFovY = height / max(2.0f * max(focalY, 1e-4f), 1e-4f);
-    float limX = 1.3f * tanHalfFovX;
-    float limY = 1.3f * tanHalfFovY;
-
-    // Z-sign agnostic projection (works for OpenCV +Z and OpenGL -Z conventions)
-    float absZ = abs(viewPos.z);
-    float signZ = (viewPos.z >= 0.0f) ? 1.0f : -1.0f;
-    float safeAbsZ = max(absZ, 1e-4f);
-    float invAbsZ = 1.0f / safeAbsZ;
-    float invAbsZ2 = invAbsZ * invAbsZ;
-
-    // Compute tangent values (position / |z|) and clamp to frustum
-    float tx = viewPos.x * invAbsZ;
-    float ty = viewPos.y * invAbsZ;
-    float xClamped = clamp(tx, -limX, limX) * safeAbsZ;
-    float yClamped = clamp(ty, -limY, limY) * safeAbsZ;
-
-    // Z-sign agnostic Jacobian:
-    // J[0][2] and J[1][2] include signZ for correct derivative of 1/|z|
-    float3 col0 = float3(focalX * invAbsZ, 0.0f, 0.0f);
-    float3 col1 = float3(0.0f, focalY * invAbsZ, 0.0f);
-    float3 col2 = float3(-focalX * xClamped * signZ * invAbsZ2, -focalY * yClamped * signZ * invAbsZ2, 0.0f);
-    float3x3 J = float3x3(col0, col1, col2);
-
-    float3x3 T = J * viewRotation;
-    float3x3 covFull = T * cov3d * transpose(T);
-
-    float2x2 cov2d = float2x2(covFull[0][0], covFull[0][1], covFull[1][0], covFull[1][1]);
-    cov2d[0][0] += 0.3f;
-    cov2d[1][1] += 0.3f;
-    return cov2d;
-}
-
-// DEPRECATED: Use projectCovariance2D instead
-inline float2x2 projectCovarianceWithProjMatrix(
-    float3x3 cov3d,
-    float3 viewPos,
-    float3x3 viewRotation,
-    float4x4 projMatrix,
-    float width,
-    float height
-) {
-    return projectCovariance2D(cov3d, viewPos, viewRotation, projMatrix, float2(width, height));
-}
-
 inline void computeConicAndRadius(float2x2 cov, thread float4& conic, thread float& radius) {
     float a = cov[0][0], b = cov[0][1], c = cov[1][0], d = cov[1][1];
     float det = a * d - b * c;
@@ -485,19 +397,6 @@ inline void computeConicAndRadius(float2x2 cov, thread float4& conic, thread flo
     float sqrtDelta = sqrt(delta);
     float maxEig = mid + sqrtDelta;
     radius = 3.0f * ceil(sqrt(max(maxEig, 1e-5f)));
-}
-
-inline float4 invertCovariance2D(float2x2 cov) {
-    float det = cov[0][0] * cov[1][1] - cov[0][1] * cov[1][0];
-    float invDet = 1.0f / max(det, 1e-8f);
-    return float4(cov[1][1] * invDet, -cov[0][1] * invDet, cov[0][0] * invDet, 0.0f);
-}
-
-inline float radiusFromCovariance(float2x2 cov) {
-    float det = cov[0][0] * cov[1][1] - cov[0][1] * cov[1][0];
-    float mid = 0.5f * (cov[0][0] + cov[1][1]);
-    float delta = max(mid * mid - det, 1e-5f);
-    return 3.0f * ceil(sqrt(max(mid + sqrt(delta), 1e-5f)));
 }
 
 inline float2 computeOBBExtents(float2x2 cov, float sigma_multiplier) {
@@ -527,51 +426,9 @@ inline float2 computeOBBExtents(float2x2 cov, float sigma_multiplier) {
     return float2(xExtent, yExtent);
 }
 
-inline float2 computeOBBExtentsFromComponents(float a, float b, float d, float sigma_multiplier) {
-    float det = a * d - b * b;
-    float mid = 0.5f * (a + d);
-    float disc = max(mid * mid - det, 1e-6f);
-    float sqrtDisc = sqrt(disc);
-
-    float lambda1 = mid + sqrtDisc;
-    float lambda2 = max(mid - sqrtDisc, 1e-6f);
-
-    float e1 = sigma_multiplier * sqrt(max(lambda1, 1e-6f));
-    float e2 = sigma_multiplier * sqrt(max(lambda2, 1e-6f));
-
-    float2 v1;
-    if (abs(b) > 1e-6f) {
-        float vx = b, vy = lambda1 - a;
-        float vlen = sqrt(vx * vx + vy * vy);
-        v1 = float2(vx, vy) / max(vlen, 1e-6f);
-    } else {
-        v1 = (a >= d) ? float2(1.0f, 0.0f) : float2(0.0f, 1.0f);
-    }
-
-    float xExtent = abs(v1.x) * e1 + abs(v1.y) * e2;
-    float yExtent = abs(v1.y) * e1 + abs(v1.x) * e2;
-    return float2(xExtent, yExtent);
-}
-
-inline float2 computeOBBExtentsFromConic(float3 conic, float sigma_multiplier) {
-    float invA = conic.x, invB = conic.y, invD = conic.z;
-    float conicDet = invA * invD - invB * invB;
-    if (abs(conicDet) < 1e-8f) {
-        return float2(sigma_multiplier * 10.0f, sigma_multiplier * 10.0f);
-    }
-    float a = invD / conicDet;
-    float b = -invB / conicDet;
-    float d = invA / conicDet;
-    return computeOBBExtentsFromComponents(a, b, d, sigma_multiplier);
-}
 
 constant float GAUSSIAN_TAU = 1.0f / 255.0f;
 constant float GAUSSIAN_LN2 = 0.693147180559945f;
-
-// ============================================================================
-// Ellipse packing helpers (theta + sigma1/sigma2) for 16-byte GaussianRenderData
-// ============================================================================
-
 constant float kPiF = 3.14159265358979323846f;
 
 inline UINT16 packThetaPi(float theta) {
@@ -795,28 +652,6 @@ inline bool intersectsTile(
     return gaussianIntersectsTile(pix_min, pix_max, center, conic, power);
 }
 
-inline bool intersectsTileSimple(
-    int2 pix_min, int2 pix_max,
-    float2 center, float3 conic, float opacity, float radius
-) {
-    float power = gaussianComputePower(opacity);
-    return gaussianIntersectsTile(pix_min, pix_max, center, conic, power);
-}
-
-inline bool intersectsTileHalf(
-    int2 pix_min, int2 pix_max,
-    half2 center, half3 conic, half opacity, half2 obbExtents
-) {
-    float power = gaussianComputePower(float(opacity));
-    return gaussianIntersectsTile(pix_min, pix_max, float2(center), float3(conic), power);
-}
-
-// ============================================================================
-// Shared covariance stabilization
-// Ensures numerical stability for half-precision packing and prevents
-// degenerate conics (needles/lines). Use this before packing to half.
-// ============================================================================
-
 constant float kCovStabilize_MinVar = 1e-4f;
 constant float kCovStabilize_MinDet = 1e-8f;
 constant float kCovStabilize_MaxAxisRatio = 256.0f;
@@ -877,11 +712,6 @@ inline float2x2 stabilizeCovariance2D(float2x2 cov, float2 screenSize) {
 
     return covOut;
 }
-
-// ============================================================================
-// Shared culling helpers
-// These consolidate the duplicated culling logic across all projection kernels
-// ============================================================================
 
 // Scale culling: reject Gaussians that are too small to matter
 constant float kMinGaussianScale = 0.0005f;
@@ -950,10 +780,6 @@ inline bool cullByScreenBounds(
             screenPos.y - obbExtents.y > height);
 }
 
-// ============================================================================
-// Shared tile bounds computation
-// ============================================================================
-
 struct TileBounds {
     int minTileX;
     int maxTileX;
@@ -1001,11 +827,6 @@ inline TileBounds computeTileBounds(
     return result;
 }
 
-// ============================================================================
-// Shared Gaussian projection result
-// Contains all computed values from projection + culling
-// ============================================================================
-
 struct GaussianProjection {
     // Screen space
     float2 screenPos;
@@ -1027,16 +848,5 @@ struct GaussianProjection {
     bool culled;        // true if any cull check failed
     uint cullReason;    // bitmask of which culls failed (for debugging)
 };
-
-// Cull reason flags
-constant uint CULL_NONE = 0;
-constant uint CULL_SCALE = 1 << 0;
-constant uint CULL_NEAR_PLANE = 1 << 1;
-constant uint CULL_FAR_PLANE = 1 << 2;
-constant uint CULL_OPACITY = 1 << 3;
-constant uint CULL_COVARIANCE = 1 << 4;
-constant uint CULL_RADIUS = 1 << 5;
-constant uint CULL_TOTAL_INK = 1 << 6;
-constant uint CULL_OFF_SCREEN = 1 << 7;
 
 #endif // GAUSSIAN_SHARED_H

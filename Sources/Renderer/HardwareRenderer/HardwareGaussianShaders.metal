@@ -1,8 +1,6 @@
 #include <metal_stdlib>
 #include <metal_atomic>
-#if __METAL_VERSION__ >= 310
 #include <metal_mesh>
-#endif
 #include "BridgingTypes.h"
 #include "GaussianShared.h"
 
@@ -18,10 +16,6 @@ constant float MIN_OPACITY = 1.0f / 255.0f;
 constant uint MAX_INDEXED_SPLAT_COUNT = 1024;
 constant float BOUNDS_RADIUS = 3.0f;
 constant float BOUNDS_RADIUS_SQUARED = BOUNDS_RADIUS * BOUNDS_RADIUS;
-
-// ============================================================================
-// Tile memory depth blending + postprocess
-// ============================================================================
 
 typedef struct {
     half4 color [[raster_order_group(0)]];
@@ -531,10 +525,6 @@ fragment DepthFragmentStore stereoInstancedFragmentBackToFront(
     return out;
 }
 
-// ============================================================================
-// Mono (Single Texture) Rendering
-// ============================================================================
-
 template<typename GaussianType, typename HarmonicType>
 void monoProjectCullImpl(
     const device GaussianType* gaussians,
@@ -789,10 +779,6 @@ fragment half4 monoGaussianFragment(MonoVertexOut in [[stage_in]]) {
     return half4(in.color * alpha, alpha);
 }
 
-// ============================================================================
-// Mesh shaders (from MeshGaussianShaders.metal)
-// ============================================================================
-#if __METAL_VERSION__ >= 310
 constant uint VERTICES_PER_GAUSSIAN = 4;
 constant uint TRIANGLES_PER_GAUSSIAN = 2;
 constant uint GAUSSIANS_PER_OBJECT_TG = 64;
@@ -995,10 +981,6 @@ void stereoMeshShader(
     }
 }
 
-// ============================================================================
-// Mono (Single Texture) Mesh Shaders
-// ============================================================================
-
 struct MonoObjectPayload {
     InstancedGaussianData gaussians[GAUSSIANS_PER_OBJECT_TG];
     uint validCount;
@@ -1128,4 +1110,3 @@ half4 monoFragmentShader(MonoVertexOut in [[stage_in]]) {
 
     return half4(in.color * alpha, alpha);
 }
-#endif

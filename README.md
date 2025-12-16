@@ -75,10 +75,19 @@ commandBuffer.commit()
 
 ## Stereo Rendering
 
-All renderers implement `GaussianRenderer.renderStereo(...)` with a `StereoRenderTarget`:
+Stereo rendering is supported by **DepthFirstRenderer** and **HardwareRenderer** via `GaussianRenderer.renderStereo(...)` and a `StereoRenderTarget`:
 
 - `.sideBySide(colorTexture:depthTexture:)`: left eye on the left half, right eye on the right half.
 - `.foveated(drawable:configuration:)`: visionOS Compositor Services output (rasterization rate map supported).
+
+### Feature Table
+
+| Renderer | Mono | Stereo (Side-by-Side) | Stereo (Foveated / visionOS) |
+|---------|------|------------------------|-------------------------------|
+| GlobalRenderer | ✅ | ❌ | ❌ |
+| LocalRenderer | ✅ | ❌ | ❌ |
+| DepthFirstRenderer | ✅ | ✅ | ⚠️ |
+| HardwareRenderer | ✅ | ✅ | ✅ |
 
 ## Renderers
 

@@ -437,65 +437,6 @@ public final class GlobalRenderer: GaussianRenderer, @unchecked Sendable {
         )
     }
 
-    /// Build tile assignments starting from an already-compacted visible list in `frame.visibleIndices/frame.visibleCount`.
-    /// Used by the LOD path to avoid any O(M) visibility compaction work.
-    func buildTileAssignmentsFromVisibleList(
-        commandBuffer: MTLCommandBuffer,
-        gaussianCount: Int,
-        projectionOutput: ProjectionOutput,
-        params: RenderParams,
-        frame: GlobalViewResources
-    ) throws -> TileAssignmentBuffers {
-        guard gaussianCount <= self.limits.maxGaussians else {
-            throw RendererError.invalidGaussianCount(provided: gaussianCount, maximum: self.limits.maxGaussians)
-        }
-
-        let tileCount = Int(params.tilesX * params.tilesY)
-        guard tileCount <= self.limits.maxTileCount else {
-            throw RendererError.invalidTileCount(provided: tileCount, maximum: self.limits.maxTileCount)
-        }
-
-        let requiredCapacity = gaussianCount * 4
-        guard requiredCapacity <= frame.tileAssignmentMaxAssignments else {
-            throw RendererError.invalidAssignmentCapacity(required: requiredCapacity, available: frame.tileAssignmentMaxAssignments)
-        }
-
-        self.resetTileBuilderState(commandBuffer: commandBuffer, frame: frame)
-
-        let indirectBuffers = TwoPassTileAssignEncoder.IndirectBuffers(
-            visibleIndices: frame.visibleIndices,
-            visibleCount: frame.visibleCount,
-            indirectDispatchArgs: frame.tileAssignDispatchArgs
-        )
-
-        self.twoPassTileAssignEncoder.encodeFromVisibleList(
-            commandBuffer: commandBuffer,
-            tileWidth: Int(params.tileWidth),
-            tileHeight: Int(params.tileHeight),
-            tilesX: Int(params.tilesX),
-            maxAssignments: frame.tileAssignmentMaxAssignments,
-            boundsBuffer: projectionOutput.bounds,
-            coverageBuffer: frame.coverageBuffer,
-            renderData: projectionOutput.renderData,
-            tileIndicesBuffer: frame.tileIndices,
-            tileIdsBuffer: frame.tileIds,
-            tileAssignmentHeader: frame.tileAssignmentHeader,
-            blockSumsBuffer: frame.tileAssignBlockSums,
-            blockSumsLevel2OffsetBytes: (((gaussianCount + 255) / 256) + 1) * MemoryLayout<UInt32>.stride,
-            prefixSumDispatchArgs: frame.scatterDispatchBuffer,
-            prefixSumBlockCountBuffer: frame.prefixSumBlockCountBuffer,
-            indirectBuffers: indirectBuffers
-        )
-
-        return TileAssignmentBuffers(
-            tileCount: tileCount,
-            maxAssignments: frame.tileAssignmentMaxAssignments,
-            tileIndices: frame.tileIndices,
-            tileIds: frame.tileIds,
-            header: frame.tileAssignmentHeader
-        )
-    }
-
     /// Build ordered gaussian buffers - generates sort keys, sorts, and prepares for rendering
     /// Uses index-based render (no pack step - render reads via sortedIndices into packed renderData)
     func buildOrderedGaussians(

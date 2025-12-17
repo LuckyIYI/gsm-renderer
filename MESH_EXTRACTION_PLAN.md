@@ -2,406 +2,470 @@
 
 ## Overview
 
-This document describes the implementation of mesh extraction based on **Gaussian Opacity Fields (GOF)** paper (Yu et al., 2024). The algorithm extracts triangle meshes from 3D Gaussian representations by computing an opacity field and using marching cubes to extract the isosurface.
+This document describes the implementation of mesh extraction based on **Gaussian Opacity Fields (GOF)** paper (Yu et al., 2024). The algorithm extracts triangle meshes from 3D Gaussian representations by computing an opacity field and using marching cubes/tetrahedra to extract the isosurface.
 
-**Reference:** https://github.com/autonomousvision/gaussian-opacity-fields
+**Paper:** [arXiv:2404.10772](https://arxiv.org/abs/2404.10772)
+**Code:** https://github.com/autonomousvision/gaussian-opacity-fields
+**Project:** https://niujinshuchong.github.io/gaussian-opacity-fields/
 
 ---
 
-## 1. Mathematical Foundation
+## 1. Mathematical Foundation (Complete from Paper)
 
-### 1.1 3D Gaussian Definition
+### 1.1 3D Gaussian Parameterization
 
-Each Gaussian is defined by:
-- **Position:** μ ∈ ℝ³
-- **Covariance:** Σ = R · S · Sᵀ · Rᵀ where:
-  - R is the rotation matrix from quaternion q
-  - S = diag(sx, sy, sz) is the scale matrix
+Each 3D Gaussian is defined by:
+- **Position (mean):** μ ∈ ℝ³
+- **Scale:** S = diag(sₓ, sᵧ, sᵤ) - diagonal scale matrix
+- **Rotation:** R ∈ SO(3) - rotation matrix from quaternion q = (qₓ, qᵧ, qᵤ, qᵥ)
 - **Opacity:** α ∈ [0, 1]
+- **Spherical Harmonics:** SH coefficients for view-dependent color
 
-### 1.2 Gaussian Evaluation at a 3D Point
-
-For a query point **p** ∈ ℝ³, the Gaussian contribution is:
-
+**Covariance Matrix:**
 ```
-G(p) = exp(-½ · (p - μ)ᵀ · Σ⁻¹ · (p - μ))
+Σ = R · S · Sᵀ · Rᵀ = R · S² · Rᵀ
 ```
 
-The weighted opacity contribution from Gaussian i at point p:
-
+**Inverse Covariance (Precision Matrix):**
 ```
-αᵢ(p) = αᵢ · G(p)
-```
+Σ⁻¹ = R · S⁻² · Rᵀ
 
-### 1.3 Opacity Field Computation
-
-The opacity at a 3D point is computed by accumulating contributions from all Gaussians using alpha compositing:
-
-```
-α(p) = 1 - ∏ᵢ (1 - αᵢ(p))
+where S⁻² = diag(1/sₓ², 1/sᵧ², 1/sᵤ²)
 ```
 
-In log-space for numerical stability:
+### 1.2 Ray-Gaussian Intersection (GOF Key Contribution)
 
+Unlike standard 3DGS which projects Gaussians to 2D, GOF uses **ray-tracing based volume rendering**.
+
+**Ray Definition:**
 ```
-α(p) = 1 - exp(∑ᵢ log(1 - αᵢ(p)))
-```
+r(t) = o + t·d
 
-Where αᵢ(p) is clamped to [0, 0.99] before accumulation.
-
-### 1.4 SDF Conversion
-
-The opacity field is converted to a signed distance field (SDF) for isosurface extraction:
-
-```
-SDF(p) = 0.5 - α(p)
+where:
+  o = ray origin (camera position)
+  d = ray direction (normalized)
+  t = distance along ray
 ```
 
-- SDF < 0: Inside the surface (α > 0.5)
-- SDF > 0: Outside the surface (α < 0.5)
-- SDF = 0: On the surface (α = 0.5)
+**Gaussian in Ray Coordinates:**
 
-### 1.5 Inverse Covariance (Precision Matrix)
-
-For efficient computation, we use the inverse covariance (precision matrix):
+The GOF paper transforms the Gaussian into a quadratic form along the ray. Given the view-to-Gaussian transformation, the evaluation becomes:
 
 ```
-Σ⁻¹ = (R · S · Sᵀ · Rᵀ)⁻¹ = R · S⁻² · Rᵀ
+Q(t) = AA·t² + BB·t + CC
 ```
 
-Where S⁻² = diag(1/sx², 1/sy², 1/sz²)
+Where (from the CUDA implementation):
+```
+ray_point = (ray.x, ray.y, 1.0)  // homogeneous ray direction
+n = Σ⁻¹_view · ray_point         // transformed by view-space precision
 
-The Mahalanobis distance squared:
+AA = ray.x · n[0] + ray.y · n[1] + n[2]
+BB = 2 · (b[0]·ray.x + b[1]·ray.y + b[2])
+CC = c
+```
+
+The precomputed values:
+```
+Σ⁻¹_view[6] = Rᵀ · S⁻² · R      // symmetric 3x3, upper triangle (6 values)
+b[3] = S⁻² · R · t_cam           // translation component
+c = t_camᵀ · S⁻² · t_cam         // constant term
+```
+
+**Optimal Depth (intersection point):**
+```
+t* = -BB / (2·AA)
+```
+
+**Minimum Quadratic Value (Gaussian exponent):**
+```
+min_value = -(BB/AA)·(BB/4) + CC = CC - BB²/(4·AA)
+```
+
+### 1.3 Alpha/Opacity Computation
+
+**Per-Gaussian Alpha at Intersection:**
+```
+power = -0.5 · min_value
+G = exp(power)
+α = min(0.99, opacity · G)
+```
+
+The 0.99 clamp prevents numerical issues with fully opaque regions.
+
+**Validity Check:**
+```
+if α < 1/255: skip this Gaussian (negligible contribution)
+```
+
+### 1.4 Transmittance-Based Alpha Compositing
+
+**Front-to-Back Compositing:**
+```
+C = Σᵢ (colorᵢ · αᵢ · Tᵢ)
+T_{i+1} = Tᵢ · (1 - αᵢ)
+
+where T₀ = 1.0 (initial transmittance)
+```
+
+**Final Pixel Color:**
+```
+C_final = C + T_final · C_background
+```
+
+**Accumulated Alpha (Opacity Field Value):**
+```
+α_accumulated = 1 - T_final = 1 - ∏ᵢ(1 - αᵢ)
+```
+
+### 1.5 Multi-View Opacity Field (for Mesh Extraction)
+
+The GOF paper evaluates opacity at 3D query points across **multiple camera views** and takes the **minimum**:
 
 ```
-d²(p) = (p - μ)ᵀ · Σ⁻¹ · (p - μ)
+α(p) = 1 - min_view[ T_view(p) ]
+
+where T_view(p) = accumulated transmittance at point p from view
+```
+
+This multi-view minimum ensures conservative surface estimation.
+
+**Simplified Single-View Version (our implementation):**
+```
+For query point p:
+  T = 1.0
+  for each Gaussian i:
+    d² = (p - μᵢ)ᵀ · Σᵢ⁻¹ · (p - μᵢ)   // Mahalanobis distance²
+    αᵢ = min(0.99, opacityᵢ · exp(-0.5 · d²))
+    T *= (1 - αᵢ)
+  α(p) = 1 - T
+```
+
+### 1.6 SDF Conversion
+
+**Opacity to Signed Distance Field:**
+```
+SDF(p) = α(p) - 0.5
+```
+
+Note: GOF uses `alpha - 0.5`, not `0.5 - alpha`, so:
+- **SDF > 0:** Inside surface (α > 0.5, high opacity)
+- **SDF < 0:** Outside surface (α < 0.5, low opacity)
+- **SDF = 0:** On surface (α = 0.5, isosurface)
+
+Our implementation uses `isoLevel - α(p)` for flexibility.
+
+### 1.7 Surface Normal Estimation
+
+**From Ray-Gaussian Intersection:**
+
+The GOF paper approximates surface normals using the ray-Gaussian intersection plane:
+```
+n_surface ≈ n_ray-gaussian = normalize(∇Q(t*))
+```
+
+**From Depth Map (training regularization):**
+```
+n_depth = depth_to_normal(rendered_depth)
+```
+
+**From Rendered Normals:**
+```
+n_render = transform_to_world(rendered_normal_image)
 ```
 
 ---
 
-## 2. Algorithm Pipeline
+## 2. Training Loss Functions (from Paper)
 
-### 2.1 Overview
+### 2.1 RGB Reconstruction Loss
+```
+L_rgb = (1 - λ_dssim) · L1(render, gt) + λ_dssim · (1 - SSIM(render, gt))
+```
+
+### 2.2 Depth Distortion Loss
+```
+L_distortion = mean(distortion_map)
+```
+
+The distortion map penalizes spread-out Gaussian contributions along rays.
+
+### 2.3 Depth-Normal Consistency Loss
+```
+L_depth_normal = mean(1 - n_render · n_depth)
+```
+
+Enforces alignment between:
+- Normals computed from rendered depth
+- Directly rendered normal vectors
+
+### 2.4 Complete Training Objective
+```
+L = L_rgb + λ_depth_normal · L_depth_normal + λ_distortion · L_distortion
+```
+
+Both geometric losses are activated after warmup iterations.
+
+---
+
+## 3. Mesh Extraction Algorithm
+
+### 3.1 Overview Pipeline
 
 ```
 ┌─────────────────────────────────────────────────────────────────┐
 │                     MESH EXTRACTION PIPELINE                     │
 ├─────────────────────────────────────────────────────────────────┤
 │                                                                  │
-│  1. GRID GENERATION                                              │
-│     ├── Define 3D grid bounds (AABB of Gaussians + margin)      │
-│     └── Create uniform grid of query points                      │
+│  1. TETRAHEDRAL GRID GENERATION                                  │
+│     ├── Compute AABB of Gaussians + margin                       │
+│     ├── Create uniform point grid                                │
+│     └── Triangulate points into tetrahedra                       │
 │                                                                  │
-│  2. OPACITY FIELD COMPUTATION (Compute Shader)                   │
-│     ├── For each grid point p:                                   │
-│     │   ├── For each Gaussian i:                                 │
-│     │   │   ├── Compute d² = Mahalanobis distance²              │
-│     │   │   ├── Compute αᵢ(p) = αᵢ · exp(-0.5 · d²)            │
-│     │   │   └── Accumulate: T *= (1 - αᵢ(p))                    │
-│     │   └── Final: α(p) = 1 - T                                 │
-│     └── Output: 3D opacity grid                                  │
+│  2. OPACITY FIELD EVALUATION                                     │
+│     ├── For each grid vertex:                                    │
+│     │   ├── For each view (multi-view version):                 │
+│     │   │   └── Render/integrate alpha at vertex                │
+│     │   └── α(p) = 1 - min_view(T_view)                         │
+│     └── Output: per-vertex opacity values                        │
 │                                                                  │
 │  3. SDF CONVERSION                                               │
-│     └── SDF(p) = 0.5 - α(p)                                     │
+│     └── SDF(p) = α(p) - 0.5                                     │
 │                                                                  │
-│  4. MARCHING CUBES (Compute Shader)                              │
-│     ├── For each grid cell:                                      │
-│     │   ├── Classify 8 corners (inside/outside)                 │
-│     │   ├── Lookup triangle configuration                        │
-│     │   └── Generate vertices via linear interpolation           │
-│     └── Output: Triangle mesh                                    │
+│  4. MARCHING TETRAHEDRA                                          │
+│     ├── For each tetrahedron:                                    │
+│     │   ├── Classify 4 vertices (inside/outside)                │
+│     │   ├── Identify crossing edges (sign change)               │
+│     │   └── Generate 0-2 triangles via lookup table              │
+│     └── Output: initial mesh                                     │
 │                                                                  │
-│  5. VERTEX REFINEMENT (Optional)                                 │
-│     └── Binary search to refine vertex positions                 │
+│  5. BINARY SEARCH REFINEMENT (8 iterations)                      │
+│     ├── For each edge vertex:                                    │
+│     │   ├── p_mid = (p_left + p_right) / 2                      │
+│     │   ├── Evaluate SDF(p_mid)                                  │
+│     │   └── Update left/right based on sign                      │
+│     └── Output: refined vertex positions                         │
+│                                                                  │
+│  6. MESH FILTERING                                               │
+│     ├── Filter vertices by distance threshold                    │
+│     └── Remove faces with invalid vertices                       │
 │                                                                  │
 └─────────────────────────────────────────────────────────────────┘
 ```
 
-### 2.2 Grid Generation
+### 3.2 Tetrahedra vs Marching Cubes
 
-The grid bounds are computed from the Gaussian point cloud:
+GOF uses **Marching Tetrahedra** (from Tetra-NeRF) instead of Marching Cubes:
+- Tetrahedra have only 16 configurations (vs 256 for cubes)
+- No ambiguous cases
+- Better suited for adaptive refinement
+- Each cube subdivides into 5-6 tetrahedra
 
+**Tetrahedron Edge Indices:**
 ```
-bounds_min = min(μᵢ - 3·max(sᵢ)) - margin
-bounds_max = max(μᵢ + 3·max(sᵢ)) + margin
+base_tet_edges = [0,1], [0,2], [0,3], [1,2], [1,3], [2,3]  // 6 edges
 ```
 
-Grid resolution is typically 256³ or 512³ depending on scene complexity.
+**Valid Tetrahedra (produce triangles):**
+```
+0 < occ_sum < 4   // Some vertices inside, some outside
+```
 
-### 2.3 Spatial Acceleration Structure
+### 3.3 Vertex Interpolation
 
-To avoid O(N·M) complexity where N = grid points and M = Gaussians, we use a uniform spatial hash:
+**Linear Interpolation on Edges:**
+```
+For edge with vertices p₁, p₂ and SDF values v₁, v₂:
+  t = v₁ / (v₁ - v₂)
+  p_surface = p₁ + t · (p₂ - p₁)
+```
 
-1. **Voxelize Gaussians:** Each Gaussian covers voxels within its 3σ radius
-2. **Build Hash Table:** Map voxel IDs to lists of overlapping Gaussians
-3. **Query:** For each grid point, only evaluate Gaussians in nearby voxels
+### 3.4 Binary Search Refinement
 
-This reduces complexity to approximately O(N·k) where k is the average number of Gaussians per voxel.
+**8 Iterations of Bisection:**
+```python
+for iteration in range(8):
+    p_mid = (p_left + p_right) / 2
+    sdf_mid = evaluate_opacity(p_mid) - 0.5
+
+    # Update based on sign consistency
+    if sign(sdf_mid) == sign(sdf_left):
+        p_left = p_mid
+        sdf_left = sdf_mid
+    else:
+        p_right = p_mid
+        sdf_right = sdf_mid
+
+p_final = (p_left + p_right) / 2
+```
+
+### 3.5 Mesh Filtering
+
+```python
+# Filter by distance to nearest Gaussian
+mask = (distance_to_gaussian <= scale_threshold)
+valid_faces = faces where all 3 vertices satisfy mask
+```
 
 ---
 
-## 3. Marching Cubes Algorithm
+## 4. Implementation Details (Our Version)
 
-### 3.1 Cell Classification
+### 4.1 Key Differences from Paper
 
-Each cell has 8 corners. A corner is "inside" if SDF < 0 (opacity > 0.5).
+| Paper (GOF) | Our Implementation |
+|-------------|-------------------|
+| Multi-view opacity evaluation | Single evaluation at grid points |
+| Marching Tetrahedra | Marching Cubes (simpler) |
+| Tetra-NeRF triangulation | Uniform cubic grid |
+| CPU-based extraction | GPU compute shaders |
+| Binary search refinement | Linear interpolation only |
 
-The 8 corners form a binary index (0-255):
-```
-cornerIndex = (c0 < 0) | ((c1 < 0) << 1) | ... | ((c7 < 0) << 7)
-```
-
-### 3.2 Edge Table
-
-256-entry lookup table mapping corner configurations to edge intersections.
-
-```
-edgeTable[cornerIndex] = 12-bit mask indicating which edges are crossed
-```
-
-### 3.3 Triangle Table
-
-256×16 table mapping configurations to triangle vertex sequences:
-
-```
-triTable[cornerIndex][0..15] = edge indices forming triangles (-1 = end)
-```
-
-### 3.4 Vertex Interpolation
-
-For an edge with endpoints p1, p2 and values v1, v2:
-
-```
-t = v1 / (v1 - v2)
-vertex = p1 + t · (p2 - p1)
-```
-
-This places the vertex where SDF = 0.
-
----
-
-## 4. Implementation Details
-
-### 4.1 Data Structures
+### 4.2 Data Structures
 
 ```metal
 // Mesh extraction parameters
 struct MeshExtractionParams {
-    float3 gridMin;        // Grid lower bound
-    float3 gridMax;        // Grid upper bound
-    uint3 gridDims;        // Grid dimensions (e.g., 256×256×256)
-    float3 voxelSize;      // Size of each voxel
-    float isoLevel;        // Isosurface threshold (0.5)
-    uint gaussianCount;    // Number of Gaussians
-};
-
-// Output vertex
-struct MeshVertex {
-    float3 position;
-    float3 normal;
-    float3 color;
-};
-
-// Output triangle
-struct MeshTriangle {
-    uint v0, v1, v2;
+    float3 gridMin;          // Grid lower bound
+    float  voxelSize;        // Voxel size
+    float3 gridMax;          // Grid upper bound
+    float  isoLevel;         // Isosurface threshold (0.5)
+    uint3  gridDims;         // Grid dimensions
+    uint   gaussianCount;    // Number of Gaussians
+    float  opacityCutoff;    // Min opacity (1/255)
+    float  sigmaCutoff;      // Distance cutoff (3.0)
 };
 ```
 
-### 4.2 Compute Shader Stages
-
-#### Stage 1: Compute Gaussian AABBs and Grid Bounds
+### 4.3 Compute Shader: Opacity Field
 
 ```metal
-kernel void computeGaussianBounds(
-    const device PackedWorldGaussian* gaussians,
-    device float3* minBounds,
-    device float3* maxBounds,
-    device atomic_uint* counter,
-    uint gid [[thread_position_in_grid]]
-);
+kernel void computeOpacityFieldKernel(...) {
+    float3 worldPos = gridMin + float3(gid) * voxelSize;
+
+    float transmittance = 1.0;
+    for (uint i = 0; i < gaussianCount; i++) {
+        // Compute inverse covariance
+        float3x3 invCov = R · diag(1/s²) · Rᵀ;
+
+        // Mahalanobis distance squared
+        float3 delta = worldPos - position;
+        float d2 = dot(delta, invCov * delta);
+
+        // Skip if too far
+        if (d2 > sigmaCutoff²) continue;
+
+        // Gaussian contribution
+        float alpha = min(0.99, opacity * exp(-0.5 * d2));
+        transmittance *= (1 - alpha);
+
+        // Early exit
+        if (transmittance < 1e-6) break;
+    }
+
+    opacityGrid[index] = 1.0 - transmittance;
+}
 ```
 
-#### Stage 2: Build Spatial Hash
+### 4.4 Compute Shader: Marching Cubes
 
 ```metal
-kernel void buildSpatialHash(
-    const device PackedWorldGaussian* gaussians,
-    device uint* hashTable,
-    device uint* gaussianLists,
-    constant MeshExtractionParams& params,
-    uint gid [[thread_position_in_grid]]
-);
+kernel void marchingCubesGenerateKernel(...) {
+    // Sample 8 corners
+    float sdf[8];
+    for (int i = 0; i < 8; i++) {
+        sdf[i] = isoLevel - sampleOpacity(corner[i]);
+    }
+
+    // Compute cube index
+    int cubeIndex = 0;
+    for (int i = 0; i < 8; i++) {
+        if (sdf[i] < 0) cubeIndex |= (1 << i);
+    }
+
+    // Generate triangles from lookup table
+    for (int i = 0; triTable[cubeIndex][i] != -1; i += 3) {
+        // Interpolate vertices on edges
+        // Write triangle
+    }
+}
 ```
-
-#### Stage 3: Compute Opacity Field
-
-```metal
-kernel void computeOpacityField(
-    const device PackedWorldGaussian* gaussians,
-    const device uint* hashTable,
-    const device uint* gaussianLists,
-    device float* opacityGrid,
-    constant MeshExtractionParams& params,
-    uint3 gid [[thread_position_in_grid]]
-);
-```
-
-#### Stage 4: Marching Cubes - Count Triangles
-
-```metal
-kernel void marchingCubesCount(
-    const device float* opacityGrid,
-    device uint* triangleCounts,
-    constant MeshExtractionParams& params,
-    uint3 gid [[thread_position_in_grid]]
-);
-```
-
-#### Stage 5: Prefix Sum for Triangle Offsets
-
-Reuse existing `GaussianPrefixScan.h` infrastructure.
-
-#### Stage 6: Marching Cubes - Generate Triangles
-
-```metal
-kernel void marchingCubesGenerate(
-    const device float* opacityGrid,
-    const device uint* triangleOffsets,
-    device MeshVertex* vertices,
-    device MeshTriangle* triangles,
-    constant MeshExtractionParams& params,
-    uint3 gid [[thread_position_in_grid]]
-);
-```
-
-### 4.3 Optimizations
-
-1. **Threadgroup Memory:** Cache opacity values for neighboring voxels
-2. **Coalesced Access:** Process voxels in Morton order for better cache locality
-3. **Early Exit:** Skip cells with all corners inside or outside
-4. **LOD:** Multi-resolution extraction for large scenes
 
 ---
 
-## 5. Swift Interface
+## 5. Mathematical Validation
 
-```swift
-public struct MeshExtractionConfig {
-    public var gridResolution: Int = 256
-    public var isoLevel: Float = 0.5
-    public var margin: Float = 0.1
-    public var refinementIterations: Int = 4
-}
+### 5.1 Opacity Field Validation
 
-public struct ExtractedMesh {
-    public var vertices: [SIMD3<Float>]
-    public var normals: [SIMD3<Float>]
-    public var colors: [SIMD3<Float>]
-    public var triangles: [SIMD3<UInt32>]
-}
+Compare against reference Python:
+```python
+def compute_opacity_reference(point, gaussians):
+    """Reference implementation matching GOF paper."""
+    transmittance = 1.0
+    for g in gaussians:
+        # Build precision matrix: Σ⁻¹ = R · S⁻² · Rᵀ
+        R = quaternion_to_matrix(g.rotation)
+        S_inv2 = np.diag(1.0 / (g.scale ** 2))
+        precision = R @ S_inv2 @ R.T
 
-public class MeshExtractor {
-    public init(device: MTLDevice) throws
+        # Mahalanobis distance squared
+        delta = point - g.position
+        d2 = delta @ precision @ delta
 
-    public func extractMesh(
-        gaussians: MTLBuffer,
-        gaussianCount: Int,
-        harmonics: MTLBuffer?,
-        config: MeshExtractionConfig
-    ) async throws -> ExtractedMesh
-}
+        # Gaussian contribution
+        gaussian_value = np.exp(-0.5 * d2)
+        alpha = min(0.99, g.opacity * gaussian_value)
+
+        transmittance *= (1 - alpha)
+
+    return 1.0 - transmittance
 ```
+
+### 5.2 Expected Results
+
+| Test Case | Expected |
+|-----------|----------|
+| Single spherical Gaussian | Spherical mesh |
+| Two overlapping Gaussians | Merged blob |
+| Two separated Gaussians | Two components |
+| Opacity = 0.5 Gaussian | Mesh at 1σ from center |
+| Opacity = 0.99 Gaussian | Mesh at ~3σ from center |
 
 ---
 
 ## 6. Memory Requirements
 
-For a 256³ grid:
-- Opacity grid: 256³ × 4 bytes = 64 MB
-- Spatial hash: ~16 MB (depends on scene)
-- Triangle buffer: ~100 MB (worst case)
-- Total: ~200 MB
-
-For a 512³ grid:
-- Opacity grid: 512³ × 4 bytes = 512 MB
-- Spatial hash: ~32 MB
-- Triangle buffer: ~400 MB
-- Total: ~1 GB
+| Grid Resolution | Opacity Grid | Triangle Buffer | Total |
+|-----------------|--------------|-----------------|-------|
+| 64³             | 1 MB         | ~10 MB          | ~15 MB |
+| 128³            | 8 MB         | ~50 MB          | ~70 MB |
+| 256³            | 64 MB        | ~200 MB         | ~300 MB |
+| 512³            | 512 MB       | ~800 MB         | ~1.5 GB |
 
 ---
 
-## 7. Validation
+## 7. References
 
-### 7.1 Unit Tests
+1. Yu, Z., Sattler, T., & Geiger, A. (2024). "Gaussian Opacity Fields: Efficient Adaptive Surface Reconstruction in Unbounded Scenes." arXiv:2404.10772
 
-1. Single Gaussian: Should produce sphere-like mesh
-2. Two overlapping Gaussians: Should merge correctly
-3. Separated Gaussians: Should produce distinct components
+2. Kerbl, B., et al. (2023). "3D Gaussian Splatting for Real-Time Radiance Field Rendering." SIGGRAPH
 
-### 7.2 Numerical Validation
+3. Lorensen, W. E., & Cline, H. E. (1987). "Marching cubes: A high resolution 3D surface construction algorithm." ACM SIGGRAPH
 
-Compare opacity values against reference Python implementation:
-```python
-def compute_opacity(point, gaussians):
-    transmittance = 1.0
-    for g in gaussians:
-        d2 = mahalanobis_squared(point, g.mean, g.cov_inv)
-        alpha = g.opacity * exp(-0.5 * d2)
-        alpha = min(alpha, 0.99)
-        transmittance *= (1 - alpha)
-    return 1 - transmittance
-```
+4. Kulhanek, J., & Sattler, T. (2023). "Tetra-NeRF: Representing Neural Radiance Fields Using Tetrahedra." ICCV
 
 ---
 
-## 8. File Structure
+## 8. Summary of Key Equations
 
-```
-Sources/Renderer/
-├── MeshExtraction/
-│   ├── MeshExtractor.swift           # Main Swift interface
-│   ├── MeshExtractionResources.swift # Buffer management
-│   ├── MeshExtractionShaders.metal   # All compute shaders
-│   ├── MarchingCubesTables.h         # Edge/triangle lookup tables
-│   └── Encoders/
-│       ├── ComputeBoundsEncoder.swift
-│       ├── BuildHashEncoder.swift
-│       ├── OpacityFieldEncoder.swift
-│       └── MarchingCubesEncoder.swift
-└── Shared/
-    └── MeshExtractionTypes.h         # Shared type definitions
-```
-
----
-
-## 9. Implementation Order
-
-1. **Phase 1: Core Types** (This PR)
-   - Add MeshExtractionTypes.h to BridgingTypes.h
-   - Create marching cubes lookup tables
-
-2. **Phase 2: Opacity Field** (This PR)
-   - Implement computeOpacityField shader
-   - No spatial acceleration (brute force for correctness)
-
-3. **Phase 3: Marching Cubes** (This PR)
-   - Implement count and generate shaders
-   - Reuse prefix sum infrastructure
-
-4. **Phase 4: Swift Interface** (This PR)
-   - MeshExtractor class
-   - Memory management
-
-5. **Phase 5: Optimizations** (Future)
-   - Spatial hash acceleration
-   - Multi-resolution support
-   - Binary search refinement
-
----
-
-## 10. References
-
-1. Yu, Z., et al. "Gaussian Opacity Fields: Efficient and Compact Surface Reconstruction in Unbounded Scenes." arXiv:2404.10772 (2024)
-2. Lorensen, W. E., & Cline, H. E. "Marching cubes: A high resolution 3D surface construction algorithm." ACM SIGGRAPH (1987)
-3. Kerbl, B., et al. "3D Gaussian Splatting for Real-Time Radiance Field Rendering." SIGGRAPH (2023)
+| Concept | Formula |
+|---------|---------|
+| Covariance | Σ = R · S² · Rᵀ |
+| Precision | Σ⁻¹ = R · S⁻² · Rᵀ |
+| Mahalanobis d² | d² = (p-μ)ᵀ · Σ⁻¹ · (p-μ) |
+| Gaussian value | G(p) = exp(-0.5 · d²) |
+| Per-Gaussian α | α = min(0.99, opacity · G(p)) |
+| Transmittance | T = ∏(1 - αᵢ) |
+| Total opacity | α(p) = 1 - T |
+| SDF | SDF = α - 0.5 |
+| Interpolation | t = v₁/(v₁-v₂), p = p₁ + t·(p₂-p₁) |

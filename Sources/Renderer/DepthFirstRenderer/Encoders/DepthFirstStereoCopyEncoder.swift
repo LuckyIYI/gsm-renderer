@@ -4,22 +4,25 @@ import RendererTypes
 /// Encoder that copies the intermediate 2-slice stereo texture array into the final target,
 /// using a render pass so we can attach a rasterization rate map (foveation) and use vertex amplification.
 final class DepthFirstStereoCopyEncoder {
-    private let renderPipeline: MTLRenderPipelineState
+    private struct PipelineKey: Hashable {
+        var pixelFormat: MTLPixelFormat
+        var sampleCount: Int
+    }
 
-    init(device: MTLDevice, library: MTLLibrary, colorFormat: MTLPixelFormat = .rgba16Float) throws {
+    private let device: MTLDevice
+    private let vertexFn: MTLFunction
+    private let fragmentFn: MTLFunction
+    private var pipelineCache: [PipelineKey: MTLRenderPipelineState] = [:]
+
+    init(device: MTLDevice, library: MTLLibrary) throws {
         guard let vertexFn = library.makeFunction(name: "stereoCopyVertex"),
               let fragmentFn = library.makeFunction(name: "stereoCopyFragment")
         else {
             throw RendererError.failedToCreatePipeline("Stereo copy shaders not found")
         }
-
-        let desc = MTLRenderPipelineDescriptor()
-        desc.vertexFunction = vertexFn
-        desc.fragmentFunction = fragmentFn
-        desc.colorAttachments[0].pixelFormat = colorFormat
-        desc.inputPrimitiveTopology = .triangle
-        desc.maxVertexAmplificationCount = 2
-        self.renderPipeline = try device.makeRenderPipelineState(descriptor: desc)
+        self.device = device
+        self.vertexFn = vertexFn
+        self.fragmentFn = fragmentFn
     }
 
     func encodeRender(
@@ -29,6 +32,29 @@ final class DepthFirstStereoCopyEncoder {
         rasterizationRateMap: MTLRasterizationRateMap?,
         configuration: StereoConfiguration
     ) {
+        let key = PipelineKey(
+            pixelFormat: destinationTexture.pixelFormat,
+            sampleCount: destinationTexture.sampleCount
+        )
+        let renderPipeline: MTLRenderPipelineState
+        if let cached = pipelineCache[key] {
+            renderPipeline = cached
+        } else {
+            let desc = MTLRenderPipelineDescriptor()
+            desc.vertexFunction = vertexFn
+            desc.fragmentFunction = fragmentFn
+            desc.colorAttachments[0].pixelFormat = destinationTexture.pixelFormat
+            desc.rasterSampleCount = max(1, destinationTexture.sampleCount)
+            desc.inputPrimitiveTopology = .triangle
+            desc.maxVertexAmplificationCount = 2
+            do {
+                renderPipeline = try device.makeRenderPipelineState(descriptor: desc)
+            } catch {
+                return
+            }
+            pipelineCache[key] = renderPipeline
+        }
+
         let rpd = MTLRenderPassDescriptor()
         rpd.colorAttachments[0].texture = destinationTexture
         rpd.colorAttachments[0].loadAction = .dontCare
@@ -39,7 +65,7 @@ final class DepthFirstStereoCopyEncoder {
         guard let encoder = commandBuffer.makeRenderCommandEncoder(descriptor: rpd) else { return }
         encoder.label = "DepthFirstStereoCopy"
 
-        encoder.setRenderPipelineState(self.renderPipeline)
+        encoder.setRenderPipelineState(renderPipeline)
 
         let leftViewport = MTLViewport(
             originX: configuration.leftEye.viewport.originX,

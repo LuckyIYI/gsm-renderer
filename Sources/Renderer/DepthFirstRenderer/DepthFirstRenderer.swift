@@ -89,7 +89,7 @@ public final class DepthFirstRenderer: GaussianRenderer, @unchecked Sendable {
 
         // Stereo encoders (tiled pipeline)
         self.stereoComputeRenderEncoder = try DepthFirstStereoComputeRenderEncoder(device: device, library: library)
-        self.stereoCopyEncoder = try DepthFirstStereoCopyEncoder(device: device, library: library, colorFormat: config.colorFormat)
+        self.stereoCopyEncoder = try DepthFirstStereoCopyEncoder(device: device, library: library)
 
         self.limits = RendererLimits(
             from: config,
